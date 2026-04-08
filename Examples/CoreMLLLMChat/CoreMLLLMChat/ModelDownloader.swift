@@ -43,9 +43,9 @@ final class ModelDownloader: NSObject {
 
     override init() {
         super.init()
-        let config = URLSessionConfiguration.background(withIdentifier: "com.coreml-llm.download")
-        config.isDiscretionary = false
-        config.sessionSendsLaunchEvents = true
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 300
+        config.timeoutIntervalForResource = 3600  // 1 hour for large files
         backgroundSession = URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }
 
@@ -69,7 +69,24 @@ final class ModelDownloader: NSObject {
         isDownloading = true
         progress = 0
         status = "Downloading \(model.name)..."
-        defer { isDownloading = false }
+
+        // Keep app alive during download
+        #if os(iOS)
+        var bgTask: UIBackgroundTaskIdentifier = .invalid
+        bgTask = UIApplication.shared.beginBackgroundTask {
+            UIApplication.shared.endBackgroundTask(bgTask)
+            bgTask = .invalid
+        }
+        #endif
+
+        defer {
+            isDownloading = false
+            #if os(iOS)
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+            }
+            #endif
+        }
 
         // Clean up any partial download
         let destDir = modelsDirectory.appendingPathComponent(model.folderName)
@@ -238,8 +255,11 @@ extension ModelDownloader: URLSessionDownloadDelegate {
         let fileProgress = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
         let (completed, total) = currentFileProgress
         let overallProgress = (Double(completed) + fileProgress) / Double(total)
+        let mbDone = Double(totalBytesWritten) / 1_000_000
+        let mbTotal = Double(totalBytesExpectedToWrite) / 1_000_000
         Task { @MainActor in
             self.progress = overallProgress
+            self.status = String(format: "%.0f / %.0f MB (%d/%d)", mbDone, mbTotal, completed + 1, total)
         }
     }
 
