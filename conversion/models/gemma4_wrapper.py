@@ -87,8 +87,6 @@ class Gemma4MonolithicWrapper(nn.Module):
         num_layers = config.num_hidden_layers
 
         # --- Embedding ---
-        # HF ScaledWordEmbedding has embed_scale=sqrt(hidden_size) built-in.
-        # Our plain nn.Embedding doesn't, so we apply it here.
         hidden_states = self.embed_tokens(input_ids).to(MODEL_DTYPE)
         hidden_states = hidden_states * (config.hidden_size ** 0.5)
 
@@ -140,7 +138,7 @@ class Gemma4MonolithicWrapper(nn.Module):
 
             x = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
 
-            # Q projection + norm + RoPE (always computed)
+            # Q projection + norm + RoPE
             q = layer.self_attn["q_proj"](x).view(1, num_heads, hd, 1).permute(0, 1, 3, 2).to(MODEL_DTYPE)
             q = layer.self_attn["q_norm"](q.reshape(1, num_heads, hd)).view(1, num_heads, 1, hd)
             if is_full:
@@ -155,7 +153,6 @@ class Gemma4MonolithicWrapper(nn.Module):
             max_hd = config.global_head_dim
 
             if not is_kv_shared:
-                # Compute own K/V
                 k = layer.self_attn["k_proj"](x).view(1, num_kv_heads, hd, 1).permute(0, 1, 3, 2).to(MODEL_DTYPE)
                 v = layer.self_attn["v_proj"](x).view(1, num_kv_heads, hd, 1).permute(0, 1, 3, 2).to(MODEL_DTYPE)
                 k = layer.self_attn["k_norm"](k.reshape(1, num_kv_heads, hd)).view(1, num_kv_heads, 1, hd)
@@ -219,19 +216,17 @@ class Gemma4MonolithicWrapper(nn.Module):
                 attn_output.permute(0, 2, 1).unsqueeze(2)
             ).squeeze(2).permute(0, 2, 1)
 
-            # Post-attention norm (sandwich)
+            # Post-attention norm (ANERMSNorm now computes in float32 internally)
             attn_output = layer.post_attention_layernorm(attn_output)
-
             hidden_states = residual + attn_output
 
             # MLP with sandwich norm
             residual = hidden_states
             hidden_states = layer.pre_feedforward_layernorm(hidden_states)
 
-            # GELU MLP
-            x = hidden_states.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
-            gate = layer.mlp["gate_proj"](x)
-            up = layer.mlp["up_proj"](x)
+            x_mlp = hidden_states.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
+            gate = layer.mlp["gate_proj"](x_mlp)
+            up = layer.mlp["up_proj"](x_mlp)
             gate = F.gelu(gate, approximate="tanh")
             mlp_out = layer.mlp["down_proj"](gate * up)
             hidden_states = mlp_out.squeeze(2).permute(0, 2, 1)
@@ -239,13 +234,13 @@ class Gemma4MonolithicWrapper(nn.Module):
             hidden_states = layer.post_feedforward_layernorm(hidden_states)
             hidden_states = residual + hidden_states
 
-            # Per-layer input (matches HF: gate → act_fn → multiply → project → norm → residual)
+            # Per-layer input
             residual_pl = hidden_states
             start = layer_idx * self.per_layer_dim
             end = start + self.per_layer_dim
-            per_layer_slice = per_layer_combined[:, :, start:end]  # (1, 1, 256)
+            per_layer_slice = per_layer_combined[:, :, start:end]
             gated = layer.per_layer_input_gate(hidden_states.to(MODEL_DTYPE))
-            gated = F.gelu(gated, approximate="tanh")  # act_fn after gate
+            gated = F.gelu(gated, approximate="tanh")
             gated = gated * per_layer_slice
             gated = layer.per_layer_projection(gated)
             hidden_states = layer.post_per_layer_input_norm(gated)
@@ -258,7 +253,7 @@ class Gemma4MonolithicWrapper(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         # --- LM Head + Softcapping + Argmax ---
-        x = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
+        x = hidden_states.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
         logits = self.lm_head(x).squeeze(2).permute(0, 2, 1)
 
         # Logit softcapping: tanh(logits / cap) * cap

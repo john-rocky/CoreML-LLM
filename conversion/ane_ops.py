@@ -38,6 +38,11 @@ class ANERMSNorm(nn.Module):
         self.hidden_size = hidden_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+
+        # Compute in float32 (matches HF's Gemma4RMSNorm which casts to float32)
+        x = x.float()
+
         # Step 1: Make mean zero by doubling with negation
         doubled = torch.cat([x, -x], dim=-1)
 
@@ -53,8 +58,8 @@ class ANERMSNorm(nn.Module):
         # Step 3: Keep only the first half using chunk (avoids dynamic shape int)
         normed, _ = torch.chunk(normed, 2, dim=-1)
 
-        # Step 4: Apply learnable scale
-        return normed * self.weight.to(normed.dtype)
+        # Step 4: Apply learnable scale and cast back
+        return (normed * self.weight.float()).to(input_dtype)
 
 
 class Conv2dLinear(nn.Module):
