@@ -17,6 +17,7 @@ final class LLMRunner {
 
     // Tokenizer (simplified — in production, use swift-transformers)
     private var tokenizer: SimpleTokenizer?
+    private var architecture = "gemma4"
 
     func loadModel(from url: URL) async throws {
         loadingStatus = "Compiling model..."
@@ -34,9 +35,13 @@ final class LLMRunner {
         // Load model config to get context length
         let configURL = url.deletingLastPathComponent().appendingPathComponent("model_config.json")
         if let data = try? Data(contentsOf: configURL),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let ctx = json["context_length"] as? Int {
-            self.contextLength = ctx
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let ctx = json["context_length"] as? Int {
+                self.contextLength = ctx
+            }
+            if let arch = json["architecture"] as? String {
+                self.architecture = arch
+            }
         }
 
         // Load tokenizer
@@ -163,9 +168,15 @@ final class LLMRunner {
     }
 
     private func buildPrompt(messages: [ChatMessage]) -> String {
-        // Detect model type from context length or model config
-        // For now, support both Qwen and Gemma formats
-        var prompt = ""
+        if architecture.hasPrefix("qwen") {
+            return buildQwenPrompt(messages: messages)
+        } else {
+            return buildGemmaPrompt(messages: messages)
+        }
+    }
+
+    private func buildGemmaPrompt(messages: [ChatMessage]) -> String {
+        var prompt = "<bos>"
         for msg in messages {
             switch msg.role {
             case .user:
@@ -177,7 +188,23 @@ final class LLMRunner {
             }
         }
         prompt += "<|turn>model\n"
-        return "<bos>" + prompt
+        return prompt
+    }
+
+    private func buildQwenPrompt(messages: [ChatMessage]) -> String {
+        var prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        for msg in messages {
+            switch msg.role {
+            case .user:
+                prompt += "<|im_start|>user\n\(msg.content)<|im_end|>\n"
+            case .assistant:
+                prompt += "<|im_start|>assistant\n\(msg.content)<|im_end|>\n"
+            case .system:
+                break
+            }
+        }
+        prompt += "<|im_start|>assistant\n"
+        return prompt
     }
 }
 
