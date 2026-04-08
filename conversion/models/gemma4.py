@@ -119,7 +119,7 @@ class Gemma4Model(nn.Module):
         per_layer_dim = config.hidden_size_per_layer_input  # 256
         total_per_layer_dim = per_layer_dim * config.num_hidden_layers  # 8960
         self.embed_tokens_per_layer = nn.Embedding(config.vocab_size, total_per_layer_dim)
-        self.per_layer_model_projection = nn.Linear(config.hidden_size, total_per_layer_dim, bias=False)
+        self.per_layer_model_projection = nn.Linear(config.hidden_size, total_per_layer_dim, bias=False, dtype=MODEL_DTYPE)
         self.per_layer_model_projection_scale = config.hidden_size ** -0.5
         self.per_layer_input_scale = 2.0 ** -0.5
         self.per_layer_embed_scale = per_layer_dim ** 0.5

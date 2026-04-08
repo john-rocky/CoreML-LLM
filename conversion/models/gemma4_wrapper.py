@@ -93,11 +93,11 @@ class Gemma4MonolithicWrapper(nn.Module):
 
         # --- Per-layer embeddings (matches HF project_per_layer_inputs) ---
         # 1. Look up per-layer token embeddings and scale
-        per_layer_raw = self.embed_tokens_per_layer(input_ids).to(MODEL_DTYPE) * torch.tensor(self.per_layer_embed_scale, dtype=MODEL_DTYPE)
+        per_layer_raw = self.embed_tokens_per_layer(input_ids).to(MODEL_DTYPE) * self.per_layer_embed_scale
         # Shape: (1, 1, num_layers * per_layer_dim) = (1, 1, 8960)
 
         # 2. Project main embeddings to per-layer space
-        per_layer_proj = self.per_layer_model_projection(hidden_states.float()).to(MODEL_DTYPE) * torch.tensor(self.per_layer_model_projection_scale, dtype=MODEL_DTYPE)
+        per_layer_proj = self.per_layer_model_projection(hidden_states.to(MODEL_DTYPE)) * self.per_layer_model_projection_scale
 
         # 3. Apply norm to projection per-layer slices (HF does this BEFORE combining)
         # We apply norm to each 256-dim slice of the 8960-dim projection
@@ -109,7 +109,7 @@ class Gemma4MonolithicWrapper(nn.Module):
         per_layer_proj_normed = torch.cat(normed_slices, dim=-1)
 
         # 4. Combine: (normed_projection + raw) * input_scale
-        per_layer_combined = (per_layer_proj_normed + per_layer_raw) * torch.tensor(self.per_layer_input_scale, dtype=MODEL_DTYPE)
+        per_layer_combined = (per_layer_proj_normed + per_layer_raw) * self.per_layer_input_scale
 
         # --- Get RoPE for both types ---
         cos_s = torch.index_select(self.cos_sliding, 0, position_ids).unsqueeze(0).unsqueeze(0)
