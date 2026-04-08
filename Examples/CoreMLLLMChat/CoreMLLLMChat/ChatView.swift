@@ -1,4 +1,5 @@
 import SwiftUI
+import PhotosUI
 
 struct ChatView: View {
     @State private var runner = LLMRunner()
@@ -6,24 +7,23 @@ struct ChatView: View {
     @State private var inputText = ""
     @State private var showModelPicker = false
     @State private var streamingText = ""
+    @State private var selectedPhoto: PhotosPickerItem?
+    @State private var selectedImage: CGImage?
+    @State private var selectedImageData: Data?
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // Status bar
                 if !runner.isLoaded {
                     statusBar
                 }
 
-                // Messages
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 12) {
                             ForEach(messages) { message in
                                 MessageBubble(message: message)
                             }
-
-                            // Streaming response
                             if !streamingText.isEmpty {
                                 MessageBubble(message: ChatMessage(role: .assistant, content: streamingText))
                                     .id("streaming")
@@ -32,34 +32,45 @@ struct ChatView: View {
                         .padding()
                     }
                     .onChange(of: streamingText) {
-                        withAnimation {
-                            proxy.scrollTo("streaming", anchor: .bottom)
-                        }
+                        withAnimation { proxy.scrollTo("streaming", anchor: .bottom) }
                     }
                 }
 
-                // Performance indicator
                 if runner.isGenerating {
                     HStack {
-                        ProgressView()
-                            .scaleEffect(0.8)
+                        ProgressView().scaleEffect(0.8)
                         Text(String(format: "%.1f tok/s", runner.tokensPerSecond))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                     .padding(.vertical, 4)
                 }
 
-                Divider()
+                // Image preview
+                if let imageData = selectedImageData, let uiImage = UIImage(data: imageData) {
+                    HStack {
+                        Image(uiImage: uiImage)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(height: 60)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        Button { clearImage() } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal)
+                    .padding(.top, 4)
+                }
 
-                // Input bar
+                Divider()
                 inputBar
             }
-            .navigationTitle("CoreML LLM")
+            .navigationTitle(runner.isLoaded ? runner.modelName : "CoreML LLM")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button(runner.isLoaded ? "Switch Model" : "Get Model") {
+                    Button(runner.isLoaded ? "Switch" : "Get Model") {
                         showModelPicker = true
                     }
                     .disabled(runner.isGenerating)
@@ -68,6 +79,7 @@ struct ChatView: View {
                     Button("Clear") {
                         messages.removeAll()
                         streamingText = ""
+                        clearImage()
                         runner.resetConversation()
                     }
                     .disabled(runner.isGenerating)
@@ -79,55 +91,57 @@ struct ChatView: View {
                     loadModel(from: modelURL.deletingLastPathComponent())
                 }
             }
+            .onChange(of: selectedPhoto) {
+                loadPhoto()
+            }
         }
     }
-
-    // MARK: - Subviews
 
     private var statusBar: some View {
         HStack {
             Image(systemName: runner.isLoaded ? "checkmark.circle.fill" : "circle")
                 .foregroundStyle(runner.isLoaded ? .green : .secondary)
             Text(runner.loadingStatus)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(.caption).foregroundStyle(.secondary)
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
+        .padding(.horizontal).padding(.vertical, 8)
         .frame(maxWidth: .infinity)
         .background(.ultraThinMaterial)
     }
 
     private var inputBar: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 8) {
+            // Image picker (only for multimodal models)
+            if runner.hasVision {
+                PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                    Image(systemName: "photo")
+                        .font(.title3)
+                }
+                .disabled(runner.isGenerating)
+            }
+
             TextField("Message", text: $inputText, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(1...5)
                 .disabled(!runner.isLoaded || runner.isGenerating)
 
-            Button {
-                sendMessage()
-            } label: {
+            Button { sendMessage() } label: {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.title2)
             }
             .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                       || !runner.isLoaded
-                       || runner.isGenerating)
+                       || !runner.isLoaded || runner.isGenerating)
         }
         .padding()
     }
 
-    // MARK: - Actions
-
     private func loadModel(from folderURL: URL) {
         let modelURL = folderURL.appendingPathComponent("model.mlpackage")
         messages.append(ChatMessage(role: .system, content: "Loading model..."))
-
         Task {
             do {
                 try await runner.loadModel(from: modelURL)
-                messages.append(ChatMessage(role: .system, content: "Model loaded! Start chatting."))
+                messages.append(ChatMessage(role: .system, content: "Model loaded! " + (runner.hasVision ? "Image input enabled." : "")))
             } catch {
                 messages.append(ChatMessage(role: .system, content: "Failed: \(error.localizedDescription)"))
             }
@@ -142,13 +156,15 @@ struct ChatView: View {
         inputText = ""
         streamingText = ""
 
+        let image = selectedImage
+        clearImage()
+
         Task {
             do {
-                let stream = try await runner.generate(messages: messages)
+                let stream = try await runner.generate(messages: messages, image: image)
                 for await token in stream {
                     streamingText += token
                 }
-                // Move streaming text to messages
                 if !streamingText.isEmpty {
                     messages.append(ChatMessage(role: .assistant, content: streamingText))
                     streamingText = ""
@@ -158,9 +174,25 @@ struct ChatView: View {
             }
         }
     }
-}
 
-// MARK: - Message Bubble
+    private func loadPhoto() {
+        guard let item = selectedPhoto else { return }
+        Task {
+            if let data = try? await item.loadTransferable(type: Data.self) {
+                selectedImageData = data
+                if let uiImage = UIImage(data: data) {
+                    selectedImage = uiImage.cgImage
+                }
+            }
+        }
+    }
+
+    private func clearImage() {
+        selectedPhoto = nil
+        selectedImage = nil
+        selectedImageData = nil
+    }
+}
 
 struct MessageBubble: View {
     let message: ChatMessage
@@ -168,33 +200,26 @@ struct MessageBubble: View {
     var body: some View {
         HStack {
             if message.role == .user { Spacer(minLength: 60) }
-
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
-                Text(message.role == .user ? "You" : "Assistant")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-
+                Text(message.role == .user ? "You" : message.role == .assistant ? "Assistant" : "System")
+                    .font(.caption2).foregroundStyle(.secondary)
                 Text(message.content)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
+                    .padding(.horizontal, 14).padding(.vertical, 10)
                     .background(backgroundColor)
                     .foregroundStyle(message.role == .user ? .white : .primary)
                     .clipShape(RoundedRectangle(cornerRadius: 16))
             }
-
             if message.role != .user { Spacer(minLength: 60) }
         }
     }
 
     private var backgroundColor: Color {
         switch message.role {
-        case .user: return .blue
-        case .assistant: return Color(.systemGray5)
-        case .system: return Color(.systemOrange).opacity(0.2)
+        case .user: .blue
+        case .assistant: Color(.systemGray5)
+        case .system: Color.orange.opacity(0.2)
         }
     }
 }
 
-#Preview {
-    ChatView()
-}
+#Preview { ChatView() }

@@ -1,47 +1,43 @@
 # CoreMLLLMChat
 
-A minimal iOS chat app demonstrating on-device LLM inference using CoreML with ANE+GPU optimization.
+iOS chat app with on-device LLM inference using CoreML (ANE+GPU).
+
+Supports text chat (Qwen2.5, Gemma 4) and image understanding (Gemma 4 multimodal).
 
 ## Setup
 
-### 1. Convert a Model
+### 1. Open in Xcode
+
+Open the `Package.swift` in Xcode:
 
 ```bash
-cd ../../conversion
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt && pip install scikit-learn
-python convert.py --model qwen2.5-0.5b --context-length 512 --output ./output/qwen2.5-0.5b
+open Examples/CoreMLLLMChat/Package.swift
 ```
 
-### 2. Transfer Model to Device
+Or: File → Open → select `Package.swift`
 
-Copy the output folder (containing `model.mlpackage`, `model_config.json`, and `hf_model/`) to your device via AirDrop, Files app, or Xcode.
+### 2. Build
 
-### 3. Run the App
+- Set development team in Signing & Capabilities
+- Build to device (iOS 18+, iPhone or iPad)
+- Xcode will resolve swift-transformers dependency automatically
 
-1. Open `CoreMLLLMChat.xcodeproj` in Xcode
-2. Set your development team in Signing & Capabilities
-3. Build and run on device (iOS 18+)
-4. Tap "Load Model" and select the folder containing the model files
+### 3. Use
 
-## Architecture
+- Tap **"Get Model"** → select and download a model
+- Chat with text
+- For Gemma 4 multimodal: tap the photo icon to attach an image
 
-```
-CoreMLLLMChatApp.swift  — App entry point
-ChatView.swift          — SwiftUI chat interface with streaming
-LLMRunner.swift         — CoreML model loading and inference loop
-SimpleTokenizer.swift   — Minimal BPE tokenizer (loads tokenizer.json)
-ChatMessage.swift       — Message data model
-```
+## Features
 
-## Notes
+- **swift-transformers tokenizer** — proper BPE tokenization via HuggingFace
+- **Streaming generation** — tokens appear as generated, with tok/s display
+- **Image input** — PhotosPicker for Gemma 4 multimodal image captioning
+- **Model download** — downloads from GitHub Releases with progress
+- **Qwen/Gemma chat templates** — auto-detected from model config
 
-- Requires iOS 18+ (MLState API for stateful KV cache)
-- First model load compiles the CoreML model (may take 30-60 seconds)
-- The SimpleTokenizer is a minimal implementation; for production, use [swift-transformers](https://github.com/huggingface/swift-transformers)
-- Model files are NOT bundled — load from device storage at runtime
+## Requirements
 
-## Supported Models
-
-- **Qwen2.5-0.5B** (302 MB, int4) — Fast, accurate
-- **Gemma 4 E2B** (2.4 GB, int4) — Larger, multimodal text decoder
+- iOS 18+ (MLState API)
+- iPhone 15 Pro or newer recommended (8 GB RAM)
+- Xcode 16+
