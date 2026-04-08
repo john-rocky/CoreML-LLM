@@ -8,13 +8,9 @@ Supports text chat (Qwen2.5, Gemma 4) and image understanding (Gemma 4 multimoda
 
 ### 1. Open in Xcode
 
-Open the `Package.swift` in Xcode:
-
 ```bash
-open Examples/CoreMLLLMChat/Package.swift
+open Examples/CoreMLLLMChat/CoreMLLLMChat.xcodeproj
 ```
-
-Or: File → Open → select `Package.swift`
 
 ### 2. Build
 

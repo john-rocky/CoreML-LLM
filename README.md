@@ -64,12 +64,12 @@ print(out['token_id'])  # Next token prediction
 ### 3. iOS App
 
 ```bash
-open Examples/CoreMLLLMChat/Package.swift
+open Examples/CoreMLLLMChat/CoreMLLLMChat.xcodeproj
 ```
 
-Build to device (iOS 18+) → "Get Model" → Download → Chat.
+Set your development team → Build to device (iOS 18+) → "Get Model" → Download → Chat.
 
-For multimodal: place `vision.mlpackage` alongside `model.mlpackage` → tap 📷 to attach images.
+For Gemma 4 multimodal: tap 📷 to attach a photo, then ask about it.
 
 ## How It Works
 
