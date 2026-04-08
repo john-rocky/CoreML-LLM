@@ -1,0 +1,7 @@
+coremltools>=8.0
+torch>=2.2.0
+transformers>=4.40.0
+safetensors>=0.4.0
+numpy>=1.24.0
+pyyaml>=6.0
+huggingface-hub>=0.20.0

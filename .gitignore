@@ -1,0 +1,39 @@
+# CoreML models
+*.mlpackage
+*.mlpackage.zip
+*.mlmodelc
+*.mlmodel
+
+# PyTorch
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+*.egg
+
+# Xcode
+*.xcuserstate
+*.xcworkspace
+xcuserdata/
+DerivedData/
+build/
+.build/
+
+# macOS
+.DS_Store
+*.swp
+
+# IDE
+.idea/
+.vscode/
+
+# Output
+output/
