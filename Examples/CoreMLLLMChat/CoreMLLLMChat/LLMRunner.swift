@@ -34,6 +34,12 @@ final class LLMRunner {
     private var perLayerProjWeight: Data?  // (8960, 1536) float16
     private var perLayerNormWeight: Data?  // (256,) float32
 
+    // Pre-computed RoPE tables (for chunked model)
+    private var cosSlidingTable: Data?  // (max_len, 256) float16
+    private var sinSlidingTable: Data?
+    private var cosFullTable: Data?     // (max_len, 512) float16
+    private var sinFullTable: Data?
+
     // Shared
     private var tokenizer: (any Tokenizer)?
     private var contextLength = 512
@@ -141,6 +147,13 @@ final class LLMRunner {
 
         perLayerProjWeight = try? Data(contentsOf: folder.appendingPathComponent("per_layer_projection.bin"), options: .mappedIfSafe)
         perLayerNormWeight = try? Data(contentsOf: folder.appendingPathComponent("per_layer_norm_weight.bin"), options: .mappedIfSafe)
+
+        // RoPE tables (numpy .npy files → raw float16 data, skip 128-byte npy header)
+        loadingStatus = "Loading RoPE tables..."
+        cosSlidingTable = try? Data(contentsOf: folder.appendingPathComponent("cos_sliding.npy"), options: .mappedIfSafe)
+        sinSlidingTable = try? Data(contentsOf: folder.appendingPathComponent("sin_sliding.npy"), options: .mappedIfSafe)
+        cosFullTable = try? Data(contentsOf: folder.appendingPathComponent("cos_full.npy"), options: .mappedIfSafe)
+        sinFullTable = try? Data(contentsOf: folder.appendingPathComponent("sin_full.npy"), options: .mappedIfSafe)
 
         isChunked = true
     }
@@ -269,12 +282,15 @@ final class LLMRunner {
               let chunk1State, let chunk2State,
               let embedTokens, let embedPerLayer else { throw NSError(domain: "", code: 0) }
         let ctx = contextLength, hs = hiddenSize
-        let nlayers = 35, pld = perLayerDim
 
-        let pos = try MLMultiArray(shape: [1], dataType: .int32)
-        pos[0] = NSNumber(value: Int32(position))
         let mask = try makeCausalMask(position: position, contextLength: ctx)
         let umask = try makeUpdateMask(position: position, contextLength: ctx)
+
+        // Compute cos/sin for current position from RoPE tables
+        let cosS = try lookupRoPE(table: cosSlidingTable, position: position, dim: 256)
+        let sinS = try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
+        let cosF = try lookupRoPE(table: cosFullTable, position: position, dim: 512)
+        let sinF = try lookupRoPE(table: sinFullTable, position: position, dim: 512)
 
         // Compute embeddings externally
         let hiddenStatesIn: MLMultiArray
@@ -284,46 +300,48 @@ final class LLMRunner {
             hiddenStatesIn = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hs)])
         }
 
-        // Per-layer combined: raw + projection
         let perLayerCombined = try computePerLayerCombined(tokenID: tokenID, embedding: hiddenStatesIn)
 
-        // Chunk 1: layers 0-11
+        // Chunk 1: layers 0-11 (cos/sin instead of position_ids)
         let input1 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: hiddenStatesIn),
             "per_layer_combined": MLFeatureValue(multiArray: perLayerCombined),
-            "position_ids": MLFeatureValue(multiArray: pos),
+            "cos_s": MLFeatureValue(multiArray: cosS),
+            "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF),
+            "sin_f": MLFeatureValue(multiArray: sinF),
             "causal_mask": MLFeatureValue(multiArray: mask),
             "update_mask": MLFeatureValue(multiArray: umask),
         ])
         let out1 = try chunk1.prediction(from: input1, using: chunk1State)
         let hiddenStates = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
 
-        // Chunk 2: layers 12-23 → hidden_states (+ stores kv13/kv14 internally)
+        // Chunk 2: layers 12-23 → hidden_states + kv13/kv14
         let input2 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: hiddenStates),
             "per_layer_combined": MLFeatureValue(multiArray: perLayerCombined),
-            "position_ids": MLFeatureValue(multiArray: pos),
+            "cos_s": MLFeatureValue(multiArray: cosS),
+            "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF),
+            "sin_f": MLFeatureValue(multiArray: sinF),
             "causal_mask": MLFeatureValue(multiArray: mask),
             "update_mask": MLFeatureValue(multiArray: umask),
         ])
         let out2 = try chunk2.prediction(from: input2, using: chunk2State)
         let hiddenStates2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
-
-        // Read KV13/KV14 from chunk2's KV cache state for chunk3
-        // Chunk2 stores layers 12-23: local indices 0-11
-        // Layer 13 = local 1, Layer 14 = local 2
-        // KV cache layout: [K0..K11, V0..V11] = 24 entries
-        // K13 = index 1, V13 = index 13, K14 = index 2, V14 = index 14
-        let kv13_k = try extractKVSlice(from: chunk2State, cacheIndex: 1, headDim: 256)
-        let kv13_v = try extractKVSlice(from: chunk2State, cacheIndex: 13, headDim: 256)
-        let kv14_k = try extractKVSlice(from: chunk2State, cacheIndex: 2, headDim: 512)
-        let kv14_v = try extractKVSlice(from: chunk2State, cacheIndex: 14, headDim: 512)
+        let kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
+        let kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
+        let kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
+        let kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
 
         // Chunk 3: layers 24-34 + norm + lm_head → token_id
         let input3 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: hiddenStates2),
             "per_layer_combined": MLFeatureValue(multiArray: perLayerCombined),
-            "position_ids": MLFeatureValue(multiArray: pos),
+            "cos_s": MLFeatureValue(multiArray: cosS),
+            "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF),
+            "sin_f": MLFeatureValue(multiArray: sinF),
             "causal_mask": MLFeatureValue(multiArray: mask),
             "kv13_k": MLFeatureValue(multiArray: kv13_k),
             "kv13_v": MLFeatureValue(multiArray: kv13_v),
@@ -334,19 +352,37 @@ final class LLMRunner {
         return out3.featureValue(for: "token_id")!.multiArrayValue![0].intValue
     }
 
-    private func extractKVSlice(from state: MLState, cacheIndex: Int, headDim: Int) throws -> MLMultiArray {
-        // Read from the KV cache state
-        // KV cache shape: (24, 1, 512, 512) — [layer, kv_heads, seq, max_head_dim]
-        // We need: (1, 1, 512, headDim)
-        let ctx = contextLength
-        let result = try MLMultiArray(shape: [1, 1, NSNumber(value: ctx), NSNumber(value: headDim)], dataType: .float16)
+    /// Look up cos/sin values for a position from a numpy .npy file.
+    private func lookupRoPE(table: Data?, position: Int, dim: Int) throws -> MLMultiArray {
+        let result = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: dim)], dataType: .float16)
+        let dstPtr = result.dataPointer.bindMemory(to: UInt16.self, capacity: dim)
 
-        // Access state's buffer
-        // MLState doesn't have direct read access — the KV values are passed through chunk2's outputs
-        // TODO: chunk2 needs to output kv13/kv14 explicitly
+        guard let table else {
+            memset(dstPtr, 0, dim * MemoryLayout<UInt16>.stride)
+            return result
+        }
 
-        // For now, zero-fill (this will be fixed when chunk2 outputs KV)
-        memset(result.dataPointer, 0, ctx * headDim * MemoryLayout<UInt16>.stride)
+        // numpy .npy format: header then raw data
+        var headerSize = 128  // typical
+        table.withUnsafeBytes { raw in
+            let bytes = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            let hlen = Int(bytes[8]) | (Int(bytes[9]) << 8)
+            headerSize = 10 + hlen
+        }
+
+        let rowBytes = dim * MemoryLayout<UInt16>.stride
+        let offset = headerSize + position * rowBytes
+
+        guard offset + rowBytes <= table.count else {
+            memset(dstPtr, 0, rowBytes)
+            return result
+        }
+
+        table.withUnsafeBytes { raw in
+            let srcPtr = raw.baseAddress!.advanced(by: offset)
+            memcpy(dstPtr, srcPtr, rowBytes)
+        }
+
         return result
     }
 
