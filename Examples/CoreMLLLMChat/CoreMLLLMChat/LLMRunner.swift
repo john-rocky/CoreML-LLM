@@ -329,15 +329,18 @@ final class LLMRunner {
                     var imageIdx = 0
                     var nextID = 0
 
-                    // Prefill with progress
+                    // Prefill with progress — wrap each step in autoreleasepool
+                    // to drain CoreML MLMultiArray allocations (prevents memory growth)
                     self.loadingStatus = "Prefill 0/\(tokenIDs.count)..."
                     for (step, tid) in tokenIDs.enumerated() {
-                        if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 256 {
-                            let imgEmb = self.sliceFeature(feats, at: imageIdx)
-                            nextID = try self.predictStep(tokenID: 0, position: step, imageEmbedding: imgEmb)
-                            imageIdx += 1
-                        } else {
-                            nextID = try self.predictStep(tokenID: tid, position: step)
+                        try autoreleasepool {
+                            if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 256 {
+                                let imgEmb = self.sliceFeature(feats, at: imageIdx)
+                                nextID = try self.predictStep(tokenID: 0, position: step, imageEmbedding: imgEmb)
+                                imageIdx += 1
+                            } else {
+                                nextID = try self.predictStep(tokenID: tid, position: step)
+                            }
                         }
                         self.currentPosition = step + 1
                         self.loadingStatus = "Prefill \(step + 1)/\(tokenIDs.count)..."
@@ -355,7 +358,9 @@ final class LLMRunner {
                         tokenCount += 1
                         let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                         if elapsed > 0 { self.tokensPerSecond = Double(tokenCount) / elapsed }
-                        nextID = try self.predictStep(tokenID: nextID, position: self.currentPosition)
+                        try autoreleasepool {
+                            nextID = try self.predictStep(tokenID: nextID, position: self.currentPosition)
+                        }
                         self.currentPosition += 1
                     }
                     self.loadingStatus = "Ready"
