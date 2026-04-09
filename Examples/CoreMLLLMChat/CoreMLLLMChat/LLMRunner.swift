@@ -85,31 +85,13 @@ final class LLMRunner {
         }
 
         let mlConfig = MLModelConfiguration()
-        mlConfig.computeUnits = .all  // Try ANE first
+        mlConfig.computeUnits = .all  // ANE for small chunks, .cpuAndGPU fallback for monolithic
 
         let chunk1URL = findModel(in: folder, name: "chunk1")
-        do {
-            if chunk1URL != nil {
-                try await loadChunked(folder: folder, config: mlConfig)
-            } else {
-                try await loadMonolithic(url: url, folder: folder, config: mlConfig)
-            }
-            // Force compilation by running a dummy prediction to catch ANE errors early
-            if let m = model, let s = state {
-                loadingStatus = "Verifying model..."
-                try dummyPredict(model: m, state: s)
-            }
-        } catch {
-            // ANE compilation failed, fall back to CPU+GPU
-            loadingStatus = "ANE failed, using CPU+GPU..."
-            mlConfig.computeUnits = .cpuAndGPU
-            model = nil
-            state = nil
-            if chunk1URL != nil {
-                try await loadChunked(folder: folder, config: mlConfig)
-            } else {
-                try await loadMonolithic(url: url, folder: folder, config: mlConfig)
-            }
+        if chunk1URL != nil {
+            try await loadChunked(folder: folder, config: mlConfig)
+        } else {
+            try await loadMonolithic(url: url, folder: folder, config: mlConfig)
         }
 
         // Vision model: defer loading to save memory (loaded on first image)
@@ -183,19 +165,16 @@ final class LLMRunner {
     }
 
     private func loadChunked(folder: URL, config mlConfig: MLModelConfiguration) async throws {
-        loadingStatus = "Loading chunk 1/3..."
+        loadingStatus = "Loading chunk 1/2..."
         chunk1 = try MLModel(contentsOf: findModel(in: folder, name: "chunk1")!, configuration: mlConfig)
         chunk1State = chunk1?.makeState()
 
-        loadingStatus = "Loading chunk 2/3..."
+        loadingStatus = "Loading chunk 2/2..."
         chunk2 = try MLModel(contentsOf: findModel(in: folder, name: "chunk2")!, configuration: mlConfig)
-        chunk2State = chunk2?.makeState()
+        // chunk2 is stateless (all KV shared from chunk1's layers 13/14)
 
-        loadingStatus = "Loading chunk 3/3..."
-        chunk3 = try MLModel(contentsOf: findModel(in: folder, name: "chunk3")!, configuration: mlConfig)
-
-        // Load external embeddings (memory-mapped)
-        loadingStatus = "Loading embeddings..."
+        // Load external embeddings
+        loadingStatus = "Loading external embeddings..."
         let vocabSize = 262144
         let nlayers = 35
         let etURL = folder.appendingPathComponent("embed_tokens_q8.bin")
@@ -216,7 +195,7 @@ final class LLMRunner {
         // Pre-convert projection to float32 for Accelerate BLAS
         if let projData = perLayerProjWeight {
             loadingStatus = "Converting projection..."
-            let count = nlayers * perLayerDim * hiddenSize  // 8960 * 1536
+            let count = nlayers * perLayerDim * hiddenSize
             var f32 = [Float](repeating: 0, count: count)
             projData.withUnsafeBytes { raw in
                 let f16Ptr = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
@@ -225,16 +204,10 @@ final class LLMRunner {
                 }
             }
             perLayerProjF32 = f32
-            perLayerProjWeight = nil  // Release mapped data, no longer needed
+            perLayerProjWeight = nil
         }
 
-        // RoPE tables (numpy .npy files → raw float16 data, skip 128-byte npy header)
-        loadingStatus = "Loading RoPE tables..."
-        cosSlidingTable = try? Data(contentsOf: folder.appendingPathComponent("cos_sliding.npy"), options: .mappedIfSafe)
-        sinSlidingTable = try? Data(contentsOf: folder.appendingPathComponent("sin_sliding.npy"), options: .mappedIfSafe)
-        cosFullTable = try? Data(contentsOf: folder.appendingPathComponent("cos_full.npy"), options: .mappedIfSafe)
-        sinFullTable = try? Data(contentsOf: folder.appendingPathComponent("sin_full.npy"), options: .mappedIfSafe)
-
+        useExternalPLE = true
         isChunked = true
     }
 
@@ -439,87 +412,85 @@ final class LLMRunner {
     // MARK: - Chunked Prediction
 
     private func predictChunked(tokenID: Int, position: Int, imageEmbedding: MLMultiArray? = nil) throws -> Int {
-        guard let chunk1, let chunk2, let chunk3,
-              let chunk1State, let chunk2State,
-              let embedTokens, let embedPerLayer else {
+        // 2-chunk lite architecture:
+        // chunk1: layers 0-14 + embedding (stateful)
+        // chunk2: layers 15-34 + norm + lm_head (stateless, KV13/14 passed in)
+        guard let chunk1, let chunk2,
+              let chunk1State,
+              let embedTokens else {
             var missing = [String]()
             if self.chunk1 == nil { missing.append("chunk1") }
             if self.chunk2 == nil { missing.append("chunk2") }
-            if self.chunk3 == nil { missing.append("chunk3") }
+            if self.chunk1State == nil { missing.append("chunk1_state") }
             if self.embedTokens == nil { missing.append("embed_tokens") }
-            if self.embedPerLayer == nil { missing.append("embed_per_layer") }
             throw NSError(domain: "LLMRunner", code: 0,
                           userInfo: [NSLocalizedDescriptionKey: "Missing: \(missing.joined(separator: ", "))"])
         }
-        let ctx = contextLength, hs = hiddenSize
+        let ctx = contextLength
 
+        // Embedding (for PLE projection)
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let emb = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hiddenSize)])
+        let t1 = CFAbsoluteTimeGetCurrent()
+        let plc = try computePerLayerCombined(tokenID: tokenID, embedding: emb)
+        let t2 = CFAbsoluteTimeGetCurrent()
+        profileEmbed += (t1 - t0)
+        profilePLE += (t2 - t1)
+
+        let ids = try MLMultiArray(shape: [1, 1], dataType: .int32)
+        ids[[0, 0] as [NSNumber]] = NSNumber(value: Int32(tokenID))
+        let pos = try MLMultiArray(shape: [1], dataType: .int32)
+        pos[0] = NSNumber(value: Int32(position))
         let mask = try makeCausalMask(position: position, contextLength: ctx)
         let umask = try makeUpdateMask(position: position, contextLength: ctx)
 
-        // Compute cos/sin for current position from RoPE tables
-        let cosS = try lookupRoPE(table: cosSlidingTable, position: position, dim: 256)
-        let sinS = try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
-        let cosF = try lookupRoPE(table: cosFullTable, position: position, dim: 512)
-        let sinF = try lookupRoPE(table: sinFullTable, position: position, dim: 512)
-
-        // Compute embeddings externally
-        let hiddenStatesIn: MLMultiArray
+        let imgEmb: MLMultiArray
         if let imageEmbedding {
-            hiddenStatesIn = imageEmbedding
+            imgEmb = imageEmbedding
         } else {
-            hiddenStatesIn = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hs)])
+            imgEmb = try MLMultiArray(shape: [1, 1, NSNumber(value: hiddenSize)], dataType: .float16)
+            memset(imgEmb.dataPointer, 0, hiddenSize * MemoryLayout<UInt16>.stride)
         }
 
-        let perLayerCombined = try computePerLayerCombined(tokenID: tokenID, embedding: hiddenStatesIn)
-
-        // Chunk 1: layers 0-11 (cos/sin instead of position_ids)
+        let tp = CFAbsoluteTimeGetCurrent()
+        // Chunk 1: embedding + layers 0-14, outputs hidden + kv13/14
         let input1 = try MLDictionaryFeatureProvider(dictionary: [
-            "hidden_states": MLFeatureValue(multiArray: hiddenStatesIn),
-            "per_layer_combined": MLFeatureValue(multiArray: perLayerCombined),
-            "cos_s": MLFeatureValue(multiArray: cosS),
-            "sin_s": MLFeatureValue(multiArray: sinS),
-            "cos_f": MLFeatureValue(multiArray: cosF),
-            "sin_f": MLFeatureValue(multiArray: sinF),
+            "input_ids": MLFeatureValue(multiArray: ids),
+            "position_ids": MLFeatureValue(multiArray: pos),
             "causal_mask": MLFeatureValue(multiArray: mask),
             "update_mask": MLFeatureValue(multiArray: umask),
+            "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "image_embedding": MLFeatureValue(multiArray: imgEmb),
         ])
         let out1 = try chunk1.prediction(from: input1, using: chunk1State)
         let hiddenStates = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        let kv13_k = out1.featureValue(for: "kv13_k")!.multiArrayValue!
+        let kv13_v = out1.featureValue(for: "kv13_v")!.multiArrayValue!
+        let kv14_k = out1.featureValue(for: "kv14_k")!.multiArrayValue!
+        let kv14_v = out1.featureValue(for: "kv14_v")!.multiArrayValue!
 
-        // Chunk 2: layers 12-23 → hidden_states + kv13/kv14
+        // Chunk 2: layers 15-34 + norm + lm_head, uses kv13/14 from chunk1
         let input2 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: hiddenStates),
-            "per_layer_combined": MLFeatureValue(multiArray: perLayerCombined),
-            "cos_s": MLFeatureValue(multiArray: cosS),
-            "sin_s": MLFeatureValue(multiArray: sinS),
-            "cos_f": MLFeatureValue(multiArray: cosF),
-            "sin_f": MLFeatureValue(multiArray: sinF),
+            "position_ids": MLFeatureValue(multiArray: pos),
             "causal_mask": MLFeatureValue(multiArray: mask),
             "update_mask": MLFeatureValue(multiArray: umask),
-        ])
-        let out2 = try chunk2.prediction(from: input2, using: chunk2State)
-        let hiddenStates2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
-        let kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
-        let kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
-        let kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
-        let kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
-
-        // Chunk 3: layers 24-34 + norm + lm_head → token_id
-        let input3 = try MLDictionaryFeatureProvider(dictionary: [
-            "hidden_states": MLFeatureValue(multiArray: hiddenStates2),
-            "per_layer_combined": MLFeatureValue(multiArray: perLayerCombined),
-            "cos_s": MLFeatureValue(multiArray: cosS),
-            "sin_s": MLFeatureValue(multiArray: sinS),
-            "cos_f": MLFeatureValue(multiArray: cosF),
-            "sin_f": MLFeatureValue(multiArray: sinF),
-            "causal_mask": MLFeatureValue(multiArray: mask),
+            "per_layer_combined": MLFeatureValue(multiArray: plc),
             "kv13_k": MLFeatureValue(multiArray: kv13_k),
             "kv13_v": MLFeatureValue(multiArray: kv13_v),
             "kv14_k": MLFeatureValue(multiArray: kv14_k),
             "kv14_v": MLFeatureValue(multiArray: kv14_v),
         ])
-        let out3 = try chunk3.prediction(from: input3)
-        return out3.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+        let out2 = try chunk2.prediction(from: input2)
+        profilePredict += (CFAbsoluteTimeGetCurrent() - tp)
+        profileCount += 1
+        if profileCount % 10 == 0 {
+            let n = Double(profileCount)
+            print(String(format: "[Profile] emb=%.1fms ple=%.1fms predict=%.1fms (%.1f tok/s)",
+                         profileEmbed/n * 1000, profilePLE/n * 1000, profilePredict/n * 1000,
+                         1000.0 / ((profileEmbed + profilePLE + profilePredict) / n * 1000)))
+        }
+        return out2.featureValue(for: "token_id")!.multiArrayValue![0].intValue
     }
 
     /// Look up cos/sin values for a position from a numpy .npy file.
