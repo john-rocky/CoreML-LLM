@@ -404,24 +404,47 @@ final class LLMRunner {
         // projection weight: (8960, 1536) float16
         let embPtr = embedding.dataPointer.bindMemory(to: UInt16.self, capacity: hiddenSize)
 
-        // Simple matmul: result = embedding @ projWeight^T * projScale
+        // Step 1: Compute projection = embedding @ projWeight^T * projScale
+        var proj = [Float](repeating: 0, count: totalDim)
         perLayerProjWeight.withUnsafeBytes { rawBuf in
-            let projPtr = rawBuf.baseAddress!.assumingMemoryBound(to: UInt16.self)
+            let projWPtr = rawBuf.baseAddress!.assumingMemoryBound(to: UInt16.self)
             for i in 0..<totalDim {
                 var sum: Float = 0
                 let rowStart = i * hiddenSize
                 for j in 0..<hiddenSize {
                     let e = float16ToFloat(embPtr[j])
-                    let w = float16ToFloat(projPtr[rowStart + j])
+                    let w = float16ToFloat(projWPtr[rowStart + j])
                     sum += e * w
                 }
-                sum *= perLayerProjScale
-
-                // Combine: (proj + raw) * inputScale
-                let rawVal = float16ToFloat(raw[i])
-                let combined = (sum + rawVal) * perLayerInputScale
-                resultPtr[i] = floatToFloat16(combined)
+                proj[i] = sum * perLayerProjScale
             }
+        }
+
+        // Step 2: Apply RMSNorm to each per_layer_dim slice of projection
+        if let normData = perLayerNormWeight {
+            normData.withUnsafeBytes { normRaw in
+                let normW = normRaw.baseAddress!.assumingMemoryBound(to: Float.self)
+                let eps: Float = 1e-6
+                for li in 0..<nlayers {
+                    let s = li * pld
+                    var meanSq: Float = 0
+                    for j in 0..<pld {
+                        meanSq += proj[s + j] * proj[s + j]
+                    }
+                    meanSq = meanSq / Float(pld) + eps
+                    let invRms = 1.0 / sqrtf(meanSq)
+                    for j in 0..<pld {
+                        proj[s + j] = proj[s + j] * invRms * normW[j]
+                    }
+                }
+            }
+        }
+
+        // Step 3: Combine (normed_proj + raw) * inputScale
+        for i in 0..<totalDim {
+            let rawVal = float16ToFloat(raw[i])
+            let combined = (proj[i] + rawVal) * perLayerInputScale
+            resultPtr[i] = floatToFloat16(combined)
         }
 
         return result
