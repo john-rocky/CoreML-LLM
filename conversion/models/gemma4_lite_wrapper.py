@@ -194,10 +194,13 @@ class Gemma4LiteWrapper(nn.Module):
             start = layer_idx * self.per_layer_dim
             end = start + self.per_layer_dim
             per_layer_slice = per_layer_combined[:, :, start:end]
-            gated = layer.per_layer_input_gate(hidden_states.to(MODEL_DTYPE))
+            hs_conv = hidden_states.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
+            gated = layer.per_layer_input_gate(hs_conv)
             gated = F.gelu(gated, approximate="tanh")
-            gated = gated * per_layer_slice
+            per_layer_slice_conv = per_layer_slice.permute(0, 2, 1).unsqueeze(2)
+            gated = gated * per_layer_slice_conv
             gated = layer.per_layer_projection(gated)
+            gated = gated.squeeze(2).permute(0, 2, 1)
             hidden_states = layer.post_per_layer_input_norm(gated)
             hidden_states = residual_pl + hidden_states
             hidden_states = hidden_states * layer.layer_scalar

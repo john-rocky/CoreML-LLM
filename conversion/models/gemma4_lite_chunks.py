@@ -115,11 +115,17 @@ def _run_layer(layer, layer_idx, hidden_states, cos_s, sin_s, cos_f, sin_f,
     residual_pl = hidden_states
     s = layer_idx * config.hidden_size_per_layer_input
     e = s + config.hidden_size_per_layer_input
-    per_layer_slice = per_layer_combined[:, :, s:e]
-    gated = layer.per_layer_input_gate(hidden_states.to(MODEL_DTYPE))
+    per_layer_slice = per_layer_combined[:, :, s:e]  # (1, 1, per_layer_dim)
+    # Conv2d layout: (batch, channels, 1, seq)
+    hs_conv = hidden_states.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)  # (1, hidden, 1, 1)
+    gated = layer.per_layer_input_gate(hs_conv)  # (1, per_layer_dim, 1, 1)
     gated = F.gelu(gated, approximate="tanh")
-    gated = gated * per_layer_slice
-    gated = layer.per_layer_projection(gated)
+    # Multiply with per_layer_slice: reshape slice to (1, per_layer_dim, 1, 1)
+    per_layer_slice_conv = per_layer_slice.permute(0, 2, 1).unsqueeze(2)
+    gated = gated * per_layer_slice_conv
+    gated = layer.per_layer_projection(gated)  # (1, hidden, 1, 1)
+    # Back to (1, 1, hidden)
+    gated = gated.squeeze(2).permute(0, 2, 1)
     hidden_states = layer.post_per_layer_input_norm(gated)
     hidden_states = residual_pl + hidden_states
     hidden_states = hidden_states * layer.layer_scalar

@@ -401,8 +401,9 @@ class Gemma4DecoderLayer(nn.Module):
 
         # Per-layer input processing
         per_layer_dim = 256  # hidden_size_per_layer_input
-        self.per_layer_input_gate = nn.Linear(hidden_size, per_layer_dim, bias=False, dtype=MODEL_DTYPE)
-        self.per_layer_projection = nn.Linear(per_layer_dim, hidden_size, bias=False, dtype=MODEL_DTYPE)
+        # Use Conv2d for ANE efficiency (3x throughput vs Linear on ANE)
+        self.per_layer_input_gate = nn.Conv2d(hidden_size, per_layer_dim, 1, bias=False, dtype=MODEL_DTYPE)
+        self.per_layer_projection = nn.Conv2d(per_layer_dim, hidden_size, 1, bias=False, dtype=MODEL_DTYPE)
         self.post_per_layer_input_norm = ANERMSNorm(hidden_size, eps=eps)
 
 
