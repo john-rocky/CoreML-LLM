@@ -335,6 +335,12 @@ final class LLMRunner {
                     // Prefill with progress — wrap each step in autoreleasepool
                     // to drain CoreML MLMultiArray allocations (prevents memory growth)
                     self.loadingStatus = "Prefill 0/\(tokenIDs.count)..."
+                    let ctxLimit = self.contextLength
+                    if tokenIDs.count >= ctxLimit {
+                        continuation.yield("[Error: prompt too long (\(tokenIDs.count) >= \(ctxLimit)). Try a shorter question or smaller image.]")
+                        continuation.finish()
+                        return
+                    }
                     for (step, tid) in tokenIDs.enumerated() {
                         try autoreleasepool {
                             if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 280 {
@@ -356,6 +362,8 @@ final class LLMRunner {
 
                     for _ in 0..<256 {
                         if eosIDs.contains(nextID) { break }
+                        // Stop if we hit the context length
+                        if self.currentPosition >= ctxLimit { break }
                         let text = self.tokenizer!.decode(tokens: [nextID])
                         continuation.yield(text)
                         tokenCount += 1
@@ -740,7 +748,9 @@ final class LLMRunner {
         let umask = try MLMultiArray(shape: [1, 1, NSNumber(value: contextLength), 1], dataType: .float16)
         let up = umask.dataPointer.bindMemory(to: UInt16.self, capacity: contextLength)
         memset(up, 0, contextLength * MemoryLayout<UInt16>.stride)
-        up[position] = 0x3C00
+        // Clamp to last valid position if overflow (generation will stop shortly)
+        let clamped = min(position, contextLength - 1)
+        up[clamped] = 0x3C00
         return umask
     }
 
