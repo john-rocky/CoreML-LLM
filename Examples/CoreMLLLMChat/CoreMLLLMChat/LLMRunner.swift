@@ -104,10 +104,13 @@ final class LLMRunner {
         }
 
         // Vision model: defer loading to save memory (loaded on first image)
+        // Vision uses .cpuAndGPU because it's not ANE-optimized (ANE compile fails).
         if findModel(in: folder, name: "vision") != nil {
             hasVision = true
             visionModelURL = findModel(in: folder, name: "vision")
-            visionConfig = mlConfig
+            let visionCfg = MLModelConfiguration()
+            visionCfg.computeUnits = .cpuAndGPU
+            visionConfig = visionCfg
         }
 
         // Tokenizer
