@@ -202,18 +202,25 @@ class PrefillChunk1(nn.Module):
         self.num_layers_total = model.config.num_hidden_layers
 
     def _compute_ple_batch(self, hidden_states, per_layer_raw):
-        """Compute per_layer_combined for batched input (1, N, hidden)."""
+        """Compute per_layer_combined for batched input (1, N, hidden).
+
+        Fused version: reshape to (1, N, num_layers, per_layer_dim) and apply
+        a single ANE cat-trick layer_norm across all layer slices at once,
+        replacing 35 individual norms + 34 concats with 1 op."""
         N = PREFILL_N
         # (1, N, hidden) → (1, hidden, 1, N)
         h_conv = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
         proj = self.per_layer_model_projection(h_conv) * self.per_layer_model_projection_scale  # (1, total_pld, 1, N)
         proj = proj.squeeze(2).permute(0, 2, 1)  # (1, N, total_pld)
-        normed_slices = []
-        for li in range(self.num_layers_total):
-            s = li * self.per_layer_dim
-            e = s + self.per_layer_dim
-            normed_slices.append(self.per_layer_projection_norm(proj[:, :, s:e]))
-        proj_normed = torch.cat(normed_slices, dim=-1)
+        # (1, N, num_layers * pld) → (1, N, num_layers, pld) → cat-trick over last dim
+        proj_grouped = proj.view(1, N, self.num_layers_total, self.per_layer_dim)
+        norm_w = self.per_layer_projection_norm.weight
+        eps = float(self.per_layer_projection_norm.eps)
+        doubled = torch.cat([proj_grouped, -proj_grouped], dim=-1)
+        normed = F.layer_norm(doubled, normalized_shape=(2 * self.per_layer_dim,),
+                              weight=None, bias=None, eps=eps)
+        normed, _ = torch.chunk(normed, 2, dim=-1)
+        proj_normed = (normed * norm_w).view(1, N, self.num_layers_total * self.per_layer_dim)
         return (proj_normed + per_layer_raw) * self.per_layer_input_scale
 
     def forward(self, hidden_states, causal_mask, per_layer_raw,

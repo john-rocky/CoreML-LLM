@@ -226,20 +226,29 @@ class SWAChunk1(nn.Module):
         hidden_states: (1, 1, hidden)
         per_layer_raw: (1, 1, num_layers * per_layer_dim) — already scaled by per_layer_embed_scale
         Returns: (1, 1, num_layers * per_layer_dim)
+
+        The per-layer norm has identical weights across all 35 layer slices
+        (it's a single ANERMSNorm reused), so instead of 35 separate norms +
+        34 concats (~100 MIL ops), we reshape to (1, 35, 256) and apply ONE
+        layer_norm over the last dim. ~70 ops eliminated per forward pass.
         """
+        import torch.nn.functional as F
         # Conv2d layout: (1, 1, hidden) → (1, hidden, 1, 1)
         h_conv = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
-        # Project: (1, hidden, 1, 1) → (1, total_pld, 1, 1)
         proj = self.per_layer_model_projection(h_conv) * self.per_layer_model_projection_scale
-        # Back to (1, 1, total_pld)
+        # (1, total_pld, 1, 1) → (1, 1, total_pld) → (1, num_layers, per_layer_dim)
         proj = proj.squeeze(2).permute(0, 2, 1)
-        # RMSNorm per layer slice (each slice is per_layer_dim long)
-        normed_slices = []
-        for li in range(self.num_layers_total):
-            s = li * self.per_layer_dim
-            e = s + self.per_layer_dim
-            normed_slices.append(self.per_layer_projection_norm(proj[:, :, s:e]))
-        proj_normed = torch.cat(normed_slices, dim=-1)
+        proj_grouped = proj.view(1, self.num_layers_total, self.per_layer_dim)
+
+        # ANE cat-trick RMSNorm: layer_norm([x, -x]) then drop mirror.
+        norm_w = self.per_layer_projection_norm.weight  # (per_layer_dim,)
+        eps = float(self.per_layer_projection_norm.eps)
+        doubled = torch.cat([proj_grouped, -proj_grouped], dim=-1)
+        normed = F.layer_norm(doubled, normalized_shape=(2 * self.per_layer_dim,),
+                              weight=None, bias=None, eps=eps)
+        normed, _ = torch.chunk(normed, 2, dim=-1)
+        proj_normed = (normed * norm_w).view(1, 1, self.num_layers_total * self.per_layer_dim)
+
         # Combine: (normed_proj + raw) * input_scale
         return (proj_normed + per_layer_raw) * self.per_layer_input_scale
 
