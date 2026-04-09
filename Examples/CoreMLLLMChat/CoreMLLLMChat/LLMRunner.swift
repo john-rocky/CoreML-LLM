@@ -337,7 +337,7 @@ final class LLMRunner {
                     self.loadingStatus = "Prefill 0/\(tokenIDs.count)..."
                     for (step, tid) in tokenIDs.enumerated() {
                         try autoreleasepool {
-                            if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 256 {
+                            if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 280 {
                                 let imgEmb = self.sliceFeature(feats, at: imageIdx)
                                 nextID = try self.predictStep(tokenID: 0, position: step, imageEmbedding: imgEmb)
                                 imageIdx += 1
@@ -502,7 +502,10 @@ final class LLMRunner {
             hiddenIn = textEmb
         }
         let t1 = CFAbsoluteTimeGetCurrent()
-        let plc = try computePerLayerCombined(tokenID: tokenID, embedding: textEmb)
+        // PLE projection uses the ACTUAL hidden state (image or text), matching
+        // the original monolithic model behavior. Raw per-layer lookup still uses
+        // tokenID (PAD=0 for image positions).
+        let plc = try computePerLayerCombined(tokenID: tokenID, embedding: hiddenIn)
         let t2 = CFAbsoluteTimeGetCurrent()
         profileEmbed += (t1 - t0)
         profilePLE += (t2 - t1)
@@ -795,7 +798,7 @@ final class LLMRunner {
         for m in messages {
             if m.role == .user {
                 if hasImage {
-                    p += "<|turn>user\n\n\n\(String(repeating: "<|image|>", count: 256))\n\n\(m.content)<turn|>\n"
+                    p += "<|turn>user\n\n\n\(String(repeating: "<|image|>", count: 280))\n\n\(m.content)<turn|>\n"
                 } else { p += "<|turn>user\n\(m.content)<turn|>\n" }
             } else if m.role == .assistant { p += "<|turn>model\n\(m.content)<turn|>\n" }
         }
