@@ -37,3 +37,8 @@ build/
 
 # Output
 output/
+
+# Media assets (upload to GitHub release / user-attachments instead)
+*.mp4
+*.mov
+*.gif

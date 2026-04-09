@@ -6,7 +6,7 @@ Unlike MLX Swift (GPU-only), CoreML-LLM targets the **Apple Neural Engine**: ~10
 
 > **v0.2.0** — Sliding Window Attention, batched prefill (seq=64), PLE on ANE, 2048 context. See [What's new](#whats-new-in-v020).
 
-<!-- TODO: Add demo GIF/video here after device testing -->
+<video src="https://github.com/john-rocky/CoreML-LLM/releases/download/v0.2.0/CoreMLLLM.mp4" width="360" controls></video>
 
 ## Performance (Gemma 4 E2B, iPhone 15 Pro)
 
