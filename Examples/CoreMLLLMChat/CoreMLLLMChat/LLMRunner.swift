@@ -211,6 +211,8 @@ final class LLMRunner {
                     var imageIdx = 0
                     var nextID = 0
 
+                    // Prefill with progress
+                    self.loadingStatus = "Prefill 0/\(tokenIDs.count)..."
                     for (step, tid) in tokenIDs.enumerated() {
                         if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 256 {
                             let imgEmb = self.sliceFeature(feats, at: imageIdx)
@@ -220,7 +222,9 @@ final class LLMRunner {
                             nextID = try self.predictStep(tokenID: tid, position: step)
                         }
                         self.currentPosition = step + 1
+                        self.loadingStatus = "Prefill \(step + 1)/\(tokenIDs.count)..."
                     }
+                    self.loadingStatus = "Generating..."
 
                     let startTime = CFAbsoluteTimeGetCurrent()
                     var tokenCount = 0
@@ -236,7 +240,11 @@ final class LLMRunner {
                         nextID = try self.predictStep(tokenID: nextID, position: self.currentPosition)
                         self.currentPosition += 1
                     }
-                } catch {}
+                    self.loadingStatus = "Ready"
+                } catch {
+                    self.loadingStatus = "Error: \(error.localizedDescription)"
+                    continuation.yield("[Error: \(error.localizedDescription)]")
+                }
                 continuation.finish()
             }
         }
