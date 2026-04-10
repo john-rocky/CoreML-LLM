@@ -264,6 +264,7 @@ struct ChatView: View {
     private func sendMessage() {
         var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let audio = audioRecorder.recordedSamples
+        print("[ChatView] sendMessage: text='\(text.prefix(30))', audio=\(audio != nil ? "\(audio!.count) samples" : "nil"), isRecording=\(audioRecorder.isRecording)")
 
         // Allow audio-only sends with a default prompt
         if text.isEmpty && audio != nil {
@@ -284,6 +285,7 @@ struct ChatView: View {
 
         Task {
             do {
+                print("[ChatView] calling generate with audio=\(audio != nil ? "\(audio!.count)" : "nil")")
                 let stream = try await runner.generate(messages: messages, image: image,
                                                         audio: audio)
                 for await token in stream {
