@@ -135,40 +135,25 @@ final class ModelDownloader: NSObject {
         let sdpaPrefix = "sdpa-8k/"
         var files: [DownloadFile]
 
-        files = [
-            .init(remotePath: "\(sdpaPrefix)swa/chunk1.mlmodelc/weights/weight.bin",       localPath: "chunk1.mlmodelc/weights/weight.bin",       estimatedSize: 155_436_864),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk1.mlmodelc/coremldata.bin",           localPath: "chunk1.mlmodelc/coremldata.bin",           estimatedSize: 500_000),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk1.mlmodelc/model.mil",                localPath: "chunk1.mlmodelc/model.mil",                estimatedSize: 450_000),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk1.mlmodelc/analytics/coremldata.bin", localPath: "chunk1.mlmodelc/analytics/coremldata.bin", estimatedSize: 250),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk2.mlmodelc/weights/weight.bin",       localPath: "chunk2.mlmodelc/weights/weight.bin",       estimatedSize: 133_963_968),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk2.mlmodelc/coremldata.bin",           localPath: "chunk2.mlmodelc/coremldata.bin",           estimatedSize: 500_000),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk2.mlmodelc/model.mil",                localPath: "chunk2.mlmodelc/model.mil",                estimatedSize: 320_000),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk2.mlmodelc/analytics/coremldata.bin", localPath: "chunk2.mlmodelc/analytics/coremldata.bin", estimatedSize: 250),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk3.mlmodelc/weights/weight.bin",       localPath: "chunk3.mlmodelc/weights/weight.bin",       estimatedSize: 325_282_880),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk3.mlmodelc/coremldata.bin",           localPath: "chunk3.mlmodelc/coremldata.bin",           estimatedSize: 500_000),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk3.mlmodelc/model.mil",                localPath: "chunk3.mlmodelc/model.mil",                estimatedSize: 340_000),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk3.mlmodelc/analytics/coremldata.bin", localPath: "chunk3.mlmodelc/analytics/coremldata.bin", estimatedSize: 250),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk4.mlmodelc/weights/weight.bin",       localPath: "chunk4.mlmodelc/weights/weight.bin",       estimatedSize: 526_874_880),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk4.mlmodelc/coremldata.bin",           localPath: "chunk4.mlmodelc/coremldata.bin",           estimatedSize: 500_000),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk4.mlmodelc/model.mil",                localPath: "chunk4.mlmodelc/model.mil",                estimatedSize: 345_000),
-            .init(remotePath: "\(sdpaPrefix)swa/chunk4.mlmodelc/analytics/coremldata.bin", localPath: "chunk4.mlmodelc/analytics/coremldata.bin", estimatedSize: 250),
-            // Prefill chunks (seq=512, SDPA fused)
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk1.mlmodelc/weights/weight.bin",       localPath: "prefill_chunk1.mlmodelc/weights/weight.bin",       estimatedSize: 155_436_864),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk1.mlmodelc/coremldata.bin",           localPath: "prefill_chunk1.mlmodelc/coremldata.bin",           estimatedSize: 1_000),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk1.mlmodelc/model.mil",                localPath: "prefill_chunk1.mlmodelc/model.mil",                estimatedSize: 450_000),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk1.mlmodelc/analytics/coremldata.bin", localPath: "prefill_chunk1.mlmodelc/analytics/coremldata.bin", estimatedSize: 250),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk2.mlmodelc/weights/weight.bin",       localPath: "prefill_chunk2.mlmodelc/weights/weight.bin",       estimatedSize: 133_963_968),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk2.mlmodelc/coremldata.bin",           localPath: "prefill_chunk2.mlmodelc/coremldata.bin",           estimatedSize: 1_000),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk2.mlmodelc/model.mil",                localPath: "prefill_chunk2.mlmodelc/model.mil",                estimatedSize: 320_000),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk2.mlmodelc/analytics/coremldata.bin", localPath: "prefill_chunk2.mlmodelc/analytics/coremldata.bin", estimatedSize: 250),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk3.mlmodelc/weights/weight.bin",       localPath: "prefill_chunk3.mlmodelc/weights/weight.bin",       estimatedSize: 325_282_880),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk3.mlmodelc/coremldata.bin",           localPath: "prefill_chunk3.mlmodelc/coremldata.bin",           estimatedSize: 1_000),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk3.mlmodelc/model.mil",                localPath: "prefill_chunk3.mlmodelc/model.mil",                estimatedSize: 340_000),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk3.mlmodelc/analytics/coremldata.bin", localPath: "prefill_chunk3.mlmodelc/analytics/coremldata.bin", estimatedSize: 250),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk4.mlmodelc/weights/weight.bin",       localPath: "prefill_chunk4.mlmodelc/weights/weight.bin",       estimatedSize: 526_874_880),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk4.mlmodelc/coremldata.bin",           localPath: "prefill_chunk4.mlmodelc/coremldata.bin",           estimatedSize: 1_000),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk4.mlmodelc/model.mil",                localPath: "prefill_chunk4.mlmodelc/model.mil",                estimatedSize: 345_000),
-            .init(remotePath: "\(sdpaPrefix)prefill/chunk4.mlmodelc/analytics/coremldata.bin", localPath: "prefill_chunk4.mlmodelc/analytics/coremldata.bin", estimatedSize: 250),
+        // Download .mlpackage (3 files each). iPhone compiles to .mlmodelc on first load.
+        // This avoids cross-platform compilation issues (xcrun compiles for Mac only).
+        func pkg(_ sub: String, _ name: String, _ localName: String, weightSize: Int) -> [DownloadFile] {
+            [.init(remotePath: "\(sdpaPrefix)\(sub)/\(name).mlpackage/Manifest.json",
+                   localPath: "\(localName).mlpackage/Manifest.json", estimatedSize: 500),
+             .init(remotePath: "\(sdpaPrefix)\(sub)/\(name).mlpackage/Data/com.apple.CoreML/model.mlmodel",
+                   localPath: "\(localName).mlpackage/Data/com.apple.CoreML/model.mlmodel", estimatedSize: 500_000),
+             .init(remotePath: "\(sdpaPrefix)\(sub)/\(name).mlpackage/Data/com.apple.CoreML/weights/weight.bin",
+                   localPath: "\(localName).mlpackage/Data/com.apple.CoreML/weights/weight.bin", estimatedSize: weightSize)]
+        }
+        files = pkg("swa", "chunk1", "chunk1", weightSize: 155_436_864)
+             + pkg("swa", "chunk2", "chunk2", weightSize: 133_963_968)
+             + pkg("swa", "chunk3", "chunk3", weightSize: 325_282_880)
+             + pkg("swa", "chunk4", "chunk4", weightSize: 526_874_880)
+             + pkg("prefill", "prefill_chunk1", "prefill_chunk1", weightSize: 155_436_864)
+             + pkg("prefill", "prefill_chunk2", "prefill_chunk2", weightSize: 133_963_968)
+             + pkg("prefill", "prefill_chunk3", "prefill_chunk3", weightSize: 325_282_880)
+             + pkg("prefill", "prefill_chunk4", "prefill_chunk4", weightSize: 526_874_880)
+        files += [
             .init(remotePath: "\(sdpaPrefix)model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
             // Tokenizer
             .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
