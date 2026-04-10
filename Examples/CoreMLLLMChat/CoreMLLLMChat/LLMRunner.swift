@@ -456,22 +456,12 @@ final class LLMRunner {
                     let startTime = CFAbsoluteTimeGetCurrent()
                     var tokenCount = 0
                     let eosIDs: Set<Int> = [1, 106, 151645]
-                    print("[DEBUG] After prefill: nextID = \(nextID), currentPosition = \(self.currentPosition), tokenIDs.count = \(tokenIDs.count)")
-                    print("[DEBUG] tokenIDs (first 20): \(Array(tokenIDs.prefix(20)))")
-                    let firstDecoded = self.tokenizer!.decode(tokens: [nextID])
-                    print("[DEBUG] nextID decodes to: '\(firstDecoded)' (eosIDs.contains: \(eosIDs.contains(nextID)))")
 
-                    for stepIdx in 0..<256 {
-                        if eosIDs.contains(nextID) {
-                            print("[DEBUG] Hit EOS at step \(stepIdx) with nextID=\(nextID), breaking")
-                            break
-                        }
+                    for _ in 0..<256 {
+                        if eosIDs.contains(nextID) { break }
                         // Stop if we hit the context length
                         if self.currentPosition >= ctxLimit { break }
                         let text = self.tokenizer!.decode(tokens: [nextID])
-                        if stepIdx < 5 {
-                            print("[DEBUG] step \(stepIdx): pos=\(self.currentPosition) id=\(nextID) text='\(text)'")
-                        }
                         continuation.yield(text)
                         tokenCount += 1
                         let elapsed = CFAbsoluteTimeGetCurrent() - startTime

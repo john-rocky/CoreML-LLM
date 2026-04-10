@@ -20,19 +20,14 @@ struct ChatView: View {
             VStack(spacing: 0) {
                 if !runner.isLoaded {
                     statusBar
-                    // Big fallback button in case the toolbar button has
-                    // SwiftUI hit-test issues. Always shown when no model.
                     Button {
-                        print("[UI] Big Get Model tapped")
                         showModelPicker = true
                     } label: {
                         HStack {
                             Image(systemName: "arrow.down.circle.fill")
-                            Text("Get Model")
-                                .fontWeight(.semibold)
+                            Text("Get Model").fontWeight(.semibold)
                         }
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 12)
+                        .padding(.horizontal, 24).padding(.vertical, 12)
                         .background(Color.accentColor)
                         .foregroundColor(.white)
                         .clipShape(Capsule())
@@ -116,11 +111,8 @@ struct ChatView: View {
                 // hit-test bug that swallows taps).
                 if runner.isLoaded {
                     ToolbarItem(placement: .topBarLeading) {
-                        Button("Switch") {
-                            print("[UI] Switch tapped")
-                            showModelPicker = true
-                        }
-                        .disabled(runner.isGenerating)
+                        Button("Switch") { showModelPicker = true }
+                            .disabled(runner.isGenerating || benchmarkRunning)
                     }
                 }
                 if runner.isLoaded {

@@ -2,24 +2,26 @@
 
 **On-device LLMs on Apple Neural Engine** — Run **Gemma 4** on iPhone with CoreML, ANE-optimized, no server.
 
-Unlike MLX Swift (GPU-only), CoreML-LLM targets the **Apple Neural Engine**: ~10x lower power for always-on, battery-friendly inference.
+CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a good fit for always-on, battery-friendly inference. [MLX Swift](https://github.com/ml-explore/mlx-swift) is the best choice when you want maximum throughput from the GPU; CoreML-LLM is the answer when you want the LLM to live on the ANE so the GPU stays free.
 
-> **v0.2.0** — Sliding Window Attention, batched prefill (seq=64), PLE on ANE, 2048 context. See [What's new](#whats-new-in-v020).
+> **v0.3.0** — Correct prefill (fp16 overflow fix), ~2.5× faster decode, N=512 batched prefill, 99.78% ops on ANE verified via `MLComputePlan`. See [What's new](#whats-new-in-v030).
 
 <video src="https://github.com/user-attachments/assets/4f749080-eef1-4728-a2e9-4784afb44e80" width="360"></video>
 
 ## Performance (Gemma 4 E2B, iPhone 15 Pro)
 
-| | v0.1.0 | **v0.2.0** |
-|---|---:|---:|
-| Context length | 512 | **2048** |
-| Decode speed | ~11 tok/s | ~11.5 tok/s |
-| Prefill (33 tokens) | ~2970 ms (per-token) | **188 ms** (batched, 15.8×) |
-| Prefill throughput | ~11 tok/s | **~175 tok/s effective** |
-| Memory footprint | ~250 MB | ~250 MB |
-| Compute unit | ANE | ANE |
+| | v0.1.0 | v0.2.0 | **v0.3.0** |
+|---|---:|---:|---:|
+| Context length | 512 | 2048 | **2048** |
+| Decode speed | ~11 tok/s | ~11 tok/s | **~28 tok/s** |
+| Prefill (40 tokens) | ~3.6 s | ~220 ms | **~415 ms (96 tok/s eff.)** |
+| Batched prefill window | — | 64 tokens | **512 tokens** |
+| ANE placement (dispatched ops) | — | — | **99.78%** |
+| Compute unit | ANE | ANE | ANE |
 
-Mac (M-series, ANE): ~25 tok/s decode. Power draw ~2 W vs ~20 W for MLX GPU path on the same model.
+Ground-truth ANE placement measured on iPhone 15 Pro via `MLComputePlan` (7,294 of 7,310 dispatched LLM ops on ANE; the remaining 16 CPU ops are the tail argmax in chunk4 / prefill_chunk4). Vision encoder runs on GPU by design.
+
+> **Power draw:** we don't publish a specific wattage yet. iOS's public `batteryLevel` API is too coarse (~5% granularity) for a clean short-run measurement. What we can say: the device stays at `ProcessInfo.thermalState == .fair` through 10 minutes of sustained generation, so the draw is clearly modest — but a specific number will wait until we have a USB-C power meter or 24h Settings → Battery data.
 
 ## Pre-converted Models
 
@@ -28,7 +30,7 @@ Mac (M-series, ANE): ~25 tok/s decode. Power draw ~2 W vs ~20 W for MLX GPU path
 | **Gemma 4 E2B** | 2.7 GB | Image + Text* | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
 | Qwen2.5-0.5B | 302 MB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen2.5-0.5b-coreml) |
 
-<sub>* Gemma 4 image understanding is present but preprocessing accuracy is being finalized for v0.3. Text inference is production-ready.</sub>
+<sub>* Gemma 4 image understanding is present but image preprocessing / vision-encoder alignment is still being tuned. Text inference is production-ready.</sub>
 
 The iOS sample app downloads models automatically. You can also convert your own.
 
@@ -65,7 +67,7 @@ python convert.py --list
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/john-rocky/CoreML-LLM", from: "0.2.0"),
+    .package(url: "https://github.com/john-rocky/CoreML-LLM", from: "0.3.0"),
 ]
 ```
 
@@ -81,27 +83,37 @@ for await token in try await llm.stream("Tell me a story") {
 }
 ```
 
-## What's new in v0.2.0
+## What's new in v0.3.0
 
-### Sliding Window Attention (SWA)
-Gemma 4 ships with 28 sliding-window layers (W=512) and 7 full-attention layers. v0.2.0 exploits this natively: 28/35 layers are now O(W) instead of O(context), so decode speed stays flat as context grows from 512 → 2048.
+### Prefill correctness fix (fp16 overflow)
+v0.2.0's batched prefill produced wrong hidden states on iPhone: the `q_norm` weights were pre-scaled by `sqrt(head_dim)` in order to enable fused `scaled_dot_product_attention` (which always divides by `sqrt(d)`). In fp16 that pre-scaling overflowed inside `Q @ K^T` at prefill N ≥ 64, and the model emitted `<turn|>` immediately after the prompt.
 
-- Sliding KV cache: `(num_slots, 1, W, max_hd)` with shift-based update.
-- Full KV cache: `(num_slots, 1, ctx, max_hd)` with mask-based update.
-- Two causal masks per step: `(1, 1, 1, W)` sliding + `(1, 1, 1, ctx)` full.
+Fix: reverted to manual attention (`matmul → add → softmax → matmul`) with scale=1.0, matching Gemma 4's effective attention scale after `q_norm` / `k_norm` unit-normalise Q and K. Manual attention loses SDPA fusion but keeps the graph on the ANE and — surprisingly — is also measurably faster on iPhone (likely because the previous path was partially falling back to CPU when the overflow tripped an ANE compile constraint).
 
-### Batched Prefill (seq=64)
-A separate set of prefill chunks processes up to 64 tokens in a single CoreML call, then writes K/V back into the persistent decode caches. TTFT on a 33-token prompt drops from ~3 s to 188 ms on iPhone 15 Pro.
+Verified on Mac against the HuggingFace reference implementation, and on iPhone against `MLComputePlan`.
 
-Implementation: 4 prefill chunks mirror the 4 decode chunks (L0-7 / L8-14 / L15-24 / L25-34). Prefill chunk 4 selects the real last token via a masked sum (`hidden_states × last_position_mask`), avoiding dynamic indexing (ANE-friendly).
+### Decode ~2.5× faster
+As a side effect of the prefill fix and the associated chunk rebuild, decode went from ~11 tok/s to **~28 tok/s** on iPhone 15 Pro, sustained over a 10-minute benchmark run.
 
-Fallback: prompts >64 tokens or with images use the existing per-token decode path.
+### Prefill window 64 → 512
+The batched prefill path now covers the first 512 tokens in a single CoreML call (was 64). Multimodal prompts (≈ 280 image placeholders + surrounding text) now fit in a single prefill pass instead of falling back to per-token decode.
 
-### PLE on ANE
-Gemma 4's Per-Layer Embedding (8960×1536 projection + 35 RMSNorm slices) was 8 ms/token on CPU BLAS in v0.1.0. Moved inside the CoreML graph (Conv2d + LayerNorm) → **1.8 ms/token** on ANE.
+### ANE placement verification (`MLComputePlan`)
+New "ANE?" debug button in the sample app calls `MLComputePlan.load(contentsOf:)` for every loaded chunk and walks `MLModelStructure.Program.Block.operations`, bucketing each op by its preferred `MLComputeDevice`. On iPhone 15 Pro the LLM chunks report **7,294 / 7,310 dispatched ops on the ANE (99.78%)**; the 16 CPU ops are the tail argmax in `chunk4` / `prefill_chunk4`.
 
-### Context length 2048
-Stateless KV cache with explicit I/O (no `MLState`) to avoid per-layer state registration overhead. Combined with SWA, context extension is nearly free.
+The denominator excludes `constexpr_affine_dequantize` / `constexpr_lut_to_dense` (INT4 palette expansion) and other compile-time ops that `deviceUsage(for:)` correctly reports as `nil` — those don't dispatch at runtime and shouldn't appear in "X% on ANE".
+
+### Battery benchmark mode
+New "Bench" menu in the sample app runs sustained generation for 5 / 10 / 30 minutes against a fixed prompt, recording `UIDevice.batteryLevel` and `ProcessInfo.thermalState` start / end. Aborts automatically if thermal state reaches `.serious` so the device doesn't cook. Honest note: iOS's public battery API is too coarse to turn a 10-minute run into a precise wattage, which is why we don't publish a W number yet.
+
+### Multimodal token count fix
+The sample app was inserting 280 `<|image|>` placeholders per image (matching the vision encoder's output tensor shape). For square 768×768 inputs only the first 256 soft tokens are real — the encoder zero-pads the remaining 24. Feeding those 24 zero hidden states to the LLM was causing it to say "I can't describe this image" even when the rest of the pipeline worked. Fixed: the prompt now uses 256 placeholders.
+
+## Carried over from v0.2.0
+
+- **Sliding Window Attention** — 28 sliding-window layers (W=512) and 7 full-attention layers, so decode stays flat as context grows from 512 to 2048.
+- **Per-Layer Embedding on ANE** — Gemma 4's 8960×1536 projection + 35 RMSNorm slices moved inside the CoreML graph (Conv2d + LayerNorm), ~1.8 ms/token on ANE instead of ~8 ms on CPU BLAS.
+- **Context length 2048** — stateless KV cache with explicit I/O (no `MLState`) to avoid per-layer state registration overhead.
 
 ## Architecture
 
@@ -136,20 +148,20 @@ Stateless KV cache with explicit I/O (no `MLState`) to avoid per-layer state reg
 | Pre-computed RoPE | cos/sin as model inputs, looked up in Swift | Eliminates `gather`/`greater_equal` (int ops → CPU) |
 | Explicit KV I/O | Plain tensor inputs/outputs, no `MLState` | Avoids int64 state indices that break ANE placement |
 | Sliding Window | Shift-based cache for 28/35 layers | O(W) per step instead of O(ctx) |
-| Batched Prefill | One CoreML call for 64 tokens | 15× faster TTFT vs per-token |
+| Batched Prefill | One CoreML call for up to 512 tokens | Order-of-magnitude faster TTFT vs per-token |
 | PLE in graph | Conv2d projection + per-layer norm | 8 ms → 1.8 ms/token |
 
-### Why Not MLX?
+### Why not MLX?
 
-| | CoreML-LLM (this) | MLX Swift |
-|---|---|---|
-| Hardware | **ANE + CPU fallback** | GPU only |
-| Power (iPhone) | **~2 W** | ~20 W |
-| Always-on friendly | **Yes** | No (thermal) |
-| Peak speed | ~11 tok/s (E2B) | ~30 tok/s (E2B) |
-| Use case | **Always-on, battery, background** | Max throughput on plugged-in Mac |
+MLX Swift targets the Apple GPU (Metal) and is excellent when you want maximum throughput on a plugged-in Mac. CoreML-LLM targets the Apple Neural Engine instead — which matters when:
 
-ANE and GPU are complementary. CoreML-LLM is the answer when you want an LLM running continuously on a phone without melting it.
+- You want the GPU to stay free for rendering, games, or other ML work
+- You want the LLM to coexist with foreground apps without competing for the same silicon
+- You want the model placed on the most power-efficient compute unit available on Apple devices
+
+The two are complementary, not competing. If you're on a Mac and want to burn through a 70B model as fast as possible, use MLX. If you want a 2B model quietly running on ANE inside an iPhone app, this library is aimed at that case.
+
+We have verified the ANE placement on iPhone with `MLComputePlan` (99.78% of dispatched ops). We have not yet published a head-to-head power comparison against MLX on iPhone — previous versions of this README quoted `~2 W` and `~20 W` numbers that were not measured on-device, and those have been removed. A proper comparison will land in a follow-up once we have instrumented measurement.
 
 ## Adding New Models
 
