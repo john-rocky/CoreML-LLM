@@ -614,9 +614,8 @@ final class LLMRunner {
             hiddenIn = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hiddenSize)])
             plRaw = try lookupPerLayerRaw(tokenID: tokenID)
         }
-        let t2 = CFAbsoluteTimeGetCurrent()
+        let t1 = CFAbsoluteTimeGetCurrent()
         profileEmbed += (t1 - t0)
-        profilePLE += (t2 - t1)
 
         let maskFull = try makeCausalMask(position: position, contextLength: ctx)
         let maskSliding = try makeSlidingCausalMask(position: position, W: W)
