@@ -1,6 +1,7 @@
 import Accelerate
 import CoreML
 import Foundation
+import IOKit.ps
 import Tokenizers
 import UIKit
 
@@ -1590,9 +1591,46 @@ final class LLMRunner {
         return lines.joined(separator: "\n")
     }
 
-    /// Lightweight memory-only report (no MLComputePlan, instant).
+    /// Lightweight memory + battery report (no MLComputePlan, instant).
     func memoryReport() -> String {
-        var lines = ["Memory (task_vm_info):"]
+        var lines = ["Battery (IOPowerSources):"]
+        // IOKit.ps is a public framework — read whatever keys the OS exposes.
+        let blob = IOPSCopyPowerSourcesInfo()?.takeRetainedValue()
+        if let sources = IOPSCopyPowerSourcesList(blob)?.takeRetainedValue() as? [Any],
+           let source = sources.first {
+            if let desc = IOPSGetPowerSourceDescription(blob, source as CFTypeRef)?
+                .takeUnretainedValue() as? [String: Any] {
+                // Dump all available keys for diagnostics
+                let interestingKeys = [
+                    "Current Capacity", "Max Capacity", "Current",
+                    "Voltage", "Is Charging", "Power Source State",
+                    "Name", "Type", "Time to Empty", "Time to Full Charge",
+                    "BatteryHealth", "Temperature",
+                ]
+                for key in interestingKeys {
+                    if let val = desc[key] {
+                        lines.append("  \(key): \(val)")
+                    }
+                }
+                // Also dump any keys we didn't expect
+                let known = Set(interestingKeys)
+                for (key, val) in desc.sorted(by: { $0.key < $1.key }) {
+                    if !known.contains(key) {
+                        lines.append("  \(key): \(val)")
+                    }
+                }
+                // Calculate power if current + voltage available
+                if let mA = desc["Current"] as? Int, let mV = desc["Voltage"] as? Int {
+                    let watts = Double(abs(mA)) * Double(mV) / 1_000_000.0
+                    lines.append("  ** Power: \(String(format: "%.2f", watts)) W **")
+                }
+            }
+        } else {
+            lines.append("  (IOPSCopyPowerSourcesInfo unavailable)")
+        }
+
+        lines.append("")
+        lines.append("Memory (task_vm_info):")
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
         let kr = withUnsafeMutablePointer(to: &info) {
