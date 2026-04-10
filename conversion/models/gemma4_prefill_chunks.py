@@ -120,17 +120,11 @@ def _run_layer_prefill(
     K_expanded = K_for_attn.repeat_interleave(n_rep, dim=1)  # (1, num_heads, N, hd)
     V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
 
-    # SDPA fusion with d^(1/4) pre-scaling. Pre-scale Q and K by d^(1/4) so
-    # SDPA's built-in /sqrt(d) gives effective scale=1.0 (Gemma 4's intended scale).
-    # d^(1/4) is small enough (4.0 for d=256, 4.76 for d=512) to avoid fp16 overflow.
-    import math
-    scale_factor = math.pow(hd, 0.25)
-    q_scaled = (q * scale_factor).to(MODEL_DTYPE)
-    K_scaled = (K_expanded * scale_factor).to(MODEL_DTYPE)
-    V_fp16 = V_expanded.to(MODEL_DTYPE)
-    causal_mask_fp16 = causal_mask.to(MODEL_DTYPE)
-    attn_output = F.scaled_dot_product_attention(q_scaled, K_scaled, V_fp16,
-                                                  attn_mask=causal_mask_fp16)
+    # Manual attention with scale=1.0 (Gemma 4 uses pre-normalized Q/K).
+    attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
+    attn_weights = attn_weights + causal_mask
+    attn_weights = ane_softmax(attn_weights, dim=-1)
+    attn_output = torch.matmul(attn_weights, V_expanded)
 
     # Back to (1, hidden, 1, N) format for o_proj
     # (1, num_heads, N, hd) → (1, N, num_heads, hd) → (1, N, num_heads*hd) → (1, num_heads*hd, 1, N)

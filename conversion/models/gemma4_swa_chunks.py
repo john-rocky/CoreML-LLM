@@ -132,21 +132,15 @@ def _run_layer_swa(
     K_expanded = K_for_attn.repeat_interleave(n_rep, dim=1)
     V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
 
-    # SDPA fusion: scale Q and K by d^(1/4) so SDPA's built-in /sqrt(d) gives
-    # the correct effective scale of 1.0 (Gemma 4 uses q_norm/k_norm).
-    #
-    # Math: (Q * d^(1/4)) @ (K * d^(1/4))^T / sqrt(d)
-    #     = Q @ K^T * d^(1/2) / d^(1/2) = Q @ K^T   ✓
-    #
-    # Previous approach pre-scaled Q by sqrt(d) which overflowed fp16.
-    # d^(1/4) is much smaller: 4.0 (d=256) or 4.76 (d=512) vs 16 or 22.6.
-    import math
-    scale_factor = math.pow(hd, 0.25)
-    q_scaled = (q * scale_factor).to(MODEL_DTYPE)
-    K_scaled = (K_expanded * scale_factor).to(MODEL_DTYPE)
-    V_fp16 = V_expanded.to(MODEL_DTYPE)
-    mask = (causal_mask_full if is_full else causal_mask_sliding).to(MODEL_DTYPE)
-    attn_output = F.scaled_dot_product_attention(q_scaled, K_scaled, V_fp16, attn_mask=mask)
+    # Manual attention with scale=1.0 (Gemma 4's effective scale after q_norm/k_norm).
+    # SDPA fusion was attempted with d^(1/4) pre-scaling but CoreML's SDPA
+    # decomposition produces slightly different results from manual attention,
+    # causing wrong token predictions. Keeping manual attention for correctness.
+    mask = causal_mask_full if is_full else causal_mask_sliding
+    attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
+    attn_weights = attn_weights + mask
+    attn_weights = ane_softmax(attn_weights, dim=-1)
+    attn_output = torch.matmul(attn_weights, V_expanded)
 
     attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(1, 1, -1)
     attn_output = layer.self_attn["o_proj"](
