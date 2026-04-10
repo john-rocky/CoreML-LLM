@@ -1,7 +1,7 @@
 import Accelerate
 import CoreML
 import Foundation
-import IOKit.ps
+// IOKit.ps is not available on iOS — use dlsym to call IOPowerSources at runtime.
 import Tokenizers
 import UIKit
 
@@ -1594,40 +1594,40 @@ final class LLMRunner {
     /// Lightweight memory + battery report (no MLComputePlan, instant).
     func memoryReport() -> String {
         var lines = ["Battery (IOPowerSources):"]
-        // IOKit.ps is a public framework — read whatever keys the OS exposes.
-        let blob = IOPSCopyPowerSourcesInfo()?.takeRetainedValue()
-        if let sources = IOPSCopyPowerSourcesList(blob)?.takeRetainedValue() as? [Any],
-           let source = sources.first {
-            if let desc = IOPSGetPowerSourceDescription(blob, source as CFTypeRef)?
-                .takeUnretainedValue() as? [String: Any] {
-                // Dump all available keys for diagnostics
-                let interestingKeys = [
-                    "Current Capacity", "Max Capacity", "Current",
-                    "Voltage", "Is Charging", "Power Source State",
-                    "Name", "Type", "Time to Empty", "Time to Full Charge",
-                    "BatteryHealth", "Temperature",
-                ]
-                for key in interestingKeys {
-                    if let val = desc[key] {
+        // IOKit.ps is not importable on iOS, but the symbols exist at runtime.
+        // Use dlsym to call IOPSCopyPowerSourcesInfo / IOPSCopyPowerSourcesList.
+        typealias CopyInfoFn = @convention(c) () -> Unmanaged<CFTypeRef>?
+        typealias CopyListFn = @convention(c) (CFTypeRef?) -> Unmanaged<CFArray>?
+        typealias GetDescFn = @convention(c) (CFTypeRef?, CFTypeRef) -> Unmanaged<CFDictionary>?
+
+        let handle = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY)
+        let pInfo = dlsym(handle, "IOPSCopyPowerSourcesInfo")
+        let pList = dlsym(handle, "IOPSCopyPowerSourcesList")
+        let pDesc = dlsym(handle, "IOPSGetPowerSourceDescription")
+
+        if let pInfo, let pList, let pDesc {
+            let copyInfo = unsafeBitCast(pInfo, to: CopyInfoFn.self)
+            let copyList = unsafeBitCast(pList, to: CopyListFn.self)
+            let getDesc = unsafeBitCast(pDesc, to: GetDescFn.self)
+
+            let blob = copyInfo()?.takeRetainedValue()
+            if let sources = copyList(blob)?.takeRetainedValue() as? [Any],
+               let source = sources.first {
+                if let desc = getDesc(blob, source as CFTypeRef)?
+                    .takeUnretainedValue() as? [String: Any] {
+                    for (key, val) in desc.sorted(by: { $0.key < $1.key }) {
                         lines.append("  \(key): \(val)")
                     }
-                }
-                // Also dump any keys we didn't expect
-                let known = Set(interestingKeys)
-                for (key, val) in desc.sorted(by: { $0.key < $1.key }) {
-                    if !known.contains(key) {
-                        lines.append("  \(key): \(val)")
+                    if let mA = desc["Current"] as? Int, let mV = desc["Voltage"] as? Int {
+                        let watts = Double(abs(mA)) * Double(mV) / 1_000_000.0
+                        lines.append("  ** Power: \(String(format: "%.2f", watts)) W **")
                     }
-                }
-                // Calculate power if current + voltage available
-                if let mA = desc["Current"] as? Int, let mV = desc["Voltage"] as? Int {
-                    let watts = Double(abs(mA)) * Double(mV) / 1_000_000.0
-                    lines.append("  ** Power: \(String(format: "%.2f", watts)) W **")
                 }
             }
         } else {
-            lines.append("  (IOPSCopyPowerSourcesInfo unavailable)")
+            lines.append("  (IOPowerSources symbols not found)")
         }
+        if handle != nil { dlclose(handle) }
 
         lines.append("")
         lines.append("Memory (task_vm_info):")
