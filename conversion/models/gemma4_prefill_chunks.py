@@ -121,6 +121,10 @@ def _run_layer_prefill(
     V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
 
     # Manual attention with scale=1.0 (Gemma 4 uses pre-normalized Q/K).
+    # SDPA fusion tested with both attn_mask and is_causal approaches but
+    # coremltools' SDPA decomposition produces subtly different results from
+    # manual attention in CoreML (not a mask issue — precision difference in
+    # the decomposed op sequence). Keeping manual attention for correctness.
     attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
     attn_weights = attn_weights + causal_mask
     attn_weights = ane_softmax(attn_weights, dim=-1)
