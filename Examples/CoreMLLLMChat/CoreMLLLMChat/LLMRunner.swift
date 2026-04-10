@@ -393,12 +393,12 @@ final class LLMRunner {
                         return
                     }
 
-                    // Hybrid fast path: batched prefill (seq=N) for the first up to N
-                    // tokens, then per-token decode for any remaining prompt tokens.
-                    // Works for both text-only and mixed text+image batches — image
-                    // tokens at positions marked by IMAGE_TOKEN_ID are replaced with
-                    // vision encoder features on the fly.
-                    let havePrefill = self.isChunked
+                    // DEBUG: temporarily disable prefill path to verify the
+                    // bug is in our prefill chunks vs the decode chunks.
+                    // Force per-token decode (v0.2.0 behaviour).
+                    let FORCE_PER_TOKEN_DECODE = true
+                    let havePrefill = !FORCE_PER_TOKEN_DECODE
+                        && self.isChunked
                         && self.prefillChunk1 != nil
                         && self.prefillChunk2 != nil
                         && self.prefillChunk3 != nil
