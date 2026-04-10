@@ -10,13 +10,30 @@ struct ChatView: View {
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var selectedImage: CGImage?
     @State private var selectedImageData: Data?
-    @State private var debugButtonTaps = 0
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 if !runner.isLoaded {
                     statusBar
+                    // Big fallback button in case the toolbar button has
+                    // SwiftUI hit-test issues. Always shown when no model.
+                    Button {
+                        print("[UI] Big Get Model tapped")
+                        showModelPicker = true
+                    } label: {
+                        HStack {
+                            Image(systemName: "arrow.down.circle.fill")
+                            Text("Get Model")
+                                .fontWeight(.semibold)
+                        }
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 12)
+                        .background(Color.accentColor)
+                        .foregroundColor(.white)
+                        .clipShape(Capsule())
+                    }
+                    .padding(.top, 12)
                 }
 
                 ScrollViewReader { proxy in
@@ -81,9 +98,8 @@ struct ChatView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button(runner.isLoaded ? "Switch" : "Get Model (\(debugButtonTaps))") {
-                        debugButtonTaps += 1
-                        print("[UI] Get Model tapped, count=\(debugButtonTaps), showModelPicker -> true")
+                    Button(runner.isLoaded ? "Switch" : "Get Model") {
+                        print("[UI] Get Model tapped")
                         showModelPicker = true
                     }
                     .disabled(runner.isGenerating)
