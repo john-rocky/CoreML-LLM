@@ -516,7 +516,8 @@ final class LLMRunner {
                     var tokenCount = 0
                     let eosIDs: Set<Int> = [1, 106, 151645]
 
-                    for _ in 0..<256 {
+                    let maxDecodeTokens = min(contextLength - currentPosition, 2048)
+                    for _ in 0..<maxDecodeTokens {
                         if eosIDs.contains(nextID) { break }
                         // Stop if we hit the context length
                         if self.currentPosition >= ctxLimit { break }
