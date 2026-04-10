@@ -214,7 +214,8 @@ struct ChatView: View {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
 
-        messages.append(ChatMessage(role: .user, content: text))
+        let attachedImageData = selectedImageData
+        messages.append(ChatMessage(role: .user, content: text, imageData: attachedImageData))
         inputText = ""
         streamingText = ""
 
@@ -346,6 +347,13 @@ struct MessageBubble: View {
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
                 Text(message.role == .user ? "You" : message.role == .assistant ? "Assistant" : "System")
                     .font(.caption2).foregroundStyle(.secondary)
+                if let data = message.imageData, let uiImage = UIImage(data: data) {
+                    Image(uiImage: uiImage)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: 200, maxHeight: 200)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
                 Text(message.content)
                     .padding(.horizontal, 14).padding(.vertical, 10)
                     .background(backgroundColor)
