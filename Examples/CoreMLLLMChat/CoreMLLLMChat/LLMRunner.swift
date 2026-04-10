@@ -475,13 +475,19 @@ final class LLMRunner {
         // Process audio if provided.
         var audioFeatures: MLMultiArray?
         if let audio {
+            print("[Audio] Received \(audio.count) samples (\(String(format: "%.2f", Double(audio.count)/16000.0))s)")
             if audioModel == nil, let url = audioModelURL, let cfg = audioConfig {
                 loadingStatus = "Loading audio model..."
+                print("[Audio] Loading model from \(url.lastPathComponent)...")
                 audioModel = try MLModel(contentsOf: url, configuration: cfg)
+                print("[Audio] Model loaded OK")
             }
             if let am = audioModel, let mel = melFilterbank {
                 loadingStatus = "Processing audio..."
                 audioFeatures = try processAudio(audio, with: am, melFilterbank: mel)
+                print("[Audio] Features: \(audioFeatures!.shape), count=\(audioFeatures!.count)")
+            } else {
+                print("[Audio] SKIP: audioModel=\(audioModel != nil), melFilterbank=\(melFilterbank != nil)")
             }
         }
 
@@ -490,6 +496,8 @@ final class LLMRunner {
         let prompt = buildPrompt(messages: messages, hasImage: hasImage,
                                  hasAudio: hasAudioInput)
         let tokenIDs = tokenizer!.encode(text: prompt)
+        let audioTokenCount = tokenIDs.filter { $0 == 258881 }.count
+        print("[Audio] hasAudioInput=\(hasAudioInput), prompt tokens=\(tokenIDs.count), audio_tokens=\(audioTokenCount)")
 
         resetConversation()
 
@@ -543,12 +551,14 @@ final class LLMRunner {
                         self.loadingStatus = "Prefill (batch \(prefillLen)/\(tokenIDs.count))..."
                         try autoreleasepool {
                             let batch = Array(tokenIDs[0..<prefillLen])
+                            print("[Audio] Prefill batch: \(batch.filter { $0 == AUDIO_TOKEN_ID }.count) audio tokens, audioFeatures=\(audioFeatures != nil)")
                             nextID = try self.runPrefill(tokenIDs: batch, imageFeatures: imageFeatures,
                                                          audioFeatures: audioFeatures)
                         }
                         // Advance indices by tokens consumed in the prefill batch.
                         imageIdx = tokenIDs[0..<prefillLen].filter { $0 == IMAGE_TOKEN_ID }.count
                         audioIdx = tokenIDs[0..<prefillLen].filter { $0 == AUDIO_TOKEN_ID }.count
+                        print("[Audio] After prefill: imageIdx=\(imageIdx), audioIdx=\(audioIdx)")
                         self.currentPosition = prefillLen
 
                         // Per-token decode for remaining prompt tokens (if any).
