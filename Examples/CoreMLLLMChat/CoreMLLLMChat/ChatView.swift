@@ -97,12 +97,18 @@ struct ChatView: View {
             .navigationTitle(runner.isLoaded ? runner.modelName : "CoreML LLM")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button(runner.isLoaded ? "Switch" : "Get Model") {
-                        print("[UI] Get Model tapped")
-                        showModelPicker = true
+                // Show "Switch" only when a model is already loaded.
+                // The "Get Model" entry point lives in the big in-view button
+                // (toolbar topBarLeading + inline title has a SwiftUI iOS 18
+                // hit-test bug that swallows taps).
+                if runner.isLoaded {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Switch") {
+                            print("[UI] Switch tapped")
+                            showModelPicker = true
+                        }
+                        .disabled(runner.isGenerating)
                     }
-                    .disabled(runner.isGenerating)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Clear") {
