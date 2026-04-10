@@ -1569,6 +1569,29 @@ final class LLMRunner {
         return lines.joined(separator: "\n")
     }
 
+    /// Lightweight memory-only report (no MLComputePlan, instant).
+    func memoryReport() -> String {
+        var lines = ["Memory (task_vm_info):"]
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        if kr == KERN_SUCCESS {
+            let phys = Double(info.phys_footprint) / 1024 / 1024
+            let resident = Double(info.resident_size) / 1024 / 1024
+            let compressed = Double(info.compressed) / 1024 / 1024
+            lines.append("  phys_footprint : \(String(format: "%.1f", phys)) MB  (jetsam basis)")
+            lines.append("  resident_size  : \(String(format: "%.1f", resident)) MB")
+            lines.append("  compressed     : \(String(format: "%.1f", compressed)) MB")
+        }
+        let available = os_proc_available_memory()
+        lines.append("  os_proc_available: \(available / 1024 / 1024) MB")
+        return lines.joined(separator: "\n")
+    }
+
     @available(iOS 17.0, *)
     private func countOps(plan: MLComputePlan) -> (total: Int, ane: Int, gpu: Int, cpu: Int) {
         guard case let .program(program) = plan.modelStructure,

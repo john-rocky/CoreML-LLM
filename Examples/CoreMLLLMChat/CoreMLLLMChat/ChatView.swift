@@ -117,6 +117,11 @@ struct ChatView: View {
                 }
                 if runner.isLoaded {
                     ToolbarItem(placement: .topBarTrailing) {
+                        Button("Mem") {
+                            messages.append(ChatMessage(role: .system, content: runner.memoryReport()))
+                        }
+                    }
+                    ToolbarItem(placement: .topBarTrailing) {
                         Button("ANE?") { verifyANE() }
                             .disabled(runner.isGenerating || benchmarkRunning)
                     }
