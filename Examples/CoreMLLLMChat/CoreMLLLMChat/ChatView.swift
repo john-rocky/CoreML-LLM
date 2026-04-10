@@ -197,7 +197,10 @@ struct ChatView: View {
     }
 
     private func loadModel(from folderURL: URL) {
-        let modelURL = folderURL.appendingPathComponent("model.mlpackage")
+        // Use bundled model if available (for testing without HF download)
+        let bundled = Bundle.main.url(forResource: "gemma4-e2b", withExtension: nil)
+        let folder = bundled ?? folderURL
+        let modelURL = folder.appendingPathComponent("model.mlpackage")
         messages.append(ChatMessage(role: .system, content: "Loading model..."))
         // Detached so the synchronous MLModel(contentsOf:) calls inside
         // loadChunked can't block the main actor / UI thread.
