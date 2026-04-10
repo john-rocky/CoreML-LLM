@@ -4,33 +4,31 @@
 
 CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a good fit for always-on, battery-friendly inference. [MLX Swift](https://github.com/ml-explore/mlx-swift) is the best choice when you want maximum throughput from the GPU; CoreML-LLM is the answer when you want the LLM to live on the ANE so the GPU stays free.
 
-> **v0.3.0** — Correct prefill (fp16 overflow fix), ~2.5× faster decode, N=512 batched prefill, 99.78% ops on ANE verified via `MLComputePlan`. See [What's new](#whats-new-in-v030).
+> **v0.4.0** — Multimodal image understanding, PLE corruption fix, memory diagnostics. See [What's new](#whats-new-in-v040).
 
 ![demo](https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a)
 
 ## Performance (Gemma 4 E2B, iPhone 17 Pro)
 
-| | v0.1.0 | v0.2.0 | **v0.3.0** |
-|---|---:|---:|---:|
-| Context length | 512 | 2048 | **2048** |
-| Decode speed | ~11 tok/s | ~11 tok/s | **~28 tok/s** |
-| Prefill (40 tokens) | ~3.6 s | ~220 ms | **~415 ms (96 tok/s eff.)** |
-| Batched prefill window | — | 64 tokens | **512 tokens** |
-| ANE placement (dispatched ops) | — | — | **99.78%** |
-| Compute unit | ANE | ANE | ANE |
+| | v0.1.0 | v0.2.0 | v0.3.0 | **v0.4.0** |
+|---|---:|---:|---:|---:|
+| Context length | 512 | 2048 | 2048 | **2048** |
+| Decode speed | ~11 tok/s | ~11 tok/s | ~28 tok/s | **~28 tok/s** |
+| Prefill (40 tokens) | ~3.6 s | ~220 ms | ~415 ms | **~415 ms (96 tok/s)** |
+| Multimodal (image) | — | — | broken | **working** |
+| ANE placement | — | — | 99.78% | **99.78%** |
+| Memory (`phys_footprint`) | — | — | — | **~1 GB** |
 
-Ground-truth ANE placement measured on iPhone 17 Pro via `MLComputePlan` (7,294 of 7,310 dispatched LLM ops on ANE; the remaining 16 CPU ops are the tail argmax in chunk4 / prefill_chunk4). Vision encoder runs on GPU by design.
+Ground-truth ANE placement measured via `MLComputePlan` (7,294 / 7,310 dispatched LLM ops on ANE). Vision encoder runs on GPU by design.
 
-> **Power draw:** we don't publish a specific wattage yet. iOS's public `batteryLevel` API is too coarse (~5% granularity) for a clean short-run measurement. What we can say: the device stays at `ProcessInfo.thermalState == .fair` through 10 minutes of sustained generation, so the draw is clearly modest — but a specific number will wait until we have a USB-C power meter or 24h Settings → Battery data.
+> **Memory:** ~1 GB `phys_footprint` (the iOS jetsam basis), measured via `task_vm_info`. Previous versions of this README quoted ~250 MB from Xcode's memory gauge, which underreports when CoreML loads INT4 palettized weights. The actual number is ~873 MB after load, ~981 MB during inference. `os_proc_available` remains ~5 GB on iPhone 17 Pro (8 GB RAM).
 
 ## Pre-converted Models
 
 | Model | Size | Multimodal | Download |
 |-------|------|------------|----------|
-| **Gemma 4 E2B** | 2.7 GB | Image + Text* | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
+| **Gemma 4 E2B** | 2.7 GB | Image + Text | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
 | Qwen2.5-0.5B | 302 MB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen2.5-0.5b-coreml) |
-
-<sub>* Gemma 4 image understanding is present but image preprocessing / vision-encoder alignment is still being tuned. Text inference is production-ready.</sub>
 
 The iOS sample app downloads models automatically. You can also convert your own.
 
@@ -45,6 +43,32 @@ open Examples/CoreMLLLMChat/CoreMLLLMChat.xcodeproj
 Set your development team → build to an iOS 18+ device → **Get Model** → Download → Chat.
 
 The app uses `.cpuAndNeuralEngine` to force ANE execution.
+
+### Swift Package
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/john-rocky/CoreML-LLM", from: "0.4.0"),
+]
+```
+
+```swift
+import CoreMLLLM
+
+let llm = try await CoreMLLLM.load(from: modelDirectory)
+let answer = try await llm.generate("What is the capital of France?")
+// → "The capital of France is **Paris**."
+
+// Streaming
+for await token in try await llm.stream("Tell me a story") {
+    print(token, terminator: "")
+}
+
+// Multimodal (Gemma 4)
+let caption = try await llm.generate("Describe this image", image: cgImage)
+```
+
+Auto-detects model layout: chunked SWA (Gemma 4 E2B) or monolithic (Qwen2.5).
 
 ### Convert a Model
 
@@ -63,57 +87,41 @@ python convert.py --model gemma4-e2b --output ./output/gemma4-e2b
 python convert.py --list
 ```
 
-### Swift Package
+## What's new in v0.4.0
 
-```swift
-dependencies: [
-    .package(url: "https://github.com/john-rocky/CoreML-LLM", from: "0.3.0"),
-]
-```
+### Multimodal image understanding
+Gemma 4 E2B can now describe images on iPhone. The vision encoder runs on GPU (`.cpuAndGPU`), produces 256 soft tokens projected to the LLM's hidden space, and the features are injected at `<|image|>` placeholder positions during prefill/decode.
 
-```swift
-import CoreMLLLM
+Two bugs were preventing this from working:
 
-let llm = try await CoreMLLLM.load(from: modelDirectory)
-let answer = try await llm.generate("What is the capital of France?")
-// → "The capital of France is **Paris**."
+1. **PLE corruption at image positions** — Per-Layer Embedding was being looked up from the PAD/IMAGE token IDs (norm ~94 each) instead of being zeroed for image positions. All 256 image positions received garbage PLE that corrupted the model's internal state. Fix: set `per_layer_raw = zeros` for any position where the hidden state comes from the vision encoder.
 
-for await token in try await llm.stream("Tell me a story") {
-    print(token, terminator: "")
-}
-```
+2. **Multi-turn prompt duplication** — `buildPrompt()` inserted 256 image placeholders into every user message when `hasImage` was true. On the second turn, the first message's 256 placeholders would consume all vision features, leaving the second message's placeholders with no features. Fix: image tokens are now inserted only for the last user message.
+
+Image features are cached across conversation turns so follow-up questions about a previously sent image work without re-attaching it. Cache clears on "Clear".
+
+See [docs/MULTIMODAL.md](docs/MULTIMODAL.md) for the full architecture and debugging notes.
+
+### Memory diagnostics
+New "Mem" button in the sample app reports `task_vm_info` (`phys_footprint`, `resident_size`, `compressed`) and `os_proc_available_memory()` instantly, without the heavy `MLComputePlan` load that the "ANE?" button requires.
+
+### Memory correction
+Previous versions quoted ~250 MB memory usage from Xcode's gauge. Actual `phys_footprint` (iOS jetsam basis) is **~1 GB** — INT4 palettized model weights are counted in `phys_footprint` but may not appear in Xcode's gauge. Corrected in this release. Thanks to community feedback for flagging this.
 
 ## What's new in v0.3.0
 
-### Prefill correctness fix (fp16 overflow)
-v0.2.0's batched prefill produced wrong hidden states on iPhone: the `q_norm` weights were pre-scaled by `sqrt(head_dim)` in order to enable fused `scaled_dot_product_attention` (which always divides by `sqrt(d)`). In fp16 that pre-scaling overflowed inside `Q @ K^T` at prefill N ≥ 64, and the model emitted `<turn|>` immediately after the prompt.
-
-Fix: reverted to manual attention (`matmul → add → softmax → matmul`) with scale=1.0, matching Gemma 4's effective attention scale after `q_norm` / `k_norm` unit-normalise Q and K. Manual attention loses SDPA fusion but keeps the graph on the ANE and — surprisingly — is also measurably faster on iPhone (likely because the previous path was partially falling back to CPU when the overflow tripped an ANE compile constraint).
-
-Verified on Mac against the HuggingFace reference implementation, and on iPhone against `MLComputePlan`.
-
-### Decode ~2.5× faster
-As a side effect of the prefill fix and the associated chunk rebuild, decode went from ~11 tok/s to **~28 tok/s** on iPhone 17 Pro, sustained over a 10-minute benchmark run.
-
-### Prefill window 64 → 512
-The batched prefill path now covers the first 512 tokens in a single CoreML call (was 64). Multimodal prompts (≈ 280 image placeholders + surrounding text) now fit in a single prefill pass instead of falling back to per-token decode.
-
-### ANE placement verification (`MLComputePlan`)
-New "ANE?" debug button in the sample app calls `MLComputePlan.load(contentsOf:)` for every loaded chunk and walks `MLModelStructure.Program.Block.operations`, bucketing each op by its preferred `MLComputeDevice`. On iPhone 17 Pro the LLM chunks report **7,294 / 7,310 dispatched ops on the ANE (99.78%)**; the 16 CPU ops are the tail argmax in `chunk4` / `prefill_chunk4`.
-
-The denominator excludes `constexpr_affine_dequantize` / `constexpr_lut_to_dense` (INT4 palette expansion) and other compile-time ops that `deviceUsage(for:)` correctly reports as `nil` — those don't dispatch at runtime and shouldn't appear in "X% on ANE".
-
-### Battery benchmark mode
-New "Bench" menu in the sample app runs sustained generation for 5 / 10 / 30 minutes against a fixed prompt, recording `UIDevice.batteryLevel` and `ProcessInfo.thermalState` start / end. Aborts automatically if thermal state reaches `.serious` so the device doesn't cook. Honest note: iOS's public battery API is too coarse to turn a 10-minute run into a precise wattage, which is why we don't publish a W number yet.
-
-### Multimodal token count fix
-The sample app was inserting 280 `<|image|>` placeholders per image (matching the vision encoder's output tensor shape). For square 768×768 inputs only the first 256 soft tokens are real — the encoder zero-pads the remaining 24. Feeding those 24 zero hidden states to the LLM was causing it to say "I can't describe this image" even when the rest of the pipeline worked. Fixed: the prompt now uses 256 placeholders.
+- **Prefill fp16 overflow fix** — `q_norm` pre-scaling overflowed `Q @ K^T` in fp16. Reverted to manual attention with scale=1.0.
+- **Decode ~2.5× faster** — 11 → 28 tok/s (side effect of the rebuild).
+- **Prefill window 64 → 512** — multimodal prompts fit in a single prefill pass.
+- **ANE placement verified** — 99.78% via `MLComputePlan` on iPhone.
+- **Swift Package works** — `CoreMLLLM.load(from:)` auto-detects chunked vs monolithic models.
+- **Battery benchmark** — "Bench" menu for sustained generation + SoC drain tracking.
 
 ## Carried over from v0.2.0
 
-- **Sliding Window Attention** — 28 sliding-window layers (W=512) and 7 full-attention layers, so decode stays flat as context grows from 512 to 2048.
-- **Per-Layer Embedding on ANE** — Gemma 4's 8960×1536 projection + 35 RMSNorm slices moved inside the CoreML graph (Conv2d + LayerNorm), ~1.8 ms/token on ANE instead of ~8 ms on CPU BLAS.
-- **Context length 2048** — stateless KV cache with explicit I/O (no `MLState`) to avoid per-layer state registration overhead.
+- **Sliding Window Attention** — 28 sliding (W=512) + 7 full-attention layers.
+- **Per-Layer Embedding on ANE** — 8960×1536 projection inside the CoreML graph.
+- **Context length 2048** — stateless KV cache with explicit I/O.
 
 ## Architecture
 
@@ -161,17 +169,9 @@ MLX Swift targets the Apple GPU (Metal) and is excellent when you want maximum t
 
 The two are complementary, not competing. If you're on a Mac and want to burn through a 70B model as fast as possible, use MLX. If you want a 2B model quietly running on ANE inside an iPhone app, this library is aimed at that case.
 
-We have verified the ANE placement on iPhone with `MLComputePlan` (99.78% of dispatched ops). We have not yet published a head-to-head power comparison against MLX on iPhone — previous versions of this README quoted `~2 W` and `~20 W` numbers that were not measured on-device, and those have been removed. A proper comparison will land in a follow-up once we have instrumented measurement.
-
 ## Adding New Models
 
-See [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md) for a step-by-step guide and [docs/CONVERSION.md](docs/CONVERSION.md) for the full conversion reference.
-
-Known gotchas documented from real debugging:
-- Attention scale: some models use `1.0` (QK-norm), not `1/√d` — wrong value produces coherent but incorrect text
-- KV sharing, `v_norm`, per-layer embeddings, dual (sliding/full) RoPE
-- PyTorch auto-promotes fp16 → fp32 inside `torch.exp`; force explicit `.to(fp16)` after softmax ops
-- Any int64/int32 op in the graph (gather, greater_equal, etc.) will pull the whole block onto CPU — pre-compute constants on the host side
+See [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md) for a step-by-step guide, [docs/CONVERSION.md](docs/CONVERSION.md) for the full conversion reference, and [docs/MULTIMODAL.md](docs/MULTIMODAL.md) for the vision pipeline architecture.
 
 ## Project Structure
 
@@ -179,9 +179,11 @@ Known gotchas documented from real debugging:
 CoreML-LLM/
 ├── Package.swift
 ├── Sources/CoreMLLLM/
-│   ├── CoreMLLLM.swift                  # Public API
-│   ├── ModelConfig.swift
-│   └── ImageProcessor.swift
+│   ├── CoreMLLLM.swift                  # Public API (auto-detects model layout)
+│   ├── ChunkedEngine.swift              # SWA 4-chunk decode + prefill engine
+│   ├── EmbeddingLookup.swift            # INT8 quantized embedding table
+│   ├── ImageProcessor.swift             # Vision encoder preprocessing
+│   └── ModelConfig.swift
 ├── conversion/                          # Python conversion pipeline
 │   ├── convert.py                       # CLI entry point
 │   ├── ane_ops.py                       # ANE-optimized ops (RMSNorm, softmax, RoPE)
@@ -191,13 +193,14 @@ CoreML-LLM/
 │       ├── qwen2.py
 │       ├── gemma4.py                    # Gemma 4 E2B base model
 │       ├── gemma4_swa_chunks.py         # 4-chunk decode (SWA)
-│       ├── gemma4_prefill_chunks.py     # 4-chunk prefill (seq=64)
+│       ├── gemma4_prefill_chunks.py     # 4-chunk prefill (seq=512)
 │       └── gemma4_vision.py
 ├── Examples/CoreMLLLMChat/              # iOS sample app
 │   └── CoreMLLLMChat.xcodeproj
 └── docs/
     ├── CONVERSION.md
-    └── ADDING_MODELS.md
+    ├── ADDING_MODELS.md
+    └── MULTIMODAL.md
 ```
 
 ## Requirements
