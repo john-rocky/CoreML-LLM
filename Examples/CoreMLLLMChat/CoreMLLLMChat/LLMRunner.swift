@@ -55,6 +55,10 @@ final class LLMRunner {
 
     // Root folder of the currently loaded model (for MLComputePlan inspection).
     private var modelFolderURL: URL?
+    // Deferred prefill loading
+    private var prefillFolder: URL?
+    private var prefillConfig: MLModelConfiguration?
+    private var prefillLoaded = false
 
     // External embeddings (for chunked model without embedded vocab tables)
     private var embedTokens: EmbeddingLookup?
@@ -115,6 +119,7 @@ final class LLMRunner {
         }
 
         let mlConfig = MLModelConfiguration()
+        prefillConfig = mlConfig
         // Verified on Mac: model fully ANE-compatible, 34 tok/s with forced ANE.
         // On iPhone, .cpuAndNeuralEngine forces ANE and falls back to CPU (not GPU)
         // for unsupported ops. GPU is excluded to guarantee ANE usage.
@@ -226,25 +231,16 @@ final class LLMRunner {
             return m
         }
 
-        // Load all chunks in parallel. MLModel(contentsOf:) is thread-safe
-        // and the ANE compiler can pipeline compilation across chunks.
-        loadingStatus = "Loading chunks (first run = ANE compile, can take 1-2 min)..."
-        let hasPrefillFiles = findModel(in: folder, name: "prefill_chunk1") != nil
+        // Load decode chunks in parallel. Prefill chunks are deferred to
+        // first inference (saves ~50% of initial load time).
+        loadingStatus = "Loading decode chunks..."
+        prefillFolder = findModel(in: folder, name: "prefill_chunk1") != nil ? folder : nil
         let loadT0 = CFAbsoluteTimeGetCurrent()
         try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
-            let chunkNames = ["chunk1", "chunk2", "chunk3", "chunk4"]
-            for name in chunkNames {
+            for name in ["chunk1", "chunk2", "chunk3", "chunk4"] {
                 group.addTask {
                     let m = try loadOne(name, name)
                     return (name, m)
-                }
-            }
-            if hasPrefillFiles {
-                for name in ["prefill_chunk1", "prefill_chunk2", "prefill_chunk3", "prefill_chunk4"] {
-                    group.addTask {
-                        let m = try loadOne(name, name)
-                        return (name, m)
-                    }
                 }
             }
             for try await (name, model) in group {
@@ -253,9 +249,6 @@ final class LLMRunner {
                 case "chunk2": chunk2 = model
                 case "chunk3": chunk3 = model
                 case "chunk4": chunk4 = model
-                case "prefill_chunk1": prefillChunk1 = model
-                case "prefill_chunk2": prefillChunk2 = model
-                case "prefill_chunk3": prefillChunk3 = model
                 case "prefill_chunk4": prefillChunk4 = model
                 default: break
                 }
@@ -457,9 +450,21 @@ final class LLMRunner {
                         return
                     }
 
-                    // Hybrid path: batched prefill for first up to N tokens,
-                    // then per-token decode for the rest. Prefill bug from earlier
-                    // (q_norm pre-scaling overflow) is fixed in v0.3.
+                    // Lazy-load prefill chunks on first use (saves ~50% initial load time)
+                    if self.isChunked && !self.prefillLoaded,
+                       let folder = self.prefillFolder, let cfg = self.prefillConfig {
+                        self.loadingStatus = "Loading prefill chunks..."
+                        func loadP(_ name: String) -> MLModel? {
+                            guard let url = self.findModel(in: folder, name: name) else { return nil }
+                            return try? MLModel(contentsOf: url, configuration: cfg)
+                        }
+                        self.prefillChunk1 = loadP("prefill_chunk1")
+                        self.prefillChunk2 = loadP("prefill_chunk2")
+                        self.prefillChunk3 = loadP("prefill_chunk3")
+                        self.prefillChunk4 = loadP("prefill_chunk4")
+                        self.prefillLoaded = true
+                    }
+
                     let havePrefill = self.isChunked
                         && self.prefillChunk1 != nil
                         && self.prefillChunk2 != nil
