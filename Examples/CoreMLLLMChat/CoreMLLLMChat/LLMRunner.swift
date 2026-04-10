@@ -602,17 +602,18 @@ final class LLMRunner {
         let W = slidingWindow
 
         let t0 = CFAbsoluteTimeGetCurrent()
-        // External embedding (text by default). Image tokens: use imageEmbedding.
-        let textEmb = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hiddenSize)])
         let hiddenIn: MLMultiArray
+        let plRaw: MLMultiArray
         if let imageEmbedding {
+            // Image token: use vision features, ZERO per-layer raw.
             hiddenIn = imageEmbedding
+            let totalDim = 35 * perLayerDim
+            plRaw = try MLMultiArray(shape: [1, 1, NSNumber(value: totalDim)], dataType: .float16)
+            memset(plRaw.dataPointer, 0, totalDim * MemoryLayout<UInt16>.stride)
         } else {
-            hiddenIn = textEmb
+            hiddenIn = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hiddenSize)])
+            plRaw = try lookupPerLayerRaw(tokenID: tokenID)
         }
-        let t1 = CFAbsoluteTimeGetCurrent()
-        // PLE: lookup raw only. Projection done inside chunk1 on ANE.
-        let plRaw = try lookupPerLayerRaw(tokenID: tokenID)
         let t2 = CFAbsoluteTimeGetCurrent()
         profileEmbed += (t1 - t0)
         profilePLE += (t2 - t1)
@@ -926,13 +927,17 @@ final class LLMRunner {
     }
 
     /// Build (1, N, 35*per_layer_dim) per-token raw per-layer embedding.
+    /// Image positions get zero PLE — their per_layer contribution comes from
+    /// the projection of vision features inside chunk1, not from token lookup.
     private func buildPrefillPerLayerRaw(tokenIDs: [Int], N: Int) throws -> MLMultiArray {
+        let IMAGE_TOKEN_ID = 258880
         guard let embedPerLayer else { throw NSError(domain: "LLMRunner", code: 11) }
         let totalDim = 35 * perLayerDim
         let arr = try MLMultiArray(shape: [1, NSNumber(value: N), NSNumber(value: totalDim)], dataType: .float16)
         memset(arr.dataPointer, 0, N * totalDim * MemoryLayout<UInt16>.stride)
         let dst = arr.dataPointer.bindMemory(to: UInt16.self, capacity: N * totalDim)
         for (i, tid) in tokenIDs.enumerated() {
+            if tid == IMAGE_TOKEN_ID { continue }  // leave as zero
             let raw = embedPerLayer.lookupRaw(tid)
             for j in 0..<totalDim {
                 dst[i * totalDim + j] = raw[j]
