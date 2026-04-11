@@ -95,7 +95,11 @@ public final class ModelDownloader: NSObject {
 
     // MARK: - Public
 
-    public func isDownloaded(_ model: ModelInfo) -> Bool { localModelURL(for: model) != nil }
+    public func isDownloaded(_ model: ModelInfo) -> Bool {
+        // Don't report as downloaded while still downloading this model
+        if isDownloading && downloadingModelId == model.id { return false }
+        return localModelURL(for: model) != nil
+    }
 
     public func hasFiles(_ model: ModelInfo) -> Bool {
         fileManager.fileExists(atPath: modelsDirectory.appendingPathComponent(model.folderName).path)
