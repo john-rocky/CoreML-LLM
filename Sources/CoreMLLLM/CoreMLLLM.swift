@@ -174,6 +174,30 @@ public final class CoreMLLLM: @unchecked Sendable {
         return llm
     }
 
+    /// Download (if needed) and load a model in one call.
+    ///
+    /// ```swift
+    /// let llm = try await CoreMLLLM.load(model: .gemma4e2b) { print($0) }
+    /// ```
+    ///
+    /// If the model is already downloaded, skips straight to loading.
+    public static func load(
+        model: ModelDownloader.ModelInfo,
+        computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
+        onProgress: ((String) -> Void)? = nil
+    ) async throws -> CoreMLLLM {
+        let downloader = ModelDownloader.shared
+        let modelURL: URL
+        if let existing = downloader.localModelURL(for: model) {
+            modelURL = existing
+        } else {
+            onProgress?("Downloading \(model.name)...")
+            modelURL = try await downloader.download(model)
+        }
+        let directory = modelURL.deletingLastPathComponent()
+        return try await load(from: directory, computeUnits: computeUnits, onProgress: onProgress)
+    }
+
     /// Whether this model supports image input.
     public var supportsVision: Bool { visionModelURL != nil }
 
@@ -247,6 +271,13 @@ public final class CoreMLLLM: @unchecked Sendable {
             audioFeatures = features
             actualAudioTokens = tokenCount
             print("[CoreMLLLM] audio: \(audio.count) samples → \(tokenCount) real tokens (model max: \(audioNumTokens))")
+            // Dump first feature vector for on-device verification
+            let ptr = features.dataPointer.bindMemory(to: Float16.self, capacity: features.count)
+            let v0 = Float(ptr[0]), v1 = Float(ptr[1]), v2 = Float(ptr[2])
+            let v3 = Float(ptr[3]), v4 = Float(ptr[4])
+            print("[CoreMLLLM] features[0,:5] = [\(v0), \(v1), \(v2), \(v3), \(v4)]")
+            let range0 = (0..<config.hiddenSize).map { Float(ptr[$0]) }
+            print("[CoreMLLLM] features[0] range: [\(range0.min()!), \(range0.max()!)]")
         }
 
         let hasImage = imageFeatures != nil
