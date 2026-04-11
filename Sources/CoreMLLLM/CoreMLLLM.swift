@@ -241,19 +241,19 @@ public final class CoreMLLLM: @unchecked Sendable {
 
         // Process audio
         var audioFeatures: MLMultiArray?
+        var actualAudioTokens = 0
         if let audio {
-            print("[CoreMLLLM] audio: \(audio.count) samples (\(String(format: "%.2f", Double(audio.count)/16000.0))s)")
-            audioFeatures = try processAudio(audio)
-            print("[CoreMLLLM] audioFeatures: \(audioFeatures!.shape)")
-        } else {
-            print("[CoreMLLLM] audio: nil")
+            let (features, tokenCount) = try processAudio(audio)
+            audioFeatures = features
+            actualAudioTokens = tokenCount
+            print("[CoreMLLLM] audio: \(audio.count) samples → \(tokenCount) real tokens (model max: \(audioNumTokens))")
         }
 
         let hasImage = imageFeatures != nil
         let hasAudioInput = audioFeatures != nil
-        let chatPrompt = buildPrompt(messages, hasImage: hasImage, hasAudio: hasAudioInput)
+        let chatPrompt = buildPrompt(messages, hasImage: hasImage, hasAudio: hasAudioInput,
+                                     audioTokenCount: actualAudioTokens)
         let tokenIDs = tokenizer.encode(text: chatPrompt)
-        print("[CoreMLLLM] hasAudio=\(hasAudioInput), tokens=\(tokenIDs.count), audioTokens=\(tokenIDs.filter{$0==258881}.count)")
 
         reset()
 
@@ -261,7 +261,7 @@ public final class CoreMLLLM: @unchecked Sendable {
         let imgFeats = imageFeatures
         let audFeats = audioFeatures
         let tokens = tokenIDs
-        let audTokenCount = mutableSelf.audioNumTokens
+        let audTokenCount = actualAudioTokens
         let ctxLimit = config.contextLength
 
         return AsyncStream { continuation in
@@ -467,30 +467,46 @@ public final class CoreMLLLM: @unchecked Sendable {
 
     // MARK: - Private: audio
 
-    private func processAudio(_ samples: [Float]) throws -> MLMultiArray {
+    /// Returns (features, actualTokenCount).
+    /// actualTokenCount is based on real audio length, not the padded model input.
+    private func processAudio(_ samples: [Float]) throws -> (MLMultiArray, Int) {
         if audioModel == nil, let url = audioModelURL, let cfg = audioConfig {
             audioModel = try MLModel(contentsOf: url, configuration: cfg)
         }
         guard let am = audioModel else { throw CoreMLLLMError.audioNotAvailable }
         guard let mel = melFilterbank else { throw CoreMLLLMError.audioNotAvailable }
-        return try AudioProcessor.process(samples, with: am,
-                                           melFilterbank: mel,
-                                           targetFrames: audioMelFrames)
+
+        // Compute actual mel frames from audio length (matching HF Gemma4AudioFeatureExtractor)
+        let padLeft = 160  // frameLength / 2, semicausal pad
+        let paddedLen = padLeft + samples.count
+        let unfoldSize = 321  // frameLength + 1
+        let actualMelFrames = max(0, (paddedLen - unfoldSize) / 160 + 1)
+        // After 2x Conv2d stride 2: tokens = ceil(ceil(melFrames / 2) / 2)
+        let afterConv1 = (actualMelFrames + 1) / 2
+        let actualTokens = min((afterConv1 + 1) / 2, audioNumTokens)
+
+        let features = try AudioProcessor.process(samples, with: am,
+                                                    melFilterbank: mel,
+                                                    targetFrames: audioMelFrames)
+        return (features, actualTokens)
     }
 
     // MARK: - Private: prompt building
 
     private func buildPrompt(_ messages: [Message], hasImage: Bool,
-                              hasAudio: Bool = false) -> String {
+                              hasAudio: Bool = false,
+                              audioTokenCount: Int = 0) -> String {
         if config.architecture.hasPrefix("qwen") {
             return buildQwenPrompt(messages)
         }
-        return buildGemmaPrompt(messages, hasImage: hasImage, hasAudio: hasAudio)
+        return buildGemmaPrompt(messages, hasImage: hasImage, hasAudio: hasAudio,
+                                audioTokenCount: audioTokenCount)
     }
 
-    private func buildGemmaPrompt(_ messages: [Message], hasImage: Bool, hasAudio: Bool) -> String {
+    private func buildGemmaPrompt(_ messages: [Message], hasImage: Bool, hasAudio: Bool,
+                                   audioTokenCount: Int = 0) -> String {
         let imageBlock = "<|image>" + String(repeating: "<|image|>", count: 256) + "<image|>"
-        let audioBlock = "<|audio>" + String(repeating: "<|audio|>", count: audioNumTokens) + "<audio|>"
+        let audioBlock = "<|audio>" + String(repeating: "<|audio|>", count: audioTokenCount) + "<audio|>"
         let lastUserIdx = messages.lastIndex { $0.role == .user }
 
         var p = "<bos>"
