@@ -167,24 +167,10 @@ final class ChunkedEngine {
             }
         }
 
-        // Validate RoPE table covers the requested context length
-        var effectiveConfig = config
-        if let cosF {
-            let headerSize: Int = cosF.withUnsafeBytes { raw in
-                let b = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
-                return 10 + (Int(b[8]) | (Int(b[9]) << 8))
-            }
-            let ropeMaxPos = (cosF.count - headerSize) / (512 * MemoryLayout<UInt16>.stride)
-            if config.contextLength > ropeMaxPos {
-                print("[ChunkedEngine] WARNING: context_length (\(config.contextLength)) > RoPE table (\(ropeMaxPos)). Clamping. Regenerate with larger --context-length.")
-                effectiveConfig.contextLength = ropeMaxPos
-            }
-        }
-
         // SWA KV buffers — IOSurface-backed for zero-copy CPU↔ANE transfer
         let maxHd = 512
-        let ctx = effectiveConfig.contextLength
-        let W = effectiveConfig.slidingWindow
+        let ctx = config.contextLength
+        let W = config.slidingWindow
         func ioSurfaceArray(slots: Int, seqLen: Int) throws -> MLMultiArray {
             let width = maxHd
             let height = slots * 1 * seqLen
@@ -226,7 +212,7 @@ final class ChunkedEngine {
             kFull1: ioSurfaceArray(slots: 1, seqLen: ctx), vFull1: ioSurfaceArray(slots: 1, seqLen: ctx),
             kSliding2: ioSurfaceArray(slots: 5, seqLen: W), vSliding2: ioSurfaceArray(slots: 5, seqLen: W),
             kFull2: ioSurfaceArray(slots: 2, seqLen: ctx), vFull2: ioSurfaceArray(slots: 2, seqLen: ctx),
-            config: effectiveConfig, prefillN: prefillN)
+            config: config, prefillN: prefillN)
     }
 
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,

@@ -5,7 +5,7 @@ public struct ModelConfig: Sendable {
     public let modelName: String
     public let architecture: String
     public let hiddenSize: Int
-    public var contextLength: Int
+    public let contextLength: Int
     public let vocabSize: Int
     public let bosTokenId: Int
     public let eosTokenId: Int
