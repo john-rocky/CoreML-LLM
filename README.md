@@ -14,10 +14,11 @@ CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a 
 
 | | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | **v0.5.0** |
 |---|---:|---:|---:|---:|---:|
-| Context length | 512 | 2048 | 2048 | 2048 | **2048** |
+| Context length | 512 | 2048 | 2048 | 2048 | **8192** |
 | Decode speed | ~11 tok/s | ~11 tok/s | ~28 tok/s | ~28 tok/s | **~31 tok/s** |
 | Prefill | ~11 tok/s | ~175 tok/s | ~96 tok/s | ~96 tok/s | **~154 tok/s** |
 | Multimodal (image) | — | — | broken | working | **working** |
+| Multimodal (audio) | — | — | — | — | **working** |
 | ANE placement | — | — | 99.78% | 99.78% | **99.78%** |
 | Memory (`phys_footprint`) | — | — | — | ~1 GB | **~1 GB** |
 
@@ -57,18 +58,55 @@ dependencies: [
 ```swift
 import CoreMLLLM
 
-let llm = try await CoreMLLLM.load(from: modelDirectory)
+// Download (if needed) + load in one line
+let llm = try await CoreMLLLM.load(model: .gemma4e2b) { status in
+    print(status)  // "Downloading...", "Loading chunks...", "Ready"
+}
+
+// Or load from a local directory
+// let llm = try await CoreMLLLM.load(from: modelDirectory)
+
+// Simple generation
 let answer = try await llm.generate("What is the capital of France?")
-// → "The capital of France is **Paris**."
 
 // Streaming
 for await token in try await llm.stream("Tell me a story") {
     print(token, terminator: "")
 }
+print("\(llm.tokensPerSecond) tok/s")
 
-// Multimodal (Gemma 4)
+// Multi-turn conversation
+let messages: [CoreMLLLM.Message] = [
+    .init(role: .user, content: "Hi!"),
+    .init(role: .assistant, content: "Hello!"),
+    .init(role: .user, content: "What is 2+2?"),
+]
+for await token in try await llm.stream(messages) {
+    print(token, terminator: "")
+}
+
+// Image understanding (Gemma 4)
 let caption = try await llm.generate("Describe this image", image: cgImage)
+
+// Audio understanding (Gemma 4)
+let transcript = try await llm.generate("What did they say?", audio: pcmSamples)
 ```
+
+#### Model Download
+
+```swift
+import CoreMLLLM
+
+// Background download with pause/resume
+let model = ModelDownloader.ModelInfo.defaults[0]  // Gemma 4 E2B
+let url = try await ModelDownloader.shared.download(model)
+
+// Pause / Resume
+ModelDownloader.shared.pause()
+ModelDownloader.shared.resumeDownload()
+```
+
+Downloads continue in the background via `URLSessionConfiguration.background`. Resume data is persisted to disk.
 
 Auto-detects model layout: chunked SWA (Gemma 4 E2B) or monolithic (Qwen2.5).
 
@@ -195,29 +233,30 @@ See [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md) for a step-by-step guide, [do
 ```
 CoreML-LLM/
 ├── Package.swift
-├── Sources/CoreMLLLM/
-│   ├── CoreMLLLM.swift                  # Public API (auto-detects model layout)
+├── Sources/CoreMLLLM/                   # Swift Package (import CoreMLLLM)
+│   ├── CoreMLLLM.swift                  # Public API — load, generate, stream
 │   ├── ChunkedEngine.swift              # SWA 4-chunk decode + prefill engine
-│   ├── EmbeddingLookup.swift            # INT8 quantized embedding table
+│   ├── EmbeddingLookup.swift            # INT8 quantized embedding lookup
 │   ├── ImageProcessor.swift             # Vision encoder preprocessing
+│   ├── AudioProcessor.swift             # Mel spectrogram + audio encoder
+│   ├── ModelDownloader.swift            # Background download with pause/resume
 │   └── ModelConfig.swift
+├── Examples/CoreMLLLMChat/              # iOS sample app (uses CoreMLLLM package)
+│   └── CoreMLLLMChat/
+│       ├── LLMRunner.swift              # @Observable wrapper around CoreMLLLM
+│       ├── ChatView.swift               # SwiftUI chat UI
+│       ├── ModelPickerView.swift         # Model download/selection UI
+│       ├── AudioRecorder.swift          # Microphone recording
+│       └── CoreMLLLMChatApp.swift
 ├── conversion/                          # Python conversion pipeline
 │   ├── convert.py                       # CLI entry point
-│   ├── ane_ops.py                       # ANE-optimized ops (RMSNorm, softmax, RoPE)
-│   ├── base_model.py
+│   ├── ane_ops.py                       # ANE-optimized ops
 │   ├── exporter.py                      # CoreML export + INT4 palettization
 │   └── models/
-│       ├── qwen2.py
-│       ├── gemma4.py                    # Gemma 4 E2B base model
-│       ├── gemma4_swa_chunks.py         # 4-chunk decode (SWA)
-│       ├── gemma4_prefill_chunks.py     # 4-chunk prefill (seq=512)
-│       └── gemma4_vision.py
-├── Examples/CoreMLLLMChat/              # iOS sample app
-│   └── CoreMLLLMChat.xcodeproj
+│       ├── gemma4.py / gemma4_swa_chunks.py / gemma4_prefill_chunks.py
+│       ├── gemma4_vision.py / gemma4_audio.py
+│       └── qwen2.py
 └── docs/
-    ├── CONVERSION.md
-    ├── ADDING_MODELS.md
-    └── MULTIMODAL.md
 ```
 
 ## Requirements

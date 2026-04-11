@@ -52,14 +52,19 @@ public final class ModelDownloader: NSObject {
             self.folderName = folderName
         }
 
-        public static let defaults: [ModelInfo] = [
-            ModelInfo(id: "gemma4-e2b", name: "Gemma 4 E2B", size: "2.8 GB",
-                      downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
-                      folderName: "gemma4-e2b"),
-            ModelInfo(id: "qwen2.5-0.5b", name: "Qwen2.5 0.5B (Text)", size: "309 MB",
-                      downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
-                      folderName: "qwen2.5-0.5b"),
-        ]
+        /// Gemma 4 E2B — multimodal (image + audio + text), 2.8 GB, ANE-optimized.
+        public static let gemma4e2b = ModelInfo(
+            id: "gemma4-e2b", name: "Gemma 4 E2B", size: "2.8 GB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
+            folderName: "gemma4-e2b")
+
+        /// Qwen2.5 0.5B — text only, 309 MB.
+        public static let qwen25_05b = ModelInfo(
+            id: "qwen2.5-0.5b", name: "Qwen2.5 0.5B (Text)", size: "309 MB",
+            downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
+            folderName: "qwen2.5-0.5b")
+
+        public static let defaults: [ModelInfo] = [gemma4e2b, qwen25_05b]
     }
 
     private struct DownloadFile: Codable {

@@ -15,7 +15,6 @@
 		B1000006 /* ModelPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000006 /* ModelPickerView.swift */; };
 		B1000007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B2000007 /* Assets.xcassets */; };
 		B1000008 /* Transformers in Frameworks */ = {isa = PBXBuildFile; productRef = B9000001 /* Transformers */; };
-		B1000009 /* EmbeddingLookup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000008 /* EmbeddingLookup.swift */; };
 		B100000A /* AudioRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = B200000A /* AudioRecorder.swift */; };
 /* End PBXBuildFile section */
 
@@ -26,7 +25,6 @@
 		B2000004 /* LLMRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LLMRunner.swift; sourceTree = "<group>"; };
 		B2000006 /* ModelPickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelPickerView.swift; sourceTree = "<group>"; };
 		B2000007 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		B2000008 /* EmbeddingLookup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmbeddingLookup.swift; sourceTree = "<group>"; };
 		B2000009 /* CoreMLLLMChat.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CoreMLLLMChat.entitlements; sourceTree = "<group>"; };
 		B200000A /* AudioRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorder.swift; sourceTree = "<group>"; };
 		B3000001 /* CoreMLLLMChat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CoreMLLLMChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -61,7 +59,6 @@
 				B2000003 /* ChatMessage.swift */,
 				B2000004 /* LLMRunner.swift */,
 				B2000006 /* ModelPickerView.swift */,
-				B2000008 /* EmbeddingLookup.swift */,
 				B200000A /* AudioRecorder.swift */,
 				B2000009 /* CoreMLLLMChat.entitlements */,
 				B2000007 /* Assets.xcassets */,
@@ -154,7 +151,6 @@
 				B1000003 /* ChatMessage.swift in Sources */,
 				B1000004 /* LLMRunner.swift in Sources */,
 				B1000006 /* ModelPickerView.swift in Sources */,
-				B1000009 /* EmbeddingLookup.swift in Sources */,
 				B100000A /* AudioRecorder.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

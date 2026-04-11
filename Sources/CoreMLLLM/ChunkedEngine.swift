@@ -1,5 +1,6 @@
 import Accelerate
 import CoreML
+import CoreVideo
 import Foundation
 
 /// Internal engine for SWA-chunked Gemma 4 E2B inference.
@@ -77,20 +78,45 @@ final class ChunkedEngine {
             guard let url = findModel(name) else {
                 throw CoreMLLLMError.modelNotFound(name)
             }
-            return try MLModel(contentsOf: url, configuration: mlConfig)
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let m = try MLModel(contentsOf: url, configuration: mlConfig)
+            let dt = CFAbsoluteTimeGetCurrent() - t0
+            print("[Load] \(name) done in \(String(format: "%.1f", dt))s")
+            return m
         }
 
-        // Decode chunks (required)
-        let c1 = try loadOne("chunk1")
-        let c2 = try loadOne("chunk2")
-        let c3 = try loadOne("chunk3")
-        let c4 = try loadOne("chunk4")
+        // Load all chunks in parallel (MLModel(contentsOf:) is thread-safe,
+        // ANE compiler can pipeline compilation across chunks)
+        let hasPrefillFiles = findModel("prefill_chunk1") != nil
+        var c1: MLModel!, c2: MLModel!, c3: MLModel!, c4: MLModel!
+        var p1: MLModel?, p2: MLModel?, p3: MLModel?, p4: MLModel?
 
-        // Prefill chunks (optional — graceful fallback to per-token decode)
-        let p1 = findModel("prefill_chunk1") != nil ? try? loadOne("prefill_chunk1") : nil
-        let p2 = findModel("prefill_chunk2") != nil ? try? loadOne("prefill_chunk2") : nil
-        let p3 = findModel("prefill_chunk3") != nil ? try? loadOne("prefill_chunk3") : nil
-        let p4 = findModel("prefill_chunk4") != nil ? try? loadOne("prefill_chunk4") : nil
+        let loadT0 = CFAbsoluteTimeGetCurrent()
+        try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
+            for name in ["chunk1", "chunk2", "chunk3", "chunk4"] {
+                group.addTask { (name, try loadOne(name)) }
+            }
+            if hasPrefillFiles {
+                for name in ["prefill_chunk1", "prefill_chunk2", "prefill_chunk3", "prefill_chunk4"] {
+                    group.addTask { (name, try loadOne(name)) }
+                }
+            }
+            for try await (name, model) in group {
+                switch name {
+                case "chunk1": c1 = model
+                case "chunk2": c2 = model
+                case "chunk3": c3 = model
+                case "chunk4": c4 = model
+                case "prefill_chunk1": p1 = model
+                case "prefill_chunk2": p2 = model
+                case "prefill_chunk3": p3 = model
+                case "prefill_chunk4": p4 = model
+                default: break
+                }
+            }
+        }
+        let loadDt = CFAbsoluteTimeGetCurrent() - loadT0
+        print("[Load] All \(hasPrefillFiles ? 8 : 4) chunks loaded in \(String(format: "%.1f", loadDt))s (parallel)")
 
         // Embeddings
         let vocabSize = config.vocabSize
@@ -113,7 +139,14 @@ final class ChunkedEngine {
         var projF32 = [Float](repeating: 0, count: count)
         projData.withUnsafeBytes { raw in
             let f16Ptr = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
-            for i in 0..<count { projF32[i] = fp16ToF32(f16Ptr[i]) }
+            // Vectorized fp16→fp32 via Accelerate (vs scalar loop)
+            var src = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: f16Ptr),
+                                    height: 1, width: UInt(count), rowBytes: count * 2)
+            projF32.withUnsafeMutableBufferPointer { dst in
+                var dstBuf = vImage_Buffer(data: dst.baseAddress!, height: 1,
+                                           width: UInt(count), rowBytes: count * 4)
+                vImageConvert_Planar16FtoPlanarF(&src, &dstBuf, 0)
+            }
         }
         let normWeight = try? Data(contentsOf: directory.appendingPathComponent("per_layer_norm_weight.bin"),
                                    options: .mappedIfSafe)
@@ -134,17 +167,53 @@ final class ChunkedEngine {
             }
         }
 
-        // SWA KV buffers
+        // Validate RoPE table covers the requested context length
+        var effectiveConfig = config
+        if let cosF {
+            let headerSize: Int = cosF.withUnsafeBytes { raw in
+                let b = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                return 10 + (Int(b[8]) | (Int(b[9]) << 8))
+            }
+            let ropeMaxPos = (cosF.count - headerSize) / (512 * MemoryLayout<UInt16>.stride)
+            if config.contextLength > ropeMaxPos {
+                print("[ChunkedEngine] WARNING: context_length (\(config.contextLength)) > RoPE table (\(ropeMaxPos)). Clamping. Regenerate with larger --context-length.")
+                effectiveConfig.contextLength = ropeMaxPos
+            }
+        }
+
+        // SWA KV buffers — IOSurface-backed for zero-copy CPU↔ANE transfer
         let maxHd = 512
-        let ctx = config.contextLength
-        let W = config.slidingWindow
-        func zeros(slots: Int, seqLen: Int) throws -> MLMultiArray {
+        let ctx = effectiveConfig.contextLength
+        let W = effectiveConfig.slidingWindow
+        func ioSurfaceArray(slots: Int, seqLen: Int) throws -> MLMultiArray {
+            let width = maxHd
+            let height = slots * 1 * seqLen
+            var pixelBuffer: CVPixelBuffer?
+            let attrs: [String: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault, width, height,
+                kCVPixelFormatType_OneComponent16Half,
+                attrs as CFDictionary, &pixelBuffer)
+            if status == kCVReturnSuccess, let pb = pixelBuffer {
+                CVPixelBufferLockBaseAddress(pb, [])
+                memset(CVPixelBufferGetBaseAddress(pb)!, 0, CVPixelBufferGetDataSize(pb))
+                CVPixelBufferUnlockBaseAddress(pb, [])
+                let shape: [NSNumber] = [NSNumber(value: slots), 1,
+                                          NSNumber(value: seqLen), NSNumber(value: maxHd)]
+                return try MLMultiArray(pixelBuffer: pb, shape: shape)
+            }
+            // Fallback to standard allocation
+            print("[KV] IOSurface failed for \(slots)x\(seqLen)x\(maxHd), using standard MLMultiArray")
             let arr = try MLMultiArray(
                 shape: [NSNumber(value: slots), 1, NSNumber(value: seqLen), NSNumber(value: maxHd)],
                 dataType: .float16)
             memset(arr.dataPointer, 0, slots * seqLen * maxHd * MemoryLayout<UInt16>.stride)
             return arr
         }
+        print("[KV] Allocating IOSurface-backed KV cache buffers")
 
         return try ChunkedEngine(
             chunk1: c1, chunk2: c2, chunk3: c3, chunk4: c4,
@@ -153,11 +222,11 @@ final class ChunkedEngine {
             perLayerProjF32: projF32, perLayerNormWeight: normWeight,
             cosSlidingTable: cosS, sinSlidingTable: sinS,
             cosFullTable: cosF, sinFullTable: sinF,
-            kSliding1: zeros(slots: 7, seqLen: W), vSliding1: zeros(slots: 7, seqLen: W),
-            kFull1: zeros(slots: 1, seqLen: ctx), vFull1: zeros(slots: 1, seqLen: ctx),
-            kSliding2: zeros(slots: 5, seqLen: W), vSliding2: zeros(slots: 5, seqLen: W),
-            kFull2: zeros(slots: 2, seqLen: ctx), vFull2: zeros(slots: 2, seqLen: ctx),
-            config: config, prefillN: prefillN)
+            kSliding1: ioSurfaceArray(slots: 7, seqLen: W), vSliding1: ioSurfaceArray(slots: 7, seqLen: W),
+            kFull1: ioSurfaceArray(slots: 1, seqLen: ctx), vFull1: ioSurfaceArray(slots: 1, seqLen: ctx),
+            kSliding2: ioSurfaceArray(slots: 5, seqLen: W), vSliding2: ioSurfaceArray(slots: 5, seqLen: W),
+            kFull2: ioSurfaceArray(slots: 2, seqLen: ctx), vFull2: ioSurfaceArray(slots: 2, seqLen: ctx),
+            config: effectiveConfig, prefillN: prefillN)
     }
 
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
@@ -297,7 +366,8 @@ final class ChunkedEngine {
 
     // MARK: - Batched prefill (seq=N)
 
-    func runPrefill(tokenIDs: [Int], imageFeatures: MLMultiArray? = nil) throws -> Int {
+    func runPrefill(tokenIDs: [Int], imageFeatures: MLMultiArray? = nil,
+                    audioFeatures: MLMultiArray? = nil, audioNumTokens: Int = 50) throws -> Int {
         guard let p1 = prefillChunk1, let p2 = prefillChunk2,
               let p3 = prefillChunk3, let p4 = prefillChunk4 else {
             throw CoreMLLLMError.prefillNotAvailable
@@ -308,7 +378,8 @@ final class ChunkedEngine {
 
         reset()
 
-        let hiddenIn = try buildPrefillHidden(tokenIDs: tokenIDs, N: N, imageFeatures: imageFeatures)
+        let hiddenIn = try buildPrefillHidden(tokenIDs: tokenIDs, N: N, imageFeatures: imageFeatures,
+                                                audioFeatures: audioFeatures, audioNumTokens: audioNumTokens)
         let plRaw = try buildPrefillPLR(tokenIDs: tokenIDs, N: N)
         let causal = try makePrefillCausalMask(N: N)
         let cosS = try buildPrefillRoPE(table: cosSlidingTable, N: N, dim: 256)
@@ -501,19 +572,28 @@ final class ChunkedEngine {
     // MARK: - Prefill helpers
 
     private func buildPrefillHidden(tokenIDs: [Int], N: Int,
-                                     imageFeatures: MLMultiArray? = nil) throws -> MLMultiArray {
+                                     imageFeatures: MLMultiArray? = nil,
+                                     audioFeatures: MLMultiArray? = nil,
+                                     audioNumTokens: Int = 50) throws -> MLMultiArray {
         let IMAGE_TOKEN_ID = 258880
+        let AUDIO_TOKEN_ID = 258881
         let hidden = config.hiddenSize
         let arr = try MLMultiArray(shape: [1, NSNumber(value: N), NSNumber(value: hidden)], dataType: .float16)
         memset(arr.dataPointer, 0, N * hidden * MemoryLayout<UInt16>.stride)
         let dst = arr.dataPointer.bindMemory(to: UInt16.self, capacity: N * hidden)
-        let featPtr = imageFeatures?.dataPointer.bindMemory(to: UInt16.self, capacity: imageFeatures!.count)
+        let imgPtr = imageFeatures?.dataPointer.bindMemory(to: UInt16.self, capacity: imageFeatures?.count ?? 0)
+        let audPtr = audioFeatures?.dataPointer.bindMemory(to: UInt16.self, capacity: audioFeatures?.count ?? 0)
         var imageIdx = 0
+        var audioIdx = 0
         for (i, tid) in tokenIDs.enumerated() {
-            if tid == IMAGE_TOKEN_ID, let fp = featPtr, imageIdx < 256 {
+            if tid == IMAGE_TOKEN_ID, let fp = imgPtr, imageIdx < 256 {
                 memcpy(dst.advanced(by: i * hidden), fp.advanced(by: imageIdx * hidden),
                        hidden * MemoryLayout<UInt16>.stride)
                 imageIdx += 1
+            } else if tid == AUDIO_TOKEN_ID, let ap = audPtr, audioIdx < audioNumTokens {
+                memcpy(dst.advanced(by: i * hidden), ap.advanced(by: audioIdx * hidden),
+                       hidden * MemoryLayout<UInt16>.stride)
+                audioIdx += 1
             } else {
                 let emb = try embedTokens.lookup(tid, shape: [1, 1, NSNumber(value: hidden)])
                 let src = emb.dataPointer.bindMemory(to: UInt16.self, capacity: hidden)
@@ -533,7 +613,7 @@ final class ChunkedEngine {
             // Image positions get zero PLE — the per_layer_model_projection from
             // hidden_states (vision features) is computed inside chunk1 on ANE.
             // Adding per_layer_raw from IMAGE_TOKEN_ID corrupts PLE with nonsense.
-            if tid == IMAGE_TOKEN_ID { continue }
+            if tid == IMAGE_TOKEN_ID || tid == 258881 { continue }  // image/audio: zero PLE
             let raw = embedPerLayer.lookupRaw(tid)
             for j in 0..<totalDim { dst[i * totalDim + j] = raw[j] }
         }
