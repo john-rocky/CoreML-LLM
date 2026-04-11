@@ -406,7 +406,7 @@ public final class ModelDownloader: NSObject {
              + prefillMeta("prefill_chunk3", "chunk3")
              + prefillMeta("prefill_chunk4", "chunk4")
         files += [
-            .init(remotePath: "sdpa-8k/model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
+            .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 500),
             .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
             .init(remotePath: "hf_model/tokenizer_config.json", localPath: "hf_model/tokenizer_config.json", estimatedSize: 5_000),
             .init(remotePath: "hf_model/config.json", localPath: "hf_model/config.json", estimatedSize: 5_000),
