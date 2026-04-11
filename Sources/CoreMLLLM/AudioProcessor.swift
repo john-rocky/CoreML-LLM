@@ -120,9 +120,17 @@ public enum AudioProcessor {
         let outDim = proj.outDim
         let hp = hidden.dataPointer.bindMemory(to: Float16.self, capacity: hidden.count)
 
-        // fp16 → fp32 batch conversion
+        // fp16 → fp32 batch conversion via Accelerate
         var inputF32 = [Float](repeating: 0, count: S * inDim)
-        for i in 0..<(S * inDim) { inputF32[i] = Float(hp[i]) }
+        inputF32.withUnsafeMutableBufferPointer { dst in
+            var srcBuf = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: hp),
+                                        height: 1, width: vImagePixelCount(S * inDim),
+                                        rowBytes: S * inDim * 2)
+            var dstBuf = vImage_Buffer(data: dst.baseAddress!, height: 1,
+                                        width: vImagePixelCount(S * inDim),
+                                        rowBytes: S * inDim * 4)
+            vImageConvert_Planar16FtoPlanarF(&srcBuf, &dstBuf, 0)
+        }
 
         // output_proj: (S, 1024) @ W^T(1024, 1536) → (S, 1536)
         var projected = [Float](repeating: 0, count: S * outDim)
@@ -156,12 +164,20 @@ public enum AudioProcessor {
                     proj.embedProjWeight, Int32(outDim),
                     0.0, &features, Int32(outDim))
 
-        // fp32 → fp16 batch conversion
+        // fp32 → fp16 batch conversion via Accelerate
         let result = try! MLMultiArray(
             shape: [1, NSNumber(value: S), NSNumber(value: outDim)],
             dataType: .float16)
-        let rp = result.dataPointer.bindMemory(to: Float16.self, capacity: S * outDim)
-        for i in 0..<(S * outDim) { rp[i] = Float16(features[i]) }
+        let rp = result.dataPointer.bindMemory(to: UInt16.self, capacity: S * outDim)
+        features.withUnsafeBufferPointer { src in
+            var srcBuf = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.baseAddress!),
+                                        height: 1, width: vImagePixelCount(S * outDim),
+                                        rowBytes: S * outDim * 4)
+            var dstBuf = vImage_Buffer(data: rp, height: 1,
+                                        width: vImagePixelCount(S * outDim),
+                                        rowBytes: S * outDim * 2)
+            vImageConvert_PlanarFtoPlanar16F(&srcBuf, &dstBuf, 0)
+        }
 
         return result
     }

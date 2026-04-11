@@ -285,14 +285,6 @@ public final class CoreMLLLM: @unchecked Sendable {
             let (features, tokenCount) = try processAudio(audio)
             audioFeatures = features
             actualAudioTokens = tokenCount
-            print("[CoreMLLLM] audio: \(audio.count) samples → \(tokenCount) real tokens (model max: \(audioNumTokens))")
-            // Dump first feature vector for on-device verification
-            let ptr = features.dataPointer.bindMemory(to: Float16.self, capacity: features.count)
-            let v0 = Float(ptr[0]), v1 = Float(ptr[1]), v2 = Float(ptr[2])
-            let v3 = Float(ptr[3]), v4 = Float(ptr[4])
-            print("[CoreMLLLM] features[0,:5] = [\(v0), \(v1), \(v2), \(v3), \(v4)]")
-            let range0 = (0..<config.hiddenSize).map { Float(ptr[$0]) }
-            print("[CoreMLLLM] features[0] range: [\(range0.min()!), \(range0.max()!)]")
         }
 
         let hasImage = imageFeatures != nil
@@ -406,12 +398,14 @@ public final class CoreMLLLM: @unchecked Sendable {
                     } else {
                         // Monolithic path
                         for (step, tid) in tokens.enumerated() {
-                            if let emb = multimodalEmbedding(for: tid) {
-                                nextID = try mutableSelf.predictMonolithic(
-                                    tokenID: 0, position: step, imageEmbedding: emb)
-                            } else {
-                                nextID = try mutableSelf.predictMonolithic(
-                                    tokenID: tid, position: step)
+                            try autoreleasepool {
+                                if let emb = multimodalEmbedding(for: tid) {
+                                    nextID = try mutableSelf.predictMonolithic(
+                                        tokenID: 0, position: step, imageEmbedding: emb)
+                                } else {
+                                    nextID = try mutableSelf.predictMonolithic(
+                                        tokenID: tid, position: step)
+                                }
                             }
                         }
                         let eosIDs: Set<Int> = [1, 106, 151645]
@@ -420,17 +414,22 @@ public final class CoreMLLLM: @unchecked Sendable {
                         var tokenCount = 0
                         for _ in 0..<maxTokens {
                             if eosIDs.contains(nextID) { break }
+                            if pos >= ctxLimit { break }
                             let text = mutableSelf.tokenizer.decode(tokens: [nextID])
                             continuation.yield(text)
                             tokenCount += 1
                             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                             if elapsed > 0 { mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed }
-                            nextID = try mutableSelf.predictMonolithic(
-                                tokenID: nextID, position: pos)
+                            try autoreleasepool {
+                                nextID = try mutableSelf.predictMonolithic(
+                                    tokenID: nextID, position: pos)
+                            }
                             pos += 1
                         }
                     }
-                } catch {}
+                } catch {
+                    print("[CoreMLLLM] Error: \(error)")
+                }
                 continuation.finish()
             }
         }
