@@ -42,6 +42,11 @@ public enum AudioProcessor {
     ) throws -> MLMultiArray {
         let mel = computeMelSpectrogram(
             samples, melFilterbank: melFilterbank, targetFrames: targetFrames)
+        // Dump mel for verification
+        let melPtr = mel.dataPointer.bindMemory(to: Float16.self, capacity: mel.count)
+        let m0 = Float(melPtr[0]), m1 = Float(melPtr[1]), m2 = Float(melPtr[2])
+        let m3 = Float(melPtr[3]), m4 = Float(melPtr[4])
+        print("[AudioProc] mel[0,:5] = [\(m0), \(m1), \(m2), \(m3), \(m4)]")
         let input = try MLDictionaryFeatureProvider(dictionary: [
             "input_features": MLFeatureValue(multiArray: mel),
         ])
