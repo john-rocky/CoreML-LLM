@@ -541,7 +541,7 @@ final class ChunkedEngine {
         let result = try MLMultiArray(shape: [1, 1, NSNumber(value: totalDim)], dataType: .float16)
         let raw = embedPerLayer.lookupRaw(tokenID)
         let dst = result.dataPointer.bindMemory(to: UInt16.self, capacity: totalDim)
-        for i in 0..<totalDim { dst[i] = raw[i] }
+        memcpy(dst, raw, totalDim * MemoryLayout<UInt16>.stride)
         return result
     }
 
