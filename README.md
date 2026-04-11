@@ -14,13 +14,16 @@ CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a 
 
 | | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | **v0.5.0** |
 |---|---:|---:|---:|---:|---:|
-| Context length | 512 | 2048 | 2048 | 2048 | **8192** |
+| Context length | 512 | 2048 | 2048 | 2048 | **2048 (up to 8K)** |
 | Decode speed | ~11 tok/s | ~11 tok/s | ~28 tok/s | ~28 tok/s | **~31 tok/s** |
+| Decode @ 8K ctx | — | — | — | — | **~15 tok/s** |
 | Prefill | ~11 tok/s | ~175 tok/s | ~96 tok/s | ~96 tok/s | **~154 tok/s** |
 | Multimodal (image) | — | — | broken | working | **working** |
 | Multimodal (audio) | — | — | — | — | **working** |
 | ANE placement | — | — | 99.78% | 99.78% | **99.78%** |
 | Memory (`phys_footprint`) | — | — | — | ~1 GB | **~1 GB** |
+
+Default context is 2048 (31 tok/s). Pass `contextLength: 8192` for longer context at ~15 tok/s. The slowdown comes from 7 full-attention layers whose KV cache scales with context length (28 sliding-window layers stay O(512) regardless).
 
 Ground-truth ANE placement measured via `MLComputePlan` (7,294 / 7,310 dispatched LLM ops on ANE). Vision encoder runs on GPU by design.
 
