@@ -375,7 +375,7 @@ final class ChunkedEngine {
 
         profilePredict += (CFAbsoluteTimeGetCurrent() - t1)
         profileCount += 1
-        if profileCount % 10 == 0 {
+        if profileCount == 1 || profileCount % 10 == 0 {
             let n = Double(profileCount)
             let eMs = profileEmbed / n * 1000
             let pMs = profilePredict / n * 1000
