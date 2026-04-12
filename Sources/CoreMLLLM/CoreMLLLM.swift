@@ -37,6 +37,10 @@ public final class CoreMLLLM: @unchecked Sendable {
     private var monolithicModel: MLModel?
     private var monolithicState: MLState?
 
+    // EAGLE-3 speculative decoding (optional — nil if the fusion/draft/verify
+    // assets aren't in the model directory).
+    private var speculativeLoop: SpeculativeLoop?
+
     // Vision (lazy loaded to save memory)
     private var visionModel: MLModel?
     private var visionModelURL: URL?
@@ -115,6 +119,33 @@ public final class CoreMLLLM: @unchecked Sendable {
             onProgress?("Loading chunks (first run = ANE compile, can take 1-2 min)...")
             llm.chunkedEngine = try await ChunkedEngine.load(
                 from: directory, config: config, computeUnits: computeUnits)
+            // EAGLE-3 assets are optional. All three must be present or
+            // speculative decoding stays off. Gemma 4 fusion layers are
+            // [8, 17, 34] per eagle3_config.json.
+            func findAsset(_ name: String) -> URL? {
+                let compiled = directory.appendingPathComponent("\(name).mlmodelc")
+                if FileManager.default.fileExists(atPath: compiled.path) { return compiled }
+                let pkg = directory.appendingPathComponent("\(name).mlpackage")
+                if FileManager.default.fileExists(atPath: pkg.path) { return pkg }
+                return nil
+            }
+            if let fusionURL = findAsset("eagle3_fusion"),
+               let draftURL = findAsset("eagle3_draft"),
+               findAsset("verify_chunk1") != nil {
+                do {
+                    onProgress?("Loading EAGLE-3 speculative (fusion + draft + 4 verify chunks)...")
+                    try await llm.chunkedEngine?.loadVerifyChunks(
+                        from: directory, computeUnits: computeUnits)
+                    llm.speculativeLoop = try SpeculativeLoop(
+                        fusionURL: fusionURL, draftURL: draftURL,
+                        K: 3, fusionLayers: [8, 17, 34],
+                        embedScale: config.embedScale)
+                    print("[Load] EAGLE-3 speculative ready (K=3)")
+                } catch {
+                    print("[Load] EAGLE-3 unavailable: \(error). Falling back to T=1 decode.")
+                    llm.speculativeLoop = nil
+                }
+            }
         } else {
             let mlConfig = MLModelConfiguration()
             mlConfig.computeUnits = computeUnits
@@ -203,6 +234,15 @@ public final class CoreMLLLM: @unchecked Sendable {
         let directory = modelURL.deletingLastPathComponent()
         return try await load(from: directory, computeUnits: computeUnits,
                                onProgress: onProgress)
+    }
+
+    /// Whether EAGLE-3 speculative decoding is loaded and active for this model.
+    public var supportsSpeculative: Bool { speculativeLoop != nil }
+
+    /// Rolling acceptance rate observed on recent speculative bursts. 1.0 before
+    /// any burst has run; decays toward 0 if the draft consistently mispredicts.
+    public var speculativeAcceptance: Double {
+        speculativeLoop?.rollingAcceptance ?? 0
     }
 
     /// Whether this model supports image input.
@@ -372,20 +412,82 @@ public final class CoreMLLLM: @unchecked Sendable {
                         let startTime = CFAbsoluteTimeGetCurrent()
                         var tokenCount = 0
                         let maxDecode = min(ctxLimit - engine.currentPosition, maxTokens)
+                        let spec = mutableSelf.speculativeLoop
 
-                        for _ in 0..<maxDecode {
+                        // First iteration is always plain T=1 decode so hidden_at_L*
+                        // taps get populated before speculative can read them.
+                        var didFirstDecode = false
+
+                        decodeLoop: for _ in 0..<maxDecode {
                             if eosIDs.contains(nextID) { break }
                             if engine.currentPosition >= ctxLimit { break }
-                            let text = mutableSelf.tokenizer.decode(tokens: [nextID])
-                            continuation.yield(text)
-                            tokenCount += 1
-                            let elapsed = CFAbsoluteTimeGetCurrent() - startTime
-                            if elapsed > 0 { mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed }
-                            try autoreleasepool {
-                                nextID = try engine.predictStep(tokenID: nextID,
-                                                                 position: engine.currentPosition)
+
+                            let useSpec = (spec != nil) && didFirstDecode
+                                && engine.canSpeculate && (spec?.shouldSpeculate ?? false)
+
+                            if useSpec, let sl = spec {
+                                // Speculative burst: yields 1..K+1 accepted tokens.
+                                let accepted: [Int32]
+                                do {
+                                    accepted = try sl.drawBurst(
+                                        target: engine,
+                                        tTokNext: Int32(nextID),
+                                        tokenEmbed: { try engine.embedToken($0) })
+                                } catch {
+                                    // On any speculative failure, fall back to T=1 this step.
+                                    print("[Spec] burst failed: \(error) — falling back to T=1")
+                                    let text = mutableSelf.tokenizer.decode(tokens: [nextID])
+                                    continuation.yield(text)
+                                    tokenCount += 1
+                                    let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                                    if elapsed > 0 {
+                                        mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed
+                                    }
+                                    try autoreleasepool {
+                                        nextID = try engine.predictStep(
+                                            tokenID: nextID, position: engine.currentPosition)
+                                    }
+                                    engine.currentPosition += 1
+                                    continue decodeLoop
+                                }
+
+                                // `accepted` always starts with the tTokNext we passed in.
+                                // commitAccepted has already advanced currentPosition by
+                                // accepted.count and refreshed hidden taps.
+                                for tok in accepted {
+                                    let t = Int(tok)
+                                    if eosIDs.contains(t) {
+                                        let text = mutableSelf.tokenizer.decode(tokens: [t])
+                                        continuation.yield(text)
+                                        tokenCount += 1
+                                        break decodeLoop
+                                    }
+                                    let text = mutableSelf.tokenizer.decode(tokens: [t])
+                                    continuation.yield(text)
+                                    tokenCount += 1
+                                    if tokenCount >= maxTokens { break decodeLoop }
+                                }
+                                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                                if elapsed > 0 {
+                                    mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed
+                                }
+                                nextID = engine.lastArgmaxAfterDecode
+                            } else {
+                                // Plain T=1 decode.
+                                let text = mutableSelf.tokenizer.decode(tokens: [nextID])
+                                continuation.yield(text)
+                                tokenCount += 1
+                                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                                if elapsed > 0 {
+                                    mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed
+                                }
+                                try autoreleasepool {
+                                    nextID = try engine.predictStep(
+                                        tokenID: nextID, position: engine.currentPosition)
+                                }
+                                engine.currentPosition += 1
+                                didFirstDecode = true
                             }
-                            engine.currentPosition += 1
                         }
                     } else {
                         // Monolithic path

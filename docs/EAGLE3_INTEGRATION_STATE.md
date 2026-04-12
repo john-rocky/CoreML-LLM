@@ -2,7 +2,7 @@
 
 Working document for the ongoing EAGLE-3 integration on this MacBook Air (M3 16GB). Written so a new session can pick up from here without re-deriving context.
 
-**Last updated:** 2026-04-12. Branch: `feature/audio-support`.
+**Last updated:** 2026-04-12 (Phase 2A scaffolded). Branch: `feature/audio-support`.
 
 ---
 
@@ -31,6 +31,10 @@ All under `/Users/daisukemajima/Downloads/CoreML-LLM/output/`:
 | `eagle3-chunks/chunk2.mlpackage` | 128MB | existing + **`hidden_at_L8` (1,1,1536) fp16** | `build_eagle3_chunks.py` |
 | `eagle3-chunks/chunk3.mlpackage` | 311MB | existing + **`hidden_at_L17` (1,1,1536) fp16** | `build_eagle3_chunks.py` |
 | `eagle3-chunks/chunk4.mlpackage` | 503MB | `token_id`, `token_logit`, **`hidden_at_L34`** (pre-norm, 1,1,1536 fp16) | `build_eagle3_chunks.py` |
+| `eagle3-chunks/verify_chunk1.mlpackage` | 149MB | `hidden_states_out`, `per_layer_combined_out` (T=3) | `build_eagle3_verify.py` |
+| `eagle3-chunks/verify_chunk2.mlpackage` | 128MB | + `kv13_k/v_out` (1,1,515,256), `kv14_k/v_out` (1,1,2051,512) | `build_eagle3_verify.py` |
+| `eagle3-chunks/verify_chunk3.mlpackage` | 311MB | `hidden_states_out` | `build_eagle3_verify.py` |
+| `eagle3-chunks/verify_chunk4.mlpackage` | 503MB | `token_ids` (3,) int32, `token_logits` (3,) fp16 | `build_eagle3_verify.py` |
 
 All INT4 palettized (group_size=32). Output dtype 65552 = `MLMultiArrayDataType.float16`.
 
@@ -78,23 +82,69 @@ Downgraded from 2.11 to try to fix convert.py (didn't help — bug is elsewhere)
 
 ## Remaining work
 
-### Phase 2A — Verify chunks (N=3) — NOT STARTED
-Blocker: `_run_layer_swa` is hardcoded for T=1 (line 70 of `gemma4_swa_chunks.py`: `q.view(1, num_heads, hd, 1)` assumes T=1). Verify chunks need T=3 to batch-verify K=3 candidates.
+### Phase 2A — Verify chunks (T=3) — **SCAFFOLDED, build in progress**
+Chose approach 3 (neither rewrite SWA nor reuse prefill): new `_run_layer_verify` helper that mirrors `_run_layer_swa` structure but handles T positions with read-only KV cache. Attention concats cache with newly-computed K/V (`K_for_attn = cat([K_cache, k_new], dim=2)`) so Swift supplies masks of shape `(1,1,T,W+T)` and `(1,1,T,ctx+T)`. No K/V writes — Swift commits by re-running T=1 decode per accepted token.
 
-Two approaches:
-1. **Rewrite _run_layer_swa to handle variable T.** Cleanest but touches the core decode path — risk of regressing the shipped T=1 code.
-2. **Build verify chunks on top of `_run_layer_prefill`** (in `gemma4_prefill_chunks.py`) which already handles T>1 (used for batched prefill, N=64/512). Build with sample shapes N=3, keep K/V I/O explicit so Swift can discard rejected updates.
+Files added this session:
+| File | What |
+|---|---|
+| `conversion/models/gemma4_verify_chunks.py` | `_run_layer_verify` + `VerifyChunk1..4` (T is a ctor arg, default 3) |
+| `conversion/build_eagle3_verify.py` | Conversion entry: `--only chunk1 -T 3` per-chunk; INT4 palettized |
 
-Recommend **approach 2** (less risk).
+**Verify chunk I/O contract** (T=3):
 
-Files to create: `conversion/build_eagle3_verify.py`. Outputs:
-- `verify_chunk1.mlpackage` — SWAChunk1 at T=3
-- `verify_chunk2.mlpackage` — + `hidden_at_L8` at last position (or all 3 positions)
-- `verify_chunk3.mlpackage` — + `hidden_at_L17`
-- `verify_chunk4.mlpackage` — + `hidden_at_L34` (pre-norm), + `token_ids` per position (shape (1,3) int32)
+| chunk | inputs (besides shared mask/RoPE/PLE) | outputs |
+|---|---|---|
+| verify_chunk1 | `per_layer_raw` (1,T,35·256), `K/V_sliding_in` (7,1,W,512), `K/V_full_in` (1,1,ctx,512) | `hidden_states_out` (1,T,1536), `per_layer_combined_out` (1,T,8960) |
+| verify_chunk2 | `per_layer_combined`, `K/V_sliding_in` (5,…), `K/V_full_in` (2,…) | `hidden_states_out`, `kv13_k_out` (1,1,W+T=515,256), `kv13_v_out`, `kv14_k_out` (1,1,ctx+T=2051,512), `kv14_v_out` |
+| verify_chunk3 | `kv13_k` (1,1,W+T,256), `kv14_k` (1,1,ctx+T,512) | `hidden_states_out` (1,T,1536) |
+| verify_chunk4 | same as chunk3 | `token_ids` (T,) int32, `token_logits` (T,) fp16 |
 
-### Phase 2B — Swift integration in ChunkedEngine
-`SpeculativeLoop.swift` is already written (see file in Sources/CoreMLLLM/). It expects a `SpeculativeTarget`-conforming object. ChunkedEngine needs:
+Status (2026-04-12, all built):
+
+| File | Size | Build (convert + palettize) |
+|---|---:|---|
+| `verify_chunk1.mlpackage` | 149MB | ~25s + 44s |
+| `verify_chunk2.mlpackage` | 128MB | ~18s + 44s |
+| `verify_chunk3.mlpackage` | 311MB | ~30s + 97s |
+| `verify_chunk4.mlpackage` | 503MB | ~55s + ~160s (vocab head dominates) |
+
+Smoke test `python /tmp/smoke_verify_chunks.py` PASS. I/O names and shapes match spec (incl. kv13_k_out `[1,1,515,256]`, kv14_k_out `[1,1,2051,512]`, chunk4 `token_ids [3] int32` + `token_logits [3] fp16`).
+
+**Parity validation (done, partial)**:
+
+- **Layer-level parity — PASS.** `/tmp/parity_layer.py` runs `_run_layer_swa × 3` vs `_run_layer_verify × 1` with matched random init for one sliding (L0) and one full (L4) layer. Max abs diff ≤ 4e-3 in fp16, safely under the fp16 noise floor.
+- **Chunk1 fp32 drill-through — PASS.** Per-layer diff through L0..L7 in fp32 is 10⁻⁵ (float epsilon). Confirms `_run_layer_verify` is **mathematically equivalent** to SWA-sequential; the fp16 amplification below is pure accumulated rounding, not a bug.
+- **E2E argmax, fp32 — PASS.** `/tmp/parity_e2e_fp32.py` runs SWAChunk1..4 × 3 vs VerifyChunk1..4 × 1 in fp32 with random init. All 3 argmaxes match; |Δlogit| ≤ 0.24. Confirms the full pipeline (including kv13/kv14 shared-layer flow in chunks 3/4) is mathematically equivalent.
+- **E2E argmax, fp16 random — expected fail (not a bug).** Same test in fp16 diverges on steps 1, 2. Cause: rounding grows ~2× per layer through 35 layers and `torch.randn` logits over 262K vocab have effectively no top-1 separation. Does NOT predict real-model behavior.
+- **Still nice-to-have** before iPhone deploy: real-prompt argmax parity on-device (compile the verify chunks, feed actual cache/hidden after prefill, assert verify argmax = decode-sequential argmax over a few dozen bursts). This is the only remaining gate. Real Gemma-4 logits are sharp enough (top-1 typically 5+ above top-2) that fp16 drift shouldn't flip argmax; if it does, the draft's acceptance rate will crater visibly in bench. Not blocking Phase 2B scaffolding.
+
+Known gotchas for any reconvert:
+- Sample masks must match attended-dim length: `causal_mask_full` last dim = `ctx + T`, `causal_mask_sliding` = `W + T`. Rebuilding at a different T requires passing `-T N` to `build_eagle3_verify.py`.
+- cos/sin shapes are `(1,1,T,256)` for sliding and `(1,1,T,512)` for full (same convention as decode).
+- chunk3/4 receive kv13/kv14 already extended to W+T and ctx+T — those come directly from chunk2's output; Swift never builds them from scratch.
+
+### Phase 2B — Swift integration in ChunkedEngine — **SCAFFOLDED 2026-04-12**
+`SpeculativeLoop.swift` is already written (see file in Sources/CoreMLLLM/). It expects a `SpeculativeTarget`-conforming object. ChunkedEngine now conforms (extension at the bottom of `ChunkedEngine.swift`):
+
+- `loadVerifyChunks(from:computeUnits:)` — lazy parallel load of verify_chunk{1..4}.
+- `canSpeculate` — true when all four verify chunks are loaded and at least one decode step has captured `hidden_at_L{8,17,34}`.
+- `predictStep` now stashes the three hidden taps from decode chunks 2/3/4 (via `featureValue(for:)?.multiArrayValue`, so non-EAGLE-3 chunks silently set them to nil).
+- Mask/RoPE/input builders: `makeVerifyCausalMaskFull(position:T:ctx:)`, `makeVerifyCausalMaskSliding(position:T:W:)`, `buildVerifyHidden(tokenIDs:)`, `buildVerifyPLR(tokenIDs:)`, `buildVerifyRoPE(table:position:T:dim:)`.
+- `lastHiddenMulti(at:)`, `commitAccepted(_:)`, `verifyCandidates(_:K:)` — the three protocol methods. `commitAccepted` replays `predictStep` per accepted token (simple/correct; can be optimized later).
+
+`swift build` clean (only pre-existing accelerate-deprecation + IOSurface throwing-expression warnings).
+
+**Public API wired (2026-04-12).** `CoreMLLLM.swift` now:
+- Auto-loads `eagle3_fusion.mlpackage`, `eagle3_draft.mlpackage`, and `verify_chunk{1..4}.mlpackage` from the model directory when all are present. Any failure falls back silently to T=1 decode.
+- Exposes `supportsSpeculative: Bool` and `speculativeAcceptance: Double`.
+- In `stream()`'s decode loop, runs one plain T=1 decode first to populate `hidden_at_L*`, then uses speculative bursts while `canSpeculate && shouldSpeculate`. On any burst error, falls back to T=1 for that step. Yields each accepted token individually so the stream consumer sees the same token sequence as non-speculative decode.
+
+`swift build` clean. No functional bench yet — validation is iPhone deploy (Phase 3).
+
+**Original Phase 2B plan retained below for reference.**
+
+
 
 1. **Store `hidden_at_L{8,17,34}`** after each decode step. Modify `decodeStep()` (ChunkedEngine.swift around line 340-386) to fetch these outputs from chunk2/3/4 and stash in 3 ivars.
 
@@ -108,12 +158,24 @@ Files to create: `conversion/build_eagle3_verify.py`. Outputs:
        // Last iteration naturally refreshes the lastHiddenAtL* ivars
    }
    func verifyCandidates(_ candidates: [Int32], K: Int) throws -> [Int32] {
-       // Needs verify_chunk1..4 (Phase 2A).
-       // Until Phase 2A lands: throw SpeculativeError.verifyFailed("verify chunks not built")
+       // Call verify_chunk1..4.mlmodelc in sequence. Build T-aware masks
+       // (see "Verify-chunk mask builder" below). Cache is READ-ONLY during
+       // verify; no K/V writes back. Return chunk4's token_ids (T,).
    }
    ```
 
-3. **Make CoreMLLLM public API** decide when to use speculative (based on `SpeculativeLoop.shouldSpeculate` + rolling acceptance). See `SpeculativeLoop.swift:194`.
+3. **Verify-chunk mask builder** (new Swift helpers, sibling to `makeCausalMask` / `makeSlidingCausalMask`):
+   - `makeVerifyCausalMaskFull(position: Int, T: Int, ctx: Int) -> MLMultiArray` shape (1,1,T,ctx+T):
+     - `[t, i]` for `i ∈ 0..<ctx`: 0 if `i < position` else -inf
+     - `[t, ctx+j]` for `j ∈ 0..<T`: 0 if `j ≤ t` else -inf
+   - `makeVerifyCausalMaskSliding(position: Int, T: Int, W: Int) -> MLMultiArray` shape (1,1,T,W+T):
+     - Cache slot `i ∈ 0..<W` maps to abs pos `position - W + i` (valid if ≥ 0 and ≤ position-1).
+     - Abs range for query `t`: `[position + t - W + 1, position + t]`, clip to ≥ 0.
+     - Set `[t, W+j]` to 0 if `j ≤ t` else -inf.
+   - Per-token RoPE cos/sin: reuse `lookupRoPE` for positions `[position, position+T-1]` and stack on the T axis to `(1,1,T,dim)`.
+   - `per_layer_raw`: embed each candidate token with `EmbeddingLookup.perLayerRaw(tokenID:)` and stack on T axis.
+
+4. **Make CoreMLLLM public API** decide when to use speculative (based on `SpeculativeLoop.shouldSpeculate` + rolling acceptance). See `SpeculativeLoop.swift:194`.
 
 ### Phase 3 — iPhone deployment + bench
 1. Compile `.mlpackage` → `.mlmodelc` (either via Xcode "Add to target" or at runtime via `MLModel.compileModel(at:)`).
@@ -155,7 +217,9 @@ python /tmp/smoke_eagle3_chunks.py
 
 | File | What |
 |---|---|
-| `conversion/build_eagle3_chunks.py` | New — builds decode chunks with hidden taps |
+| `conversion/build_eagle3_chunks.py` | Builds decode chunks with hidden taps |
+| `conversion/models/gemma4_verify_chunks.py` | New — verify T=3 helper + chunks, read-only KV |
+| `conversion/build_eagle3_verify.py` | New — conversion entry for verify chunks |
 | `conversion/test_eagle3_infer.py` | Patched for Mac (apply_rope dtype, draft fp16 cast, HF_DIR fallback) |
 | `conversion/build_speculative.py` | Patched `HF_DIR` to env var / `../output/gemma4-e2b/hf_model` fallback |
 | `docs/EAGLE3_INTEGRATION_STATE.md` | This file |
