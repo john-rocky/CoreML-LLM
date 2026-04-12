@@ -268,6 +268,8 @@ final class ChunkedEngine {
         profileEmbed = 0
         profilePredict = 0
         profileCount = 0
+        profileMask = 0
+        profileC1 = 0; profileC2 = 0; profileC3 = 0; profileC4 = 0
     }
 
     // MARK: - Single-token decode step
@@ -276,6 +278,12 @@ final class ChunkedEngine {
     private var profileEmbed: Double = 0
     private var profilePredict: Double = 0
     private var profileCount: Int = 0
+    // Per-chunk breakdown (includes the chunk's own copyBack cost for KV-holding chunks).
+    private var profileMask: Double = 0
+    private var profileC1: Double = 0
+    private var profileC2: Double = 0
+    private var profileC3: Double = 0
+    private var profileC4: Double = 0
 
     func predictStep(tokenID: Int, position: Int,
                      imageEmbedding: MLMultiArray? = nil) throws -> Int {
@@ -305,8 +313,11 @@ final class ChunkedEngine {
         let sinS = try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
         let cosF = try lookupRoPE(table: cosFullTable, position: position, dim: 512)
         let sinF = try lookupRoPE(table: sinFullTable, position: position, dim: 512)
+        let tMask = CFAbsoluteTimeGetCurrent()
+        profileMask += (tMask - t1)
 
         // Chunk 1
+        let tC1Start = CFAbsoluteTimeGetCurrent()
         let out1 = try chunk1.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: hiddenIn),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
@@ -326,8 +337,11 @@ final class ChunkedEngine {
         copyBack(out1, "V_sliding_out", into: vSliding1)
         copyBack(out1, "K_full_out", into: kFull1)
         copyBack(out1, "V_full_out", into: vFull1)
+        let tC1End = CFAbsoluteTimeGetCurrent()
+        profileC1 += (tC1End - tC1Start)
 
         // Chunk 2
+        let tC2Start = CFAbsoluteTimeGetCurrent()
         let out2 = try chunk2.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h1),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
@@ -350,6 +364,8 @@ final class ChunkedEngine {
         let kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
         let kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
         let kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
+        let tC2End = CFAbsoluteTimeGetCurrent()
+        profileC2 += (tC2End - tC2Start)
 
         let shared: [String: MLFeatureValue] = [
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
@@ -363,13 +379,19 @@ final class ChunkedEngine {
         ]
 
         // Chunk 3
+        let tC3Start = CFAbsoluteTimeGetCurrent()
         var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
         let h3 = try chunk3.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
             .featureValue(for: "hidden_states_out")!.multiArrayValue!
+        let tC3End = CFAbsoluteTimeGetCurrent()
+        profileC3 += (tC3End - tC3Start)
 
         // Chunk 4
+        let tC4Start = CFAbsoluteTimeGetCurrent()
         var d4 = shared; d4["hidden_states"] = MLFeatureValue(multiArray: h3)
         let out4 = try chunk4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4))
+        let tC4End = CFAbsoluteTimeGetCurrent()
+        profileC4 += (tC4End - tC4Start)
 
         profilePredict += (CFAbsoluteTimeGetCurrent() - t1)
         profileCount += 1
@@ -377,8 +399,16 @@ final class ChunkedEngine {
             let n = Double(profileCount)
             let eMs = profileEmbed / n * 1000
             let pMs = profilePredict / n * 1000
-            print(String(format: "[Profile] emb=%.1fms predict=%.1fms total=%.1fms (%.1f tok/s)",
-                         eMs, pMs, eMs + pMs, 1000.0 / (eMs + pMs)))
+            let mMs = profileMask / n * 1000
+            let c1 = profileC1 / n * 1000
+            let c2 = profileC2 / n * 1000
+            let c3 = profileC3 / n * 1000
+            let c4 = profileC4 / n * 1000
+            print(String(format:
+                "[Profile] emb=%.1fms mask=%.1fms | c1=%.1f c2=%.1f c3=%.1f c4=%.1f " +
+                "(sum=%.1fms) | predict=%.1fms total=%.1fms (%.1f tok/s)",
+                eMs, mMs, c1, c2, c3, c4, c1 + c2 + c3 + c4,
+                pMs, eMs + pMs, 1000.0 / (eMs + pMs)))
         }
 
         return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
