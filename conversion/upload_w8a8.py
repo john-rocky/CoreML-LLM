@@ -3,14 +3,34 @@
 
 Uploads to a subfolder `w8a8-8k/` within the existing repo,
 keeping the original INT4 models untouched.
+
+Post-upload, this script HEAD-checks each file the Swift
+`ModelDownloader.buildW8A8FileList()` expects and fails loudly if any
+are missing. An earlier revision of this script silently skipped files
+<1024 bytes and left the HF repo missing chunkN.mlmodelc/coremldata.bin
+(required by CoreML), causing the iOS download to 404 mid-stream; see
+the commit message history for the incident.
 """
 import os
 import shutil
+import sys
+import urllib.request
 from huggingface_hub import HfApi
 
 REPO_ID = "mlboydaisuke/gemma-4-E2B-coreml"
 LOCAL_DIR = "/tmp/w8a8-all-compiled"
 HF_PREFIX = "w8a8-8k"  # subfolder in repo
+
+# Files the Swift client downloads per chunk. Must stay in sync with
+# Sources/CoreMLLLM/ModelDownloader.swift :: buildW8A8FileList().
+REQUIRED_PER_CHUNK = [
+    "coremldata.bin",             # REQUIRED by CoreML; was the historically-missing one
+    "model.mil",
+    "metadata.json",
+    "weights/weight.bin",
+    "analytics/coremldata.bin",   # missing file still 404s the Swift download
+]
+REQUIRED_ROOT = ["model_config.json"]
 
 # Also need: model_config.json, embeddings, RoPE, tokenizer
 # These are shared with the base model — upload a model_config.json that marks W8A8
@@ -75,6 +95,54 @@ def main():
     print(f"\nNote: Shared files (embeddings, RoPE, tokenizer) are in the repo root.")
     print(f"The app should download {HF_PREFIX}/ chunks + root shared files.")
 
+    print("\nVerifying uploaded files with HEAD requests...")
+    missing = verify_hf_state()
+    if missing:
+        print(f"\nFAIL: {len(missing)} required file(s) missing on HF:")
+        for m in missing:
+            print(f"  - {m}")
+        print("\nFix: re-upload the missing files (check the filter in upload_w8a8.py).")
+        sys.exit(1)
+    print("OK — all files the Swift client expects are reachable on HF.")
+
+
+def verify_hf_state() -> list[str]:
+    """HEAD-check every file buildW8A8FileList expects. Returns list of paths
+    that returned 4xx (empty list = all OK)."""
+    def head_ok(rel_path: str) -> bool:
+        url = f"https://huggingface.co/{REPO_ID}/resolve/main/{HF_PREFIX}/{rel_path}"
+        req = urllib.request.Request(url, method="HEAD")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status < 400
+        except urllib.error.HTTPError as e:
+            return e.code < 400
+        except Exception:
+            return False
+
+    missing = []
+    for chunk in ["chunk1", "chunk2", "chunk3", "chunk4"]:
+        for f in REQUIRED_PER_CHUNK:
+            p = f"{chunk}.mlmodelc/{f}"
+            if not head_ok(p):
+                missing.append(p)
+    for f in REQUIRED_ROOT:
+        if not head_ok(f):
+            missing.append(f)
+    return missing
+
 
 if __name__ == "__main__":
+    # `python upload_w8a8.py verify` runs the HEAD check in isolation
+    # (skips the actual upload). Useful for incident triage.
+    if len(sys.argv) == 2 and sys.argv[1] == "verify":
+        print(f"Verifying {REPO_ID}/{HF_PREFIX}/ ...")
+        missing = verify_hf_state()
+        if missing:
+            print(f"\nMISSING ({len(missing)}):")
+            for m in missing:
+                print(f"  {m}")
+            sys.exit(1)
+        print("OK — all required files present.")
+        sys.exit(0)
     main()

@@ -601,6 +601,17 @@ public final class ModelDownloader: NSObject {
     }
     #endif
 
+    /// Files inside an mlmodelc that CoreML doesn't require to load the model.
+    /// A 404 on these shouldn't abort the whole download — the upload process
+    /// for W8A8 has historically produced HF repos missing `coremldata.bin`
+    /// (since fixed) and `metadata.json` (still missing in some uploads); the
+    /// latter is purely descriptive. Keep this list conservative — anything
+    /// not listed here is treated as required.
+    private func isOptionalMlmodelcFile(_ localPath: String) -> Bool {
+        localPath.hasSuffix(".mlmodelc/metadata.json")
+            || localPath.hasSuffix(".mlmodelc/analytics/coremldata.bin")
+    }
+
     private var modelsDirectory: URL {
         fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("Models")
     }
@@ -626,6 +637,23 @@ extension ModelDownloader: URLSessionDownloadDelegate {
             try? fileManager.removeItem(at: location)
             let url = downloadTask.originalRequest?.url?.absoluteString ?? "(unknown)"
             let taskId = downloadTask.taskIdentifier
+
+            // Optional files: metadata.json and analytics/coremldata.bin inside
+            // an mlmodelc are descriptive, not functional — CoreML loads fine
+            // without them. Treat 404 on these as non-fatal so a slightly
+            // incomplete HF upload doesn't abort the entire download.
+            if http.statusCode == 404 && isOptionalMlmodelcFile(localPath) {
+                print("[Download] Skipping optional missing file: \(localPath) (404)")
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.activeDownloadTasks.removeValue(forKey: taskId)
+                    self.activeTaskFileIndex.removeValue(forKey: taskId)
+                    self.activeTaskBytes.removeValue(forKey: taskId)
+                    self.fillDownloadSlots()
+                }
+                return
+            }
+
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.activeDownloadTasks.removeValue(forKey: taskId)
