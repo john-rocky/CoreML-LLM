@@ -97,6 +97,11 @@ struct ModelRow: View {
                         Text("(incomplete)")
                             .foregroundStyle(.orange)
                     }
+                    if model.id.contains("w8a8") {
+                        Text("Requires base model")
+                            .foregroundStyle(.orange)
+                            .font(.caption2)
+                    }
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)

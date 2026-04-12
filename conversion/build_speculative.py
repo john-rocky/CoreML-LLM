@@ -30,7 +30,7 @@ from models.gemma4_swa_chunks import SWAChunk1, SWAChunk2, SWAChunk3, SWAChunk4
 from ane_ops import MODEL_DTYPE, InModelArgmax
 
 HF_DIR = os.environ.get("GEMMA4_HF_DIR", f"{ROOT}/../output/gemma4-e2b/hf_model")
-CTX = 2048
+CTX = int(os.environ.get("GEMMA4_CTX", "2048"))
 W = 512
 N_VERIFY = 4
 fp16 = ct.converters.mil.mil.types.fp16

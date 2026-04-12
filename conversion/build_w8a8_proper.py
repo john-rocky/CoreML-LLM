@@ -20,6 +20,11 @@ import coremltools.optimize.coreml as cto
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
+# Workaround for coremltools 9.0 tmp-package leak during activation
+# calibration. Must be imported BEFORE any MLModel is instantiated.
+# Remove once apple/coremltools ships the upstream fix.
+import coremltools_tmp_cleanup  # noqa: F401
+
 from models.gemma4 import Gemma4Model
 from models.gemma4_swa_chunks import SWAChunk1, SWAChunk2, SWAChunk3, SWAChunk4
 from ane_ops import MODEL_DTYPE
@@ -192,7 +197,7 @@ def build_w8a8_chunk2(cal_data, output_dir):
     try:
         mlmodel_a8 = cto.linear_quantize_activations(
             mlmodel, act_cfg, cal_data,
-            calibration_op_group_size=10  # process in groups to avoid memory issues
+            calibration_op_group_size=50  # larger groups = fewer batches = less temp leak
         )
         print(f"  Activation quantization done in {time.time()-t:.1f}s")
     except Exception as e:

@@ -43,16 +43,22 @@ final class ChunkedEngine {
     // SWA KV cache buffers (persistent across decode steps, zeroed on reset)
     private var kSliding1: MLMultiArray  // (7, 1, W, maxHd)
     private var vSliding1: MLMultiArray
-    private var kFull1: MLMultiArray     // (1, 1, ctx, maxHd)
+    private var kFull1: MLMultiArray     // (1, 1, FW, maxHd) — FW or ctx
     private var vFull1: MLMultiArray
     private var kSliding2: MLMultiArray  // (5, 1, W, maxHd)
     private var vSliding2: MLMultiArray
-    private var kFull2: MLMultiArray     // (2, 1, ctx, maxHd)
+    private var kFull2: MLMultiArray     // (2, 1, FW, maxHd) — FW or ctx
     private var vFull2: MLMultiArray
 
     let config: ModelConfig
     let prefillN: Int
     var currentPosition: Int = 0
+
+    /// WFA mode: full-attention layers use shift-based windowed KV (no update_mask).
+    /// Auto-detected from model inputs or config.full_window > 0.
+    let isWFA: Bool
+    /// Full-attention window size. In WFA mode: e.g. 2048. In SWA mode: = ctx.
+    var fullWindow: Int { isWFA ? config.fullWindow : config.contextLength }
 
     var hasPrefill: Bool {
         prefillChunk1 != nil && prefillChunk2 != nil
@@ -168,8 +174,6 @@ final class ChunkedEngine {
         }
 
         // Validate context length: every chunk must agree with model_config.json.
-        // Mixed 2K / 8K chunk files from different builds are rejected with a clear
-        // error so the user knows to re-download a consistent set.
         let configuredCtx = config.contextLength
         for (label, model) in [("chunk1", c1!), ("chunk2", c2!), ("chunk3", c3!), ("chunk4", c4!)] {
             if let desc = model.modelDescription.inputDescriptionsByName["causal_mask_full"],
@@ -182,10 +186,29 @@ final class ChunkedEngine {
             }
         }
 
-        // SWA KV buffers — IOSurface-backed for zero-copy CPU↔ANE transfer
+        // Auto-detect WFA mode: check if chunk1 expects "update_mask" input.
+        // WFA models use shift-based KV and don't need update_mask.
+        let detectedWFA = c1!.modelDescription.inputDescriptionsByName["update_mask"] == nil
+        if detectedWFA {
+            print("[ChunkedEngine] WFA mode detected (no update_mask in chunk1)")
+        }
+
+        // Auto-detect WFA fullWindow from model's causal_mask_full shape
+        var effectiveConfig = config
+        if detectedWFA,
+           let desc = c1!.modelDescription.inputDescriptionsByName["causal_mask_full"],
+           let c = desc.multiArrayConstraint,
+           let maskSize = c.shape.last?.intValue {
+            effectiveConfig.fullWindow = maskSize
+            print("[ChunkedEngine] WFA fullWindow=\(maskSize) (from model)")
+        }
+
+        // SWA/WFA KV buffers — IOSurface-backed for zero-copy CPU↔ANE transfer
         let maxHd = 512
         let ctx = configuredCtx
         let W = config.slidingWindow
+        // Full-attention KV: use fullWindow (WFA) or contextLength (SWA)
+        let fullKVLen = detectedWFA ? effectiveConfig.fullWindow : ctx
         func ioSurfaceArray(slots: Int, seqLen: Int) throws -> MLMultiArray {
             let width = maxHd
             let height = slots * 1 * seqLen
@@ -214,7 +237,7 @@ final class ChunkedEngine {
             memset(arr.dataPointer, 0, slots * seqLen * maxHd * MemoryLayout<UInt16>.stride)
             return arr
         }
-        print("[KV] Allocating IOSurface-backed KV cache buffers (ctx=\(ctx))")
+        print("[KV] Allocating IOSurface-backed KV cache buffers (fullKV=\(fullKVLen), W=\(W))")
 
         return try ChunkedEngine(
             chunk1: c1, chunk2: c2, chunk3: c3, chunk4: c4,
@@ -224,10 +247,10 @@ final class ChunkedEngine {
             cosSlidingTable: cosS, sinSlidingTable: sinS,
             cosFullTable: cosF, sinFullTable: sinF,
             kSliding1: ioSurfaceArray(slots: 7, seqLen: W), vSliding1: ioSurfaceArray(slots: 7, seqLen: W),
-            kFull1: ioSurfaceArray(slots: 1, seqLen: ctx), vFull1: ioSurfaceArray(slots: 1, seqLen: ctx),
+            kFull1: ioSurfaceArray(slots: 1, seqLen: fullKVLen), vFull1: ioSurfaceArray(slots: 1, seqLen: fullKVLen),
             kSliding2: ioSurfaceArray(slots: 5, seqLen: W), vSliding2: ioSurfaceArray(slots: 5, seqLen: W),
-            kFull2: ioSurfaceArray(slots: 2, seqLen: ctx), vFull2: ioSurfaceArray(slots: 2, seqLen: ctx),
-            config: config, prefillN: prefillN)
+            kFull2: ioSurfaceArray(slots: 2, seqLen: fullKVLen), vFull2: ioSurfaceArray(slots: 2, seqLen: fullKVLen),
+            config: effectiveConfig, prefillN: prefillN, isWFA: detectedWFA)
     }
 
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
@@ -241,7 +264,7 @@ final class ChunkedEngine {
                  kFull1: MLMultiArray, vFull1: MLMultiArray,
                  kSliding2: MLMultiArray, vSliding2: MLMultiArray,
                  kFull2: MLMultiArray, vFull2: MLMultiArray,
-                 config: ModelConfig, prefillN: Int) {
+                 config: ModelConfig, prefillN: Int, isWFA: Bool = false) {
         self.chunk1 = chunk1; self.chunk2 = chunk2
         self.chunk3 = chunk3; self.chunk4 = chunk4
         self.prefillChunk1 = prefillChunk1; self.prefillChunk2 = prefillChunk2
@@ -254,7 +277,7 @@ final class ChunkedEngine {
         self.kFull1 = kFull1; self.vFull1 = vFull1
         self.kSliding2 = kSliding2; self.vSliding2 = vSliding2
         self.kFull2 = kFull2; self.vFull2 = vFull2
-        self.config = config; self.prefillN = prefillN
+        self.config = config; self.prefillN = prefillN; self.isWFA = isWFA
     }
 
     // MARK: - Reset
@@ -279,8 +302,8 @@ final class ChunkedEngine {
 
     func predictStep(tokenID: Int, position: Int,
                      imageEmbedding: MLMultiArray? = nil) throws -> Int {
-        let ctx = config.contextLength
         let W = config.slidingWindow
+        let FW = fullWindow
         let hidden = config.hiddenSize
 
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -298,20 +321,27 @@ final class ChunkedEngine {
         let t1 = CFAbsoluteTimeGetCurrent()
         profileEmbed += (t1 - t0)
 
-        let maskFull = try makeCausalMask(position: position, length: ctx)
+        // WFA: full-attention mask is sliding (size FW), no update_mask
+        // SWA: full-attention mask is causal (size ctx), with update_mask
+        let maskFull: MLMultiArray
         let maskSliding = try makeSlidingCausalMask(position: position, W: W)
-        let umask = try makeUpdateMask(position: position, length: ctx)
         let cosS = try lookupRoPE(table: cosSlidingTable, position: position, dim: 256)
         let sinS = try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
         let cosF = try lookupRoPE(table: cosFullTable, position: position, dim: 512)
         let sinF = try lookupRoPE(table: sinFullTable, position: position, dim: 512)
 
+        if isWFA {
+            // WFA: full mask is sliding window of size FW
+            maskFull = try makeSlidingCausalMask(position: position, W: FW)
+        } else {
+            maskFull = try makeCausalMask(position: position, length: config.contextLength)
+        }
+
         // Chunk 1
-        let out1 = try chunk1.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+        var d1: [String: MLFeatureValue] = [
             "hidden_states": MLFeatureValue(multiArray: hiddenIn),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
             "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
-            "update_mask": MLFeatureValue(multiArray: umask),
             "per_layer_raw": MLFeatureValue(multiArray: plRaw),
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
@@ -319,7 +349,12 @@ final class ChunkedEngine {
             "V_sliding_in": MLFeatureValue(multiArray: vSliding1),
             "K_full_in": MLFeatureValue(multiArray: kFull1),
             "V_full_in": MLFeatureValue(multiArray: vFull1),
-        ]))
+        ]
+        if !isWFA {
+            let umask = try makeUpdateMask(position: position, length: config.contextLength)
+            d1["update_mask"] = MLFeatureValue(multiArray: umask)
+        }
+        let out1 = try chunk1.prediction(from: MLDictionaryFeatureProvider(dictionary: d1))
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
         copyBack(out1, "K_sliding_out", into: kSliding1)
@@ -328,11 +363,10 @@ final class ChunkedEngine {
         copyBack(out1, "V_full_out", into: vFull1)
 
         // Chunk 2
-        let out2 = try chunk2.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+        var d2: [String: MLFeatureValue] = [
             "hidden_states": MLFeatureValue(multiArray: h1),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
             "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
-            "update_mask": MLFeatureValue(multiArray: umask),
             "per_layer_combined": MLFeatureValue(multiArray: plc),
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
@@ -340,7 +374,12 @@ final class ChunkedEngine {
             "V_sliding_in": MLFeatureValue(multiArray: vSliding2),
             "K_full_in": MLFeatureValue(multiArray: kFull2),
             "V_full_in": MLFeatureValue(multiArray: vFull2),
-        ]))
+        ]
+        if !isWFA {
+            let umask = try makeUpdateMask(position: position, length: config.contextLength)
+            d2["update_mask"] = MLFeatureValue(multiArray: umask)
+        }
+        let out2 = try chunk2.prediction(from: MLDictionaryFeatureProvider(dictionary: d2))
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
         copyBack(out2, "K_sliding_out", into: kSliding2)
         copyBack(out2, "V_sliding_out", into: vSliding2)
@@ -351,16 +390,19 @@ final class ChunkedEngine {
         let kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
         let kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
 
-        let shared: [String: MLFeatureValue] = [
+        var shared: [String: MLFeatureValue] = [
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
             "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
-            "update_mask": MLFeatureValue(multiArray: umask),
             "per_layer_combined": MLFeatureValue(multiArray: plc),
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
             "kv13_k": MLFeatureValue(multiArray: kv13_k), "kv13_v": MLFeatureValue(multiArray: kv13_v),
             "kv14_k": MLFeatureValue(multiArray: kv14_k), "kv14_v": MLFeatureValue(multiArray: kv14_v),
         ]
+        if !isWFA {
+            let umask = try makeUpdateMask(position: position, length: config.contextLength)
+            shared["update_mask"] = MLFeatureValue(multiArray: umask)
+        }
 
         // Chunk 3
         var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)

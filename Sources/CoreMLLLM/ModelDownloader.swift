@@ -64,13 +64,19 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
             folderName: "gemma4-e2b")
 
+        /// Gemma 4 E2B W8A8 — INT8 activations for A17 Pro+ ANE fast path. Experimental 8K.
+        public static let gemma4e2bW8A8 = ModelInfo(
+            id: "gemma4-e2b-w8a8", name: "Gemma 4 E2B W8A8 (8K, Experimental)", size: "1.1 GB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main/w8a8-8k",
+            folderName: "gemma4-e2b-w8a8")
+
         /// Qwen2.5 0.5B — text only, 309 MB.
         public static let qwen25_05b = ModelInfo(
             id: "qwen2.5-0.5b", name: "Qwen2.5 0.5B (Text)", size: "309 MB",
             downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
             folderName: "qwen2.5-0.5b")
 
-        public static let defaults: [ModelInfo] = [gemma4e2b, qwen25_05b]
+        public static let defaults: [ModelInfo] = [gemma4e2b, gemma4e2bW8A8, qwen25_05b]
     }
 
     private struct DownloadFile: Codable {
@@ -317,6 +323,26 @@ public final class ModelDownloader: NSObject {
             }
         }
 
+        // W8A8 variant: link shared files (embeddings, RoPE, tokenizer) from base model
+        if model.id.contains("w8a8") {
+            let baseDir = modelsDirectory.appendingPathComponent(ModelInfo.gemma4e2b.folderName)
+            let sharedFiles = [
+                "embed_tokens_q8.bin", "embed_tokens_scales.bin",
+                "embed_tokens_per_layer_q8.bin", "embed_tokens_per_layer_scales.bin",
+                "per_layer_projection.bin", "per_layer_norm_weight.bin",
+                "cos_sliding.npy", "sin_sliding.npy", "cos_full.npy", "sin_full.npy",
+                "model_config.json", "hf_model",
+                "vision.mlmodelc", "audio.mlmodelc",
+            ]
+            for name in sharedFiles {
+                let src = baseDir.appendingPathComponent(name)
+                let dst = dest.appendingPathComponent(name)
+                if fileManager.fileExists(atPath: src.path) && !fileManager.fileExists(atPath: dst.path) {
+                    try? fileManager.copyItem(at: src, to: dst)
+                }
+            }
+        }
+
         cleanupPersistedState()
         isDownloading = false
         isPaused = false
@@ -389,6 +415,12 @@ public final class ModelDownloader: NSObject {
     // MARK: - HuggingFace File List
 
     private func buildHuggingFaceFileList(_ model: ModelInfo) {
+        // W8A8 variant: only download chunk mlmodelc files (shared files linked from base model)
+        if model.id.contains("w8a8") {
+            buildW8A8FileList(model)
+            return
+        }
+
         let sdpaPrefix = "sdpa-8k/"
 
         func mlc(_ sub: String, _ localName: String, weightSize: Int64) -> [DownloadFile] {
@@ -472,6 +504,43 @@ public final class ModelDownloader: NSObject {
         }
 
         // Large files first (sorted biggest-first) so all 4 connections saturate immediately
+        largeFiles.sort { $0.estimatedSize > $1.estimatedSize }
+        pendingFiles = largeFiles + smallFiles
+        totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
+        completedBytes = 0
+        nextFileIndex = 0
+    }
+
+    // MARK: - W8A8 File List
+
+    private func buildW8A8FileList(_ model: ModelInfo) {
+        // W8A8 chunks only — shared files (embeddings, RoPE, tokenizer) come from base model
+        func mlc(_ name: String, weightSize: Int64) -> [DownloadFile] {
+            [.init(remotePath: "\(name).mlmodelc/weights/weight.bin",
+                   localPath: "\(name).mlmodelc/weights/weight.bin", estimatedSize: weightSize),
+             .init(remotePath: "\(name).mlmodelc/coremldata.bin",
+                   localPath: "\(name).mlmodelc/coremldata.bin", estimatedSize: 1_000),
+             .init(remotePath: "\(name).mlmodelc/model.mil",
+                   localPath: "\(name).mlmodelc/model.mil", estimatedSize: 1_500_000),
+             .init(remotePath: "\(name).mlmodelc/metadata.json",
+                   localPath: "\(name).mlmodelc/metadata.json", estimatedSize: 8_000),
+             .init(remotePath: "\(name).mlmodelc/analytics/coremldata.bin",
+                   localPath: "\(name).mlmodelc/analytics/coremldata.bin", estimatedSize: 250)]
+        }
+
+        let files = mlc("chunk1", weightSize: 156_000_000)
+            + mlc("chunk2", weightSize: 134_000_000)
+            + mlc("chunk3", weightSize: 326_000_000)
+            + mlc("chunk4", weightSize: 527_000_000)
+            + [.init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 500)]
+
+        let threshold: Int64 = 10_000_000
+        var largeFiles: [DownloadFile] = []
+        var smallFiles: [DownloadFile] = []
+        for file in files {
+            if file.estimatedSize >= threshold { largeFiles.append(file) }
+            else { smallFiles.append(file) }
+        }
         largeFiles.sort { $0.estimatedSize > $1.estimatedSize }
         pendingFiles = largeFiles + smallFiles
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }

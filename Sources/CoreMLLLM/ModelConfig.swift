@@ -14,6 +14,7 @@ public struct ModelConfig: Sendable {
     public let perLayerDim: Int
     public let numLayers: Int
     public let slidingWindow: Int
+    public var fullWindow: Int  // WFA: full-attention window size (0 = use contextLength)
     public let embedScale: Float
     public let perLayerProjScale: Float
     public let perLayerInputScale: Float
@@ -36,6 +37,7 @@ public struct ModelConfig: Sendable {
             perLayerDim: json["per_layer_dim"] as? Int ?? 256,
             numLayers: json["num_layers"] as? Int ?? 35,
             slidingWindow: json["sliding_window"] as? Int ?? 512,
+            fullWindow: json["full_window"] as? Int ?? 0,
             embedScale: Float(json["embed_scale"] as? Double ?? 39.19),
             perLayerProjScale: Float(json["per_layer_model_projection_scale"] as? Double ?? 0.0255),
             perLayerInputScale: Float(json["per_layer_input_scale"] as? Double ?? 0.707),

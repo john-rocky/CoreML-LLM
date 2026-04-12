@@ -73,6 +73,7 @@ See `docs/SPEED_8K.md` for the overall speed roadmap and tier assignments.
 - File: `conversion/build_w8a8_proper.py`
 - Idea: collect real activation traces by running the INT4 model on 32+ prompts at positions 0..31, then quantize. Also provides a W4A8 fallback (INT4 palette weights + INT8 activations) which is more stable than full W8A8 in practice.
 - Status: runs end-to-end on chunk2 (the 8K bottleneck). Needs: (1) full multi-chunk validation, (2) end-to-end quality check vs FP16 reference on a held-out prompt set, (3) `ChunkedEngine.swift` wiring for A8 I/O. This is the next lever planned for v0.6.
+- **Known blocker — coremltools 9.0 tmp leak**: `linear_quantize_activations` leaks one temp `.mlpackage` + compiled `.mlmodelc` per calibration op-group iteration (`coremltools/models/model.py` cleans up only via `atexit`). A full chunk2 run accumulates ~38 GB of `$TMPDIR` and can fill the disk before the job finishes. Local workaround: `conversion/coremltools_tmp_cleanup.py` monkey-patches `MLModel.__del__` to release the package eagerly — imported automatically by `build_w8a8.py` / `build_w8a8_proper.py`. Upstream fix proposed in `conversion/issue/` (reproducer, patch, PR text); delete the workaround once the Apple PR lands in a release.
 
 ---
 
