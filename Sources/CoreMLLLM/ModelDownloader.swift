@@ -389,7 +389,10 @@ public final class ModelDownloader: NSObject {
     // MARK: - HuggingFace File List
 
     private func buildHuggingFaceFileList(_ model: ModelInfo) {
-        let sdpaPrefix = "sdpa-8k/"
+        // `sdpa/` is the 2K-context shipping model; `sdpa-8k/` also exists on
+        // HF but is slower (the 8K decode path is still being optimized —
+        // see docs/SPEED_8K.md). Keep this at 2K until the 8K roadmap lands.
+        let sdpaPrefix = "sdpa/"
 
         func mlc(_ sub: String, _ localName: String, weightSize: Int64) -> [DownloadFile] {
             [.init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/weights/weight.bin",
