@@ -90,6 +90,12 @@ def _run_layer_verify(
     else:
         q, _ = apply_rotary_pos_emb(q, q, cos_s, sin_s)
 
+    # k_new_out / v_new_out: per-position K/V for the T new positions, for
+    # Swift-side direct-write commit. Shape (1, num_kv_heads, T, hd). For
+    # KV-shared layers these stay None (the shared kv13/kv14 update is
+    # emitted as extended kv_store_13/14 already).
+    k_new_out = None
+    v_new_out = None
     if not is_kv_shared:
         k_raw = layer.self_attn["k_proj"](x)  # (1, num_kv_heads*hd, 1, T)
         v_raw = layer.self_attn["v_proj"](x)
@@ -105,6 +111,9 @@ def _run_layer_verify(
             _, k_new = apply_rotary_pos_emb(k_new, k_new, cos_f, sin_f)
         else:
             _, k_new = apply_rotary_pos_emb(k_new, k_new, cos_s, sin_s)
+
+        k_new_out = k_new  # (1, num_kv_heads, T, hd) — post-RoPE/k_norm
+        v_new_out = v_new
 
         if is_full:
             # K_full_slot is (1, 1, ctx, max_hd=512). Slice to hd then concat.
@@ -180,7 +189,8 @@ def _run_layer_verify(
     hidden_states = residual_pl + hidden_states
     hidden_states = hidden_states * layer.layer_scalar.to(MODEL_DTYPE)
 
-    return hidden_states, kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v
+    return (hidden_states, kv_store_13_k, kv_store_13_v,
+            kv_store_14_k, kv_store_14_v, k_new_out, v_new_out)
 
 
 def _layer_kv_map(start: int, end: int, config):
@@ -245,6 +255,13 @@ class VerifyChunk1(nn.Module):
         dummy_14_k = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
         dummy_14_v = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
 
+        # Collect per-layer K_new/V_new for the T new positions, ordered by
+        # the existing cache's slot layout (sliding slots 0..6, full slot 0).
+        K_sliding_new_list = [None] * len(self.sliding_map)
+        V_sliding_new_list = [None] * len(self.sliding_map)
+        K_full_new_list = [None] * len(self.full_map)
+        V_full_new_list = [None] * len(self.full_map)
+
         for local_idx in range(self.END - self.START):
             layer_idx = self.START + local_idx
             is_full = config.is_full_attention(layer_idx)
@@ -261,7 +278,7 @@ class VerifyChunk1(nn.Module):
                 K_full_slot = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
                 V_full_slot = K_full_slot
 
-            hidden_states, *_ = _run_layer_verify(
+            (hidden_states, _, _, _, _, k_new_out, v_new_out) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states,
                 cos_s, sin_s, cos_f, sin_f,
                 causal_mask_full, causal_mask_sliding,
@@ -270,7 +287,23 @@ class VerifyChunk1(nn.Module):
                 dummy_13_k, dummy_13_v, dummy_14_k, dummy_14_v,
                 T,
             )
-        return hidden_states, per_layer_combined
+            # k_new_out/v_new_out shape (1, num_kv_heads=1, T, hd).
+            # Pad sliding layers (hd=256) to max_hd=512 so Swift sees uniform shape.
+            if is_full:
+                K_full_new_list[self.full_map[layer_idx]] = k_new_out.squeeze(0)
+                V_full_new_list[self.full_map[layer_idx]] = v_new_out.squeeze(0)
+            else:
+                pad_k = F.pad(k_new_out, (0, 512 - k_new_out.shape[-1])).squeeze(0)
+                pad_v = F.pad(v_new_out, (0, 512 - v_new_out.shape[-1])).squeeze(0)
+                K_sliding_new_list[self.sliding_map[layer_idx]] = pad_k
+                V_sliding_new_list[self.sliding_map[layer_idx]] = pad_v
+
+        K_sliding_new = torch.stack(K_sliding_new_list, dim=0)  # (7, 1, T, 512)
+        V_sliding_new = torch.stack(V_sliding_new_list, dim=0)
+        K_full_new = torch.stack(K_full_new_list, dim=0)        # (1, 1, T, 512)
+        V_full_new = torch.stack(V_full_new_list, dim=0)
+        return (hidden_states, per_layer_combined,
+                K_sliding_new, V_sliding_new, K_full_new, V_full_new)
 
 
 class VerifyChunk2(nn.Module):
@@ -296,6 +329,12 @@ class VerifyChunk2(nn.Module):
         kv14_k = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
         kv14_v = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
 
+        K_sliding_new_list = [None] * len(self.sliding_map)  # 5 slots
+        V_sliding_new_list = [None] * len(self.sliding_map)
+        K_full_new_list = [None] * len(self.full_map)  # 2 slots
+        V_full_new_list = [None] * len(self.full_map)
+        hidden_at_L8 = hidden_states  # placeholder
+
         for local_idx in range(self.END - self.START):
             layer_idx = self.START + local_idx
             is_full = config.is_full_attention(layer_idx)
@@ -312,7 +351,8 @@ class VerifyChunk2(nn.Module):
                 K_full_slot = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
                 V_full_slot = K_full_slot
 
-            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v) = _run_layer_verify(
+            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v,
+             k_new_out, v_new_out) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states,
                 cos_s, sin_s, cos_f, sin_f,
                 causal_mask_full, causal_mask_sliding,
@@ -321,8 +361,26 @@ class VerifyChunk2(nn.Module):
                 kv13_k, kv13_v, kv14_k, kv14_v,
                 T,
             )
+            # Capture hidden_at_L8 after L8 is processed (local_idx == 0).
+            if layer_idx == 8:
+                hidden_at_L8 = hidden_states
 
-        return hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+            if is_full:
+                K_full_new_list[self.full_map[layer_idx]] = k_new_out.squeeze(0)
+                V_full_new_list[self.full_map[layer_idx]] = v_new_out.squeeze(0)
+            else:
+                pad_k = F.pad(k_new_out, (0, 512 - k_new_out.shape[-1])).squeeze(0)
+                pad_v = F.pad(v_new_out, (0, 512 - v_new_out.shape[-1])).squeeze(0)
+                K_sliding_new_list[self.sliding_map[layer_idx]] = pad_k
+                V_sliding_new_list[self.sliding_map[layer_idx]] = pad_v
+
+        K_sliding_new = torch.stack(K_sliding_new_list, dim=0)  # (5, 1, T, 512)
+        V_sliding_new = torch.stack(V_sliding_new_list, dim=0)
+        K_full_new = torch.stack(K_full_new_list, dim=0)        # (2, 1, T, 512)
+        V_full_new = torch.stack(V_full_new_list, dim=0)
+        return (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v,
+                K_sliding_new, V_sliding_new, K_full_new, V_full_new,
+                hidden_at_L8)
 
 
 class VerifyChunk3(nn.Module):
@@ -342,6 +400,7 @@ class VerifyChunk3(nn.Module):
         T = self.T
         dummy_K = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
         dummy_V = dummy_K
+        hidden_at_L17 = hidden_states
         for local_idx in range(self.END - self.START):
             layer_idx = self.START + local_idx
             hidden_states, *_ = _run_layer_verify(
@@ -353,7 +412,9 @@ class VerifyChunk3(nn.Module):
                 kv13_k, kv13_v, kv14_k, kv14_v,
                 T,
             )
-        return hidden_states
+            if layer_idx == 17:
+                hidden_at_L17 = hidden_states
+        return hidden_states, hidden_at_L17
 
 
 class VerifyChunk4(nn.Module):
@@ -389,6 +450,9 @@ class VerifyChunk4(nn.Module):
                 kv13_k, kv13_v, kv14_k, kv14_v,
                 T,
             )
+        # pre-norm hidden after L34 — matches decode chunk4's hidden_at_L34
+        # (1, T, hidden).
+        hidden_at_L34 = hidden_states
 
         normed = self.norm(hidden_states)  # (1, T, hidden)
         # lm_head via Conv2d: (1, T, hidden) → (1, hidden, 1, T) → (1, vocab, 1, T) → (1, T, vocab)
@@ -400,4 +464,4 @@ class VerifyChunk4(nn.Module):
         logits2d = logits.squeeze(0)  # (T, vocab)
         token_ids = torch.argmax(logits2d, dim=-1).to(torch.int32)  # (T,)
         token_logits = logits2d.gather(-1, token_ids.long().unsqueeze(-1)).squeeze(-1)
-        return token_ids, token_logits
+        return token_ids, token_logits, hidden_at_L34

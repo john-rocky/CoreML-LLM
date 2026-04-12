@@ -65,6 +65,10 @@ public final class SpeculativeLoop {
     /// Disable speculative path when rolling acceptance drops below this.
     public var fallbackThreshold: Double = 0.30
 
+    /// Emits proposals + target-argmax comparison for the first N bursts after
+    /// instantiation. Off after the counter decays.
+    public var debugBurstsRemaining: Int = 3
+
     // MARK: - Init
 
     public init(
@@ -162,6 +166,16 @@ public final class SpeculativeLoop {
         guard targetArgmax.count == K else {
             throw SpeculativeError.verifyFailed(
                 "verify returned \(targetArgmax.count), expected \(K)")
+        }
+
+        if debugBurstsRemaining > 0 {
+            debugBurstsRemaining -= 1
+            print("[SpecDbg] tTokNext=\(tTokNext)")
+            print("[SpecDbg]   verifyTokens = \(verifyTokens)")
+            print("[SpecDbg]   proposals    = \(proposals)")
+            print("[SpecDbg]   targetArgmax = \(targetArgmax)")
+            let matches = (0..<K).map { proposals[$0] == targetArgmax[$0] }
+            print("[SpecDbg]   matches      = \(matches)")
         }
 
         // 5. Accept prefix up to first disagreement. tTokNext is always accepted

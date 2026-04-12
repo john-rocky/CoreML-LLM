@@ -73,6 +73,18 @@ final class ChunkedEngine {
     /// `tTokNext` back to `SpeculativeLoop.drawBurst` after a commit burst.
     private(set) var lastArgmaxAfterDecode: Int = 0
 
+    /// Cumulative wall-clock spent inside verify / commit. Public for
+    /// speculative-path diagnostics; `resetSpecProfile()` zeros them.
+    var specVerifyMs: Double = 0
+    var specVerifyCalls: Int = 0
+    var specCommitMs: Double = 0
+    var specCommitTokens: Int = 0
+
+    func resetSpecProfile() {
+        specVerifyMs = 0; specVerifyCalls = 0
+        specCommitMs = 0; specCommitTokens = 0
+    }
+
     var hasPrefill: Bool {
         prefillChunk1 != nil && prefillChunk2 != nil
             && prefillChunk3 != nil && prefillChunk4 != nil
@@ -989,10 +1001,13 @@ extension ChunkedEngine: SpeculativeTarget {
     public func commitAccepted(_ tokens: [Int32]) throws {
         // Simplest faithful commit: replay T=1 decode for each accepted token.
         // Refreshes the lastHiddenAtL* ivars on the final iteration.
+        let t0 = CFAbsoluteTimeGetCurrent()
         for tok in tokens {
             _ = try predictStep(tokenID: Int(tok), position: currentPosition)
             currentPosition += 1
         }
+        specCommitMs += (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        specCommitTokens += tokens.count
     }
 
     public func verifyCandidates(_ candidates: [Int32], K: Int) throws -> [Int32] {
@@ -1001,6 +1016,11 @@ extension ChunkedEngine: SpeculativeTarget {
             throw SpeculativeError.missingModel("verify_chunk{1..4} not loaded")
         }
         precondition(candidates.count == K, "candidates.count must equal K")
+        let tVerifyStart = CFAbsoluteTimeGetCurrent()
+        defer {
+            specVerifyMs += (CFAbsoluteTimeGetCurrent() - tVerifyStart) * 1000
+            specVerifyCalls += 1
+        }
         let ctx = config.contextLength
         let W = config.slidingWindow
         let P = currentPosition

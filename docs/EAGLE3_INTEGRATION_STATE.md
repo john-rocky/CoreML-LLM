@@ -135,6 +135,88 @@ Known gotchas for any reconvert:
 
 `swift build` clean (only pre-existing accelerate-deprecation + IOSurface throwing-expression warnings).
 
+### Phase 3 — iPhone 17 Pro deploy & bench — **RAN, SPECULATIVE NOT FASTER** (2026-04-12)
+
+All EAGLE-3 artifacts compiled to `.mlmodelc` and pushed to iPhone 17 Pro via `xcrun devicectl device copy to`:
+
+| File | Size | Notes |
+|---|---:|---|
+| chunk{1..4}.mlmodelc | 149 / 128 / 311 / 503 MB | Overwrote non-EAGLE-3 decode chunks |
+| verify_chunk{1..4}.mlmodelc | same | New — Phase 2A v1 outputs only (no K/V direct-write outputs yet) |
+| eagle3_fusion.mlmodelc | 13.5 MB | fp16, not palettized |
+| eagle3_draft.mlmodelc | 838 MB fp16 (replaced 210 MB INT4) | fp16 tested after INT4 ruled out as acc rate culprit |
+
+App: `Examples/CoreMLLLMChat`, bundle `com.example.CoreMLLLMChat`, domain path `Documents/Models/gemma4-e2b/`. `swift build` on Phase 2B changes clean (no new warnings).
+
+**On-device results** (with `[SpecDbg]` and per-call timing instrumentation added to `SpeculativeLoop.drawBurst` + `ChunkedEngine.verifyCandidates/commitAccepted`):
+
+| Metric | Observed | Expected (Colab eval) | Notes |
+|---|---:|---:|---|
+| Baseline T=1 decode | 28.6 tok/s | — | steady-state, `[Profile]` lines |
+| verify T=3 per call | 31.5 ms | — | close to 1 decode's cost |
+| commit per token | 33-36 ms | — | equals T=1 decode (intentional — re-runs decode) |
+| Avg accepted tokens / burst | **2.00-2.07** (always exactly 2 per burst) | 3.05 (from acc[0]=0.75, acc[1]=0.41, acc[2]=0.24) | **Draft proposals match target ~0% of the time** |
+| Speculative eff throughput | 11-17 tok/s | target 40+ | burst overhead >> draft gain |
+| Rolling acceptance | decays to 0.30 fallback within ~15 bursts | 1.0 | fallback triggers → runtime silently drops to T=1 |
+
+**Verdict**: End-to-end speculative pipeline works (fusion + draft + verify + commit + fallback all run), but on-device **draft proposals almost never match target argmax**, so no speedup — and in fact speculative is slower than T=1 until the rolling-acceptance fallback kicks in, at which point tok/s recovers to baseline.
+
+### Phase 3 diagnostic — root cause found
+
+`[SpecDbg]` dump of first 3 bursts showed proposals like `[3768, 496, 496]` vs target argmax `[68158, 18114, 236772]` — zero overlap in draft's predictions.
+
+Ruled out:
+1. **INT4 palettization degrading draft**: rebuilt draft at fp16 (no `--palettize-int4`), pushed 838 MB version. Same acc rate. Draft quantization is fine.
+2. **Draft outputs ID-mapping or random**: proposals track inputs meaningfully (distinct outputs for distinct tTokNext), just not matching target.
+
+Ran `test_eagle3_infer.py` on Mac CPU with HF Gemma 4 target + PyTorch draft:
+- Accept rate: **42.9%** (1.29 avg proposals accepted per K=3 burst)
+- This is below Colab's 74.94% but well above on-device ~0%
+
+Diagnostic: compared HF `output.hidden_states[L+1]` at fusion layers vs our custom `Gemma4Model` + `SWAChunk1..4` forward on the same "Write a haiku." prompt:
+- L8: rel_mean diff 45%, norm similar
+- L17: rel_mean diff 33%, norm similar
+- L34: **rel_mean diff 94%, HF norm 158 vs our 36** (4.4× magnitude gap)
+
+And on real argmax-chain generation (same chat-formatted prompt through Swift's `buildGemmaPrompt`):
+- HF direct: `140 ('    '), 1018 ('**'), 16251 ('Py')` — gibberish
+- On-device custom: `6895 (' leaves'), 47934 (' sway'), 107 ('\n')` — coherent haiku start
+
+→ **Our custom `Gemma4Model` produces DIFFERENT final hiddens than HF's reference Gemma 4 forward.** The draft was trained on HF's hidden distribution (via `collect_eagle_hidden_states.py` + `train_eagle3_draft.ipynb`, both using `Gemma4ForConditionalGeneration`). On-device it sees our custom forward's hiddens, which are out-of-distribution → acc ≈ 0.
+
+The custom forward appears to produce "correct for Gemma-4-it chat" behavior (tokens make sense), while HF with the same version of transformers produces gibberish — so the HF reference used at training time may have been broken, or a transformers-version mismatch has opened a gap since. Either way, **the trained draft no longer matches the target we deploy**.
+
+### Phase 3 — decision matrix for the actual speedup
+
+Separate from the acceptance-rate issue, the current `commitAccepted` implementation re-runs `predictStep` per accepted token. That means even a PERFECT draft cannot beat baseline:
+
+| Implementation | Burst formula | Burst @ avg N=3.05 | tok/s @ N=3.05 | vs baseline 28 |
+|---|---|---:|---:|---:|
+| Current (re-run decode) | 42 + 33N ms | 143 ms | 21.4 | **0.76x (slower)** |
+| K/V direct-write + 1 decode | 75 ms constant | 75 ms | 40.7 | **1.45x** |
+| K/V direct-write + Mirror v1 (draft→GPU) | ~69 ms | 69 ms | 44.2 | **1.58x** |
+| K/V direct-write + Mirror v2 (cross-burst pipeline) | ~60 ms | 60 ms | 50.8 | **1.82x** |
+
+**Two independent blockers must be fixed together** for a real speedup:
+1. **Retrain draft against our custom target** (not HF), so acc reaches Colab's ~0.75.
+2. **Rewrite `commitAccepted` to use verify's K/V / hidden outputs directly** — the Phase 2A v2 verify chunks (K/V + hidden per T position outputs) are already built in Python but NOT yet deployed; the Swift writer isn't implemented.
+
+Fixing only one of the two leaves speculative at or below baseline.
+
+### Phase 3 — current working-copy state (for resume)
+
+Code on `feature/eagle3-speculative` (local HEAD ahead of origin by diagnostic patches):
+- `Sources/CoreMLLLM/SpeculativeLoop.swift` — added `debugBurstsRemaining` + `[SpecDbg]` logging (first 3 bursts)
+- `Sources/CoreMLLLM/CoreMLLLM.swift` — added `[Spec] burst #N` per-burst stats with verify/commit breakdown, first-call gate, error fallback
+- `Sources/CoreMLLLM/ChunkedEngine.swift` — added `specVerifyMs/Calls`, `specCommitMs/Tokens` counters + `resetSpecProfile()`
+- `conversion/models/gemma4_verify_chunks.py` — Phase 2A v2 outputs added (K_sliding_new/V_sliding_new/K_full_new/V_full_new per chunk1/2, hidden_at_L{8,17,34} per chunk2/3/4). **Not yet deployed** — v1 packages are on device.
+- `conversion/build_eagle3_verify.py` — spec updated for v2 outputs. Rebuilt mlpackages exist at `output/eagle3-chunks/verify_chunk{1..4}.mlpackage` but not pushed.
+- `/tmp/compare_hidden_taps.py`, `/tmp/eagle3_draft_fp16.mlmodelc` — diagnostic artifacts, not in repo.
+
+These diagnostic additions are valid and worth committing if we continue the work; they don't affect non-speculative paths.
+
+---
+
 **Public API wired (2026-04-12).** `CoreMLLLM.swift` now:
 - Auto-loads `eagle3_fusion.mlpackage`, `eagle3_draft.mlpackage`, and `verify_chunk{1..4}.mlpackage` from the model directory when all are present. Any failure falls back silently to T=1 decode.
 - Exposes `supportsSpeculative: Bool` and `speculativeAcceptance: Double`.

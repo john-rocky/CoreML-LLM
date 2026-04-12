@@ -413,10 +413,16 @@ public final class CoreMLLLM: @unchecked Sendable {
                         var tokenCount = 0
                         let maxDecode = min(ctxLimit - engine.currentPosition, maxTokens)
                         let spec = mutableSelf.speculativeLoop
+                        print("[Spec] entering decode loop, spec=\(spec != nil ? "loaded" : "nil")")
+                        engine.resetSpecProfile()
 
                         // First iteration is always plain T=1 decode so hidden_at_L*
                         // taps get populated before speculative can read them.
                         var didFirstDecode = false
+                        var specBursts = 0
+                        var specAccepted = 0
+                        var specTokensEmitted = 0
+                        var specTotalMs: Double = 0
 
                         decodeLoop: for _ in 0..<maxDecode {
                             if eosIDs.contains(nextID) { break }
@@ -428,6 +434,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                             if useSpec, let sl = spec {
                                 // Speculative burst: yields 1..K+1 accepted tokens.
                                 let accepted: [Int32]
+                                let burstT0 = CFAbsoluteTimeGetCurrent()
                                 do {
                                     accepted = try sl.drawBurst(
                                         target: engine,
@@ -466,6 +473,27 @@ public final class CoreMLLLM: @unchecked Sendable {
                                     continuation.yield(text)
                                     tokenCount += 1
                                     if tokenCount >= maxTokens { break decodeLoop }
+                                }
+                                let burstMs = (CFAbsoluteTimeGetCurrent() - burstT0) * 1000
+                                specBursts += 1
+                                specAccepted += accepted.count
+                                specTokensEmitted += accepted.count
+                                specTotalMs += burstMs
+                                if specBursts == 1 || specBursts % 5 == 0 {
+                                    let avgAcc = Double(specAccepted) / Double(specBursts)
+                                    let effTps = Double(specTokensEmitted) / (specTotalMs / 1000)
+                                    let vMs = engine.specVerifyMs
+                                    let vCalls = max(engine.specVerifyCalls, 1)
+                                    let cMs = engine.specCommitMs
+                                    let cToks = max(engine.specCommitTokens, 1)
+                                    print(String(format:
+                                        "[Spec] burst #%d: acc=%d (avg %.2f) | last %.1fms " +
+                                        "(verify %.1fms cum/%.1f avg, commit %.1fms cum/%.1fms per tok) | " +
+                                        "eff %.1f tok/s | rollAcc=%.2f",
+                                        specBursts, accepted.count, avgAcc, burstMs,
+                                        vMs, vMs / Double(vCalls),
+                                        cMs, cMs / Double(cToks),
+                                        effTps, sl.rollingAcceptance))
                                 }
                                 let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                                 if elapsed > 0 {

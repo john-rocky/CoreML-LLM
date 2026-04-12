@@ -111,6 +111,10 @@ def build_chunk1(base, out_dir, T):
     outs = [
         ct.TensorType(name="hidden_states_out"),
         ct.TensorType(name="per_layer_combined_out"),
+        ct.TensorType(name="K_sliding_new"),
+        ct.TensorType(name="V_sliding_new"),
+        ct.TensorType(name="K_full_new"),
+        ct.TensorType(name="V_full_new"),
     ]
     do_convert(c1, s, ins, outs, f"{out_dir}/verify_chunk1.mlpackage")
 
@@ -156,6 +160,11 @@ def build_chunk2(base, out_dir, T):
         ct.TensorType(name="kv13_v_out"),
         ct.TensorType(name="kv14_k_out"),
         ct.TensorType(name="kv14_v_out"),
+        ct.TensorType(name="K_sliding_new"),
+        ct.TensorType(name="V_sliding_new"),
+        ct.TensorType(name="K_full_new"),
+        ct.TensorType(name="V_full_new"),
+        ct.TensorType(name="hidden_at_L8"),
     ]
     do_convert(c2, s, ins, outs, f"{out_dir}/verify_chunk2.mlpackage")
 
@@ -194,7 +203,10 @@ def build_chunk3(base, out_dir, T):
         ct.TensorType(name="kv14_k",              shape=s[10].shape, dtype=fp16),
         ct.TensorType(name="kv14_v",              shape=s[11].shape, dtype=fp16),
     ]
-    outs = [ct.TensorType(name="hidden_states_out")]
+    outs = [
+        ct.TensorType(name="hidden_states_out"),
+        ct.TensorType(name="hidden_at_L17"),
+    ]
     do_convert(c3, s, ins, outs, f"{out_dir}/verify_chunk3.mlpackage")
 
 
@@ -235,6 +247,7 @@ def build_chunk4(base, out_dir, T):
     outs = [
         ct.TensorType(name="token_ids",    dtype=int32),
         ct.TensorType(name="token_logits"),
+        ct.TensorType(name="hidden_at_L34"),
     ]
     do_convert(c4, s, ins, outs, f"{out_dir}/verify_chunk4.mlpackage")
 
