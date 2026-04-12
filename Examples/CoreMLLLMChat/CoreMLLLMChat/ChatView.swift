@@ -268,19 +268,27 @@ struct ChatView: View {
     }
 
     private func sendMessage() {
-        var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let audio = audioRecorder.recordedSamples
         print("[ChatView] sendMessage: text='\(text.prefix(30))', audio=\(audio != nil ? "\(audio!.count) samples" : "nil"), isRecording=\(audioRecorder.isRecording)")
 
-        // Allow audio-only sends with a default prompt
-        if text.isEmpty && audio != nil {
-            text = "What do you hear in this audio?"
-        }
-        guard !text.isEmpty else { return }
+        // Audio-only sends were previously auto-filled with
+        //   "What do you hear in this audio?"
+        // which forced the model into transcription/description mode. Gemma 4's
+        // audio tower can interpret the audio content as the user's utterance
+        // directly, so we now pass an empty text prompt and let the model
+        // respond to *what was said*, not describe *what was heard*.
+        guard !text.isEmpty || audio != nil else { return }
 
         let attachedImageData = selectedImageData
-        var content = text
-        if audio != nil { content = "[Audio] " + text }
+        let content: String
+        if audio != nil && text.isEmpty {
+            content = "[Audio]"
+        } else if audio != nil {
+            content = "[Audio] " + text
+        } else {
+            content = text
+        }
         messages.append(ChatMessage(role: .user, content: content, imageData: attachedImageData))
         inputText = ""
         streamingText = ""
