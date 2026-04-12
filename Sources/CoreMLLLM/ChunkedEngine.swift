@@ -50,6 +50,20 @@ final class ChunkedEngine {
     private var kFull2: MLMultiArray     // (2, 1, ctx, maxHd)
     private var vFull2: MLMultiArray
 
+    // Reusable per-step tensors — allocated once, updated in place each step.
+    // The old make*/lookupRoPE helpers allocated fresh MLMultiArrays every
+    // decode call (8 per step × many steps); at 8K ctx that allocation is
+    // noticeable on the critical path. These ivars are lazy-init on the
+    // first step and re-used thereafter. See `updateStepTensors(position:)`.
+    private var preMaskFull: MLMultiArray?
+    private var preMaskSliding: MLMultiArray?
+    private var preUpdateMask: MLMultiArray?
+    private var preCosS: MLMultiArray?
+    private var preSinS: MLMultiArray?
+    private var preCosF: MLMultiArray?
+    private var preSinF: MLMultiArray?
+    private var lastStepPosition: Int = -1  // dirty marker
+
     let config: ModelConfig
     let prefillN: Int
     var currentPosition: Int = 0
@@ -265,6 +279,7 @@ final class ChunkedEngine {
             memset(buf.dataPointer, 0, buf.count * MemoryLayout<UInt16>.stride)
         }
         currentPosition = 0
+        lastStepPosition = -1   // force updateStepTensors to re-fill on next predictStep
         profileEmbed = 0
         profilePredict = 0
         profileCount = 0
@@ -298,13 +313,14 @@ final class ChunkedEngine {
         let t1 = CFAbsoluteTimeGetCurrent()
         profileEmbed += (t1 - t0)
 
-        let maskFull = try makeCausalMask(position: position, length: ctx)
-        let maskSliding = try makeSlidingCausalMask(position: position, W: W)
-        let umask = try makeUpdateMask(position: position, length: ctx)
-        let cosS = try lookupRoPE(table: cosSlidingTable, position: position, dim: 256)
-        let sinS = try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
-        let cosF = try lookupRoPE(table: cosFullTable, position: position, dim: 512)
-        let sinF = try lookupRoPE(table: sinFullTable, position: position, dim: 512)
+        try updateStepTensors(position: position, ctx: ctx, W: W)
+        let maskFull = preMaskFull!
+        let maskSliding = preMaskSliding!
+        let umask = preUpdateMask!
+        let cosS = preCosS!
+        let sinS = preSinS!
+        let cosF = preCosF!
+        let sinF = preSinF!
 
         // Chunk 1
         let out1 = try chunk1.prediction(from: MLDictionaryFeatureProvider(dictionary: [
@@ -549,6 +565,89 @@ final class ChunkedEngine {
         return result
     }
 
+    /// Fill the reusable per-step tensors (masks + RoPE slices) for the
+    /// requested position. Allocates on first call, updates in place on
+    /// subsequent calls. Short-circuits if `position` hasn't advanced since
+    /// the last call (e.g. when `verifyCandidates` re-enters with the same
+    /// position after a decode refresh).
+    private func updateStepTensors(position: Int, ctx: Int, W: Int) throws {
+        // Lazy-init on first call.
+        if preMaskFull == nil {
+            preMaskFull = try MLMultiArray(
+                shape: [1, 1, 1, NSNumber(value: ctx)], dataType: .float16)
+            preMaskSliding = try MLMultiArray(
+                shape: [1, 1, 1, NSNumber(value: W)], dataType: .float16)
+            preUpdateMask = try MLMultiArray(
+                shape: [1, 1, NSNumber(value: ctx), 1], dataType: .float16)
+            preCosS = try MLMultiArray(
+                shape: [1, 1, 1, NSNumber(value: 256)], dataType: .float16)
+            preSinS = try MLMultiArray(
+                shape: [1, 1, 1, NSNumber(value: 256)], dataType: .float16)
+            preCosF = try MLMultiArray(
+                shape: [1, 1, 1, NSNumber(value: 512)], dataType: .float16)
+            preSinF = try MLMultiArray(
+                shape: [1, 1, 1, NSNumber(value: 512)], dataType: .float16)
+        }
+        guard position != lastStepPosition else { return }
+        lastStepPosition = position
+
+        // maskFull: 0 for positions [0, position], -inf fp16 (0xFC00) for
+        // (position, ctx). Zero prefix via memset, then fill tail with the
+        // exact -inf bit pattern. Per-step is < 10μs at ctx=8192 on A17+.
+        let fullMask = preMaskFull!
+        let fp = fullMask.dataPointer.bindMemory(to: UInt16.self, capacity: ctx)
+        let validFull = min(position + 1, ctx)
+        memset(fp, 0, validFull * MemoryLayout<UInt16>.stride)
+        var infPat: UInt32 = 0xFC00_FC00
+        let tailBytes = (ctx - validFull) * MemoryLayout<UInt16>.stride
+        if tailBytes > 0 {
+            memset_pattern4(fp.advanced(by: validFull), &infPat, tailBytes)
+        }
+
+        // maskSliding: 0 for last `valid` slots, -inf for the rest.
+        let slidingMask = preMaskSliding!
+        let sp = slidingMask.dataPointer.bindMemory(to: UInt16.self, capacity: W)
+        let valid = min(position + 1, W)
+        let start = W - valid
+        for i in 0..<start { sp[i] = 0xFC00 }
+        memset(sp.advanced(by: start), 0, valid * MemoryLayout<UInt16>.stride)
+
+        // updateMask: 1.0 (0x3C00) at `position`, 0 elsewhere. Clear prior
+        // one-hot bit before writing the new one.
+        let um = preUpdateMask!
+        let up = um.dataPointer.bindMemory(to: UInt16.self, capacity: ctx)
+        memset(up, 0, ctx * MemoryLayout<UInt16>.stride)
+        up[min(position, ctx - 1)] = 0x3C00
+
+        // RoPE cos/sin: copy the row at `position` from each table.
+        try copyRoPERow(table: cosSlidingTable, position: position, dim: 256, into: preCosS!)
+        try copyRoPERow(table: sinSlidingTable, position: position, dim: 256, into: preSinS!)
+        try copyRoPERow(table: cosFullTable, position: position, dim: 512, into: preCosF!)
+        try copyRoPERow(table: sinFullTable, position: position, dim: 512, into: preSinF!)
+    }
+
+    private func copyRoPERow(table: Data?, position: Int, dim: Int, into dst: MLMultiArray) throws {
+        let dp = dst.dataPointer.bindMemory(to: UInt16.self, capacity: dim)
+        guard let table else { memset(dp, 0, dim * MemoryLayout<UInt16>.stride); return }
+        var headerSize = 128
+        table.withUnsafeBytes { raw in
+            let b = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            headerSize = 10 + (Int(b[8]) | (Int(b[9]) << 8))
+        }
+        let rowBytes = dim * MemoryLayout<UInt16>.stride
+        let offset = headerSize + position * rowBytes
+        guard offset + rowBytes <= table.count else {
+            memset(dp, 0, rowBytes); return
+        }
+        _ = table.withUnsafeBytes { raw in
+            memcpy(dp, raw.baseAddress!.advanced(by: offset), rowBytes)
+        }
+    }
+
+    // Legacy single-shot builders — kept because they're still called from
+    // the prefill path and from `verifyCandidates` which uses different
+    // shapes (T=3 batched masks). Allocating per-call is fine there since
+    // prefill/verify are much lower frequency than decode.
     private func makeCausalMask(position: Int, length: Int) throws -> MLMultiArray {
         let mask = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: length)], dataType: .float16)
         let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: length)
