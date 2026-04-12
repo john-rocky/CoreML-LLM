@@ -241,6 +241,7 @@ See [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md) for a step-by-step guide and 
 | Image pipeline (vision encoder, token injection, debug notes) | [docs/MULTIMODAL.md](docs/MULTIMODAL.md) |
 | Audio pipeline (mel spec, Conformer, Swift-side projection) | [docs/AUDIO.md](docs/AUDIO.md) |
 | 8K context speed roadmap, ANE-compat matrix, reading list | [docs/SPEED_8K.md](docs/SPEED_8K.md) |
+| EAGLE-3 speculative decoding: trained ckpt → iPhone deployment contract | [docs/EAGLE3_DEPLOY.md](docs/EAGLE3_DEPLOY.md) |
 | Competitive landscape, energy/efficiency notes, spec-decoding background | [docs/RESEARCH.md](docs/RESEARCH.md) |
 | Decision log for experimental variants (WFA, Flash, W8A8, Medusa, EAGLE-3, …) | [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) |
 | Methodology behind the tok/s, ANE%, memory numbers | [docs/BENCHMARKING.md](docs/BENCHMARKING.md) |
