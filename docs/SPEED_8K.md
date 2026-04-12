@@ -49,12 +49,13 @@ Sorted by ANE feasibility × quality-preservation × ROI. All numbers are from c
 - **Expected for Gemma 4 E2B @ 8K**: **15 → ~22 tok/s**, 40% KV memory saved, zero quality loss.
 - **Source**: [mit-han-lab/duo-attention](https://github.com/mit-han-lab/duo-attention) · [paper](https://arxiv.org/abs/2410.10819)
 
-#### A2. KIVI — 2-bit KV quantization (ICML 2024)
+#### A2. KIVI — 2-bit KV quantization (ICML 2024) — **REJECTED for ANE**
 - **Idea**: per-channel for Key, per-token for Value, symmetric INT2. Zero fine-tune.
-- **Numbers**: 2.6× memory, **2.35-3.47× throughput**, <2% accuracy loss on Llama/Mistral.
-- **ANE adaptation**: INT8 KV is the pragmatic first step (ANE has int8 read, int8-int8 compute on A17+). INT2 KV would need runtime decompression → lose benefit on ANE. **Recommendation: INT8 KV first, INT4 KV as follow-up.**
-- **Expected @ 8K INT8 KV**: 15 → ~22 tok/s (bandwidth halving on KV-bound full-attn path).
-- **Source**: [jy-yuan/KIVI](https://github.com/jy-yuan/KIVI) · [paper](https://arxiv.org/abs/2402.02750)
+- **Numbers (GPU)**: 2.6× memory, **2.35-3.47× throughput**, <2% accuracy loss on Llama/Mistral.
+- **ANE reality (measured)**: KV-only INT8 gives **~0 speedup on ANE** because the ANE compute pipeline is FP16-internal and CoreML dequantizes INT8 KV to FP16 before the matmul. The theoretical DRAM→SRAM bandwidth halving does NOT materialize as wall-clock speedup on ANE. Confirmed by our bench session.
+- **What DOES work on ANE**: full **W8A8** (weights + activations both INT8) opens the int8-int8 compute path on A17 Pro+. Partial INT8 (weights-only, KV-only) all stay on the FP16 path and give zero wall-clock gain.
+- **Conclusion**: skip KIVI on ANE. Invest in W8A8 calibration instead.
+- **Source**: [jy-yuan/KIVI](https://github.com/jy-yuan/KIVI) (GPU-focused)
 
 #### A3. TriForce — self-speculative with sparse KV draft (MLSys 2025)
 - **Idea**: draft = **same target weights** with top-k *retrieved* KV (e.g., 2K out of 8K), target = full 8K. Losslessly verifies.
@@ -114,7 +115,7 @@ Sorted by ANE feasibility × quality-preservation × ROI. All numbers are from c
 |---|---|---|
 | Pre-alloc masks/RoPE | ✅ pure ANE | Swift-only buffer reuse, ANE graph unchanged |
 | KV-share Q-batching | ✅ pure ANE | Just widens matmul Q dim |
-| INT8 KV cache | ✅ pure ANE | `linear_quantize_activations`, A17+ int8 read path |
+| INT8 KV cache | ❌ measured no-op on ANE | CoreML dequantizes INT8 KV to FP16 before ANE compute. Bandwidth halving doesn't materialize. Use full W8A8 instead. |
 | W8A8 | ✅ pure ANE | THE Apple-documented int8-int8 fast path |
 | DuoAttention | ✅ pure ANE | head classification offline; runtime uses 2 static KV banks |
 | EAGLE-3 draft + verify | ✅ pure ANE | small decoder layer, EnumeratedShapes for K=1/3 |
@@ -140,13 +141,14 @@ Stacked sequentially (each factor applies to the current baseline):
 baseline                     15
 + pre-alloc masks      ×1.07     16
 + KV-share Q-batch     ×1.08     17
-+ DuoAttention (A1)    ×1.50     26     ← quality preserved, training-free
-+ INT8 KV / KIVI (A2)  ×1.35     35     ← still training-free, int8 bandwidth halving
-+ W8A8 weights+act     ×1.35     47     ← proper calibration, int8-int8 path
-+ EAGLE-3 (in train)   ×2.00     94     ← fully lossless via verify
++ W8A8 proper calib    ×1.40     24     ← opens int8-int8 ANE compute path
++ DuoAttention (A1)    ×1.50     36     ← quality preserved, training-free
++ EAGLE-3 (in train)   ×2.00     72     ← fully lossless via verify
 ```
 
-**Conservative pessimism adjustment (ANE overhead, SRAM pressure, non-linear compounding)**: multiply final by 0.65 → **~60 tok/s @ 8K** is the realistic landing zone.
+**INT8 KV / KIVI removed from the stack**: measured ineffective on ANE (CoreML dequantizes to FP16 before ANE compute). Only full W8A8 opens the int8-int8 fast path.
+
+**Conservative pessimism adjustment (ANE overhead, non-linear compounding)**: multiply final by 0.70 → **~50 tok/s @ 8K** is the realistic landing zone.
 
 Alternative path replacing EAGLE-3 with TriForce hierarchical:
 ```
@@ -164,6 +166,8 @@ For perspective:
 
 ### Parallel track P1 — EAGLE-3 (already running)
 On Colab, 2 epochs × 30k corpus, acc0 tracking 52% @ 7%. Finish, deploy, measure on iPhone. **Deliverable**: ctx=2048 at 55-70 tok/s, ctx=8192 at ~30 tok/s.
+
+> **Status snapshot 2026-04-12**: the `acc0 52% @ 7%` figure is from the most recent `train_eagle_draft.ipynb` / `train_eagle3_draft.ipynb` run (both untracked — the notebooks are still iterated in Colab). Before quoting this number elsewhere, open the latest notebook output cell and verify it still holds. The data-prep and hidden-state collection pipeline is tracked: `conversion/download_eagle_corpus.py` + `conversion/collect_eagle_hidden_states.py`. CoreML export of the draft model goes through `conversion/build_speculative.py` (modified, not yet merged). See `docs/EXPERIMENTS.md` for the abandoned Medusa comparison that motivated choosing EAGLE-3.
 
 ### Parallel track P2 — ANE bandwidth reduction (training-free, fastest ROI)
 1. **Pre-allocate masks/umask/RoPE** in `ChunkedEngine.swift:303-309, 554-576` (trivial).
