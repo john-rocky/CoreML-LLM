@@ -48,6 +48,7 @@ public final class CoreMLLLM: @unchecked Sendable {
     private var audioConfig: MLModelConfiguration?
     private var melFilterbank: [Float]?
     private var audioProjection: AudioProcessor.ProjectionWeights?
+    private var audioMelFloor: Float = 0.001
     public private(set) var audioMelFrames: Int = 200
     public private(set) var audioNumTokens: Int = 50
 
@@ -173,6 +174,14 @@ public final class CoreMLLLM: @unchecked Sendable {
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 llm.audioMelFrames = json["mel_frames"] as? Int ?? 200
                 llm.audioNumTokens = json["num_tokens"] as? Int ?? 50
+                // mel_floor / log_offset: HF stores it under either key; fall
+                // back to the default (0.001) if absent. Match the value the
+                // encoder was trained with or features drift.
+                if let mf = json["log_offset"] as? Double {
+                    llm.audioMelFloor = Float(mf)
+                } else if let mf = json["mel_floor"] as? Double {
+                    llm.audioMelFloor = Float(mf)
+                }
             }
         }
 
@@ -209,7 +218,12 @@ public final class CoreMLLLM: @unchecked Sendable {
     public var supportsVision: Bool { visionModelURL != nil }
 
     /// Whether this model supports audio input.
-    public var supportsAudio: Bool { audioModelURL != nil && melFilterbank != nil && audioProjection != nil }
+    ///
+    /// The projection (.npy files) is optional — newer audio.mlmodelc builds
+    /// fuse the projection into the graph, so only the encoder + mel
+    /// filterbank are required. Older 1024-dim-output encoders still need
+    /// `audioProjection`; `AudioProcessor.process` decides at runtime.
+    public var supportsAudio: Bool { audioModelURL != nil && melFilterbank != nil }
 
     /// Maximum audio duration in seconds that the model accepts.
     public var maxAudioDuration: TimeInterval {
@@ -512,7 +526,8 @@ public final class CoreMLLLM: @unchecked Sendable {
         }
         guard let am = audioModel else { throw CoreMLLLMError.audioNotAvailable }
         guard let mel = melFilterbank else { throw CoreMLLLMError.audioNotAvailable }
-        guard let proj = audioProjection else { throw CoreMLLLMError.audioNotAvailable }
+        // projection is optional — AudioProcessor.process will fall back to
+        // Swift-side projection only if the encoder outputs 1024-dim features.
 
         // Compute actual mel frames from audio length (matching HF Gemma4AudioFeatureExtractor)
         let padLeft = 160  // frameLength / 2, semicausal pad
@@ -526,7 +541,8 @@ public final class CoreMLLLM: @unchecked Sendable {
         let features = try AudioProcessor.process(samples, with: am,
                                                     melFilterbank: mel,
                                                     targetFrames: audioMelFrames,
-                                                    projection: proj)
+                                                    projection: audioProjection,
+                                                    melFloor: audioMelFloor)
         return (features, actualTokens)
     }
 

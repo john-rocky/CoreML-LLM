@@ -88,22 +88,48 @@ public enum AudioProcessor {
         with audioModel: MLModel,
         melFilterbank: [Float],
         targetFrames: Int,
-        projection: ProjectionWeights
+        projection: ProjectionWeights?,
+        melFloor: Float = 0.001
     ) throws -> MLMultiArray {
         let mel = computeMelSpectrogram(
-            samples, melFilterbank: melFilterbank, targetFrames: targetFrames)
+            samples, melFilterbank: melFilterbank, targetFrames: targetFrames,
+            melFloor: melFloor)
 
-        // CoreML Conformer encoder → hidden_states (1, S, 1024)
+        // CoreML Conformer encoder — output shape/name depends on which
+        // version of the model we have:
+        //   - older: output "hidden_states" (1, S, 1024), caller must run
+        //     projectHiddenStates() in Swift
+        //   - current (on HF): output "audio_features" (1, S, 1536) with the
+        //     output_proj/norm/embed_proj projection already fused into the
+        //     graph; NO Swift projection needed
+        // Pick automatically based on the model's actual output schema.
         let input = try MLDictionaryFeatureProvider(dictionary: [
             "input_features": MLFeatureValue(multiArray: mel),
         ])
-        guard let hidden = try audioModel.prediction(from: input)
-                .featureValue(for: "hidden_states")?.multiArrayValue else {
+        let out = try audioModel.prediction(from: input)
+
+        // Try the modern name first, fall back to legacy, then to any output.
+        let feat = out.featureValue(for: "audio_features")
+            ?? out.featureValue(for: "hidden_states")
+            ?? out.featureValue(for: out.featureNames.first ?? "")
+        guard let arr = feat?.multiArrayValue else {
+            print("[AudioProcessor] audio model has no usable MultiArray output; " +
+                  "featureNames=\(out.featureNames)")
             throw CoreMLLLMError.predictionFailed
         }
 
-        // Swift float32 projection: output_proj → RMSNorm → embed_proj
-        return projectHiddenStates(hidden, with: projection)
+        let lastDim = arr.shape.last?.intValue ?? 0
+        if lastDim == 1536 {
+            // Model already projected — return as-is.
+            return arr
+        }
+        // Legacy path: fall back to Swift-side projection.
+        guard let projection else {
+            print("[AudioProcessor] model output is \(lastDim)-dim but " +
+                  "no projection weights loaded; cannot produce 1536 features")
+            throw CoreMLLLMError.audioNotAvailable
+        }
+        return projectHiddenStates(arr, with: projection)
     }
 
     /// Run output_proj + RMSNorm + embed_proj in float32 on CPU via Accelerate.
@@ -185,10 +211,15 @@ public enum AudioProcessor {
     // MARK: - Mel spectrogram
 
     /// Compute mel spectrogram from raw audio.
+    ///
+    /// `melFloor` is added to each mel-bin before the log, matching HF's
+    /// `Gemma4AudioFeatureExtractor.log_offset`. Default matches the shipped
+    /// config; override if your audio_config.json says something different.
     public static func computeMelSpectrogram(
         _ samples: [Float],
         melFilterbank: [Float],
-        targetFrames: Int
+        targetFrames: Int,
+        melFloor: Float = 0.001
     ) -> MLMultiArray {
         let padLeft = frameLength / 2
         var padded = [Float](repeating: 0, count: padLeft + samples.count)
