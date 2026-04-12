@@ -1,151 +1,177 @@
 # Post-Bench Priority Reassessment
 
 **Updated:** 2026-04-12, after EAGLE-3 on-device (iPhone 17 Pro) bench.
+**Priority axis:** *model performance (decode tok/s, then quality) first; ship
+size last.*
 
 Written to overrule the pre-bench ranking in `UNEXPLORED_APPROACHES.md`. The
-pre-bench ranking assumed EAGLE-3 would reach Colab's projected 64 tok/s at
-2K. On-device measurement contradicts that: with our current target
-implementation, EAGLE-3 delivers **no speedup** because of two independent
-blockers (see `EAGLE3_INTEGRATION_STATE.md` §Phase 3 for full details):
-
-1. **Distribution mismatch**: draft trained against HF `Gemma4ForConditionalGeneration`;
-   we deploy our custom `Gemma4Model`. On real prompts the two produce different
-   hidden taps → draft acceptance rate is ~0 (observed avg N=2.07, vs Colab
-   E[N]=3.05). Fixing requires retraining the draft on data collected from
-   *our* custom forward (~3 h Colab + new data collection script).
-2. **commit-decode overhead**: `ChunkedEngine.commitAccepted` re-runs
-   `predictStep` per accepted token, so even a perfect draft cannot beat
-   baseline. Fixing requires Phase 2A v2 verify chunks (K/V + hidden outputs
-   already built in Python, not yet deployed) plus a Swift cache-writer
-   implementation (~2–3 h).
-
-Both blockers must be fixed together. Fixing only one leaves the speculative
-path at or below baseline 28 tok/s.
+pre-bench ranking placed ship-size (vocab pruning) and TTFT wins on top. That
+recommendation is deprioritized here — the user's product direction is that
+**raw decode throughput and model quality are more important than download
+size or first-token latency.**
 
 ---
 
-## What was measured
+## What was measured on iPhone 17 Pro (2K ctx, Gemma 4 E2B)
 
-| Metric (iPhone 17 Pro, 2K ctx, Gemma 4 E2B) | Observed |
-|---|---:|
-| Baseline T=1 decode (post-ANE-warmup) | **28.6 tok/s** |
-| Baseline prefill (estimated from code path, not yet measured on-device) | ~150 tok/s |
-| TTFT for 2K prompt (estimated) | ~13 s |
-| verify call at T=3 | 31.5 ms |
-| Single decode step | 33–36 ms |
-| EAGLE-3 speculative effective throughput (current impl + broken draft) | 11–17 tok/s |
-| EAGLE-3 projected if fully fixed | 40–44 tok/s (1.45–1.57× baseline) |
+| Metric | Observed | Notes |
+|---|---:|---|
+| Baseline T=1 decode | **28.6 tok/s** | steady-state post-ANE-warmup |
+| verify T=3 per call | 31.5 ms | ≈ cost of one decode step |
+| Single decode step | 33–36 ms | |
+| Avg accepted/burst | **2.00-2.07** | Colab projected E[N]=3.05 — gap is diagnostic-confirmed distribution mismatch |
+| Speculative effective tok/s | 11-17 tok/s | burst overhead not yet amortized |
 
-The decode-path ceiling on Gemma 4 E2B given the current conversion pipeline
-is therefore **~45 tok/s at 2K** even with full EAGLE-3 investment. Further
-decode wins require either a smaller target (Turbo SKU) or fundamentally
-different architecture work (W8A8, sliding-only, etc. — see
-`ALTERNATIVE_APPROACHES.md`).
-
-TTFT on the other hand is **~13 s untouched** — the biggest user-visible pain
-point, and one that no decode optimization addresses.
+See `EAGLE3_INTEGRATION_STATE.md` §Phase 3 for root-cause analysis of the
+acceptance gap (draft trained on HF Gemma-4 hiddens, on-device uses our
+custom `Gemma4Model` hiddens — distribution OOD).
 
 ---
 
-## Revised priority, in order
+## Priority, ordered by decode/quality payoff
 
-### Tier 1 — high-confidence, TTFT-focused, composable with everything
+### Tier 1 — decode-speed wins, training-free or cheap calibration
 
-| # | Approach | Effort | Expected win | Quality risk |
-|---|---|---:|---|---|
-| 1 | **D. Vocab pruning (262k → ~50k)** | ~1 day | **-1.7 GB download**, lookup cost ↓ | <1% at keep ≥ 50k |
-| 2 | **A. GPU prefill on A19 Pro tensor cores** | 1–2 days | **TTFT 13 s → ~5 s** (-60%) | none |
-| 3 | **E. Persistent prefix KV caching** | ~1 day Swift | **4–35× TTFT on cache hit** | none |
-| 4 | **F. MIL graph optimization pass** | ~1 day | op-count -20–40%, decode +1–5%, compile faster | none (verified equivalent) |
+Ordered roughly by expected gain per engineering hour.
 
-Rationale: this entire tier lands **without touching the trained artifacts**.
-It addresses the dominant UX cost (cold-start latency) and the dominant ship
-cost (download size). No retraining, no draft / verify rebuilds, no on-device
-debug cycles that depend on Colab iteration. These four alone deliver the
-biggest perceived speedup and the biggest perceived download-size win.
+| # | Approach | Expected gain @ 2K | Expected gain @ 8K | Effort | Source of claim |
+|---|---|---|---|---:|---|
+| 1 | **F. MIL graph optimization pass** | +1–5% | +1–5% | ~1 day | `UNEXPLORED_APPROACHES.md` §F |
+| 2 | **P2 from SPEED_8K: pre-alloc masks + KV-share Q-batching + INT8 KV cache** | small–moderate | +30–50% (stacked) | 2–4 days | `SPEED_8K.md` §3 P2 |
+| 3 | **W8A8 (INT8 activations + INT8 weights)** | **~1.3–1.6×** | **~1.5×** | already on `feature/w8a8-8k`, await merge | `SPEED_8K.md` §3 P4 |
+| 4 | **TriForce** (block-level top-k, training-free) | — | **~2.3×** (15→33 solo) | 3–5 days | `SPEED_8K.md` §S1 |
+| 5 | **DuoAttention** (retrieval vs streaming heads) | — | +40–80% (15→22–27) | ~1 week (includes training) | `SPEED_8K.md` §3 P3 |
 
-Recommended order within the tier:
-1. **D first** — simplest, ship-size win is the most visible.
-2. **F in parallel** — can be done while D's eval runs; reverts cleanly if a
-   graph pass breaks something.
-3. **A after D** — needs freshly-compiled prefill mlpackages; easier once
-   the pruned-vocab pipeline is the source of truth.
-4. **E last in the tier** — biggest code-path change (Swift side); benefits
-   multiply with A.
+Rationale for ordering within Tier 1:
+1. **F first** — lowest cost, no quality risk, verified-equivalent flag in
+   the scaffold. Low upside but high confidence.
+2. **P2 second** — the training-free bandwidth-reduction triad is the
+   fastest ROI for 8K compute; each step is testable in isolation.
+3. **W8A8 third** — work in progress on a sibling branch; merge when the
+   sibling lands. Potentially the single largest decode win on any ctx.
+4. **TriForce fourth** — is training-free and composes with EAGLE-3. The
+   ANE compile story is "block-level top-k with fixed budget," so it's
+   feasible here even though the original paper is more dynamic.
+5. **DuoAttention fifth** — bigger quality story than TriForce but needs a
+   calibration run (4–8 h A100). Comparable decode win.
 
-After Tier 1: **TTFT ~5 s (first use) / ~0.3 s (cached prefix), download ~1 GB,
-decode 28 tok/s.** That's the "ship it" state.
+### Tier 2 — EAGLE-3 follow-through
 
-### Tier 2 — 8K-context quality, only if long-context is a product goal
+**Requires fixing both blockers identified in Phase 3 bench to deliver any
+speedup at all.** Neither alone is sufficient (proved by bench math, see
+§Phase 3 of `EAGLE3_INTEGRATION_STATE.md`).
 
-| # | Approach | Effort | Expected win |
+| # | Sub-step | Expected gain | Effort |
+|---|---|---:|---:|
+| 6a | Retrain draft against our custom `Gemma4Model` hiddens (not HF's) | required to raise acceptance from ~0 to Colab-projected E[N]=3.05 | 3–4 h Colab + new collection script |
+| 6b | Deploy Phase 2A v2 verify chunks + Swift K/V direct-write commit | lets 6a translate to tok/s; without it, commit-decode overhead wipes out any draft gain | 2–3 h |
+| 6c | **B. Mirror Speculative Decoding v1** (draft → A19 Pro GPU) | +8–15% on top of 6a+6b | 2 days (scaffold exists) |
+
+Combined 6a+6b: **1.45× baseline** (28→40 tok/s projected). Add 6c: **1.57×**
+(28→44 tok/s). Mirror v2 (cross-burst pipelining) adds another ~15% for
+research-tier effort.
+
+Footgun for 6a: `conversion/collect_eagle_hidden_states.py` uses HF's
+`Gemma4ForConditionalGeneration`. To train a draft that matches our deployed
+target, collection must run through our custom `Gemma4Model` + `SWAChunk1..4`
+(or equivalent monolithic forward) and emit `hidden_at_L{8,17,34}` from
+those. A new collection script is required.
+
+### Tier 3 — long-context quality (only if 8K becomes a product goal)
+
+| # | Approach | Effort | Expected benefit |
 |---|---|---:|---|
-| 5 | **C. Cascading KV Cache** | 2–3 days | 8K quality preserved without fine-tune |
+| 7 | **C. Cascading KV Cache** | 2–3 days | preserves 8K quality without a fine-tune, paper reports +5.6% on LongBench |
 
-Only relevant if/when we enable 8K ctx as a default. For 2K default it is
-irrelevant. Postpone until a 8K-mode product decision is made. Preferable to
-StreamingLLM+QLoRA because it's training-free, provided Gemma 4 plays as well
-with cascading as Llama-2 does in the original paper.
+Only relevant for the 8K SKU. For 2K default, postpone. Prefer over
+StreamingLLM+QLoRA because it's training-free.
 
-### Tier 3 — EAGLE-3 follow-through (only if Tier 1 UX isn't enough)
+### Tier 4 — UX (TTFT, not decode)
 
-**Entry cost is high**, payoff is modest on this decoder's architecture.
-Proceed only if decode tok/s is the binding constraint after Tier 1 ships.
+Important for perceived latency but do not raise decode throughput once
+generation starts. Schedule after decode-speed work unless the product story
+explicitly prioritizes first-use latency.
 
-| # | Sub-step | Effort | Expected win |
-|---|---|---:|---|
-| 6a | Retrain draft against our custom target | 3–4 h | raises acc to ~Colab baseline (E[N]=3.05 projected) |
-| 6b | Phase 2A v2 verify deploy + Swift K/V direct-write commit | 2–3 h | lets 6a translate to tok/s |
-| 6c | **B. Mirror Speculative Decoding v1** (draft → A19 Pro GPU) | 2 days | +8–15% on top of 6a+6b |
-| 6d | Mirror v2 (cross-burst pipelining) | 3–5 days | +30% over EAGLE-3 |
+| # | Approach | Expected gain |
+|---|---|---|
+| 8 | **A. GPU prefill on A19 Pro tensor cores** | TTFT 13 s → ~5 s (-60%) |
+| 9 | **E. Persistent prefix KV cache** | 4–35× TTFT on cache hit |
 
-With 6a + 6b shipped: decode **40 tok/s** (1.45× baseline). Add 6c: **44
-tok/s** (1.57×). 6d is research-tier effort for incremental 10–20% — not
-worth until the rest is shipped.
+### Tier 5 — download size (deferred until performance work settles)
 
-**Critical**: 6a and 6b are a single indivisible unit. Shipping 6a without
-6b leaves speculative slower than baseline (Phase 3 bench proved this).
-Shipping 6b without 6a has the draft accepting nothing, so no benefit.
+| # | Approach | Caveat |
+|---|---|---|
+| 10 | **D. Vocabulary pruning (262k → 50-150k)** | quality claim is for English-heavy benchmarks; multilingual coverage trade-off is *very* real — see `UNEXPLORED_APPROACHES.md` §D and the table below |
 
-6a data-collection footgun: `conversion/collect_eagle_hidden_states.py`
-currently uses `target.model(input_ids=..., output_hidden_states=True)` on
-HF. To train a draft that matches our on-device target, it must instead run
-the full pipeline through our `Gemma4Model` + `SWAChunk1..4` (or equivalent
-monolithic forward) and emit `hidden_at_L{8,17,34}` from those — requires a
-new collection script. See `EAGLE3_INTEGRATION_STATE.md` §Phase 3.
+**Vocab pruning multilingual footgun** (do NOT ship without picking a coverage policy):
 
-### Tier 4 — architectural swaps (separate product, not this SKU)
+| keep | corpus | EN quality | JP quality | Other languages |
+|---|---|---|---|---|
+| 50k | English-heavy (C4-en) | <1% loss | ~5% | **30–80% loss** on Korean, Arabic, Hindi, Thai, Vietnamese, Swahili etc. |
+| 50k | mC4 (natural proportions) | <1% | ~3% | top-10 ~8%, rare 20–50% loss |
+| 100k | mC4 | <1% | <2% | top-10 <2%, rare 5–20% |
+| 150k | mC4 | <1% | <1% | top-30 <2%, rare ~3% |
+| 200k+ | any | <1% | <1% | <1% | ← almost no savings left |
 
-From `ALTERNATIVE_APPROACHES.md`:
-- #1 Distill Gemma 4 → 1B (Turbo SKU; needs $500-1k A100)
-- #5a Distill Gemma 4 → pretrained small student
-- W8A8 end-to-end if not already shipped (see `SPEED_8K.md` §3 P1)
-
-These are genuinely different products. Keep on the long-term roadmap, don't
-expect payoff inside the current iteration.
+Honest bottom line: aggressive prune (keep=50k) is only safe for an
+English+Japanese-only SKU. Multilingual SKU needs keep ≥ 100k, which drops
+the download savings from "-1.7 GB" to "-1 GB." `QLoRA` recovery can claw
+back some of the loss for keep=50-80k but adds training cost.
 
 ---
 
-## Final recommendation
+## Recommended sequencing under performance-first priority
 
-**Build and ship Tier 1 next. Tier 3 can wait until after Tier 1 tells us
-how much more speed the product needs.**
+1. **Immediate (this week)**:
+   - #1 F MIL optim (try it, revert if any graph pass regresses)
+   - #3 W8A8 (merge when sibling branch lands) in parallel
 
-Concretely: do **D + F + A + E** in that order. That's roughly one person-
-week for a large and tangible end-user improvement. At the end of it,
-decode is 28 tok/s (unchanged), download is ~1 GB (was 2.7 GB), and first-
-token wait is 5 s / 0.3 s (was 13 s). Most users care about that tradeoff
-more than about raw decode tok/s in steady-state.
+2. **Next (2–4 weeks)**:
+   - #2 P2 bandwidth-reduction triad (pre-alloc, KV-share Q-batching, INT8 KV)
+   - **THEN decide Tier 2 entry**: if W8A8 + P2 leave a decode gap worth
+     closing, pick up #6a + #6b together (indivisible — see bench math).
+     If decode is already satisfactory, park Tier 2.
 
-After Tier 1 ships, re-measure whether decode tok/s is actually the
-binding constraint for user workflows. If it is, pick up Tier 3 (6a + 6b
-together, then optionally 6c). If long-context becomes a product goal,
-pick up Tier 2 (C).
+3. **After baseline decode speed is landed**:
+   - #4 TriForce or #5 DuoAttention for 8K ctx if long-context is in scope.
+   - Otherwise #7 Cascading KV if quality at 8K is the binding constraint.
+
+4. **UX polish** (do last within scope, before shipping):
+   - #8 A GPU prefill — big TTFT win, no decode impact
+   - #9 E Prefix KV cache — incremental on top of A
+
+5. **Ship size** (after all the above):
+   - #10 D Vocab pruning — only after a product decision on multilingual
+     coverage. Publish per-language eval numbers alongside any pruned SKU.
+
+---
+
+## What this means for the decode-tok/s ceiling
+
+Cumulative best case at 2K ctx (single SKU, current target architecture):
+
+```
+Baseline (Gemma-4 E2B, MQA, current chunks)           : 28 tok/s
++ F MIL optim                          × 1.03        →  29
++ W8A8                                 × 1.4          →  41
++ P2 (INT8 KV + Q-batch + pre-alloc)   × 1.15        →  47
++ EAGLE-3 full (6a+6b+6c)              × 1.55        →  73
++ Mirror v2 cross-burst                × 1.15        →  84
+                                                        ^^
+                                                        realistic max @ 2K
+```
+
+At 8K with TriForce or DuoAttention stacked on the above: **~50–80 tok/s**
+depending on the 8K path chosen. Matches `SPEED_8K.md` §2's honest
+projection.
+
+Above that ceiling, only a **smaller target model** (Tier 4 of
+`ALTERNATIVE_APPROACHES.md`: distill to 1B) unlocks more decode speed.
 
 ---
 
 ## Links
-- [EAGLE3_INTEGRATION_STATE.md](EAGLE3_INTEGRATION_STATE.md) — full Phase 3 bench report, diagnostic details
-- [UNEXPLORED_APPROACHES.md](UNEXPLORED_APPROACHES.md) — pre-bench deep dive of A–F
+- [EAGLE3_INTEGRATION_STATE.md](EAGLE3_INTEGRATION_STATE.md) — full Phase 3 bench report
+- [UNEXPLORED_APPROACHES.md](UNEXPLORED_APPROACHES.md) — pre-bench deep dive (A–F)
+- [SPEED_8K.md](SPEED_8K.md) — 8K roadmap, W8A8 / DuoAttention / TriForce rationale
 - [ALTERNATIVE_APPROACHES.md](ALTERNATIVE_APPROACHES.md) — outside-Gemma-4 options
-- [SPEED_8K.md](SPEED_8K.md) — 8K-context roadmap, W8A8 rationale
