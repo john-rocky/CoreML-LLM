@@ -6,9 +6,9 @@ CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a 
 
 > **v0.5.0** — 31 tok/s decode (+11%), 154 tok/s prefill (+60%), IOSurface KV cache, vectorized embeddings. See [What's new](#whats-new-in-v050).
 
-| Text | Multimodal |
-|------|------------|
-| ![text](https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a) | ![multimodal](https://github.com/user-attachments/assets/2a869bf5-8315-422d-8b06-a4a7edecd173) |
+| Text | Image | Audio (v0.6) |
+|------|-------|--------------|
+| ![text](https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a) | ![multimodal](https://github.com/user-attachments/assets/2a869bf5-8315-422d-8b06-a4a7edecd173) | <video src="https://github.com/user-attachments/assets/e8deb6d0-d8b0-4210-885c-5d7a7ddc7ad3" controls></video> |
 
 ## Performance (Gemma 4 E2B, iPhone 17 Pro)
 
