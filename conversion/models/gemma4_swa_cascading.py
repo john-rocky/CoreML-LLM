@@ -29,6 +29,19 @@ Integration:
   - All ctx-sized KV buffers shrink from 8192 to 2564 entries. SRAM
     pressure drops, decode cost at ctx=8192 becomes comparable to ctx=2K.
 
+ANE compilation contract (important):
+  - `gather_idx`, `cos_p`, `sin_p` are MODEL INPUTS, not computed inside
+    the graph. Index values vary per decode step; shapes are fixed
+    (total_slots, and head_dim/2 respectively). The caller (Swift
+    runtime) pre-fills them using `build_gather_indices(position, cfg)`
+    and standard RoPE position slicing. This avoids position-dependent
+    Python control flow that would prevent ANE compilation.
+  - `k_cache` / `v_cache` are the full-history KV buffers (max_ctx long),
+    written at every decode step as in the current non-cascading path.
+    Shrinking them is a separate optimization — cascading ONLY changes
+    the read pattern, not the write. If memory also matters, combine
+    with a ring buffer on top.
+
 This file is the MODEL DEFINITION ONLY. The conversion pipeline
 (build_speculative.py) must be extended with a `--cascading` flag that
 selects this module in place of gemma4_swa_chunks.py. That extension is
@@ -154,10 +167,24 @@ class CascadingFullAttention(nn.Module):
         hidden_states: torch.Tensor,      # (1, 1, H)
         k_cache: torch.Tensor,            # (1, num_kv, max_ctx, head_dim) — full history
         v_cache: torch.Tensor,            # same
-        position: int,                    # current decode position (scalar, baked into gather)
-        rope_cos: torch.Tensor,           # (max_ctx, head_dim/2)
-        rope_sin: torch.Tensor,
+        gather_idx: torch.Tensor,         # (total_slots,) int32/int64 — precomputed by caller
+        cos_p: torch.Tensor,              # (1, head_dim/2) — already indexed at current position
+        sin_p: torch.Tensor,              # (1, head_dim/2) — same
     ) -> torch.Tensor:
+        """Cascading full-attention forward pass.
+
+        Note on `gather_idx`: position-dependent index vectors are computed by
+        the *caller* (Swift runtime or the prefill/decode driver), not inside
+        this graph. This keeps the graph static-shape and ANE-compilable —
+        index *values* can vary per step, but the *shape* is always
+        (total_slots,). The caller is expected to use `build_gather_indices`
+        (or an equivalent Swift port) to fill this tensor before each decode
+        step.
+
+        `cos_p` / `sin_p` are the RoPE factors at the CURRENT position, also
+        pre-sliced by the caller (same reason: avoid position-dependent slicing
+        inside the graph).
+        """
 
         B, T, _ = hidden_states.shape      # expect (1, 1, H)
         q = self.q_proj(hidden_states).view(B, T, self.num_heads, self.head_dim)
@@ -167,20 +194,13 @@ class CascadingFullAttention(nn.Module):
         v_new = self.v_proj(hidden_states).view(B, T, self.num_kv_heads, self.head_dim)
         v_new = self.v_norm(v_new)
 
-        # RoPE on Q at current position
-        cos_p = rope_cos[position:position + 1]   # (1, head_dim/2)
-        sin_p = rope_sin[position:position + 1]
+        # RoPE on Q / K at current position (cos/sin passed in pre-indexed)
         q = _apply_rope(q, cos_p, sin_p)
         k_new = _apply_rope(k_new, cos_p, sin_p)
 
-        # Cascading gather: build index vector (static at compile if position
-        # is part of the graph via EnumeratedShapes of chunk-indexed positions,
-        # or via a lookup-table tensor of size [max_ctx, total_slots])
-        gather_idx = build_gather_indices(position, self.cfg).to(k_cache.device)
-
-        # Gather K/V from the FULL cache (written at every decode step) via
-        # fixed pattern. Concat with k_new/v_new (current position).
-        # k_cache shape: (1, num_kv, max_ctx, head_dim) → gather on dim=2
+        # Cascading gather: indices are a model INPUT, not computed from
+        # a Python int. This is the ANE-compilable form. Index values vary
+        # per step; shape is fixed at `cfg.total_slots`.
         k_g = k_cache.index_select(dim=2, index=gather_idx)    # (1, num_kv, total_slots, head_dim)
         v_g = v_cache.index_select(dim=2, index=gather_idx)
 
