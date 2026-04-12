@@ -1,14 +1,30 @@
 # Unexplored Approaches — Deep Dive
 
-Three promising directions that are complementary (not overlapping) with the
-current EAGLE-3 / W8A8 / MQA / DuoAttention stack, chosen because they hit
-axes the current stack does not touch:
+Six directions complementary (not overlapping) with the current EAGLE-3 /
+W8A8 / MQA / DuoAttention stack, chosen because they hit axes the current
+stack does not touch.
+
+**First batch — decode / long-context** (scaffolds pushed, ready to run once
+EAGLE-3 + W8A8 iPhone bench lands):
 
 - **A. Prefill on A19 Pro GPU tensor cores** — TTFT, compute-bound path
 - **B. Mirror Speculative Decoding (Apple 2026)** — NPU+GPU parallel verify
 - **C. Cascading KV Cache** — training-free long-context quality
 
-This doc is a design study, not yet committed work.
+**Second batch — size / UX / compiler** (scaffolds pushed, independent of
+the first batch):
+
+- **D. Vocabulary pruning** — -1.7 GB download (262k → ~50k tokens)
+- **E. Persistent prefix KV caching** — 4–35× TTFT on cache hit
+- **F. MIL graph optimization pass** — 20–40% fewer ops, faster ANE compile
+
+This doc is a design study. Scaffold files are committed (see
+`conversion/build_prefill_gpu.py`, `build_eagle3_gpu.py`, `apply_vocab_pruning.py`,
+`optimize_mlpackage_graph.py`, `Sources/CoreMLLLM/MirrorSpeculativeLoop.swift`,
+`ComputePreferenceLoader.swift`, `PrefixKVCache.swift`,
+`conversion/models/gemma4_swa_cascading.py`, `cascading_runtime.py`,
+`eval_cascading_quality.py`, `benchmark_prefill.py`), but none have been run
+end-to-end on device yet.
 
 ---
 
@@ -250,36 +266,173 @@ training-free option that preserves quality.
 
 ---
 
-## Priority ordering
+## D. Vocabulary pruning (262k → ~50k)
+
+### Problem
+Gemma 4 E2B's 262k-row SentencePiece vocab covers 100+ languages and code.
+For a Japanese+English+some-code app, most of that is dead weight. Three
+tensors blow up with vocab size:
+
+  embed_tokens:       V × hidden × fp16              = 0.8 GB
+  embed_tokens_per_layer: V × L × per-layer × fp16   = 4.6 GB  ← dominant
+  lm_head:            V × hidden × fp16              = 0.8 GB
+
+(INT8 halves each on disk.) Total ship-time cost of the vocab alone on
+Gemma 4 E2B: ~2.6 GB of the 2.7 GB package.
+
+### What vocab pruning does
+Rank tokens by corpus frequency, union with must-keep specials (BOS/EOS/
+PAD/turn markers/image/audio placeholders + low reserved range), retain
+top K (default 50k = 19% of original). Slice the three embedding tables
+accordingly. Emit `vocab_remap.json` so the runtime can round-trip ids
+between the original tokenizer (which remains usable for encoding and
+decoding) and the pruned model's input/output space.
+
+### Expected size delta
+  Original (fp16) 2.7 GB → Pruned (fp16) 1.0 GB
+  After existing INT4 palettization → equivalent footprint to Apple's
+  shipped 3B on-device model.
+
+### Quality
+Training-free at keep ≥ 50k the quality impact is typically < 1 % on
+common benchmarks for models with heavy multilingual+code vocabs. Below
+40k, a short QLoRA re-stabilize (hours on A100) is recommended.
+`conversion/eval_longbench.py` is the gate.
+
+### ANE compat
+✅ Pure tensor row slicing. The embedding lookups become cheaper (lookup
+cost is linear in retained V, not original V). No graph changes required
+in the attention layers. Model config's `vocab_size` is updated; CoreML
+conversion re-runs unchanged.
+
+### Scaffold: `conversion/apply_vocab_pruning.py`
+Produces a pruned HF model + `vocab_remap.json`. Companion to the
+existing dry-run `prune_vocab.py` analyzer.
+
+### Verdict
+**Day-1 UX improvement**. Makes CoreML-LLM competitive with Apple's
+Foundation Model on footprint while retaining the "any open model"
+moat. Implementation is the simplest of all unexplored directions.
+
+---
+
+## E. Persistent prefix KV cache
+
+### Problem
+TTFT for a 2K system prompt is ~13 s on iPhone 17 Pro (ANE prefill). For
+chat apps with a **stable system prompt** (assistant persona, memory,
+RAG context), that prefill is paid every cold start and every session
+switch. EAGLE-3 / W8A8 do nothing for this.
+
+### What persistent prefix KV does
+After prefilling a prefix, serialize all KV buffers (sliding + full-
+attention + shared) to disk under a hash of the prefix token sequence.
+On future cold starts: tokenize the prefix, hash, probe cache. On hit,
+deserialize KV into the engine and skip the forward pass entirely.
+
+### Expected speedup
+Literature: 4–35× TTFT at 1–4k prefix, scaling to ~136× at 32k. Size is
+small — a 2K prefix stores ~48 MB fp16 of full-attn KV plus ~7 MB sliding.
+INT4 quantization cuts it to ~12 MB. An app with 64 cached prefixes ≈
+1 GB sandbox storage.
+
+### ANE compat
+✅ No graph change. Only affects Swift-side state management. The KV
+buffers are already IOSurface-backed half-precision arrays; serialization
+is a memcpy to disk.
+
+### Scaffold: `Sources/CoreMLLLM/PrefixKVCache.swift`
+Declares a `PrefixKVSnapshotable` protocol (which `ChunkedEngine` is
+expected to conform to) plus a file-system cache with LRU eviction,
+SHA-256-based key, model/version validation, and automatic location in
+the app's Caches directory.
+
+### Verdict
+**Quick UX win**, deliverable alongside or ahead of the decode-path
+work. No training, no calibration. Requires Swift-side
+`PrefixKVSnapshotable` implementation in ChunkedEngine (a few hundred
+lines of buffer I/O).
+
+---
+
+## F. MIL graph optimization pass
+
+### Problem
+The converted mlpackages contain many small ops (reshape, transpose,
+add, mul) that could be fused by the CoreML compiler's built-in pass
+pipeline but aren't, because `coremltools.convert()` defaults to a
+conservative pass set for compatibility. Each extra op costs a kernel
+launch on ANE and adds to first-run compile time (1–2 min cold).
+
+### What MIL graph optim does
+Reload an already-converted mlpackage, re-extract its MIL program, run
+additional passes — `dead_code_elimination`, `const_elimination`,
+`fuse_linear_bias`, `fuse_layernorm_or_instancenorm`,
+`merge_consecutive_reshapes`, `merge_consecutive_transposes`,
+`fuse_matmul_weight_bias`, `fuse_gelu_*` — and re-save. Weights are
+byte-identical; the MIL structure is leaner.
+
+### Expected gain
+Typical 20–40% op-count reduction on transformer chunks. First-run
+compile time shrinks proportionally; decode throughput sees small gains
+(1–5%) from fewer kernel launches.
+
+### ANE compat
+✅ All passes produce equivalent semantics; the resulting graph remains
+within ANE's supported op set. The optional `--verify-equivalence` flag
+runs both models on random input and compares outputs byte-for-byte.
+
+### Scaffold: `conversion/optimize_mlpackage_graph.py`
+Pass list is configurable; default is a conservative set known safe on
+Gemma-shaped graphs. Run once per chunk post-conversion.
+
+### Verdict
+**Free win if it works**, bounded risk if it doesn't (revert to un-
+optimized mlpackage). One hour of testing per chunk decides it.
+
+---
+
+## Priority ordering (all 6)
 
 | # | Approach | Confidence | Effort | Payoff | Quality risk | Composes with current stack |
 |---|---|---|---|---|---|---|
-| 1 | **A. GPU prefill**    | **High**   | 1–2 days | TTFT 60% ↓ | none      | ✅ all        |
-| 2 | **B. Mirror SD**      | Medium-High| 2–3 days | +30% over EAGLE-3 | thermal watch | ✅ EAGLE-3 successor |
-| 3 | **C. Cascading KV**   | Medium     | 2–3 days | 8K quality preserved | paper-vs-our-model gap | ✅ all |
+| 1 | **D. Vocab pruning**  | **High**   | 1 day (+QLoRA half-day) | -1.7 GB download | <1 % at keep≥50k | ✅ all |
+| 2 | **A. GPU prefill**    | **High**   | 1–2 days | TTFT 60 % ↓ | none      | ✅ all |
+| 3 | **E. Prefix KV cache**| **High**   | 1 day Swift | TTFT 4–35× on hit | none | ✅ all |
+| 4 | **F. MIL graph optim**| Medium-High| 1 day | 20–40 % ops down, compile faster | none (equiv verified) | ✅ all |
+| 5 | **B. Mirror SD**      | Medium-High| 2–3 days | +30 % over EAGLE-3 | thermal watch | ✅ EAGLE-3 successor |
+| 6 | **C. Cascading KV**   | Medium     | 2–3 days | 8K quality preserved | paper-vs-our-model gap | ✅ all |
 
-Total engineering: ~1 week for all three, if they all land.
+Total engineering for all six: ~10 working days.
 
 ### Recommended sequencing (when current stack lands)
 
-1. **After EAGLE-3 ships on iPhone** → start **A (GPU prefill)** in parallel
-   with **B (Mirror)**. A is low-risk quick win, B is higher-risk higher-
-   reward.
-2. **After W8A8 ships** → evaluate if long-context (8K) is still needed. If
-   yes, implement **C (Cascading KV)** as the training-free quality layer
-   before touching StreamingLLM+QLoRA.
+1. **Immediate (parallel with EAGLE-3 iPhone bench)** → run **D (vocab
+   pruning)**: first-class shipping artifact, matches Apple's 1 GB footprint.
+   → try **F (graph optim)**: low-cost try-it, revert if it doesn't pan out.
+   → implement **E (prefix KV cache)**: UX win independent of decode path.
+2. **After EAGLE-3 ships on iPhone** → **A (GPU prefill)** in parallel with
+   **B (Mirror SD)**. A is the safer quick win, B is the larger reward.
+3. **After W8A8 ships** → if long-context 8K is still a product goal,
+   implement **C (Cascading KV)** as the training-free quality layer
+   before falling back to StreamingLLM+QLoRA.
 
 ### What this means for the Gemma-4 ceiling
 
-Adding these three to the ceiling checklist:
+Updated ceiling checklist:
 
-- [ ] A19 Pro GPU prefill (TTFT)
-- [ ] Mirror Speculative Decoding (+30% over EAGLE-3)
-- [ ] Cascading KV Cache (8K quality without fine-tune)
+- [ ] **D. Vocabulary pruning** (−1.7 GB, ship-side)
+- [ ] **E. Persistent prefix KV caching** (4–35× TTFT on cached prefixes)
+- [ ] **F. MIL graph optimization pass** (op count −20-40%, compile faster)
+- [ ] **A. A19 Pro GPU prefill** (TTFT 13 s → 5 s)
+- [ ] **B. Mirror Speculative Decoding** (+30% over EAGLE-3)
+- [ ] **C. Cascading KV Cache** (8K quality without fine-tune)
 
-With all three, the Gemma-4 ceiling moves from 60 tok/s @ 8K to a range of
-**80–120 tok/s @ 8K + TTFT 5 s** — at which point leaving Gemma-4 scope for
-a "Turbo SKU" becomes genuinely the next bottleneck.
+With all six plus the existing stack (EAGLE-3 + W8A8 + MQA + DuoAttention),
+the Gemma-4 ceiling moves to **80–120 tok/s @ 8K, TTFT ~5 s, 1 GB
+download**. At that point leaving Gemma-4 scope for a distilled "Turbo
+SKU" (#1 / #5a in `ALTERNATIVE_APPROACHES.md`) becomes genuinely the next
+bottleneck.
 
 ---
 

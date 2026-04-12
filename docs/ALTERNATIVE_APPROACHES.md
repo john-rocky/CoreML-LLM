@@ -158,21 +158,35 @@ Realistic ANE overhead correction (×0.65) → **~60 tok/s @ 8K** under pure ANE
 ## What "Gemma-4 ceiling" means
 
 The list of **things to exhaust inside Gemma 4 scope** before entertaining
-separate product tracks (#1/#5a/#5b). All within individual-project budget:
+separate product tracks (#1/#5a/#5b). All within individual-project budget.
 
+### Decode / throughput
 - [ ] #3 MQA + QLoRA recovery ← implementation pushed, not yet executed
 - [ ] #2 Sliding-only with QLoRA recovery (fallback if MQA is insufficient)
 - [ ] W8A8 proper calibration (in flight, bench session)
 - [ ] DuoAttention head cap (Tier-2, head identification ready)
 - [ ] EAGLE-3 deployed on iPhone (in training + conversion pipeline ready)
 - [ ] Pre-alloc masks + KV-share Q-batch in ChunkedEngine (bench session)
-- [ ] Prefill on A19 Pro GPU tensor cores (independent TTFT win)
 - [ ] StreamingLLM+QLoRA for true 8K quality recovery
 - [ ] MLA retrofit via MHA2MLA (v0.6+ architectural upgrade, still within Gemma 4)
+
+### Second batch (see `docs/UNEXPLORED_APPROACHES.md`)
+- [ ] **A. A19 Pro GPU prefill** — TTFT compute-bound offload to GPU tensor cores
+- [ ] **B. Mirror Speculative Decoding** — +30 % over EAGLE-3 via NPU+GPU parallel
+- [ ] **C. Cascading KV Cache** — training-free 8K quality preservation
+- [ ] **D. Vocabulary pruning (262k→50k)** — −1.7 GB download; matches Apple 3B footprint
+- [ ] **E. Persistent prefix KV caching** — 4–35× TTFT on cache hit for fixed system prompts
+- [ ] **F. MIL graph optimization pass** — 20–40 % fewer ops, faster ANE compile
 
 **Once every item above is shipped-or-rejected-with-data**, further speed
 requires *leaving* Gemma 4 scope (#5a distill, #5b small-model swap), which is
 a separate product decision — not the main library's roadmap.
+
+### Projected envelope at full ceiling
+- **Decode**: 80–120 tok/s @ ctx=8192 (pure ANE, quality preserved)
+- **TTFT**: ~5 s on 2K prompt (or <1 s on cached prefix)
+- **Download**: ~1 GB (pruned + INT4 palettized) — matches Apple's 3B footprint
+- **Thermal**: sustained over 10 min without drift (ANE-only decode)
 
 From-scratch (#5) remains rejected at our budget unless institutional compute
 becomes available.
