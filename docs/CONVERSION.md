@@ -212,3 +212,90 @@ Instead of direct index assignment which creates untraceable `int` ops.
 - [ ] Attention matmul in float32 (Q, K cast to float32 before matmul)
 - [ ] Scale constants as tensors, not Python floats
 - [ ] Softmax in float32 before casting back
+
+## Quantization
+
+### Why INT4 palettization (shipping default)
+
+`exporter.py :: _quantize_model` applies **INT4 palettization, `per_grouped_channel`, `group_size=32`** via `ct.optimize.coreml.palettize_weights`. This is the default in `convert.py`.
+
+| Mode | Model size (Gemma 4 E2B) | Decode speed on ANE | Quality vs FP16 |
+|---|---:|---|---|
+| FP16 (no quant) | ~5.2 GB | baseline | exact |
+| INT8 weight-only | ~2.7 GB | **same as FP16** (ANE is fp16 internally) | near-exact |
+| INT4 palettized, g=32 | **~1.4 GB** | same as FP16 | qualitatively matches on chat prompts |
+| W8A8 (weight+activation) | ~2.7 GB | 1.3–1.6× (Apple ResNet-50 figures) | needs calibration, see EXPERIMENTS.md |
+
+Key facts that drove the choice:
+
+1. **ANE is fp16 internally**. Weight-only quantization (INT8 or INT4) gains **size only, not speed**. Activations are still dequantized to fp16 before compute.
+2. **INT4 is the smallest that stays qualitatively correct** on Gemma 4 E2B without calibration. `group_size=32` means one scale per 32 output channels, which is fine for attention/MLP projections; smaller groups help quality but bloat the palette metadata.
+3. **The speed lever is W8A8, not INT4**. We ship INT4 for the memory win (fits on an 8 GB iPhone alongside the OS) and keep W8A8 as the next prototype (see `docs/EXPERIMENTS.md`).
+4. **Palettized weights show up in `phys_footprint`, not Xcode's memory gauge**. This is why README v0.5 corrected the memory number from ~250 MB (gauge) to ~1 GB (jetsam metric). See `docs/BENCHMARKING.md`.
+
+The embedding table is a separate story — `gemma4_lite_wrapper.py` moves `embed_tokens` / `embed_tokens_per_layer` out of the CoreML graph entirely and quantizes them to INT8 on disk (`embed_tokens_q8.bin`). That is what makes the 2.7 GB "Gemma 4 E2B" number on HuggingFace possible despite the 262 K × 1536 embedding.
+
+### Choosing a different mode
+
+Pass `quantize` on the `CoreMLExporter.export()` call:
+
+```python
+exporter.export(output_dir, quantize="int4")   # default
+exporter.export(output_dir, quantize="int8")   # weight-only INT8, size-only win
+exporter.export(output_dir, quantize=None)     # FP16, for quality-reference builds
+```
+
+For W8A8 calibration, bypass `exporter.py` and use `build_w8a8_proper.py` directly — it needs activation traces.
+
+## From `.mlpackage` to iPhone — Deployment Recipe
+
+`convert.py` outputs `.mlpackage` directories. **These do not run on iPhone directly**. The runtime needs compiled `.mlmodelc`. There are two correct paths and several tempting-but-wrong ones.
+
+### Correct path (matches what HF-hosted pre-converted models ship)
+
+```python
+import coremltools as ct
+import shutil, os
+
+for stem in ["chunk1", "chunk2", "chunk3", "chunk4",
+             "prefill_chunk1", "prefill_chunk2", "prefill_chunk3", "prefill_chunk4"]:
+    pkg = f"./output/gemma4-e2b/{stem}.mlpackage"
+    model = ct.models.MLModel(pkg)                      # triggers compile on macOS
+    compiled = model.get_compiled_model_path()          # temp path, GC'd with `model`
+    dst = f"./output/gemma4-e2b/{stem}.mlmodelc"
+    if os.path.exists(dst): shutil.rmtree(dst)
+    shutil.copytree(compiled, dst)                      # copy before `model` goes out of scope
+    del model
+```
+
+Keep `model` alive until the copy finishes — the compiled directory lives under a temp path that is deleted when `MLModel` is GC'd.
+
+### What does *not* work (and why)
+
+- `xcrun coremlcompiler compile` — produces a Mac-specific binary `model.mil`. iPhone's CoreML runtime expects **text** MIL starting with `program(1.3)\n`. See `docs/DEPLOYMENT.md` for the byte-level check.
+- `str(mil_program)` — prints a debug display format (`main[CoreML8]`), not the serialization format.
+- Opening the `.mlpackage` in Xcode and letting it "bundle" for you — works for toy models, silently falls back to GPU compute for large Gemma-4 chunks in our experience.
+
+### Expected output layout
+
+After the steps above, your model directory should contain:
+
+```
+gemma4-e2b/
+  model_config.json                ← written by CoreMLExporter._write_config
+  chunk1.mlmodelc/  chunk2.mlmodelc/  chunk3.mlmodelc/  chunk4.mlmodelc/
+  prefill_chunk1.mlmodelc/  ...
+  embed_tokens_q8.bin              ← external INT8 embeddings (if lite wrapper)
+  embed_tokens_per_layer_q8.bin
+  cos_sliding.npy  sin_sliding.npy  cos_full.npy  sin_full.npy   ← from generate_rope.py
+  vision.mlmodelc  (multimodal models only)
+  audio.mlmodelc   audio_config.json  output_proj_*.npy  embed_proj_weight.npy  (audio models only)
+```
+
+The `ChunkedEngine.swift` loader auto-detects chunked SWA vs monolithic layouts by scanning for `chunk*.mlmodelc` files, and auto-detects context length from the `K_full_in` input shape (commits `4311991`, `7dcbda1`). So if the chunks' masks/caches got sized inconsistently (e.g. chunk4 at 2 K while others at 8 K), loading will fail loudly rather than corrupt outputs silently.
+
+### Iterating on a converted model
+
+1. Replace a `.mlmodelc` on disk.
+2. Re-launch the app. First launch triggers ANE recompile for that chunk; subsequent launches are cached.
+3. If the device rejects the file, the error usually mentions either an I/O shape mismatch (fix: check `ModelConfig.swift`'s auto-detection vs what the chunk expects) or an ANE compile failure (fix: try the lite 2-chunk variant, or shrink the chunk).

@@ -229,7 +229,21 @@ The two are complementary, not competing. If you're on a Mac and want to burn th
 
 ## Adding New Models
 
-See [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md) for a step-by-step guide, [docs/CONVERSION.md](docs/CONVERSION.md) for the full conversion reference, and [docs/MULTIMODAL.md](docs/MULTIMODAL.md) for the vision pipeline architecture.
+See [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md) for a step-by-step guide and [docs/CONVERSION.md](docs/CONVERSION.md) for the full conversion reference (including quantization rationale and the `.mlpackage` → `.mlmodelc` deployment recipe).
+
+## Documentation map
+
+| Topic | File |
+|---|---|
+| How to convert HF weights, ANE tricks, precision checklist, INT4/INT8/W8A8 rationale, iPhone deployment recipe | [docs/CONVERSION.md](docs/CONVERSION.md) |
+| Step-by-step guide to adding a new architecture | [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md) |
+| `.mlpackage` vs `.mlmodelc`, byte-level format gotchas | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
+| Image pipeline (vision encoder, token injection, debug notes) | [docs/MULTIMODAL.md](docs/MULTIMODAL.md) |
+| Audio pipeline (mel spec, Conformer, Swift-side projection) | [docs/AUDIO.md](docs/AUDIO.md) |
+| 8K context speed roadmap, ANE-compat matrix, reading list | [docs/SPEED_8K.md](docs/SPEED_8K.md) |
+| Competitive landscape, energy/efficiency notes, spec-decoding background | [docs/RESEARCH.md](docs/RESEARCH.md) |
+| Decision log for experimental variants (WFA, Flash, W8A8, Medusa, EAGLE-3, …) | [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) |
+| Methodology behind the tok/s, ANE%, memory numbers | [docs/BENCHMARKING.md](docs/BENCHMARKING.md) |
 
 ## Project Structure
 

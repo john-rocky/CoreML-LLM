@@ -1,7 +1,13 @@
-coremltools>=8.0
-torch>=2.2.0
-transformers>=4.40.0
+# Pinned to the versions that produced the pre-converted models on HuggingFace.
+# Newer minors usually work but can silently change quantization / tracing
+# behaviour — bump one at a time and re-run verification in convert_audio.py
+# and exporter.py before replacing these.
+coremltools==9.0
+torch==2.11.0
+transformers==5.5.0
 safetensors>=0.4.0
-numpy>=1.24.0
+numpy==2.4.4
 pyyaml>=6.0
 huggingface-hub>=0.20.0
+# Required for INT4 palettization clustering (ct.optimize.coreml.palettize_weights)
+scikit-learn>=1.3
