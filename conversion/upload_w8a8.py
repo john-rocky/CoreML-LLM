@@ -35,9 +35,13 @@ def main():
                 rel_path = os.path.relpath(local_file, LOCAL_DIR)
                 repo_path = f"{HF_PREFIX}/{rel_path}"
                 sz = os.path.getsize(local_file)
-                if sz < 1024:
-                    continue  # skip tiny metadata files, upload only weights + model.mil
-                print(f"  Uploading {repo_path} ({sz/1e6:.0f} MB)")
+                # Do NOT skip small files. coremldata.bin is 900-1100 bytes but
+                # REQUIRED by CoreML to load the mlmodelc. Earlier version of
+                # this script skipped files <1024 bytes and produced an HF repo
+                # that 404'd during app download; see
+                # docs/EAGLE3_INTEGRATION_STATE.md / POST_BENCH_PRIORITIES.md
+                # for the incident.
+                print(f"  Uploading {repo_path} ({sz/1e6:.2f} MB)")
                 api.upload_file(
                     path_or_fileobj=local_file,
                     path_in_repo=repo_path,
