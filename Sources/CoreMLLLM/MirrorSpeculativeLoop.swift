@@ -2,17 +2,33 @@
 //  MirrorSpeculativeLoop.swift
 //  CoreMLLLM
 //
-//  Mirror Speculative Decoding (Apple ML Research, 2026) — parallel
-//  execution of draft (GPU tensor cores) and verify (ANE) for +30% over
-//  the serial EAGLE-3 path.
+//  Mirror Speculative Decoding (Apple ML Research, 2026) — running the
+//  EAGLE-3 draft on A19 Pro GPU tensor cores while target verify stays on
+//  ANE. Scaffold for Approach B of docs/UNEXPLORED_APPROACHES.md.
 //
-//  Scaffold for Approach B of docs/UNEXPLORED_APPROACHES.md. Requires
-//  A19 Pro / M5 (GPU neural accelerators + MPP) and an EAGLE-3 draft
-//  mlpackage built with `compute_units=.cpuAndGPU` via
-//  conversion/build_eagle3_gpu.py.
+//  v1 (this file): serial-within-burst. Draft runs on GPU, verify runs on
+//    ANE, but a single burst waits on the draft to complete before verify
+//    begins because verify consumes the proposals. The wall-clock win vs
+//    the ANE-only EAGLE-3 comes from:
+//      (a) Draft kernel executes on GPU tensor cores (compute-bound
+//          Gemma4-style decoder layer + SwiGLU + lm_head at ~7.5 TFLOPS),
+//          which is typically faster per burst than ANE's matmul path
+//          at the small batch sizes a draft uses.
+//      (b) ANE is not blocked by draft, so verify can start the moment
+//          draft returns with no ANE queue contention.
+//    Expected lift over serial EAGLE-3: ~+15-20% on iPhone 17 Pro.
 //
-//  Integration: same SpeculativeTarget protocol as SpeculativeLoop, so
-//  ChunkedEngine work is shared between the two strategies.
+//  v2 (future): cross-burst pipelining. Dispatch burst N+1's fusion+draft
+//    on GPU while burst N's verify is still running on ANE. Needs an actor
+//    to own the running KV state and a queue of speculation results. This
+//    is where the Apple paper's +30% lands. Not implemented here.
+//
+//  Bidirectional Mirror (target emitting streaming corrections while draft
+//  works) is v3 / research territory.
+//
+//  Integration: reuses the SpeculativeTarget protocol from SpeculativeLoop.swift
+//  so ChunkedEngine only needs a single conformance to support both v0 (pure
+//  ANE EAGLE-3) and v1 (GPU draft + ANE verify).
 //
 
 import CoreML
@@ -24,7 +40,7 @@ public final class MirrorSpeculativeLoop {
     /// Fusion: stays on ANE (tiny graph, bandwidth fine either place).
     public let fusion: MLModel
 
-    /// Draft on GPU tensor cores (compute-bound workload).
+    /// Draft on GPU tensor cores (compute-bound; A19 Pro+ / M5 for Neural Accelerators).
     public let draftGPU: MLModel
 
     public let K: Int
@@ -34,10 +50,6 @@ public final class MirrorSpeculativeLoop {
     private(set) public var rollingAcceptance: Double = 1.0
     private let rollingAlpha: Double = 0.05
     public var fallbackThreshold: Double = 0.30
-
-    // Concurrent dispatch
-    private let draftQueue  = DispatchQueue(label: "coremlllm.mirror.draft",  qos: .userInitiated)
-    private let verifyQueue = DispatchQueue(label: "coremlllm.mirror.verify", qos: .userInitiated)
 
     // MARK: - Init
 
@@ -57,12 +69,12 @@ public final class MirrorSpeculativeLoop {
         }()
         let draftCfg = draftGPUConfiguration ?? {
             let c = MLModelConfiguration()
-            c.computeUnits = .cpuAndGPU   // GPU tensor cores (A19 Pro+ / M5)
+            c.computeUnits = .cpuAndGPU   // A19 Pro+ neural accelerators (MPP, Xcode 26.1+)
             return c
         }()
         guard FileManager.default.fileExists(atPath: fusionURL.path),
               FileManager.default.fileExists(atPath: draftGPUURL.path) else {
-            throw SpeculativeError.assetMissing("fusion or draftGPU")
+            throw SpeculativeError.assetMissing("fusion or draftGPU mlpackage")
         }
         self.fusion = try MLModel(contentsOf: fusionURL, configuration: fusionCfg)
         self.draftGPU = try MLModel(contentsOf: draftGPUURL, configuration: draftCfg)
@@ -71,91 +83,75 @@ public final class MirrorSpeculativeLoop {
         self.embedScale = embedScale
     }
 
-    // MARK: - Concurrent burst
+    // MARK: - Burst
 
-    /// Execute one decoding burst with draft and verify overlapped.
+    /// One decoding burst. Returns accepted tokens (length 1..K+1).
     ///
-    /// Semantics: draft K tokens are generated on GPU while ANE begins
-    /// running the verify chunks on `[tTokNext, proposals[0..K-2]]`.
-    /// Because the draft must complete before we know what to verify,
-    /// parallelism is limited: we can overlap draft with OTHER prep work
-    /// (fusion read, embed lookup), but not with the verify chunks
-    /// themselves. The paper gains come from pipelining multi-turn bursts.
-    ///
-    /// For v1 we implement a simpler structure:
-    ///   - draft K tokens on GPU (serial within burst)
-    ///   - kick off verify on ANE (async)
-    ///   - while verify runs, begin NEXT burst's fusion prefetch on GPU
-    ///   - accept / reject when verify returns
-    ///
-    /// True bidirectional Mirror (draft+target simultaneously speculating
-    /// at each other) is v2.
+    /// Parameters:
+    ///   - target:      the target model interface (ChunkedEngine conforming to SpeculativeTarget).
+    ///   - tTokNext:    target's own argmax for the next position, taken from the previous step's argmax output.
+    ///   - tokenEmbed:  closure producing `(1, 1, H) fp16` = embed(token) * embedScale.
     public func drawBurst(
         target: SpeculativeTarget,
         tTokNext: Int32,
         tokenEmbed: (Int32) throws -> MLMultiArray
     ) async throws -> [Int32] {
 
-        // 1. Fusion on ANE (tiny, fast)
+        // 1. Multi-layer hidden states at fusionLayers from the last decode step.
         let hs = try target.lastHiddenMulti(at: fusionLayers)
+        guard hs.count == fusionLayers.count else {
+            throw SpeculativeError.verifyFailed(
+                "target returned \(hs.count) hiddens, expected \(fusionLayers.count)")
+        }
+
+        // 2. Fuse them via the fusion mlpackage (ANE).
         var fusionInputs: [String: Any] = [:]
         let names = ["h_low", "h_mid", "h_high"]
         for (i, name) in names.enumerated() where i < hs.count { fusionInputs[name] = hs[i] }
         let fusionIn = try MLDictionaryFeatureProvider(dictionary: fusionInputs)
         let fusionOut = try await fusion.prediction(from: fusionIn)
         guard let hFused = fusionOut.featureValue(for: "h_fused")?.multiArrayValue else {
-            throw SpeculativeError.verifyFailed("fusion missing h_fused")
+            throw SpeculativeError.verifyFailed("fusion missing h_fused output")
         }
 
-        // 2. Draft K tokens on GPU (concurrent with nothing yet, until we
-        //    know the tokens we cannot begin verify)
-        let proposals: [Int32] = try await withCheckedThrowingContinuation { cont in
-            draftQueue.async {
-                do {
-                    var hPrev: MLMultiArray = hFused
-                    var eNext: MLMultiArray = try tokenEmbed(tTokNext)
-                    var out: [Int32] = []
-                    out.reserveCapacity(self.K)
-                    for _ in 0..<self.K {
-                        let draftIn = try MLDictionaryFeatureProvider(dictionary: [
-                            "h_prev": hPrev,
-                            "e_next": eNext
-                        ])
-                        let draftOut = try self.draftGPU.prediction(from: draftIn)
-                        guard
-                            let hOut = draftOut.featureValue(for: "h_out")?.multiArrayValue,
-                            let tok  = draftOut.featureValue(for: "token")?.multiArrayValue
-                        else { throw SpeculativeError.verifyFailed("draftGPU missing outputs") }
-                        let pred = tok.dataPointer.bindMemory(to: Int32.self, capacity: 1).pointee
-                        out.append(pred)
-                        hPrev = hOut
-                        eNext = try tokenEmbed(pred)
-                    }
-                    cont.resume(returning: out)
-                } catch {
-                    cont.resume(throwing: error)
-                }
+        // 3. Draft K tokens on GPU. Serial within burst — step k depends on
+        //    step k-1's hidden. Parallelism with verify is not possible
+        //    inside a single burst because verify consumes the proposals.
+        //    Cross-burst pipelining is v2.
+        var hPrev: MLMultiArray = hFused
+        var eNext: MLMultiArray = try tokenEmbed(tTokNext)
+        var proposals: [Int32] = []
+        proposals.reserveCapacity(K)
+        for _ in 0..<K {
+            let draftIn = try MLDictionaryFeatureProvider(dictionary: [
+                "h_prev": hPrev,
+                "e_next": eNext
+            ])
+            let draftOut = try await draftGPU.prediction(from: draftIn)
+            guard
+                let hOut = draftOut.featureValue(for: "h_out")?.multiArrayValue,
+                let tok = draftOut.featureValue(for: "token")?.multiArrayValue
+            else {
+                throw SpeculativeError.verifyFailed("draftGPU missing outputs")
             }
+            let pred: Int32 = tok.dataPointer
+                .bindMemory(to: Int32.self, capacity: 1)
+                .pointee
+            proposals.append(pred)
+            hPrev = hOut
+            eNext = try tokenEmbed(pred)
         }
 
-        // 3. Verify on ANE (concurrent with post-verify prep later; here it's synchronous
-        //    because we need the result before accept/reject)
-        let verifyTokens = [tTokNext] + proposals.dropLast()
-        let targetArgmax: [Int32] = try await withCheckedThrowingContinuation { cont in
-            verifyQueue.async {
-                do {
-                    let r = try target.verifyCandidates(verifyTokens, K: self.K)
-                    cont.resume(returning: r)
-                } catch {
-                    cont.resume(throwing: error)
-                }
-            }
-        }
+        // 4. Run target verify on [tTokNext, proposals[0..K-2]] (ANE).
+        var verifyTokens = [tTokNext]
+        verifyTokens.append(contentsOf: proposals.dropLast())
+        let targetArgmax = try target.verifyCandidates(verifyTokens, K: K)
         guard targetArgmax.count == K else {
-            throw SpeculativeError.verifyFailed("verify returned \(targetArgmax.count), expected \(K)")
+            throw SpeculativeError.verifyFailed(
+                "verify returned \(targetArgmax.count), expected \(K)")
         }
 
-        // 4. Accept greedily
+        // 5. Greedy accept up to first disagreement.
         var accepted: [Int32] = [tTokNext]
         var matched = 0
         for k in 0..<K {
@@ -167,23 +163,18 @@ public final class MirrorSpeculativeLoop {
                 break
             }
         }
+        // All-matched case: no bonus token here; next burst re-derives hiddens.
 
-        // 5. Commit
+        // 6. Commit to target's running state.
         try target.commitAccepted(accepted)
 
-        // 6. Rolling acceptance
+        // 7. Rolling acceptance for adaptive fallback.
         let rate = Double(matched) / Double(K)
         rollingAcceptance = rollingAlpha * rate + (1 - rollingAlpha) * rollingAcceptance
 
         return accepted
     }
 
+    /// Whether to use the speculative path for the next burst.
     public var shouldSpeculate: Bool { rollingAcceptance >= fallbackThreshold }
 }
-
-// NOTE(v2): true bidirectional Mirror would have target model speculate
-// corrections WHILE draft proposes, requiring target to emit a running
-// "most-likely-next" stream that draft can consume. This requires either
-// a second target mlpackage (streaming variant) or a custom scheduling
-// fabric above both. Deferred until v1 measures the current parallel
-// gain and we have iPhone thermal data.
