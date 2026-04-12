@@ -545,6 +545,40 @@ extension ModelDownloader: URLSessionDownloadDelegate {
         guard let localPath = downloadTask.taskDescription,
               let dest = destDir else { return }
 
+        // HTTP status check: URLSessionDownloadTask writes the response body
+        // to `location` regardless of status code. A 404 from HuggingFace is
+        // a short HTML page ("Entry not found") that would otherwise be
+        // saved verbatim and later fail a checksum / signature check with
+        // a misleading error. Catch it here with a clear error.
+        if let http = downloadTask.response as? HTTPURLResponse, http.statusCode >= 400 {
+            // Read a small excerpt of the body for the error message.
+            let snippet: String = (try? String(contentsOf: location, encoding: .utf8))?
+                .prefix(200).trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            try? fileManager.removeItem(at: location)
+            let url = downloadTask.originalRequest?.url?.absoluteString ?? "(unknown)"
+            let taskId = downloadTask.taskIdentifier
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.activeDownloadTasks.removeValue(forKey: taskId)
+                self.activeTaskFileIndex.removeValue(forKey: taskId)
+                self.activeTaskBytes.removeValue(forKey: taskId)
+                self.status = "Error: HTTP \(http.statusCode) for \(localPath)"
+                // Surface the actual server message so the user sees *why* it failed
+                // (e.g., "Entry not found. Please check the file URL.").
+                let err = NSError(domain: "CoreMLLLM.ModelDownloader", code: http.statusCode,
+                                  userInfo: [
+                                    NSLocalizedDescriptionKey:
+                                        "HTTP \(http.statusCode) fetching \(url). " +
+                                        (snippet.isEmpty ? "" : "Server: \(snippet)"),
+                                  ])
+                self.isDownloading = false
+                self.downloadingModelId = nil
+                self.downloadContinuation?.resume(throwing: err)
+                self.downloadContinuation = nil
+            }
+            return
+        }
+
         let destFile = dest.appendingPathComponent(localPath)
 
         // Must move synchronously before this method returns
