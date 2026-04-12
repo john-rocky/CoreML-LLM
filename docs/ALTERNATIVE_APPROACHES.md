@@ -4,7 +4,34 @@ This is a decision log for alternative speedup directions we considered beyond t
 current EAGLE-3 + W8A8 path. Kept for posterity so future iteration has the full
 option set on record.
 
+**Primary scope: optimize WITHIN Gemma 4 E2B as the target model.** Techniques
+that replace or distill away from Gemma 4 are genuine alternatives but belong
+to separate product tracks (a "Turbo" SKU, an "ANE-native" SKU, etc.), not the
+main CoreML-LLM library recipe. They are kept in this doc for transparency but
+ranked separately below.
+
 Status legend: **S** = picked, **A** = viable next, **B** = parked, **C** = deferred, **D** = rejected.
+
+## Scope split
+
+### Inside Gemma 4 scope (main product)
+These are weight-surgery + fine-tune + runtime tricks that preserve Gemma 4 E2B
+as the model of record. They compose cleanly with the existing chunk+prefill
+pipeline and EAGLE-3 draft.
+- #2 Sliding-only (QLoRA recovery)
+- #3 MQA on full-attention (**SELECTED**, implemented)
+- MLA retrofit (MHA2MLA-style, separate doc)
+- StreamingLLM+QLoRA recovery (for ctx>2K quality)
+- DuoAttention / KIVI / W8A8 / EAGLE-3 / Q-batch / pre-alloc — all in `docs/SPEED_8K.md`
+
+### Outside Gemma 4 scope (separate product tracks)
+These change the model of record. Listed for completeness but they are new
+products, not optimizations of the current one.
+- #1 Distill Gemma 4 → 1B (needs ~$500-1k of A100 time)
+- #5a Distill Gemma 4 → smaller pretrained student (Qwen 0.5B, Llama 3.2 1B, SmolLM2 1.7B; ~$200-1k)
+- #5b Take existing small model + ANE surgery + QLoRA (~$20-50)
+- #5 From-scratch ANE-native model (~$30-50k, research-grant tier, not individually feasible)
+- #4 Cascade router (second model needed, can be any pretrained small)
 
 ---
 
@@ -70,18 +97,37 @@ Run a 300M token predictor first; on high-confidence tokens, commit from small m
 
 ---
 
-## #5. From-scratch ANE-native model
-Design architecture from ANE constraints upward: head_dim=128, all sliding, Conv2d projections, no QK-norm (cat-trick RMSNorm native). Train 100B tokens over 2-3 weeks.
+## #5. From-scratch ANE-native model — **not individually feasible**
+Design architecture from ANE constraints upward: head_dim=128, all sliding, Conv2d projections, no QK-norm (cat-trick RMSNorm native).
 
 | Axis | Value |
 |---|---|
-| Status | **C** — v1.0+ ambition; gate: after all Gemma-4 work is exhausted |
-| Cost | H100 cluster × 2-3 weeks, ~100B tokens |
-| Expected tok/s | 2K: 80+, 8K: 50+ (solo, no spec) |
-| Compound with EAGLE-3 | 2K: 150+, 8K: 100+ |
-| Risk | Highest-investment path, quality takes months to approach Gemma |
-| Differentiation | World's first truly ANE-native LLM — unique moat |
-| Why deferred | User directive: finish Gemma-4 ceiling first |
+| Status | **D** — rejected at our budget; documented as ideal for institutional backing |
+| Cost | 1T tokens on 8×H100 ≈ **$30-50k cloud** or 1 month of a shared A100 cluster |
+| Realistic alternative | #5a / #5b below |
+| Why rejected | Individual-project budget cannot absorb a ~$30k pretraining run. Re-open only with a research grant, sponsorship, or Google/HF compute credits. |
+
+## #5a. Distill Gemma 4 → 1B (separate product: "CoreML-LLM Turbo")
+Teacher = Gemma 4 E2B; Student = 1B (new-initialized or smaller pretrained).
+
+| Axis | Value |
+|---|---|
+| Status | **C** — deferred; "Turbo" SKU, not main library |
+| Cost | 5-10B tokens self-distill on A100 ≈ **$200-1k** |
+| Expected tok/s | 2K: 90-100, 8K: 45-55 solo; with EAGLE-3 × 2× |
+| Risk | Quality drop on multilingual + code |
+| Why deferred | Main product scope is Gemma 4 itself |
+
+## #5b. Existing small model + ANE surgery (separate product)
+Take Gemma 3 270M / Llama 3.2 1B / Qwen 2.5 0.5B, apply MQA + sliding-only + ANE-friendly ops, QLoRA-stabilize.
+
+| Axis | Value |
+|---|---|
+| Status | **C** — deferred; alternative SKU |
+| Cost | A100 × 1-2 days ≈ **$20-50** |
+| Expected tok/s | 8K: 60+ solo (smaller base, lower cap) |
+| Risk | Base capability lower than Gemma 4 |
+| Why deferred | Not the primary scope |
 
 ---
 
@@ -109,17 +155,24 @@ Realistic ANE overhead correction (×0.65) → **~60 tok/s @ 8K** under pure ANE
 
 ---
 
-## What "Gemma-4 ceiling" means (the gate before #5)
+## What "Gemma-4 ceiling" means
 
-Before we entertain a from-scratch model, we should have landed:
+The list of **things to exhaust inside Gemma 4 scope** before entertaining
+separate product tracks (#1/#5a/#5b). All within individual-project budget:
 
-- [ ] #3 MQA + QLoRA recovery
+- [ ] #3 MQA + QLoRA recovery ← implementation pushed, not yet executed
+- [ ] #2 Sliding-only with QLoRA recovery (fallback if MQA is insufficient)
 - [ ] W8A8 proper calibration (in flight, bench session)
-- [ ] DuoAttention head cap (Tier-2)
+- [ ] DuoAttention head cap (Tier-2, head identification ready)
 - [ ] EAGLE-3 deployed on iPhone (in training + conversion pipeline ready)
 - [ ] Pre-alloc masks + KV-share Q-batch in ChunkedEngine (bench session)
 - [ ] Prefill on A19 Pro GPU tensor cores (independent TTFT win)
-- [ ] StreamingLLM+QLoRA or MLA retrofit evaluated (true 8K quality recovery)
+- [ ] StreamingLLM+QLoRA for true 8K quality recovery
+- [ ] MLA retrofit via MHA2MLA (v0.6+ architectural upgrade, still within Gemma 4)
 
-When every item above is decided (shipped or rejected with data), `#5 from-scratch
-ANE-native` becomes the next frontier.
+**Once every item above is shipped-or-rejected-with-data**, further speed
+requires *leaving* Gemma 4 scope (#5a distill, #5b small-model swap), which is
+a separate product decision — not the main library's roadmap.
+
+From-scratch (#5) remains rejected at our budget unless institutional compute
+becomes available.
