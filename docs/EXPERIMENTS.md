@@ -68,11 +68,28 @@ See `docs/SPEED_8K.md` for the overall speed roadmap and tier assignments.
 - Calibration used 5 random samples. Quality regressed visibly on chat outputs.
 - **Reason shelved**: insufficient calibration. Superseded by `build_w8a8_proper.py`.
 
-### W8A8 (realistic calibration)  —  Prototype
+### W8A8 (realistic calibration)  —  Rejected (2026-04-13)
 
 - File: `conversion/build_w8a8_proper.py`
 - Idea: collect real activation traces by running the INT4 model on 32+ prompts at positions 0..31, then quantize. Also provides a W4A8 fallback (INT4 palette weights + INT8 activations) which is more stable than full W8A8 in practice.
-- Status: runs end-to-end on chunk2 (the 8K bottleneck). Needs: (1) full multi-chunk validation, (2) end-to-end quality check vs FP16 reference on a held-out prompt set, (3) `ChunkedEngine.swift` wiring for A8 I/O. This is the next lever planned for v0.6.
+- Outcome: Mac Studio M4 Max compiles and runs but **0% speedup** (ANE still runs FP16 internally); iPhone 17 Pro **`ANECCompile() FAILED`** — the `quantize`/`dequantize` MIL ops that `coremltools.optimize.coreml.linear_quantize_activations` inserts are not compilable by the iPhone ANE compiler. See `docs/SPEED_8K.md §1 A2 / Tier D`. No INT8 path reaches ANE on iOS 26 / coremltools 9.0.
+- Side finding: `linear_quantize_activations` leaks ~1 temp `.mlpackage` per calibration op-group (tied to `atexit` rather than `__del__`), ~38 GB per Gemma 4 E2B chunk2 calibration run. Fillable disk. Worth filing upstream if anyone revives this path.
+
+### W2A16 palettization (2-bit, post-training)  —  Rejected (2026-04-13)
+
+- File: `conversion/build_flash.py --nbits 2`
+- Idea: Apple's own 3.18B ships W2 palettized weights (per Foundation Models 2025 tech report). Reduce weight bandwidth 8× vs FP16 (2× vs INT4). Post-training palettization via `OpPalettizerConfig(nbits=2, granularity="per_grouped_channel", group_size=32)`. Expected ×1.4–2.0 decode speedup from bandwidth reduction.
+- Size: chunk total **546 MB** (vs 1,091 MB INT4 = exactly 50%). Conversion succeeds, no compile errors.
+- Quality: **complete gibberish**. Multilingual garbage tokens, zero coherent output on 3 test prompts (France capital, photosynthesis, haiku). Tested via `conversion/smoke_w2_quality.py` with real INT8 embeddings + RoPE, autoregressive generation on Mac CPU.
+- **Root cause**: 4 codewords per group (2-bit) has insufficient representational capacity for post-training palettization. Apple sustains quality at W2 via **QAT (Quality-Aware Training)** — their shipping recipe includes quantization-aware fine-tuning, not post-training compression. Post-training W2 is not viable without QAT (days of GPU training).
+
+### W3A16 palettization (3-bit, post-training)  —  Rejected (2026-04-13)
+
+- File: `conversion/build_flash.py --nbits 3`
+- Idea: 8 codewords per group might survive post-training where 4 did not. Weight size = 75% of INT4.
+- Size: chunk total **818 MB** (vs 1,091 MB INT4 = 75%).
+- Quality: **still gibberish**, though pattern differs from W2 — repetitive underscore-separated fragments instead of multilingual noise. Not usable.
+- **Conclusion**: post-training palettization quality cliff is between 3-bit and 4-bit for Gemma 4 E2B. Only ≥4-bit palettization (already shipping) works without QAT. Sub-4-bit requires QAT or knowledge distillation, which is a multi-day GPU effort outside current scope.
 
 ---
 

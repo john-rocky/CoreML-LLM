@@ -1,8 +1,8 @@
 # 8K Context Speed — Exhaustive Research & Roadmap (v3)
 
-**Status:** ctx=2048 ships at 31 tok/s · ctx=8192 = **14.9 tok/s on iPhone 17 Pro** (PR #7 per-chunk diag, 2026-04-13) · **chunk2 (7 full-attn layers) isolated as the 8K bottleneck at 20.7 ms / 2.96 ms-per-layer, 2× slower than sibling chunks (§0b)** · WFA rejected on quality · W8A8 rejected (ANE compile fails on iPhone) · EAGLE-3 benched on-device, not faster than baseline (distribution mismatch + commit re-runs decode; see `docs/EAGLE3_INTEGRATION_STATE.md`).
+**Status:** ctx=2048 ships at 31 tok/s · ctx=8192 = **14.9 tok/s on iPhone 17 Pro** (PR #7 per-chunk diag, 2026-04-13) · **chunk2 (7 full-attn layers) isolated as the 8K bottleneck at 20.7 ms / 2.96 ms-per-layer, 2× slower than sibling chunks (§0b)** · WFA rejected on quality · W8A8 rejected (ANE compile fails on iPhone) · **W2A16/W3A16 post-training rejected (gibberish; QAT required)** · EAGLE-3 benched on-device, not faster than baseline (distribution mismatch + commit re-runs decode; see `docs/EAGLE3_INTEGRATION_STATE.md`).
 **Goal:** 8K @ 50+ tok/s *without quality loss*, with a documented path to 80+.
-**Updated:** 2026-04-13. iPhone 8K baseline measured. Per-chunk diag shows chunk2 is the single optimization target. W8A8 confirmed dead on ANE.
+**Updated:** 2026-04-13. W2A16/W3A16 post-training palettization measured — complete quality collapse without QAT. See `docs/EXPERIMENTS.md`.
 
 
 ## Primary design principle: **ANE execution is the product**

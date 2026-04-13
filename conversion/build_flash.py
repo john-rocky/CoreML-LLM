@@ -26,7 +26,7 @@ W = 512
 fp16 = ct.converters.mil.mil.types.fp16
 
 
-def do_convert(model, sample_inputs, input_specs, output_names, save_path, quantize=True):
+def do_convert(model, sample_inputs, input_specs, output_names, save_path, quantize=True, nbits=4):
     t = time.time()
     with torch.no_grad():
         traced = torch.jit.trace(model, sample_inputs, check_trace=False)
@@ -44,9 +44,9 @@ def do_convert(model, sample_inputs, input_specs, output_names, save_path, quant
         t = time.time()
         cfg = ct.optimize.coreml.OptimizationConfig(
             global_config=ct.optimize.coreml.OpPalettizerConfig(
-                nbits=4, granularity="per_grouped_channel", group_size=32))
+                nbits=nbits, granularity="per_grouped_channel", group_size=32))
         mlmodel = ct.optimize.coreml.palettize_weights(mlmodel, cfg)
-        print(f"    palettized in {time.time()-t:.1f}s")
+        print(f"    palettized W{nbits} in {time.time()-t:.1f}s")
     if os.path.exists(save_path):
         shutil.rmtree(save_path)
     mlmodel.save(save_path)
@@ -58,6 +58,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=str, default="/tmp/flash-8k")
     parser.add_argument("--chunk-size", type=int, default=1024)
+    parser.add_argument("--nbits", type=int, default=4, choices=[2, 3, 4, 6, 8],
+                        help="palettization bit width (2=W2A16, 4=INT4 default)")
+    parser.add_argument("--chunk-only", type=int, default=None, choices=[1, 2, 3, 4],
+                        help="build only the specified chunk (for quick experiments)")
     args = parser.parse_args()
 
     import models.gemma4_swa_flash as flash_mod
@@ -140,26 +144,33 @@ def main():
             "kv13_k","kv13_v","kv14_k","kv14_v"])]
         return s, inp
 
-    # Build all 4 chunks
-    print(f"\n=== FlashChunk1 (L0-7) ===")
-    c1 = FlashChunk1(base).eval()
-    s1, in1, out1 = chunk1_io()
-    do_convert(c1, s1, in1, out1, f"{args.output}/chunk1.mlpackage")
+    # Build chunks
+    only = args.chunk_only
+    nb = args.nbits
 
-    print(f"\n=== FlashChunk2 (L8-14) ===")
-    c2 = FlashChunk2(base).eval()
-    s2, in2, out2 = chunk2_io()
-    do_convert(c2, s2, in2, out2, f"{args.output}/chunk2.mlpackage")
+    if only is None or only == 1:
+        print(f"\n=== FlashChunk1 (L0-7) W{nb} ===")
+        c1 = FlashChunk1(base).eval()
+        s1, in1, out1 = chunk1_io()
+        do_convert(c1, s1, in1, out1, f"{args.output}/chunk1.mlpackage", nbits=nb)
 
-    print(f"\n=== FlashChunk3 (L15-24 shared) ===")
-    c3 = FlashChunk3(base).eval()
-    s3, in3 = chunk34_io()
-    do_convert(c3, s3, in3, ["hidden_states_out"], f"{args.output}/chunk3.mlpackage")
+    if only is None or only == 2:
+        print(f"\n=== FlashChunk2 (L8-14) W{nb} ===")
+        c2 = FlashChunk2(base).eval()
+        s2, in2, out2 = chunk2_io()
+        do_convert(c2, s2, in2, out2, f"{args.output}/chunk2.mlpackage", nbits=nb)
 
-    print(f"\n=== FlashChunk4 (L25-34 + LM) ===")
-    c4 = FlashChunk4(base).eval()
-    s4, in4 = chunk34_io()
-    do_convert(c4, s4, in4, ["token_id","token_logit","hidden_states_out"], f"{args.output}/chunk4.mlpackage")
+    if only is None or only == 3:
+        print(f"\n=== FlashChunk3 (L15-24 shared) W{nb} ===")
+        c3 = FlashChunk3(base).eval()
+        s3, in3 = chunk34_io()
+        do_convert(c3, s3, in3, ["hidden_states_out"], f"{args.output}/chunk3.mlpackage", nbits=nb)
+
+    if only is None or only == 4:
+        print(f"\n=== FlashChunk4 (L25-34 + LM) W{nb} ===")
+        c4 = FlashChunk4(base).eval()
+        s4, in4 = chunk34_io()
+        do_convert(c4, s4, in4, ["token_id","token_logit","hidden_states_out"], f"{args.output}/chunk4.mlpackage", nbits=nb)
 
     print(f"\n{'='*60}")
     print(f"Flash Decoding models saved to {args.output}/")

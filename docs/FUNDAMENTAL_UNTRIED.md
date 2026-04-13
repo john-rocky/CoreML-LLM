@@ -201,7 +201,7 @@ the only host-side work is feeding the next token's embedding.
 
 ---
 
-## 3. W2A16 palettization — the quantization Apple actually ships, not W8A8
+## 3. ~~W2A16 palettization~~ — REJECTED (2026-04-13, post-training path)
 
 ### Observation that re-prices this
 The roadmap has chased **W8A8** as the path to ANE INT8 compute — and
@@ -236,31 +236,17 @@ W8 cuts it 2×. The 4× ratio between them is the real shipping gap.
   win, and for decode the smaller working set keeps more of the model
   in SRAM (Orion: 32 MB SRAM, working sets ≤ 24 MB stay at peak).
 
-### Numbers
-- Apple's own 3.18B at W2-QAT runs at parity quality with FP16 (per the
-  Foundation Models tech report). That's QAT — quality-aware training.
-- *Post-training* W2 palettization (no fine-tune) typically has 1–3 PPL
-  bump on standard benchmarks. Acceptable for the 3rd party path *if*
-  validated on LongBench.
-- **Wall-clock**: 1.4–2.0× decode at 8K is the conservative range, from
-  the bandwidth ratio. May be more if working set crosses the 24 MB
-  SRAM threshold.
+### Measured result (2026-04-13)
+- **W2 post-training: complete gibberish.** Multilingual garbage on all 3 test prompts (France capital, photosynthesis, haiku). 4 codewords/group has insufficient capacity.
+- **W3 post-training: also gibberish.** Repetitive underscore-separated fragments. 8 codewords/group still insufficient.
+- Conversion succeeds, sizes are exactly 50% (W2) and 75% (W3) of INT4 as expected. The problem is purely quality, not compilation.
+- Apple's "1–3 PPL bump" claim for post-training W2 does not hold for Gemma 4 E2B — the quality cliff is total (not gradual). Apple sustains W2 quality via **QAT** (quality-aware training during pretraining), which is a fundamentally different approach.
+- See `docs/EXPERIMENTS.md` for detailed write-up and `conversion/smoke_w2_quality.py` for the test harness.
 
-### Honest caveat
-- The 1.4–2.0× is bandwidth-bounded. If MLState (§2) lands first and
-  eliminates per-dispatch KV bandwidth, the W2 win shrinks to "weights
-  only" which is a smaller fraction of total bandwidth. **Sequence
-  matters: do W2 first, then re-measure before committing to MLState.**
-- Quality validation (LongBench v2 + held-out chat set) is mandatory
-  before shipping. If post-training W2 regresses too far, fall back to
-  W4 palettized (already shipping in `exporter.py`).
-
-### Cost
-- ~1-2 days: existing `_quantize_model` in `conversion/exporter.py`
-  already supports palettization at INT4. Lower the `n_bits` parameter
-  from 4 to 2, set `granularity="per_grouped_channel"`, calibrate group
-  size on Mac Studio first.
-- A/B quality run on held-out prompts.
+### What remains viable
+- **W2-QAT** could work but requires days of GPU fine-tuning — not a quick win, moved to Tier C (fine-tune required) in the roadmap.
+- **INT4 palettization (current, shipping)** remains the best post-training weight compression for ANE.
+- The bandwidth hypothesis (smaller weights → faster decode) is correct in principle, but post-training palettization cannot go below 4-bit without QAT.
 - 0 model surgery; same Gemma 4 architecture.
 
 ### Composability
@@ -362,25 +348,29 @@ to begin with. The early-exit boundary is *naturally* at L14 → L15.
 
 | Step | Action | Standalone gain | Cumulative @ 8K | Days |
 |---|---|---|---|---|
-| 0 | Bench current baseline (already done: 14.5 tok/s) | — | 14.5 | 0 |
-| 1 | **W2A16 palettization** — Apple's actual recipe | ×1.4–2.0 | 20–29 | 2 |
-| 2 | **MLState stateful KV** — re-evaluate on iOS 26 | ×1.3–2.0 | 26–58 | 4 |
-| 3 | **Q=K verifier** (G1 from V2 doc, prerequisite) | ×1.0 (enabling) | 26–58 | 2 |
-| 4 | **SuffixDecoding** on chat/agentic workloads | ×1.8–3.0 | 47–174 | 3 |
-| 5 | **LayerSkip on Gemma-4 KV-share boundary** (optional) | ×1.15–1.6 | 54–278 | 4 |
+| 0 | Bench current baseline (already done: 14.9 tok/s) | — | 14.9 | 0 |
+| ~~1~~ | ~~**W2A16 palettization**~~ | ~~×1.4–2.0~~ | — | — |
+| 1 | **MLState stateful KV** — re-evaluate on iOS 26 | ×1.3–2.0 | 19–30 | 4 |
+| 2 | **Q=K verifier** (G1 from V2 doc, prerequisite) | ×1.0 (enabling) | 19–30 | 2 |
+| 3 | **SuffixDecoding** on chat/agentic workloads | ×1.8–3.0 | 34–90 | 3 |
+| 4 | **LayerSkip on Gemma-4 KV-share boundary** (optional) | ×1.15–1.6 | 39–144 | 4 |
+
+**W2A16 removed from the stack** (2026-04-13): post-training W2 and W3 palettization both produce gibberish on Gemma 4 E2B. Apple's W2 quality depends on QAT (multi-day GPU training), which is outside current scope. See `docs/EXPERIMENTS.md`.
 
 Realistic wedge (multiplicative compounding × 0.65 ANE-overhead correction):
-- Conservative (W2 hits low, MLState 0×, Suffix 1.8×, no LayerSkip):
-  14.5 × 1.4 × 1.0 × 1.8 × 0.65 ≈ **24 tok/s @ 8K**
-- Median (W2 1.7×, MLState 1.4×, Suffix 2.3×, LayerSkip 1.3×):
-  14.5 × 1.7 × 1.4 × 2.3 × 1.3 × 0.65 ≈ **67 tok/s @ 8K** ← *crosses 50*
-- Optimistic (everything lands near upper bound): 100+ tok/s @ 8K
+- Conservative (MLState 0×, Suffix 1.8×, no LayerSkip):
+  14.9 × 1.0 × 1.8 × 0.65 ≈ **17 tok/s @ 8K**
+- Median (MLState 1.4×, Suffix 2.3×, LayerSkip 1.3×):
+  14.9 × 1.4 × 2.3 × 1.3 × 0.65 ≈ **41 tok/s @ 8K**
+- Optimistic (everything lands near upper bound): 70+ tok/s @ 8K
 
-**Critical sequencing**: W2A16 first (cheapest, validates the bandwidth
-hypothesis); MLState second (confirms or refutes the dispatch-overhead
-hypothesis); SuffixDecoding third (the speculative method that doesn't
-require EAGLE-3 to land first); LayerSkip last (highest risk, lowest
-training cost speculative).
+Without W2A16 in the stack, crossing 50 tok/s requires either MLState
+landing at the high end *or* EAGLE-3 composing with SuffixDecoding.
+
+**Critical sequencing**: MLState first (confirms or refutes the
+dispatch-overhead hypothesis — the biggest unknown); SuffixDecoding
+second (speculative method that doesn't require EAGLE-3 to land first);
+LayerSkip last (highest risk, lowest training cost speculative).
 
 ---
 
@@ -391,7 +381,8 @@ and `ALTERNATIVE_APPROACHES.md` rank differently:
 
 | Item | Old priority | New priority | Reason |
 |---|---|---|---|
-| W8A8 calibration | High (Tier D) | **Skip** | INT8 compute on ANE = FP16; only bandwidth wins, and W2A16 does that better |
+| W8A8 calibration | High (Tier D) | **Skip** | INT8 compute on ANE = FP16; only bandwidth wins. W2A16 post-training also rejected (gibberish). |
+| W2A16 post-training | High (§3) | **Skip** | Measured: complete gibberish at 2-bit and 3-bit. Requires QAT (Tier C, days of GPU). |
 | INT8 KV cache | Skip (already concluded) | Skip | Same root cause |
 | EAGLE-3 (in training) | High | **Still high** | Composes with SuffixDecoding as fallback. Lossless. |
 | MQA conversion | Selected | **Defer** | Helps full-attn bandwidth — but MLState may obviate this |
