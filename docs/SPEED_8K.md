@@ -53,8 +53,9 @@ Sorted by ANE feasibility × quality-preservation × ROI. All numbers are from c
 - **Idea**: per-channel for Key, per-token for Value, symmetric INT2. Zero fine-tune.
 - **Numbers (GPU)**: 2.6× memory, **2.35-3.47× throughput**, <2% accuracy loss on Llama/Mistral.
 - **ANE reality (measured)**: KV-only INT8 gives **~0 speedup on ANE** because the ANE compute pipeline is FP16-internal and CoreML dequantizes INT8 KV to FP16 before the matmul. The theoretical DRAM→SRAM bandwidth halving does NOT materialize as wall-clock speedup on ANE. Confirmed by our bench session.
-- **What DOES work on ANE**: full **W8A8** (weights + activations both INT8) opens the int8-int8 compute path on A17 Pro+. Partial INT8 (weights-only, KV-only) all stay on the FP16 path and give zero wall-clock gain.
-- **Conclusion**: skip KIVI on ANE. Invest in W8A8 calibration instead.
+- **What was hoped to work**: full **W8A8** (weights + activations both INT8) opens the int8-int8 compute path on A17 Pro+ per Apple's ResNet50 docs.
+- **What actually works** (2026-04-13 update): **W8A8 is ANE-incompatible on iPhone**. `coremltools.experimental.linear_quantize_activations` inserts quantize / dequantize MIL ops that the iPhone ANE compiler rejects — it's not a file-mixing or calibration issue, the op set itself is unsupported. Mac Studio M4 Max also showed 0% speedup (no INT8-INT8 fast path on M4). W8A8 is off the table for ANE-only decode on this device family. See `docs/EXPERIMENTS.md` for the incident record.
+- **Conclusion**: both KIVI and W8A8 are shelved on ANE. Decode speed has to come from structural rewrites (Q-batching, DuoAttention, TriForce) and speculative decoding (EAGLE-3, Mirror), not from quantizing beyond weights.
 - **Source**: [jy-yuan/KIVI](https://github.com/jy-yuan/KIVI) (GPU-focused)
 
 #### A3. TriForce — self-speculative with sparse KV draft (MLSys 2025)
@@ -100,7 +101,7 @@ Sorted by ANE feasibility × quality-preservation × ROI. All numbers are from c
 
 ### Tier D — Apple-specific levers
 
-- **W8A8 with real calibration** (128-512 Gemma-chat samples, seq=2048): opens ANE int8-int8 path. **1.3-1.6×**. Confirmed via Apple ResNet50.
+- ~~**W8A8 with real calibration**~~ — **ANE-incompatible, shelved 2026-04-13**. `linear_quantize_activations` emits quantize/dequantize MIL ops the iPhone ANE compiler refuses. Mac Studio M4 Max also measured 0% gain. Archived script under `conversion/build_w8a8_proper.py`; do not reintroduce without evidence the op set situation has changed in a future coremltools release.
 - **EnumeratedShapes {2048, 8192}**: single mlpackage, ANE-safe for all shapes. Ship "fast mode" (2K) + "long mode" (8K) under one binary.
 - **Prefix caching / persistent KV**: for repeated system prompts. **4-35× TTFT on cache hits at 1-4K, up to 136× at 32K** (safetensors-based, survives reboot). Not decode throughput but huge UX win.
 - **A19 Pro GPU tensor cores** (Metal Performance Primitives, Xcode 26.1+): 7.5 TFLOPS FP16 / 13.5 TOPS INT8. Argmax-bench: 2.5-3.1× vs A18 Pro GPU. **Route prefill (compute-bound) to GPU**; keep decode (bandwidth-bound) on ANE.
@@ -115,8 +116,8 @@ Sorted by ANE feasibility × quality-preservation × ROI. All numbers are from c
 |---|---|---|
 | Pre-alloc masks/RoPE | ✅ pure ANE | Swift-only buffer reuse, ANE graph unchanged |
 | KV-share Q-batching | ✅ pure ANE | Just widens matmul Q dim |
-| INT8 KV cache | ❌ measured no-op on ANE | CoreML dequantizes INT8 KV to FP16 before ANE compute. Bandwidth halving doesn't materialize. Use full W8A8 instead. |
-| W8A8 | ✅ pure ANE | THE Apple-documented int8-int8 fast path |
+| INT8 KV cache | ❌ no-op on ANE (confirmed 2x) | (a) CoreML dequantizes INT8 KV to FP16 before ANE compute → no bandwidth halving; (b) any coremltools quantize/dequantize op insertion hits the same ANE compiler rejection as W8A8. Shelved. |
+| W8A8 | ❌ ANE compiler rejects | `coremltools.experimental.linear_quantize_activations` inserts quantize/dequantize MIL ops that the iPhone ANE compiler doesn't support. Mac Studio M4 Max also shows 0% speedup. Not a calibration issue — the op set itself is unsupported. See EXPERIMENTS.md 2026-04-13. |
 | DuoAttention | ✅ pure ANE | head classification offline; runtime uses 2 static KV banks |
 | EAGLE-3 draft + verify | ✅ pure ANE | small decoder layer, EnumeratedShapes for K=1/3 |
 | StreamingLLM + QLoRA | ✅ pure ANE (after FT) | standard attention post-fine-tune |
@@ -134,21 +135,23 @@ Sorted by ANE feasibility × quality-preservation × ROI. All numbers are from c
 
 ## 2. Recommended stack for 8K — honest expected throughput
 
-Stacked sequentially (each factor applies to the current baseline):
+Stacked sequentially (each factor applies to the current baseline). Updated 2026-04-13 after W8A8 was ruled out on iPhone ANE:
 
 ```
              step-speedup    cumulative tok/s @ 8K
 baseline                     15
-+ pre-alloc masks      ×1.07     16
-+ KV-share Q-batch     ×1.08     17
-+ W8A8 proper calib    ×1.40     24     ← opens int8-int8 ANE compute path
-+ DuoAttention (A1)    ×1.50     36     ← quality preserved, training-free
-+ EAGLE-3 (in train)   ×2.00     72     ← fully lossless via verify
++ pre-alloc masks      ×1.03     15.5   ← measured micro-opt (was hoped ×1.07)
++ KV-share Q-batch     ×1.08     16.7
++ DuoAttention (A1)    ×1.50     25.0   ← quality preserved, needs 4-8h A100 calib
++ EAGLE-3 (retrain)    ×1.45     36.3   ← fully lossless via verify; retrain required
++ Mirror v1 (GPU draft) ×1.15    41.8
 ```
 
-**INT8 KV / KIVI removed from the stack**: measured ineffective on ANE (CoreML dequantizes to FP16 before ANE compute). Only full W8A8 opens the int8-int8 fast path.
+**Removed from the stack**:
+- **INT8 KV / KIVI** — both (a) measured ineffective on ANE (CoreML dequantizes to FP16 before ANE compute) AND (b) any coremltools quant/dequant op insertion hits ANE compiler rejection. Shelved for good on this device family.
+- **W8A8** — same ANE compiler rejection of quantize/dequantize MIL ops. Shelved.
 
-**Conservative pessimism adjustment (ANE overhead, non-linear compounding)**: multiply final by 0.70 → **~50 tok/s @ 8K** is the realistic landing zone.
+**Conservative pessimism adjustment (ANE overhead, non-linear compounding)**: multiply final by 0.70 → **~29 tok/s @ 8K** is the realistic landing zone without W8A8. Adding TriForce on top of EAGLE-3 (see alternative path below) pushes this to 50-70 tok/s.
 
 Alternative path replacing EAGLE-3 with TriForce hierarchical:
 ```
@@ -169,20 +172,18 @@ On Colab, 2 epochs × 30k corpus, acc0 tracking 52% @ 7%. Finish, deploy, measur
 
 > **Status snapshot 2026-04-12**: the `acc0 52% @ 7%` figure is from the most recent `train_eagle_draft.ipynb` / `train_eagle3_draft.ipynb` run (both untracked — the notebooks are still iterated in Colab). Before quoting this number elsewhere, open the latest notebook output cell and verify it still holds. The data-prep and hidden-state collection pipeline is tracked: `conversion/download_eagle_corpus.py` + `conversion/collect_eagle_hidden_states.py`. CoreML export of the draft model goes through `conversion/build_speculative.py` (modified, not yet merged). See `docs/EXPERIMENTS.md` for the abandoned Medusa comparison that motivated choosing EAGLE-3.
 
-### Parallel track P2 — ANE bandwidth reduction (training-free, fastest ROI)
-1. **Pre-allocate masks/umask/RoPE** in `ChunkedEngine.swift:303-309, 554-576` (trivial).
-2. **KV-share Q-batching** for L19/24/29/34 in `gemma4_swa_chunks.py:140` (~40 LoC).
-3. **INT8 KV cache** — quantize K (per-channel) and V (per-token) to INT8 at cache-write time, dequantize at cache-read. CoreML path: post-conversion surgery, keep KV I/O as int8 arrays. Validate quality vs FP16 baseline.
+### Parallel track P2 — ANE bandwidth reduction (training-free)
+1. **Pre-allocate masks/umask/RoPE** in `ChunkedEngine.swift`. Landed in PR #6; measured ~0% on 2K (mask-fill was already sub-ms). Kept for architectural cleanup and larger-ctx where it may still matter.
+2. **KV-share Q-batching** for the 4 full-attention shared layers (L19/24/29/34) in `gemma4_swa_chunks.py`. Fuses 4 Q projections + 4 attention matmuls into batched ops. ~40 LoC conversion-side change. Open.
+3. ~~**INT8 KV cache**~~ — **shelved 2026-04-13**, same ANE compiler rejection of quantize/dequantize ops as W8A8. Even the "no quant op" variant measures 0% on ANE (CoreML dequantizes to FP16 before compute).
 
 ### Parallel track P3 — DuoAttention head identification
 1. Port DuoAttention training script to Gemma 4 E2B (setup: BookSum data, ~4-8h on A100).
 2. Produce head classification (~50% retrieval, ~50% streaming).
 3. Modify `gemma4_swa_chunks.py` to use streaming-window KV for streaming heads while keeping full KV on retrieval heads. Per-layer per-head budget known at build time → ANE-compilable.
 
-### Parallel track P4 — W8A8 calibration pipeline
-1. Real prefill+decode traces on 128-512 Gemma-chat-formatted prompts, seq=2048.
-2. `coremltools.experimental.linear_quantize_activations` → then `linear_quantize_weights` (INT4 palettized) → final W4A8 mlpackage.
-3. Validate on Mac Studio before iPhone bring-up.
+### ~~Parallel track P4 — W8A8 calibration pipeline~~ (shelved 2026-04-13)
+**Reason**: `coremltools.experimental.linear_quantize_activations` inserts quantize/dequantize MIL ops the iPhone ANE compiler rejects. Mac Studio M4 Max also measured 0% gain. Not a calibration issue — the op set itself is unsupported. Scripts remain at `conversion/build_w8a8.py` / `build_w8a8_proper.py` for historical reference; do not reinvest without evidence a future coremltools release adds ANE support for these ops.
 
 ### Sequential track S1 — after P3 lands: TriForce or advanced sparse
 Once DuoAttention is in, consider TriForce as a natural extension (it uses the same head-wise KV idea at the sequence dimension). Hierarchical mode with EAGLE-3 is the upper bound.

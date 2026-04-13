@@ -68,11 +68,19 @@ See `docs/SPEED_8K.md` for the overall speed roadmap and tier assignments.
 - Calibration used 5 random samples. Quality regressed visibly on chat outputs.
 - **Reason shelved**: insufficient calibration. Superseded by `build_w8a8_proper.py`.
 
-### W8A8 (realistic calibration)  —  Prototype
+### W8A8 (realistic calibration)  —  Shelved 2026-04-13 (ANE incompatibility)
 
 - File: `conversion/build_w8a8_proper.py`
-- Idea: collect real activation traces by running the INT4 model on 32+ prompts at positions 0..31, then quantize. Also provides a W4A8 fallback (INT4 palette weights + INT8 activations) which is more stable than full W8A8 in practice.
-- Status: runs end-to-end on chunk2 (the 8K bottleneck). Needs: (1) full multi-chunk validation, (2) end-to-end quality check vs FP16 reference on a held-out prompt set, (3) `ChunkedEngine.swift` wiring for A8 I/O. This is the next lever planned for v0.6.
+- Idea: collect real activation traces by running the INT4 model on 32+ prompts at positions 0..31, then quantize. Also provides a W4A8 fallback (INT4 palette weights + INT8 activations).
+- **Dead-end**: `coremltools.experimental.linear_quantize_activations` inserts quantize / dequantize MIL ops that the **iPhone ANE compiler refuses**. This is not a calibration or file-mixing issue — the op set itself is unsupported on ANE on the A17/A18/A19 Pro generation as of 2026-04. Mac Studio M4 Max independently measures 0% speedup (no INT8-INT8 fast path on M4, different hardware story but same conclusion for us).
+- The 1.3-1.6× number in Apple's ResNet50 doc refers to a vision-model ANE path that doesn't generalize to transformer decoder graphs produced by coremltools.
+- Scripts are kept for historical reference and in case a future coremltools release adds ANE support for these ops. Do **not** reintroduce W8A8 into the default stack without re-verifying the op support situation.
+
+### INT8 KV cache  —  Shelved (same reason as W8A8)
+
+- The pathway of quantize-on-write / dequantize-on-read adds the same coremltools quant/dequant MIL ops that the iPhone ANE compiler rejects.
+- Even the naive "store INT8, convert to FP16 in Swift before the prediction call" variant shows 0% wall-clock gain — the attention op still runs in FP16 and CoreML dequantizes the I/O on each call.
+- Neither path is worth reviving on the current ANE stack. 8K decode speed has to come from Q-batching, DuoAttention, EAGLE-3, and the TriForce/Cascading sparse-attention variants instead.
 
 ---
 
