@@ -35,16 +35,18 @@ These can ship **today**. No draft model needed.
 
 | Priority | What | Gain (standalone) | Effort | Lossless | Source |
 |---|---|---|---|---|---|
-| **1** | **W2A16 palettization** (Apple's recipe, not W8A8) | ×1.4–2.0 | 2 days | near (quality gate) | FUND §3 |
-| **2** | **MLState stateful KV** — re-evaluate on iOS 26 | ×1.3–2.0 or 0 | 3–4 days | yes | FUND §2 |
+| ~~**1**~~ | ~~**W2A16 palettization**~~ | **REJECTED (2026-04-13)** — W2/W3 post-training = gibberish. QAT required. | — | — | FUND §3 |
+| ~~**2**~~ | ~~**MLState stateful KV**~~ | **REJECTED (2026-04-13)** — `coreml_update_state` fails on ANE (error -14) on both Mac and iPhone. GPU-only. Apple's own on-device LLMs use stateless I/O. | — | — | FUND §2 |
 | **3** | **MLP tile reshape (B,C,8,8)** — vision ANE trick | up to ×1.5 on FFN | 1 day + reconvert | exact | V3 §B2 |
 | **4** | **GQA broadcast matmul** — drop repeat_interleave | ×1.05–1.15 | 1 day + reconvert | exact | V2 §G3 |
 | **5** | **KV-share Q-batching** — stack L19/24/29/34 Q | ×1.08 | ~40 LoC | yes | SPEED P2.2 |
+| **5b** | **exp2 softmax** — ANE native exp2 instruction | 0–5% | 2 LoC + reconvert | exact | V3 §B1 |
 
-Items 1, 3, 4, 5 can be batched in a **single reconversion pass**.
+Items 3, 4, 5, 5b can be batched in a **single reconversion pass** (PR #17 ready).
 
-**Phase 1 stack (conservative)**: 14.5 × 1.4 × 1.3 × 1.2 × 1.08 × 0.65
-≈ **22 tok/s**. With MLState upper bound: **35 tok/s**.
+**Phase 1 stack (conservative)**: 14.5 × 1.2 × 1.10 × 1.08 × 0.65
+≈ **14 tok/s** (micro-opts alone are modest without MLState/W2).
+**Real path to 50+ tok/s now depends entirely on Phase 2 (speculative decoding).**
 
 ---
 
@@ -143,6 +145,8 @@ Upper bound: **~120 tok/s**.
 
 | What | Why | Date |
 |---|---|---|
+| W2A16/W3A16 post-training palettization | Complete gibberish. QAT required for sub-4-bit. | 2026-04-13 |
+| MLState stateful KV | `coreml_update_state` → error -14 on ANE (Mac + iPhone). GPU-only. | 2026-04-13 |
 | W8A8 (coremltools activation quant) | `ANECCompile() FAILED` on iPhone 17 Pro | 2026-04-13 |
 | INT8 KV cache | ANE dequantizes to FP16 before compute. 0 wall-clock gain. | 2026-04-12 |
 | Naive WFA (windowed full attention) | Quality regression past window. | 2026-04-10 |

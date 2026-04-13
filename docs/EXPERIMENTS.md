@@ -109,6 +109,15 @@ See `docs/SPEED_8K.md` for the overall speed roadmap and tier assignments.
 - Idea: 3 lightweight ResBlocks predict the next 3 tokens from the final hidden state; verify with target model.
 - **Reason shelved**: published Medusa acceptance on Gemma-class models is ~1.3 %, far below EAGLE-3's 50–70 %. Confirmed on a small internal run. Kept because `build_speculative.py` reuses the same verify-chunk plumbing for EAGLE-3.
 
+### MLState stateful KV cache  —  Rejected (2026-04-13)
+
+- Files: `conversion/models/gemma4_stateful_chunks.py`, `conversion/build_stateful.py`
+- Idea: use `coremltools.StateType` (iOS 18+) to declare KV cache as internal model state, eliminating per-dispatch IOSurface round-trip. Per FUNDAMENTAL_UNTRIED.md §2 / PRIORITY_ROADMAP.md Phase 1 item 2. Expected ×1.3–2.0 if dispatch overhead is the bottleneck.
+- Implementation: StatefulChunk2 (L8-14) with `kv_sliding` (10,1,512,512) and `kv_full` (4,1,8192,512) as `ct.StateType`. CoreML conversion succeeds, INT4 palettized, 134 MB.
+- **Result**: `error code: -14` ("Failed to build the model execution plan") on both Mac ANE and iPhone 17 Pro ANE. The `coreml_update_state` op does not generate a valid ANE execution plan.
+- **Root cause**: MLState is GPU-only on current hardware/OS. HuggingFace's WWDC24 Mistral CoreML reference explicitly states stateful KV is "excellent for GPUs on Mac computers" and ANE requires "additional adaptations." Apple's own on-device Llama 3.1 and smpanaro/coreml-llm-cli both use stateless explicit-I/O KV, not MLState. The `coreml_update_state` MIL op is not supported by the ANE compiler as of iOS 26 / coremltools 9.0.
+- **Conclusion**: dispatch-overhead hypothesis (FUNDAMENTAL_UNTRIED.md §0) remains valid as a bottleneck description, but MLState cannot address it on ANE. Alternative paths to reduce dispatch overhead: (1) chunk consolidation (4→2 chunks), (2) speculative decoding (amortize dispatch across multiple tokens per burst).
+
 ### TriForce / Quest (sparse KV retrieval)  —  Planned
 
 - See `docs/SPEED_8K.md §1 A3 / A4`. Requires block-static top-k redesign to stay on ANE. Not started.
