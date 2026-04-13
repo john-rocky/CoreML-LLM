@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax
+from ane_ops import MODEL_DTYPE, _LOG2_E, apply_rotary_pos_emb, ane_softmax
 
 from .gemma4 import Gemma4Model
 
@@ -46,8 +46,8 @@ def _flash_one_chunk(Q, K_c, V_c, mask_c, m_prev, l_prev, o_prev):
     m_c = s_c.max(dim=-1, keepdim=True).values.to(MODEL_DTYPE)
     m_new = torch.maximum(m_prev, m_c)
 
-    exp_prev = torch.exp((m_prev - m_new).to(MODEL_DTYPE)).to(MODEL_DTYPE)
-    exp_c = torch.exp((s_c - m_new).to(MODEL_DTYPE)).to(MODEL_DTYPE)
+    exp_prev = torch.exp2(((m_prev - m_new) * _LOG2_E).to(MODEL_DTYPE)).to(MODEL_DTYPE)
+    exp_c = torch.exp2(((s_c - m_new) * _LOG2_E).to(MODEL_DTYPE)).to(MODEL_DTYPE)
 
     l_c = exp_c.sum(dim=-1, keepdim=True).to(MODEL_DTYPE)
     l_new = (l_prev * exp_prev + l_c).to(MODEL_DTYPE)
@@ -60,25 +60,31 @@ def _flash_one_chunk(Q, K_c, V_c, mask_c, m_prev, l_prev, o_prev):
     return m_new, l_new, o_new
 
 
-def flash_decode_attention(Q, K_expanded, V_expanded, mask, num_chunks, num_heads, head_dim):
-    """Flash Decoding with unrolled loop. Uses torch.chunk() to avoid aten::Int.
+def flash_decode_attention(Q_grouped, K_b, V_b, mask, num_chunks, num_kv_heads, n_rep, head_dim):
+    """Flash Decoding with broadcast GQA.
 
-    num_chunks, num_heads, head_dim must be Python integer constants at trace time.
+    Uses 5D tensors so matmul broadcasts over the GQA rep dim instead of
+    materializing the full num_heads expansion.
+
+    Q_grouped: (1, num_kv, n_rep, 1, head_dim)
+    K_b:       (1, num_kv, 1, S, head_dim)  — broadcast on rep dim
+    V_b:       (1, num_kv, 1, S, head_dim)
+    mask:      (1, 1, 1, S)  — auto-broadcasts to 5D
+
+    num_chunks, num_kv_heads, n_rep, head_dim must be Python integer constants.
     """
-    # Use torch.chunk to split along seq dim — produces fixed-size tensors
-    K_chunks = torch.chunk(K_expanded, num_chunks, dim=2)
-    V_chunks = torch.chunk(V_expanded, num_chunks, dim=2)
+    K_chunks = torch.chunk(K_b, num_chunks, dim=3)   # split S along dim=3
+    V_chunks = torch.chunk(V_b, num_chunks, dim=3)
     mask_chunks = torch.chunk(mask, num_chunks, dim=-1)
 
-    # All shapes use explicit constants (no .shape access)
-    m = torch.full((1, num_heads, 1, 1), -65504.0, dtype=MODEL_DTYPE)
-    l = torch.zeros(1, num_heads, 1, 1, dtype=MODEL_DTYPE)
-    o = torch.zeros(1, num_heads, 1, head_dim, dtype=MODEL_DTYPE)
+    m = torch.full((1, num_kv_heads, n_rep, 1, 1), -65504.0, dtype=MODEL_DTYPE)
+    l = torch.zeros(1, num_kv_heads, n_rep, 1, 1, dtype=MODEL_DTYPE)
+    o = torch.zeros(1, num_kv_heads, n_rep, 1, head_dim, dtype=MODEL_DTYPE)
 
     for K_c, V_c, mask_c in zip(K_chunks, V_chunks, mask_chunks):
-        m, l, o = _flash_one_chunk(Q, K_c, V_c, mask_c, m, l, o)
+        m, l, o = _flash_one_chunk(Q_grouped, K_c, V_c, mask_c, m, l, o)
 
-    return o
+    return o.view(1, num_kv_heads * n_rep, 1, head_dim)
 
 
 def _run_layer_flash(
@@ -158,22 +164,24 @@ def _run_layer_flash(
             K_for_attn = kv_store_13_k
             V_for_attn = kv_store_13_v
 
-    # GQA expansion
-    K_expanded = K_for_attn.repeat_interleave(n_rep, dim=1)
-    V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
+    # GQA via broadcast matmul — avoids materializing the n_rep expansion.
+    q_grouped = q.view(1, num_kv_heads, n_rep, 1, hd)
+    K_b = K_for_attn.unsqueeze(2)   # (1, kv, 1, S, hd)
+    V_b = V_for_attn.unsqueeze(2)   # (1, kv, 1, S, hd)
 
     # ATTENTION: use flash decoding for full-attention, standard for sliding
     mask = causal_mask_full if is_full else causal_mask_sliding
     if is_full and full_attn_chunks > 1:
-        # Flash Decoding: split K-dim into chunks with online softmax
-        attn_output = flash_decode_attention(q, K_expanded, V_expanded, mask,
-                                             full_attn_chunks, num_heads, hd)
+        # Flash Decoding with broadcast GQA
+        attn_output = flash_decode_attention(q_grouped, K_b, V_b, mask,
+                                             full_attn_chunks, num_kv_heads, n_rep, hd)
     else:
-        # Standard attention (sliding layers, or full when ctx is small)
-        attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
+        # Standard attention with broadcast GQA
+        attn_weights = torch.matmul(q_grouped, K_b.transpose(-1, -2))  # (1,kv,rep,1,S)
         attn_weights = attn_weights + mask
         attn_weights = ane_softmax(attn_weights, dim=-1)
-        attn_output = torch.matmul(attn_weights, V_expanded)
+        attn_output = torch.matmul(attn_weights, V_b)  # (1, kv, rep, 1, hd)
+        attn_output = attn_output.view(1, num_heads, 1, hd)
 
     attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(1, 1, -1)
     attn_output = layer.self_attn["o_proj"](
@@ -182,14 +190,16 @@ def _run_layer_flash(
     attn_output = layer.post_attention_layernorm(attn_output)
     hidden_states = residual + attn_output
 
-    # MLP (unchanged)
+    # MLP — tile (B,C,1,1) → (B,C,8,8) for ANE PE utilization
     residual = hidden_states
     h = layer.pre_feedforward_layernorm(hidden_states)
-    x_mlp = h.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
+    x_mlp = h.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)  # (1, C, 1, 1)
+    x_mlp = x_mlp.expand(1, -1, 8, 8)  # (1, C, 8, 8) — fills ANE spatial PEs
     gate = layer.mlp["gate_proj"](x_mlp)
     up = layer.mlp["up_proj"](x_mlp)
     gate = F.gelu(gate, approximate="tanh")
-    mlp_out = layer.mlp["down_proj"](gate * up)
+    mlp_out = layer.mlp["down_proj"](gate * up)  # (1, C, 8, 8)
+    mlp_out = mlp_out[:, :, :1, :1]  # back to (1, C, 1, 1)
     hidden_states = mlp_out.squeeze(2).permute(0, 2, 1)
     hidden_states = layer.post_feedforward_layernorm(hidden_states)
     hidden_states = residual + hidden_states

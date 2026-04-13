@@ -21,6 +21,10 @@ import torch.nn.functional as F
 
 MODEL_DTYPE = torch.float16
 
+# log2(e) = 1/ln(2). Used for exp2-based softmax: exp(x) = exp2(x * log2(e)).
+# ANE has a native EXP2 instruction but not EXP.
+_LOG2_E = 1.4426950408889634
+
 
 class ANERMSNorm(nn.Module):
     """RMSNorm optimized for Apple Neural Engine.
@@ -156,14 +160,15 @@ def apply_rotary_pos_emb(
 def ane_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Numerically stable softmax using only ANE-friendly primitives.
 
-    Avoids the softmax op entirely: max, sub, exp, sum, div.
-    All casts explicit to prevent PyTorch fp16→fp32 auto-upcast in torch.exp.
+    Avoids the softmax op entirely: max, sub, exp2, sum, div.
+    Uses exp2(x * log2(e)) instead of exp(x) — ANE has a native EXP2
+    instruction but not EXP. Mathematically identical: exp(x) = 2^(x/ln2).
+    All casts explicit to prevent PyTorch fp16→fp32 auto-upcast.
     """
-    # Force fp16 throughout; torch.exp auto-upcasts without this.
     x = x.to(MODEL_DTYPE)
     x_max = x.max(dim=dim, keepdim=True).values.to(MODEL_DTYPE)
     x_shifted = (x - x_max).to(MODEL_DTYPE)
-    exp_x = torch.exp(x_shifted).to(MODEL_DTYPE)
+    exp_x = torch.exp2((x_shifted * _LOG2_E).to(MODEL_DTYPE)).to(MODEL_DTYPE)
     exp_sum = exp_x.sum(dim=dim, keepdim=True).to(MODEL_DTYPE)
     return (exp_x / exp_sum).to(MODEL_DTYPE)
 
