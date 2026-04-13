@@ -119,6 +119,21 @@ See `docs/SPEED_8K.md` for the overall speed roadmap and tier assignments.
 
 ---
 
+## MLComputePlan silent-fallback audit  —  Measured (2026-04-13)
+
+- File: `Sources/CoreMLLLM/ComputePlanAudit.swift`
+- Idea: use `MLComputePlan.deviceUsage(for:)` (iOS 17+) to walk every MIL op in chunk1-4 and identify any op whose preferred device is not Neural Engine. Per UNEXPLORED_APPROACHES_V2.md §G2 / PRIORITY_ROADMAP.md Phase 0a.
+- **Result on iPhone 17 Pro (8K chunks)**:
+  - **chunk1 (L0-7)**: 0 compute ops on CPU/GPU. All matmul/conv/softmax/attention on ANE.
+  - **chunk2 (L8-14)**: 0 compute ops on CPU/GPU. Same.
+  - **chunk3 (L15-24)**: 0 compute ops on CPU/GPU. 1 `identity` on unknown (no-op).
+  - **chunk4 (L25-34 + LM head)**: **8 compute ops on CPU** — the entire `InModelArgmax` tail: `mul` (×2), `tanh`, `squeeze` (×2), `reduce_argmax`, `expand_dims`, `gather_along_axis`. Total estimated cost = 0.0028. This is the tanh-based softargmax + gather pipeline from `ane_ops.py::InModelArgmax`.
+  - All `constexpr_lut_to_dense` (INT4 depalettization) and `const` ops reported as "unknown" device — these are weight-loading ops that run once at model load, not per decode step.
+- **Interpretation**: the only per-step CPU fallback is chunk4's argmax tail (~8 ops, ~0.5-2 ms ANE↔CPU round-trip). chunk1-3 are 100% ANE. This confirms the dispatch-overhead hypothesis from FUNDAMENTAL_UNTRIED.md §0: the bottleneck is not individual ops falling to CPU, but the 4× per-step IOSurface round-trip between chunks.
+- **Actionable**: (1) InModelArgmax CPU fallback is small but fixable — rewrite to ANE-compatible ops or accept the ~1-3% cost. (2) No other compute ops need fixing. (3) MLState (stateful KV to eliminate IOSurface round-trips) remains the highest-leverage next step.
+
+---
+
 ## Vocabulary pruning  —  Abandoned
 
 - File: `conversion/prune_vocab.py`

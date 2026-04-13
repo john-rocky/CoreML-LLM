@@ -20,12 +20,13 @@ Run these **now**, before any speculative or conversion work. They either
 
 | # | What | Gain | Effort | Source |
 |---|---|---|---|---|
-| **0a** | **MLComputePlan audit** — print per-op device for each chunk | diagnostic (0–25%) | 0.5 day Swift | V2 §G2 |
+| ~~**0a**~~ | ~~**MLComputePlan audit**~~ | **DONE (2026-04-13)** — chunk1-3 = 100% ANE. chunk4 = 8 CPU ops in InModelArgmax tail (cost ~0.003, ~1-3% of step). No hidden CPU/GPU fallback on compute ops. **Dispatch-overhead hypothesis confirmed.** | — | V2 §G2, EXPERIMENTS.md |
 | **0b** | **ANE pipeline prewarming** — 4× dummy predictions at load | first-token fix | 10 LoC Swift | V3 §B4 |
 | **0c** | **exp2 softmax** — replace torch.exp → torch.exp2 (ANE native) | 0–5% free | 2 LoC + reconvert | V3 §B1 |
 
-After 0a: if fallback ops found, fix them before proceeding. This alone
-could deliver 5–25%.
+0a result: no compute-op fallback to fix. The 5–25% "if fallback found"
+scenario did not materialize. Bottleneck is confirmed as 4× per-step
+dispatch overhead, not per-op device placement. **MLState is the lever.**
 
 ---
 

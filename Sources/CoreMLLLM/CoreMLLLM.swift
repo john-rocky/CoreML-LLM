@@ -116,6 +116,10 @@ public final class CoreMLLLM: @unchecked Sendable {
             onProgress?("Loading chunks (first run = ANE compile, can take 1-2 min)...")
             llm.chunkedEngine = try await ChunkedEngine.load(
                 from: directory, config: config, computeUnits: computeUnits)
+            // MLComputePlan silent-fallback audit (§G2) — runs only when
+            // COMPUTE_PLAN_AUDIT env var or UserDefaults key is set.
+            await ComputePlanAudit.run(modelDirectory: directory,
+                                       computeUnits: computeUnits)
         } else {
             let mlConfig = MLModelConfiguration()
             mlConfig.computeUnits = computeUnits
