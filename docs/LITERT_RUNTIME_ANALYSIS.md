@@ -838,3 +838,168 @@ memcpy(last_verify_activations_.data(),
        hidden_size_in_bytes);
 has_valid_verify_activations_ = true;
 ```
+
+---
+
+## Appendix: ANE-Specific Optimization Opportunities
+
+Additional findings from deep-dive into LiteRT patterns mapped to Apple Neural
+Engine constraints. Ordered by estimated ROI.
+
+### Tier S — High Impact, Implementable Now
+
+#### S1. INT8 KV Cache (Bandwidth 50% Reduction)
+
+**iOS 26 natively supports INT8 model I/O.** Verified via coremltools 9.0+:
+`adjust_io_to_supported_types.py` adds `types.int8` to supported I/O types for
+`target.iOS26`. iPhone 17 Pro runs iOS 26.
+
+**Bandwidth savings:**
+
+| Component | FP16 (current) | INT8 | Saving |
+|---|---|---|---|
+| chunk1 KV (7 SWA + 1 full) | 26.1 MB | 13.0 MB | 13.0 MB |
+| chunk2 KV (5 SWA + 2 full) | 38.8 MB | 19.4 MB | 19.4 MB |
+| Shared KV13 (read 2x) | 3.0 MB | 1.5 MB | 1.5 MB |
+| Shared KV14 (read 2x) | 31.3 MB | 15.6 MB | 15.6 MB |
+| **Total per decode step** | **99.1 MB** | **49.6 MB** | **49.5 MB (50%)** |
+
+**Implementation path:**
+1. Target `ct.target.iOS26` in conversion
+2. Add MIL `dequantize(input=kv_int8, scale=calibrated_scale)` before attention matmul
+3. Add MIL `quantize(input=new_kv, scale=calibrated_scale, output_dtype='int8')`
+   before KV output
+4. Scale is compile-time constant (per-head or per-layer, calibrated offline)
+5. Swift: allocate KV cache as `MLMultiArray(dataType: .int8)` instead of `.float16`
+6. IOSurface: use `kCVPixelFormatType_OneComponent8` (unsigned) with ZP=128, or
+   standard `MLMultiArray(.int8)` (may lose zero-copy)
+
+**Constraints:**
+- `scale` must be compile-time constant (no adaptive per-token quantization)
+- IOSurface zero-copy for int8 needs `kCVPixelFormatType_OneComponent8` (unsigned),
+  signed int8 may require standard MLMultiArray fallback
+- Google ships Gemma 4 with INT8 KV -- quality impact is acceptable
+
+**Expected impact:** chunk2 (bottleneck) drops from 20.7ms to ~13ms. Total decode
+from 67ms to ~52ms -> **~19 tok/s** (vs 14.9 baseline).
+
+#### S2. Chunk3+4 Merge (Dispatch 4->3)
+
+L15-34 are all Q-only KV-shared layers (no K/V projections). They are
+computationally lighter per layer than L0-14. A 20-layer merged chunk may
+compile on ANE despite the ~15-layer empirical threshold.
+
+**Why this merge is safe:**
+- No K/V projections -> fewer ops per layer
+- Q-only attention reads shared kv13/kv14 (no per-layer KV I/O)
+- Eliminates kv13/kv14 roundtrip between chunk3 and chunk4
+- Prototype exists: `gemma4_lite_chunks.py` LiteChunk2 (L15-34)
+
+**Current chunking reason:** ANE compiler hangs with 15+ layers per chunk
+(`gemma4_stateless_chunks.py` line 5). But Q-only layers generate fewer MIL ops
+than full KV layers, so the effective threshold may be higher.
+
+| Config | Dispatches | Estimated saving |
+|---|---|---|
+| Current (4 chunks) | 4 | baseline |
+| Merge chunk3+4 | 3 | ~5-10ms |
+| LiteChunk1+2 (2 chunks) | 2 | ~15-25ms (risky: 15 layers in chunk1) |
+
+**Expected impact:** ~5-10ms -> **~17 tok/s**.
+
+### Tier A — Medium Impact, Requires Implementation
+
+#### A1. Dispatch Pipelining (Pre-prepare Next Step Inputs)
+
+Google's "sampler-driven pipeline" pattern: the sampler prepares next step's
+input tensors (positions, masks) AND kicks off the next inference call, all
+without a CPU round-trip.
+
+**Current flow:**
+```
+ANE done -> CPU argmax -> prepare position/mask -> ANE dispatch (idle gap)
+```
+
+**Optimized flow:**
+```
+ANE done -> CPU argmax + parallel next-step input prep -> immediate ANE dispatch
+```
+
+Position is predictable (`current_step + 1`), mask is deterministic. These can
+be pre-computed during the current ANE execution. Only the token embedding
+depends on argmax output.
+
+**Implementation:** In `ChunkedEngine.swift`, pre-compute next step's position
+and mask tensors during the current decode. After argmax, only the embedding
+lookup is needed before the next dispatch.
+
+**Expected impact:** ~2-5ms/step.
+
+#### A2. Single-Buffer KV Cache (Eliminate copyBack)
+
+Google's `gpu_optimized_single_buffer_cache` pattern: same buffer for KV
+input and output, with `param_tensor` indicating write position. Eliminates
+the buffer swap and copy overhead.
+
+**Current overhead:** `ChunkedEngine.swift` does `copyBack` (memcpy) of the
+entire KV buffer after each chunk execution. At 8K context, this is ~99 MB
+of copies per step.
+
+**CoreML approach:** If the model uses `scatter_nd` or `dynamic_update_slice`
+to write KV in-place, the same `MLMultiArray` can serve as both input and
+output. No `copyBack` needed.
+
+**Risk:** CoreML's ANE backend may require separate input/output buffers
+(MLState was rejected for ANE -- error -14). Needs empirical testing.
+
+#### A3. Async ANE Dispatch
+
+Google uses event-based synchronization: all inference is async, CPU only
+blocks when reading output for sampling.
+
+**Verify our dispatch is truly async:** If `ChunkedEngine` calls
+`prediction(from:)` synchronously, the CPU thread blocks for the entire ANE
+execution. Using `prediction(from:options:completionHandler:)` or
+async/await allows CPU work (next-step prep) to overlap with ANE execution.
+
+### Tier B — Confirmed Not Viable or Already Done
+
+#### B1. 2-bit Palettization
+
+**Not viable without QAT.** Post-training 2-bit = quality collapse (proven
+in `EXPERIMENTS.md`). Apple's own benchmarks show 2-bit barely faster than
+4-bit on ANE (LUT decompression overhead). QAT requires multi-day GPU training.
+
+#### B2. SWA Window-Only KV Read
+
+**Already implemented.** SWA layers receive W=512-sized KV tensors, not full
+context. The bandwidth bottleneck is full-attention layers only -> addressed
+by INT8 KV (S1).
+
+#### B3. Compiled Model Caching
+
+**Verify `.mlmodelc` persistence.** Google caches compiled models (`.xnnpack_cache`).
+CoreML equivalently compiles to `.mlmodelc`. Ensure this is persisted across
+app launches -- recompiling from `.mlpackage` every time adds seconds to cold start.
+
+### Combined Impact Estimate
+
+```
+Baseline:                    67.0 ms/tok = 14.9 tok/s @8K
+
++ INT8 KV (S1):             ~52 ms = ~19 tok/s  (+28%)
++ chunk3+4 merge (S2):      ~47 ms = ~21 tok/s  (+41%)
++ dispatch pipeline (A1):   ~44 ms = ~23 tok/s  (+54%)
++ MTP K=3 @60% acceptance:  44ms / 2.8 tok = 15.7 ms/tok = ~64 tok/s
+
+Target: LiteRT-LM 56.5 tok/s -- achievable with S1 + S2 + MTP.
+```
+
+### Recommended Action Priority
+
+| # | Action | Gain | Effort | Dependency |
+|---|---|---|---|---|
+| 1 | INT8 KV cache prototype | +28% | 2-3 days (conversion + Swift) | iOS 26 target |
+| 2 | chunk3+4 merge on-device bench | +10% | 1 day (LiteChunk2 exists) | None |
+| 3 | MTP drafter integration | x2.8 | 3-4 days (Path A) | Blocker 2 resolved |
+| 4 | Dispatch pipelining | +5% | 0.5 day Swift | None |
