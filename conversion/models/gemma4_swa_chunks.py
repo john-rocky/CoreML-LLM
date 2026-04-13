@@ -458,30 +458,34 @@ def _run_layer_verify(
     layer, layer_idx, hidden_states, seq_len,
     cos_s, sin_s, cos_f, sin_f,
     causal_mask_full, causal_mask_sliding,
-    K_for_attn, V_for_attn,
+    update_indicator,  # (1, 1, ctx, K) for full-attn KV scatter; None for shared layers
+    K_sliding_slot, V_sliding_slot,  # (num_slots, 1, W, max_hd) or None
+    K_full_slot, V_full_slot,  # (num_slots, 1, ctx, max_hd) or None
     config, per_layer_combined,
+    kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v,
+    sliding_map, full_map,
 ):
-    """Run one layer in verify mode (Q=seq_len, read-only KV cache).
+    """Run one layer in verify mode (Q=seq_len) WITH KV write-through.
 
-    Unlike _run_layer_swa, this does NOT compute K/V projections or update
-    the KV cache. The cached K/V (already with k_norm, v_norm, RoPE applied)
-    are used directly for attention.
+    For non-shared layers (L0-14): computes K/V projections and writes
+    to the cache. Sliding layers shift by K; full layers scatter via
+    update_indicator. For shared layers (L15-34): reads kv13/kv14 only.
 
-    Args:
-        hidden_states: (1, seq_len, hidden)
-        seq_len: number of query positions (K draft tokens), fixed at trace time
-        cos_s/sin_s: (1, 1, seq_len, 256) sliding RoPE for K positions
-        cos_f/sin_f: (1, 1, seq_len, 512) full RoPE for K positions
-        causal_mask_full: (1, 1, seq_len, ctx)
-        causal_mask_sliding: (1, 1, seq_len, W)
-        K_for_attn: (1, kv_heads, cache_len, hd) from cache (RoPE+norm already applied)
-        V_for_attn: (1, kv_heads, cache_len, hd) from cache (v_norm already applied)
+    After verification, rejected tokens' KV entries remain in the cache
+    but are masked out by the causal mask in future decode steps — matching
+    Google's LiteRT approach (see docs/LITERT_RUNTIME_ANALYSIS.md §B1.3).
+
+    Returns:
+        hidden_states, K_sliding_slot, V_sliding_slot, K_full_slot, V_full_slot,
+        kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v
     """
     num_heads = config.num_attention_heads
     num_kv_heads = config.num_key_value_heads
     n_rep = num_heads // num_kv_heads
+    max_hd = config.global_head_dim
     hd = config.get_head_dim(layer_idx)
     is_full = config.is_full_attention(layer_idx)
+    is_kv_shared = config.is_kv_shared(layer_idx)
 
     residual = hidden_states
     h = layer.input_layernorm(hidden_states)
@@ -496,17 +500,95 @@ def _run_layer_verify(
     q = layer.self_attn["q_norm"](q)
     q = q.view(1, seq_len, num_heads, hd).permute(0, 2, 1, 3)
 
-    # RoPE on Q only (cached K already has RoPE applied)
+    # RoPE on Q
     if is_full:
         q, _ = apply_rotary_pos_emb(q, q, cos_f, sin_f)
     else:
         q, _ = apply_rotary_pos_emb(q, q, cos_s, sin_s)
 
-    # GQA expansion of cached K/V
+    K_sliding_out = K_sliding_slot
+    V_sliding_out = V_sliding_slot
+    K_full_out = K_full_slot
+    V_full_out = V_full_slot
+
+    if not is_kv_shared:
+        # Compute K/V for all K tokens
+        k = layer.self_attn["k_proj"](x)
+        k = k.view(1, num_kv_heads, hd, seq_len).permute(0, 1, 3, 2).to(MODEL_DTYPE)
+        v = layer.self_attn["v_proj"](x)
+        v = v.view(1, num_kv_heads, hd, seq_len).permute(0, 1, 3, 2).to(MODEL_DTYPE)
+
+        # K norm, V norm (per-token via batch dim merge)
+        k = k.permute(0, 2, 1, 3).contiguous().view(seq_len, num_kv_heads, hd)
+        k = layer.self_attn["k_norm"](k)
+        k = k.view(1, seq_len, num_kv_heads, hd).permute(0, 2, 1, 3)
+        v = v_norm(v)
+
+        # RoPE on K
+        if is_full:
+            _, k = apply_rotary_pos_emb(k, k, cos_f, sin_f)
+        else:
+            _, k = apply_rotary_pos_emb(k, k, cos_s, sin_s)
+
+        # Pad to max_hd if needed: (1, kv, K, hd) -> (1, kv, K, max_hd)
+        if hd < max_hd:
+            k_padded = F.pad(k, (0, max_hd - hd))
+            v_padded = F.pad(v, (0, max_hd - hd))
+        else:
+            k_padded, v_padded = k, v
+
+        if is_full:
+            fi = full_map[layer_idx]
+            # Scatter K entries into ctx positions via indicator matmul
+            # update_indicator: (1, 1, ctx, K), k_padded: (1, kv, K, max_hd)
+            k_scattered = torch.matmul(
+                update_indicator.expand(1, num_kv_heads, -1, -1),
+                k_padded)  # (1, kv, ctx, max_hd)
+            v_scattered = torch.matmul(
+                update_indicator.expand(1, num_kv_heads, -1, -1),
+                v_padded)
+            combined_mask = update_indicator.sum(dim=-1, keepdim=True)  # (1, 1, ctx, 1)
+            slot_k = K_full_slot[fi:fi+1]
+            slot_v = V_full_slot[fi:fi+1]
+            new_k = slot_k * (1 - combined_mask) + k_scattered
+            new_v = slot_v * (1 - combined_mask) + v_scattered
+            K_full_out = torch.cat([K_full_slot[:fi], new_k, K_full_slot[fi+1:]], dim=0)
+            V_full_out = torch.cat([V_full_slot[:fi], new_v, V_full_slot[fi+1:]], dim=0)
+            K_for_attn = K_full_out[fi:fi+1][..., :hd]
+            V_for_attn = V_full_out[fi:fi+1][..., :hd]
+        else:
+            si = sliding_map[layer_idx]
+            # Shift by K and append K new entries
+            slot_k = K_sliding_slot[si:si+1]
+            slot_v = V_sliding_slot[si:si+1]
+            new_k = torch.cat([slot_k[:, :, seq_len:, :], k_padded], dim=2)
+            new_v = torch.cat([slot_v[:, :, seq_len:, :], v_padded], dim=2)
+            K_sliding_out = torch.cat([K_sliding_slot[:si], new_k, K_sliding_slot[si+1:]], dim=0)
+            V_sliding_out = torch.cat([V_sliding_slot[:si], new_v, V_sliding_slot[si+1:]], dim=0)
+            K_for_attn = K_sliding_out[si:si+1][..., :hd]
+            V_for_attn = V_sliding_out[si:si+1][..., :hd]
+
+        # Store kv13/kv14 for sharing
+        if layer_idx == 13:
+            kv_store_13_k = K_sliding_out[si:si+1][..., :256]
+            kv_store_13_v = V_sliding_out[si:si+1][..., :256]
+        elif layer_idx == 14:
+            kv_store_14_k = K_full_out[fi:fi+1][..., :512]
+            kv_store_14_v = V_full_out[fi:fi+1][..., :512]
+    else:
+        # Shared: read from kv13 or kv14
+        if is_full:
+            K_for_attn = kv_store_14_k
+            V_for_attn = kv_store_14_v
+        else:
+            K_for_attn = kv_store_13_k
+            V_for_attn = kv_store_13_v
+
+    # GQA expansion
     K_expanded = K_for_attn.repeat_interleave(n_rep, dim=1)
     V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
 
-    # Attention: (1, heads, seq_len, hd) @ (1, heads, hd, cache_len) = (1, heads, seq_len, cache_len)
+    # Attention: (1, heads, seq_len, hd) @ (1, heads, hd, cache_len)
     mask = causal_mask_full if is_full else causal_mask_sliding
     attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
     attn_weights = attn_weights + mask
@@ -549,14 +631,16 @@ def _run_layer_verify(
     hidden_states = residual_pl + hidden_states
     hidden_states = hidden_states * layer.layer_scalar.to(MODEL_DTYPE)
 
-    return hidden_states
+    return (hidden_states, K_sliding_out, V_sliding_out, K_full_out, V_full_out,
+            kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v)
 
 
 class SWAVerifyChunk1(nn.Module):
-    """Verify version of chunk1 (L0-7): Q=K queries against read-only KV cache.
+    """Verify version of chunk1 (L0-7): Q=K with KV write-through.
 
-    No KV cache updates — just computes target predictions for K draft tokens.
-    Outputs hidden_states and per_layer_combined (needed by subsequent chunks).
+    Computes K/V projections and writes them to the cache (shift for sliding,
+    scatter for full-attn). Rejected entries are masked by causal mask later.
+    Outputs hidden_states, updated KV caches, and per_layer_combined.
     """
     START, END = 0, 8
 
@@ -598,41 +682,36 @@ class SWAVerifyChunk1(nn.Module):
         return (proj_normed + per_layer_raw) * self.per_layer_input_scale
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
-                per_layer_raw, cos_s, sin_s, cos_f, sin_f,
+                update_indicator, per_layer_raw, cos_s, sin_s, cos_f, sin_f,
                 K_sliding_in, V_sliding_in, K_full_in, V_full_in):
         config = self.config
         K = self.seq_len
         per_layer_combined = self._compute_ple(hidden_states, per_layer_raw)
 
+        kv13_k = kv13_v = kv14_k = kv14_v = None
+
         for local_idx in range(self.END - self.START):
             layer_idx = self.START + local_idx
-            is_full = config.is_full_attention(layer_idx)
-            hd = config.get_head_dim(layer_idx)
-
-            if is_full:
-                fi = self.full_map[layer_idx]
-                K_for_attn = K_full_in[fi].unsqueeze(0)[..., :hd]
-                V_for_attn = V_full_in[fi].unsqueeze(0)[..., :hd]
-            else:
-                si = self.sliding_map[layer_idx]
-                K_for_attn = K_sliding_in[si].unsqueeze(0)[..., :hd]
-                V_for_attn = V_sliding_in[si].unsqueeze(0)[..., :hd]
-
-            hidden_states = _run_layer_verify(
+            (hidden_states, K_sliding_in, V_sliding_in, K_full_in, V_full_in,
+             kv13_k, kv13_v, kv14_k, kv14_v) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states, K,
                 cos_s, sin_s, cos_f, sin_f,
                 causal_mask_full, causal_mask_sliding,
-                K_for_attn, V_for_attn,
+                update_indicator,
+                K_sliding_in, V_sliding_in, K_full_in, V_full_in,
                 config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                self.sliding_map, self.full_map,
             )
 
-        return hidden_states, per_layer_combined
+        return (hidden_states, K_sliding_in, V_sliding_in,
+                K_full_in, V_full_in, per_layer_combined)
 
 
 class SWAVerifyChunk2(nn.Module):
-    """Verify version of chunk2 (L8-14): Q=K, read-only KV cache.
+    """Verify version of chunk2 (L8-14): Q=K with KV write-through.
 
-    Extracts kv13/kv14 from the cache inputs (needed by chunks 3-4).
+    Writes K/V for all K positions. Extracts updated kv13/kv14 for chunks 3-4.
     """
     START, END = 8, 15
 
@@ -644,45 +723,37 @@ class SWAVerifyChunk2(nn.Module):
         self.sliding_map, self.full_map = _layer_kv_map(self.START, self.END, model.config)
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
-                per_layer_combined, cos_s, sin_s, cos_f, sin_f,
+                update_indicator, per_layer_combined, cos_s, sin_s, cos_f, sin_f,
                 K_sliding_in, V_sliding_in, K_full_in, V_full_in):
         config = self.config
         K = self.seq_len
 
-        # Extract kv13/kv14 from existing cache (read-only)
-        # L13 sliding slot = sliding_map[13], L14 full slot = full_map[14]
-        kv13_k = K_sliding_in[self.sliding_map[13]].unsqueeze(0)[..., :256]
-        kv13_v = V_sliding_in[self.sliding_map[13]].unsqueeze(0)[..., :256]
-        kv14_k = K_full_in[self.full_map[14]].unsqueeze(0)[..., :512]
-        kv14_v = V_full_in[self.full_map[14]].unsqueeze(0)[..., :512]
+        kv13_k = kv13_v = kv14_k = kv14_v = None
 
         for local_idx in range(self.END - self.START):
             layer_idx = self.START + local_idx
-            is_full = config.is_full_attention(layer_idx)
-            hd = config.get_head_dim(layer_idx)
-
-            if is_full:
-                fi = self.full_map[layer_idx]
-                K_for_attn = K_full_in[fi].unsqueeze(0)[..., :hd]
-                V_for_attn = V_full_in[fi].unsqueeze(0)[..., :hd]
-            else:
-                si = self.sliding_map[layer_idx]
-                K_for_attn = K_sliding_in[si].unsqueeze(0)[..., :hd]
-                V_for_attn = V_sliding_in[si].unsqueeze(0)[..., :hd]
-
-            hidden_states = _run_layer_verify(
+            (hidden_states, K_sliding_in, V_sliding_in, K_full_in, V_full_in,
+             kv13_k, kv13_v, kv14_k, kv14_v) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states, K,
                 cos_s, sin_s, cos_f, sin_f,
                 causal_mask_full, causal_mask_sliding,
-                K_for_attn, V_for_attn,
+                update_indicator,
+                K_sliding_in, V_sliding_in, K_full_in, V_full_in,
                 config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                self.sliding_map, self.full_map,
             )
 
-        return hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+        return (hidden_states, K_sliding_in, V_sliding_in,
+                K_full_in, V_full_in,
+                kv13_k, kv13_v, kv14_k, kv14_v)
 
 
 class SWAVerifyChunk3(nn.Module):
-    """Verify version of chunk3 (L15-24): Q=K, shared KV from kv13/kv14."""
+    """Verify version of chunk3 (L15-24): Q=K, shared KV from kv13/kv14.
+
+    All layers are KV-shared — no cache writes. Just reads kv13/kv14.
+    """
     START, END = 15, 25
 
     def __init__(self, model: Gemma4Model, seq_len: int):
@@ -699,19 +770,16 @@ class SWAVerifyChunk3(nn.Module):
 
         for local_idx in range(self.END - self.START):
             layer_idx = self.START + local_idx
-            is_full = config.is_full_attention(layer_idx)
-
-            if is_full:
-                K_for_attn, V_for_attn = kv14_k, kv14_v
-            else:
-                K_for_attn, V_for_attn = kv13_k, kv13_v
-
-            hidden_states = _run_layer_verify(
+            (hidden_states, _, _, _, _,
+             _, _, _, _) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states, K,
                 cos_s, sin_s, cos_f, sin_f,
                 causal_mask_full, causal_mask_sliding,
-                K_for_attn, V_for_attn,
+                None,  # no update_indicator for shared layers
+                None, None, None, None,
                 config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                {}, {},  # empty maps — shared layers don't index into slots
             )
 
         return hidden_states
@@ -720,7 +788,7 @@ class SWAVerifyChunk3(nn.Module):
 class SWAVerifyChunk4(nn.Module):
     """Verify version of chunk4 (L25-34): Q=K, shared KV + norm + lm_head.
 
-    Outputs per-position token IDs (1, K) as int32.
+    Outputs per-position token IDs (1, K) and hidden_states for MTP carry state.
     """
     START, END = 25, 35
 
@@ -743,19 +811,15 @@ class SWAVerifyChunk4(nn.Module):
 
         for local_idx in range(self.END - self.START):
             layer_idx = self.START + local_idx
-            is_full = config.is_full_attention(layer_idx)
-
-            if is_full:
-                K_for_attn, V_for_attn = kv14_k, kv14_v
-            else:
-                K_for_attn, V_for_attn = kv13_k, kv13_v
-
-            hidden_states = _run_layer_verify(
+            (hidden_states, _, _, _, _,
+             _, _, _, _) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states, K,
                 cos_s, sin_s, cos_f, sin_f,
                 causal_mask_full, causal_mask_sliding,
-                K_for_attn, V_for_attn,
+                None, None, None, None, None,
                 config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                {}, {},
             )
 
         # Final norm + LM head: operates per-token (1, K, hidden)
@@ -766,4 +830,5 @@ class SWAVerifyChunk4(nn.Module):
             logits = torch.tanh(logits / self.softcap) * self.softcap
         # Per-position argmax
         token_ids = torch.argmax(logits, dim=-1).to(torch.int32)  # (1, K)
-        return token_ids
+        # Return hidden_states for MTP drafter carry state
+        return token_ids, hidden_states

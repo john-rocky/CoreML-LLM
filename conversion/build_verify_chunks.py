@@ -215,13 +215,14 @@ def main():
     save_temp(decode1, f"{tmp}/chunk1_decode.mlpackage")
     del decode1
 
-    # -- Verify Q=K --
-    print(f"\n  [verify_qK] K={K}")
+    # -- Verify Q=K (write-through) --
+    print(f"\n  [verify_qK] K={K} (write-through)")
     vc1 = SWAVerifyChunk1(base, seq_len=K).eval()
     vs1 = (
         torch.zeros(1, K, hidden, dtype=torch.float16),
         torch.zeros(1, 1, K, CTX, dtype=torch.float16),
         torch.zeros(1, 1, K, W, dtype=torch.float16),
+        torch.zeros(1, 1, CTX, K, dtype=torch.float16),  # update_indicator
         torch.zeros(1, K, nlayers * pld, dtype=torch.float16),
         torch.zeros(1, 1, K, 256, dtype=torch.float16),
         torch.zeros(1, 1, K, 256, dtype=torch.float16),
@@ -236,17 +237,19 @@ def main():
         ct.TensorType(name="hidden_states",       shape=vs1[0].shape,  dtype=fp16),
         ct.TensorType(name="causal_mask_full",     shape=vs1[1].shape,  dtype=fp16),
         ct.TensorType(name="causal_mask_sliding",  shape=vs1[2].shape,  dtype=fp16),
-        ct.TensorType(name="per_layer_raw",        shape=vs1[3].shape,  dtype=fp16),
-        ct.TensorType(name="cos_s",                shape=vs1[4].shape,  dtype=fp16),
-        ct.TensorType(name="sin_s",                shape=vs1[5].shape,  dtype=fp16),
-        ct.TensorType(name="cos_f",                shape=vs1[6].shape,  dtype=fp16),
-        ct.TensorType(name="sin_f",                shape=vs1[7].shape,  dtype=fp16),
-        ct.TensorType(name="K_sliding_in",         shape=vs1[8].shape,  dtype=fp16),
-        ct.TensorType(name="V_sliding_in",         shape=vs1[9].shape,  dtype=fp16),
-        ct.TensorType(name="K_full_in",            shape=vs1[10].shape, dtype=fp16),
-        ct.TensorType(name="V_full_in",            shape=vs1[11].shape, dtype=fp16),
+        ct.TensorType(name="update_indicator",     shape=vs1[3].shape,  dtype=fp16),
+        ct.TensorType(name="per_layer_raw",        shape=vs1[4].shape,  dtype=fp16),
+        ct.TensorType(name="cos_s",                shape=vs1[5].shape,  dtype=fp16),
+        ct.TensorType(name="sin_s",                shape=vs1[6].shape,  dtype=fp16),
+        ct.TensorType(name="cos_f",                shape=vs1[7].shape,  dtype=fp16),
+        ct.TensorType(name="sin_f",                shape=vs1[8].shape,  dtype=fp16),
+        ct.TensorType(name="K_sliding_in",         shape=vs1[9].shape,  dtype=fp16),
+        ct.TensorType(name="V_sliding_in",         shape=vs1[10].shape, dtype=fp16),
+        ct.TensorType(name="K_full_in",            shape=vs1[11].shape, dtype=fp16),
+        ct.TensorType(name="V_full_in",            shape=vs1[12].shape, dtype=fp16),
     ]
-    vout1 = ["hidden_states_out", "per_layer_combined_out"]
+    vout1 = ["hidden_states_out", "K_sliding_out", "V_sliding_out",
+             "K_full_out", "V_full_out", "per_layer_combined_out"]
     verify1 = trace_and_convert(vc1, vs1, vin1, vout1, quantize=quantize)
     save_temp(verify1, f"{tmp}/chunk1_verify.mlpackage")
     del verify1
@@ -304,13 +307,14 @@ def main():
     save_temp(decode2, f"{tmp}/chunk2_decode.mlpackage")
     del decode2
 
-    # -- Verify Q=K --
-    print(f"\n  [verify_qK] K={K}")
+    # -- Verify Q=K (write-through) --
+    print(f"\n  [verify_qK] K={K} (write-through)")
     vc2 = SWAVerifyChunk2(base, seq_len=K).eval()
     vs2 = (
         torch.zeros(1, K, hidden, dtype=torch.float16),
         torch.zeros(1, 1, K, CTX, dtype=torch.float16),
         torch.zeros(1, 1, K, W, dtype=torch.float16),
+        torch.zeros(1, 1, CTX, K, dtype=torch.float16),  # update_indicator
         torch.zeros(1, K, nlayers * pld, dtype=torch.float16),
         torch.zeros(1, 1, K, 256, dtype=torch.float16),
         torch.zeros(1, 1, K, 256, dtype=torch.float16),
@@ -325,17 +329,20 @@ def main():
         ct.TensorType(name="hidden_states",       shape=vs2[0].shape,  dtype=fp16),
         ct.TensorType(name="causal_mask_full",     shape=vs2[1].shape,  dtype=fp16),
         ct.TensorType(name="causal_mask_sliding",  shape=vs2[2].shape,  dtype=fp16),
-        ct.TensorType(name="per_layer_combined",   shape=vs2[3].shape,  dtype=fp16),
-        ct.TensorType(name="cos_s",                shape=vs2[4].shape,  dtype=fp16),
-        ct.TensorType(name="sin_s",                shape=vs2[5].shape,  dtype=fp16),
-        ct.TensorType(name="cos_f",                shape=vs2[6].shape,  dtype=fp16),
-        ct.TensorType(name="sin_f",                shape=vs2[7].shape,  dtype=fp16),
-        ct.TensorType(name="K_sliding_in",         shape=vs2[8].shape,  dtype=fp16),
-        ct.TensorType(name="V_sliding_in",         shape=vs2[9].shape,  dtype=fp16),
-        ct.TensorType(name="K_full_in",            shape=vs2[10].shape, dtype=fp16),
-        ct.TensorType(name="V_full_in",            shape=vs2[11].shape, dtype=fp16),
+        ct.TensorType(name="update_indicator",     shape=vs2[3].shape,  dtype=fp16),
+        ct.TensorType(name="per_layer_combined",   shape=vs2[4].shape,  dtype=fp16),
+        ct.TensorType(name="cos_s",                shape=vs2[5].shape,  dtype=fp16),
+        ct.TensorType(name="sin_s",                shape=vs2[6].shape,  dtype=fp16),
+        ct.TensorType(name="cos_f",                shape=vs2[7].shape,  dtype=fp16),
+        ct.TensorType(name="sin_f",                shape=vs2[8].shape,  dtype=fp16),
+        ct.TensorType(name="K_sliding_in",         shape=vs2[9].shape,  dtype=fp16),
+        ct.TensorType(name="V_sliding_in",         shape=vs2[10].shape, dtype=fp16),
+        ct.TensorType(name="K_full_in",            shape=vs2[11].shape, dtype=fp16),
+        ct.TensorType(name="V_full_in",            shape=vs2[12].shape, dtype=fp16),
     ]
-    vout2 = ["hidden_states_out", "kv13_k", "kv13_v", "kv14_k", "kv14_v"]
+    vout2 = ["hidden_states_out", "K_sliding_out", "V_sliding_out",
+             "K_full_out", "V_full_out",
+             "kv13_k", "kv13_v", "kv14_k", "kv14_v"]
     verify2 = trace_and_convert(vc2, vs2, vin2, vout2, quantize=quantize)
     save_temp(verify2, f"{tmp}/chunk2_verify.mlpackage")
     del verify2
@@ -460,7 +467,8 @@ def main():
     vc4 = SWAVerifyChunk4(base, seq_len=K).eval()
     s4_verify = shared_kv_samples(K)
     in4_verify = shared_kv_inputs(K)
-    verify4 = trace_and_convert(vc4, s4_verify, in4_verify, ["token_ids"],
+    verify4 = trace_and_convert(vc4, s4_verify, in4_verify,
+                                ["token_ids", "hidden_states_out"],
                                 quantize=quantize)
     save_temp(verify4, f"{tmp}/chunk4_verify.mlpackage")
     del verify4

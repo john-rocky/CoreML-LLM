@@ -71,6 +71,10 @@ final class ChunkedEngine {
             && verifyChunk3 != nil && verifyChunk4 != nil
     }
 
+    /// Hidden states from the last verify pass, at all K positions.
+    /// Used as MTP drafter carry state — extract at the last accepted position.
+    public private(set) var lastVerifyHiddenStates: MLMultiArray?
+
     // MARK: - Loading
 
     static func load(from directory: URL, config: ModelConfig,
@@ -613,17 +617,30 @@ final class ChunkedEngine {
         let maskFull = try makeVerifyCausalMask(startPos: startPosition, K: K, length: ctx)
         let maskSliding = try makeVerifySlidingMask(startPos: startPosition, K: K, W: W)
 
+        // Update indicator for full-attn KV scatter: (1, 1, ctx, K)
+        // Column k has 1.0 at position startPosition+k, 0.0 elsewhere
+        let updateIndicator = try MLMultiArray(shape: [1, 1, NSNumber(value: ctx), NSNumber(value: K)], dataType: .float16)
+        let indPtr = updateIndicator.dataPointer.bindMemory(to: UInt16.self, capacity: ctx * K)
+        memset(indPtr, 0, ctx * K * 2)
+        for k in 0..<K {
+            let pos = startPosition + k
+            if pos < ctx {
+                indPtr[pos * K + k] = 0x3C00  // 1.0 in float16
+            }
+        }
+
         // RoPE for K consecutive positions
         let cosS = try lookupRoPEBatch(table: cosSlidingTable, startPos: startPosition, K: K, dim: 256)
         let sinS = try lookupRoPEBatch(table: sinSlidingTable, startPos: startPosition, K: K, dim: 256)
         let cosF = try lookupRoPEBatch(table: cosFullTable, startPos: startPosition, K: K, dim: 512)
         let sinF = try lookupRoPEBatch(table: sinFullTable, startPos: startPosition, K: K, dim: 512)
 
-        // Verify chunk 1: read-only KV from kSliding1/vSliding1/kFull1/vFull1
+        // Verify chunk 1: write-through KV
         let out1 = try verifyChunk1!.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: hiddenIn),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
             "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+            "update_indicator": MLFeatureValue(multiArray: updateIndicator),
             "per_layer_raw": MLFeatureValue(multiArray: plRaw),
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
@@ -634,13 +651,18 @@ final class ChunkedEngine {
         ]))
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
-        // NOTE: no copyBack — KV cache is read-only in verify mode
+        // Copy back updated KV caches from verify
+        copyBack(out1, "K_sliding_out", into: kSliding1)
+        copyBack(out1, "V_sliding_out", into: vSliding1)
+        copyBack(out1, "K_full_out", into: kFull1)
+        copyBack(out1, "V_full_out", into: vFull1)
 
-        // Verify chunk 2: read-only KV, extracts kv13/kv14 from cache
+        // Verify chunk 2: write-through KV, outputs updated kv13/kv14
         let out2 = try verifyChunk2!.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h1),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
             "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+            "update_indicator": MLFeatureValue(multiArray: updateIndicator),
             "per_layer_combined": MLFeatureValue(multiArray: plc),
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
@@ -650,6 +672,11 @@ final class ChunkedEngine {
             "V_full_in": MLFeatureValue(multiArray: vFull2),
         ]))
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        // Copy back updated KV caches
+        copyBack(out2, "K_sliding_out", into: kSliding2)
+        copyBack(out2, "V_sliding_out", into: vSliding2)
+        copyBack(out2, "K_full_out", into: kFull2)
+        copyBack(out2, "V_full_out", into: vFull2)
         let kv13k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
         let kv13v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
         let kv14k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
@@ -670,10 +697,12 @@ final class ChunkedEngine {
         let h3 = try verifyChunk3!.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
             .featureValue(for: "hidden_states_out")!.multiArrayValue!
 
-        // Verify chunk 4: returns per-position token IDs (1, K)
+        // Verify chunk 4: returns per-position token IDs (1, K) + hidden_states
         var d4 = shared; d4["hidden_states"] = MLFeatureValue(multiArray: h3)
         let out4 = try verifyChunk4!.prediction(from: MLDictionaryFeatureProvider(dictionary: d4))
         let tokenIds = out4.featureValue(for: "token_ids")!.multiArrayValue!
+        // Store hidden_states for MTP drafter carry state
+        lastVerifyHiddenStates = out4.featureValue(for: "hidden_states_out")?.multiArrayValue
 
         // Extract K token IDs from (1, K) int32 output
         var result = [Int32]()
@@ -1053,9 +1082,9 @@ extension ChunkedEngine: SpeculativeTarget {
     }
 
     public func commitAccepted(_ tokens: [Int32]) throws {
-        for token in tokens {
-            _ = try predictStep(tokenID: Int(token), position: currentPosition)
-            currentPosition += 1
-        }
+        // Write-through: verify already wrote KV for all K positions.
+        // Rejected entries are masked out by causal mask in future steps.
+        // Just advance the position counter.
+        currentPosition += tokens.count
     }
 }
