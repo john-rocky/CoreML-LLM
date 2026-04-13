@@ -55,8 +55,15 @@ public final class CoreMLLLM: @unchecked Sendable {
     // Multi-turn: cache image features across turns
     private var cachedImageFeatures: MLMultiArray?
 
+    // MTP speculative decoding
+    private var mtpEngine: MtpSpeculativeEngine?
+    /// Toggle MTP speculation on/off for benchmarking.
+    public var mtpEnabled: Bool = true
+
     // Generation metrics
     public private(set) var tokensPerSecond: Double = 0
+    public var mtpAcceptanceRate: Double { mtpEngine?.acceptanceRate ?? 0 }
+    public var mtpTokensPerRound: Double { mtpEngine?.tokensPerRound ?? 0 }
 
     // MARK: - Public Types
 
@@ -134,6 +141,24 @@ public final class CoreMLLLM: @unchecked Sendable {
                 llm.monolithicModel = try MLModel(contentsOf: compiled, configuration: mlConfig)
             }
             llm.monolithicState = llm.monolithicModel?.makeState()
+        }
+
+        // MTP drafter (optional — enables speculative decoding)
+        let mtpCompiled = directory.appendingPathComponent("mtp_drafter.mlmodelc")
+        let mtpPkg = directory.appendingPathComponent("mtp_drafter.mlpackage")
+        let mtpURL: URL? = FileManager.default.fileExists(atPath: mtpCompiled.path) ? mtpCompiled
+            : FileManager.default.fileExists(atPath: mtpPkg.path) ? mtpPkg : nil
+        if let mtpURL, let engine = llm.chunkedEngine, engine.hasVerify {
+            onProgress?("Loading MTP drafter...")
+            do {
+                let drafterSource = try MtpDraftSource(
+                    modelURL: mtpURL, K: engine.verifyK)
+                llm.mtpEngine = MtpSpeculativeEngine(
+                    engine: engine, drafter: drafterSource)
+                print("[MTP] Drafter loaded (K=\(engine.verifyK))")
+            } catch {
+                print("[MTP] Failed to load drafter: \(error)")
+            }
         }
 
         // Vision model (optional, lazy loaded on first image)
@@ -390,21 +415,43 @@ public final class CoreMLLLM: @unchecked Sendable {
                         let startTime = CFAbsoluteTimeGetCurrent()
                         var tokenCount = 0
                         let maxDecode = min(ctxLimit - engine.currentPosition, maxTokens)
+                        let specEngine = mutableSelf.mtpEnabled ? mutableSelf.mtpEngine : nil
+                        specEngine?.reset()
 
-                        for _ in 0..<maxDecode {
-                            if eosIDs.contains(nextID) { break }
+                        var nid = Int32(nextID)
+                        while tokenCount < maxDecode {
+                            if eosIDs.contains(Int(nid)) { break }
                             if engine.currentPosition >= ctxLimit { break }
-                            let text = mutableSelf.tokenizer.decode(tokens: [nextID])
-                            continuation.yield(text)
-                            tokenCount += 1
+
+                            if let se = specEngine, se.shouldSpeculate {
+                                let emitted = try autoreleasepool {
+                                    try se.speculateStep(nextID: &nid)
+                                }
+                                for tok in emitted {
+                                    if eosIDs.contains(Int(tok)) {
+                                        nid = tok
+                                        break
+                                    }
+                                    let text = mutableSelf.tokenizer.decode(tokens: [Int(tok)])
+                                    continuation.yield(text)
+                                    tokenCount += 1
+                                }
+                            } else {
+                                let text = mutableSelf.tokenizer.decode(tokens: [Int(nid)])
+                                continuation.yield(text)
+                                tokenCount += 1
+                                try autoreleasepool {
+                                    let next = try engine.predictStep(
+                                        tokenID: Int(nid), position: engine.currentPosition)
+                                    nid = Int32(next)
+                                }
+                                engine.currentPosition += 1
+                            }
+
                             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                             if elapsed > 0 { mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed }
-                            try autoreleasepool {
-                                nextID = try engine.predictStep(tokenID: nextID,
-                                                                 position: engine.currentPosition)
-                            }
-                            engine.currentPosition += 1
                         }
+                        nextID = Int(nid)
                     } else {
                         // Monolithic path
                         for (step, tid) in tokens.enumerated() {
@@ -452,6 +499,7 @@ public final class CoreMLLLM: @unchecked Sendable {
         } else {
             monolithicState = monolithicModel?.makeState()
         }
+        mtpEngine?.reset()
         tokensPerSecond = 0
     }
 

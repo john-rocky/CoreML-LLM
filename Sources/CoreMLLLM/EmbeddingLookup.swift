@@ -57,6 +57,32 @@ final class EmbeddingLookup {
         return result
     }
 
+    /// Look up embedding WITHOUT the global embedScale factor.
+    /// Used by MTP drafter which expects unscaled embeddings.
+    func lookupUnscaled(_ tokenID: Int, shape: [NSNumber]) throws -> MLMultiArray {
+        let result = try MLMultiArray(shape: shape, dataType: .float16)
+        let dstPtr = result.dataPointer.bindMemory(to: UInt16.self, capacity: dim)
+        data.withUnsafeBytes { rawPtr in
+            let int8Ptr = rawPtr.baseAddress!.assumingMemoryBound(to: Int8.self)
+                .advanced(by: tokenID * dim)
+            scales.withUnsafeBytes { scaleRaw in
+                let scalePtr = scaleRaw.baseAddress!.assumingMemoryBound(to: UInt16.self)
+                let rowScale = fp16ToF32(scalePtr[tokenID]) / 127.0
+                vDSP.convertElements(of: UnsafeBufferPointer(start: int8Ptr, count: dim),
+                                     to: &f32Buffer)
+                vDSP.multiply(rowScale, f32Buffer, result: &f32Buffer)
+                f32Buffer.withUnsafeBufferPointer { src in
+                    var srcBuf = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.baseAddress!),
+                                               height: 1, width: UInt(dim), rowBytes: dim * 4)
+                    var dstBuf = vImage_Buffer(data: UnsafeMutableRawPointer(dstPtr),
+                                               height: 1, width: UInt(dim), rowBytes: dim * 2)
+                    vImageConvert_PlanarFtoPlanar16F(&srcBuf, &dstBuf, 0)
+                }
+            }
+        }
+        return result
+    }
+
     /// Look up and return as raw float16 bit array (for PLE computation).
     func lookupRaw(_ tokenID: Int) -> [UInt16] {
         data.withUnsafeBytes { rawPtr in

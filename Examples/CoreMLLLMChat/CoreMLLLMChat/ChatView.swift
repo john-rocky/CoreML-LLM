@@ -66,6 +66,11 @@ struct ChatView: View {
                         Text(String(format: "%.1f tok/s", runner.tokensPerSecond))
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
+                        if runner.mtpAcceptanceRate > 0 {
+                            Text(String(format: "acc0=%.0f%%", runner.mtpAcceptanceRate * 100))
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
                         if !runner.isGenerating {
                             Text("(last)")
                                 .font(.caption2)
