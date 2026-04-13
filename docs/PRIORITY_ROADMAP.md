@@ -51,41 +51,43 @@ Items 3, 4, 5, 5b can be batched in a **single reconversion pass** (PR #17 ready
 
 ---
 
-## Phase 2 — Training-free speculative (EAGLE-3 不要, 1–2 weeks)
+## Phase 2 — EAGLE-3 speculative decoding (THE critical path)
 
-All produce candidate continuations consumed by one shared **Q=K
-verifier** (which Phase 2 also builds as prerequisite).
+EAGLE-3 is now the **only** path to 50+ tok/s. SuffixDecoding measured
+T1=18% on device — too low to be primary. Q=K verifier is built for
+EAGLE-3 first; other draft sources can reuse it later.
 
 | Priority | What | Gain | Effort | Source |
 |---|---|---|---|---|
-| **6** | **Q=K multi-function verifier** — prerequisite for all spec | enabling | 2 days | V2 §G1 |
-| **7** | **In-model top-K** — replace argmax with topk(8) | enabling | 0.5 day + reconvert | V2 §G5 |
-| **8** | **SuffixDecoding** — CPU-only draft from session history | ×1.8–3.0 (chat) | 2–3 days Swift | FUND §1 |
-| **9** | **SSSD** — trie n-gram cache, lighter than SuffixDecoding | ×1.5–2.9 | 2 days Swift | V3 §A2 |
-| **10** | **Token Recycling** — adjacency-matrix draft recycling | ×1.3–1.6 | 2 days Swift | V3 §A3 |
-| **11** | **Sequoia** — optimal tree topology for the verifier | +20–33% on any above | 1 day offline DP | V3 §A4 |
-| **12** | **Traversal Verification** — better token acceptance | +10–20% accepted | 0.5 day Swift | V3 §A5 |
+| **6** | **EAGLE-3 retrain** (custom Gemma4Model target) | fixes Blocker 1 | Colab 2-4h | EAGLE3_STATE |
+| **7** | **Q=K multi-function verifier** — prerequisite | enabling | 2 days | V2 §G1 |
+| **8** | **In-model top-K** — replace argmax with topk(8) | enabling | 0.5 day + reconvert | V2 §G5 |
+| **9** | **KV direct-write in commitAccepted** | fixes Blocker 2 | 1-2 days Swift | EAGLE3_STATE |
+| **10** | **Sequoia** — optimal tree topology for verifier | +20–33% | 1 day offline DP | V3 §A4 |
+| **11** | **Traversal Verification** — better acceptance | +10–20% | 0.5 day Swift | V3 §A5 |
 
-Items 8-10 are **interchangeable draft sources** feeding the same verifier
-(items 6-7). Union their candidates per step for maximum coverage. Items
-11-12 are **pure algorithmic boosts** on top of any speculative method.
+**EAGLE-3 target**: acc0 ≥ 50% against custom target → Q=K verify →
+KV direct-write → **40-60 tok/s @ 2K, 25-35 tok/s @ 8K**.
 
-**Phase 2 stack**: Phase 1 result × SuffixDecoding 2.0× × Sequoia 1.25×
-= **55–88 tok/s** (crosses the 50 tok/s goal without EAGLE-3).
+### Demoted to auxiliary (build after EAGLE-3 lands)
+
+| What | Measured | Role |
+|---|---|---|
+| **SuffixDecoding** | T1=18%, hit=48% after 4 turns | Auxiliary: use when tree has high-confidence match, fall back to EAGLE-3 |
+| **SSSD / Token Recycling** | Not measured | Same tier as SuffixDecoding |
 
 ---
 
-## Phase 3 — EAGLE-3 lands (in training, adds ~2×)
+## Phase 3 — Post-EAGLE-3 optimizations
 
 | Priority | What | Gain | Effort | Source |
 |---|---|---|---|---|
-| **13** | **EAGLE-3 deploy** | ×2.0 | conversion + bench | SPEED P1 |
-| **14** | **Sequoia + Traversal applied to EAGLE-3 tree** | +25–40% | 1 day | V3 §A4/A5 |
-| **15** | **Staged Speculative** — chunk1-2 as stage-1 draft | ×1.3–1.8 | 2 days | V3 §A6 |
-| **16** | **Mirror SD** — NPU+GPU parallel (EAGLE-3 successor) | +30% over EAGLE-3 | 2–3 days | UNEXP §B |
+| **12** | **SuffixDecoding as auxiliary** — high-confidence tree hits | +10-30% on repetitive workloads | 1 day wiring | FUND §1 |
+| **13** | **Staged Speculative** — chunk1-2 as stage-1 draft | ×1.3–1.8 | 2 days | V3 §A6 |
+| **14** | **Mirror SD** — NPU+GPU parallel (EAGLE-3 successor) | +30% over EAGLE-3 | 2–3 days | UNEXP §B |
 
-EAGLE-3 composes with Phase 2 speculative: use SuffixDecoding when tree
-has high confidence, fall back to EAGLE-3 otherwise.
+SuffixDecoding reuses EAGLE-3's Q=K verifier. Use tree when count > threshold,
+fall back to EAGLE-3 on miss.
 
 ---
 
@@ -111,34 +113,33 @@ has high confidence, fall back to EAGLE-3 otherwise.
 
 ---
 
-## Projected throughput path
+## Projected throughput path (updated 2026-04-13)
 
 ```
-Baseline (measured)                    14.5 tok/s @ 8K
+Baseline (measured)                    14.9 tok/s @ 8K
 
-Phase 0: diagnostics + micro-opt
-  + exp2 softmax                       ×1.03  → 14.9
-  + MLComputePlan fixes (if any)       ×1.10  → 16.4
+Phase 0: diagnostics (DONE)
+  MLComputePlan audit                  no fallback ops found
+  exp2 softmax (PR #17, unmeasured)    ×1.03  → 15.3
 
-Phase 1: training-free, no draft
-  + W2A16 palettization                ×1.5   → 24.6
-  + MLState (if iOS 26 clears)         ×1.4   → 34.5
-  + MLP tile reshape                   ×1.2   → 41.4
-  + GQA broadcast + Q-batch            ×1.10  → 45.5
+Phase 1: micro-opts only (W2/MLState rejected)
+  + MLP tile reshape                   ×1.10  → 16.9
+  + GQA broadcast + Q-batch            ×1.08  → 18.2
 
-Phase 2: training-free speculative
-  + SuffixDecoding + SSSD union        ×2.0   → 91.0
-  + Sequoia + Traversal Verify         ×1.25  → 113.8
+Phase 2: EAGLE-3 speculative (THE critical path)
+  + EAGLE-3 retrain (acc0 ≥ 50%)      ×2.0   → 36.4
+  + Q=K verifier + KV direct-write     ×1.3   → 47.3
+  + Sequoia tree optimization          ×1.15  → 54.4
 
-ANE overhead correction                ×0.65  → 74 tok/s
-
-Phase 3: EAGLE-3 (replaces/compounds speculative)
-  Likely ceiling with all stacked      → 80-120 tok/s @ 8K
+ANE overhead correction                ×0.85  → 46 tok/s
 ```
 
-Conservative (MLState 0×, W2 low, Suffix 1.5×): **~35 tok/s**.
-Median (everything lands at midpoint): **~74 tok/s**.
-Upper bound: **~120 tok/s**.
+Conservative (EAGLE-3 acc0=40%, no Sequoia): **~30 tok/s @ 8K**.
+Median (acc0=55%, Q=K, Sequoia): **~46 tok/s @ 8K**.
+Upper bound (acc0=70%+, all optimizations): **~60 tok/s @ 8K**.
+
+**SuffixDecoding (measured T1=18%) adds ~10-15% on top of EAGLE-3
+for repetitive workloads only. Not in the critical path.**
 
 ---
 

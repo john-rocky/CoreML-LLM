@@ -118,6 +118,18 @@ See `docs/SPEED_8K.md` for the overall speed roadmap and tier assignments.
 - **Root cause**: MLState is GPU-only on current hardware/OS. HuggingFace's WWDC24 Mistral CoreML reference explicitly states stateful KV is "excellent for GPUs on Mac computers" and ANE requires "additional adaptations." Apple's own on-device Llama 3.1 and smpanaro/coreml-llm-cli both use stateless explicit-I/O KV, not MLState. The `coreml_update_state` MIL op is not supported by the ANE compiler as of iOS 26 / coremltools 9.0.
 - **Conclusion**: dispatch-overhead hypothesis (FUNDAMENTAL_UNTRIED.md §0) remains valid as a bottleneck description, but MLState cannot address it on ANE. Alternative paths to reduce dispatch overhead: (1) chunk consolidation (4→2 chunks), (2) speculative decoding (amortize dispatch across multiple tokens per burst).
 
+### SuffixDecoding (CPU-only draft)  —  Measured, demoted to auxiliary (2026-04-13)
+
+- Files: `Sources/CoreMLLLM/SuffixTree.swift`, `Sources/CoreMLLLM/SuffixDecoding.swift` (on branch `claude/suffix-decoding-impl`, not merged to main)
+- Idea: build suffix tree from all prior model outputs, draft K tokens via CPU trie lookup (~20µs), verify with Q=K ANE verifier. Paper reports 1.9-5.3× on chat/agentic workloads (NeurIPS 2025 Spotlight, arXiv 2411.04975).
+- **T=1 instrumentation results on iPhone 17 Pro (4 multi-turn generations)**:
+  - hit rate: 2% → 29% → 48% (climbs as tree grows, as expected)
+  - **T1 accuracy: 18.4%** (of hits, how often the top-1 draft matches model output)
+  - tree: 10k nodes after 4 generations
+- **Performance overhead**: insert at end-of-generation blocks next generation start (~1-2s for 500 token sequence). Draft lookup adds ~2 tok/s overhead even at 4th-token sampling. Async insert + NSLock fixes the blocking but doesn't eliminate lookup cost.
+- **Assessment**: T1=18% is too low to be the primary speculative method. EAGLE-3 (acc0=75%, workload-independent) is strictly better as the main draft source. SuffixDecoding is **workload-dependent** — the paper's high numbers come from production workloads with stable system prompts, RAG, and code editing patterns. Random diverse chat is the worst case.
+- **Decision**: demote to auxiliary draft source. Use suffix tree when it has a high-confidence match (e.g., count > threshold), fall back to EAGLE-3 otherwise. Don't build Q=K verifier specifically for SuffixDecoding — build it for EAGLE-3, and SuffixDecoding can reuse it later.
+
 ### TriForce / Quest (sparse KV retrieval)  —  Planned
 
 - See `docs/SPEED_8K.md §1 A3 / A4`. Requires block-static top-k redesign to stay on ANE. Not started.
