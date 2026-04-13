@@ -55,6 +55,7 @@ def forward_all(model, input_ids, position):
     W = 512  # sliding window size
     max_hd = config.global_head_dim  # 512
     nlayers = config.num_hidden_layers
+    device = input_ids.device
 
     # Embedding
     embed_scale = config.hidden_size ** 0.5
@@ -88,13 +89,13 @@ def forward_all(model, input_ids, position):
     cos_f = model.cos_full[position].view(1, 1, 1, config.global_head_dim)
     sin_f = model.sin_full[position].view(1, 1, 1, config.global_head_dim)
 
-    # Masks
-    mask_full = torch.full((1, 1, 1, ctx), -65504.0, dtype=MODEL_DTYPE, device=hidden.device)
+    # Masks — ensure all on same device as model
+    mask_full = torch.full((1, 1, 1, ctx), -65504.0, dtype=MODEL_DTYPE, device=device)
     mask_full[0, 0, 0, :position + 1] = 0
-    mask_sliding = torch.full((1, 1, 1, W), -65504.0, dtype=MODEL_DTYPE, device=hidden.device)
+    mask_sliding = torch.full((1, 1, 1, W), -65504.0, dtype=MODEL_DTYPE, device=device)
     valid = min(position + 1, W)
     mask_sliding[0, 0, 0, W - valid:] = 0
-    update_mask = torch.zeros((1, 1, ctx, 1), dtype=MODEL_DTYPE, device=hidden.device)
+    update_mask = torch.zeros((1, 1, ctx, 1), dtype=MODEL_DTYPE, device=device)
     update_mask[0, 0, min(position, ctx - 1), 0] = 1.0
 
     # KV cache (persistent across calls — stored on model)
@@ -106,10 +107,10 @@ def forward_all(model, input_ids, position):
         for i in range(nlayers):
             if not config.is_kv_shared(i):
                 model._kv_cache[i] = {
-                    'ks': torch.zeros(1, nkv, W, max_hd, dtype=MODEL_DTYPE, device=hidden.device),
-                    'vs': torch.zeros(1, nkv, W, max_hd, dtype=MODEL_DTYPE, device=hidden.device),
-                    'kf': torch.zeros(1, nkv, ctx, max_hd, dtype=MODEL_DTYPE, device=hidden.device),
-                    'vf': torch.zeros(1, nkv, ctx, max_hd, dtype=MODEL_DTYPE, device=hidden.device),
+                    'ks': torch.zeros(1, nkv, W, max_hd, dtype=MODEL_DTYPE, device=device),
+                    'vs': torch.zeros(1, nkv, W, max_hd, dtype=MODEL_DTYPE, device=device),
+                    'kf': torch.zeros(1, nkv, ctx, max_hd, dtype=MODEL_DTYPE, device=device),
+                    'vf': torch.zeros(1, nkv, ctx, max_hd, dtype=MODEL_DTYPE, device=device),
                 }
         model._kv13_k = None
         model._kv13_v = None
@@ -211,10 +212,14 @@ def main():
     total_pairs = 0
     t0 = time.time()
 
+    # Verify model is on GPU
+    print(f"  Model device: {next(model.parameters()).device}")
+    print(f"  RoPE device: {model.cos_sliding.device}")
+
     with torch.no_grad():
         for text in tqdm(texts[:num], desc="Collecting"):
             ids = tokenizer.encode(text, return_tensors="pt",
-                                   truncation=True, max_length=args.seq_len)
+                                   truncation=True, max_length=args.seq_len).to(device)
             N = ids.shape[1]
             if N < 32:
                 skipped += 1
@@ -225,7 +230,7 @@ def main():
             hiddens = []  # collect post-norm hidden for each position
 
             for t in range(N):
-                tok = ids[:, t:t+1].to(device).int()
+                tok = ids[:, t:t+1].int()
                 h = forward_all(model, tok, t)  # (1, 1, hidden)
                 hiddens.append(h[0, 0].cpu().half())  # (hidden,)
 
