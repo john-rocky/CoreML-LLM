@@ -217,6 +217,10 @@ def forward_batch(model, input_ids):
     # Shared KV storage
     kv13_k = kv13_v = kv14_k = kv14_v = None
 
+    # Collect fusion layer hiddens (EAGLE-3 needs L8, L17, L34)
+    FUSION_LAYERS = [8, 17, 34]
+    fusion_hiddens = {}
+
     for i in range(nlayers):
         is_full = config.is_full_attention(i)
         is_kv_shared = config.is_kv_shared(i)
@@ -314,9 +318,15 @@ def forward_batch(model, input_ids):
         hidden = residual_pl + hidden
         hidden = hidden * layer.layer_scalar.to(MODEL_DTYPE)
 
+        # Record fusion layer hiddens for EAGLE-3
+        if i in FUSION_LAYERS:
+            fusion_hiddens[i] = hidden[0].clone()  # (seq_len, hidden)
+
     # Final norm
     hidden = model.norm(hidden)
-    return hidden[0]  # (seq_len, hidden_size)
+    # Return: final hidden + fusion layer hiddens
+    fusion_list = [fusion_hiddens[l] for l in FUSION_LAYERS]  # list of (seq_len, hidden)
+    return hidden[0], fusion_list  # (seq_len, hidden), [3 × (seq_len, hidden)]
 
 
 def main():
@@ -363,8 +373,9 @@ def main():
             texts.append(json.loads(line)["text"])
     print(f"  {len(texts)} sequences")
 
-    # Collect hidden states
+    # Collect hidden states + fusion layer hiddens
     all_h_in, all_e_in, all_h_tgt, all_tok_tgt = [], [], [], []
+    all_fusion = [[], [], []]  # 3 fusion layers × list of (N-1, hidden)
     num = min(args.num_samples, len(texts))
     collected = 0
     skipped = 0
@@ -384,14 +395,19 @@ def main():
                 skipped += 1
                 continue
 
-            # Batch forward: all positions in one pass (~10-50× faster)
-            hiddens = forward_batch(model, ids).cpu().half()  # (N, hidden)
+            # Batch forward: all positions in one pass + fusion layer hiddens
+            hiddens, fusion_list = forward_batch(model, ids)
+            hiddens = hiddens.cpu().half()  # (N, hidden)
             embeds = model.embed_tokens(ids)[0].cpu().half() * embed_scale  # (N, hidden)
 
             # EAGLE pairs: (h[t], embed(tok[t+1])) → h[t+1]
             all_h_in.append(hiddens[:-1])
             all_e_in.append(embeds[1:])
             all_h_tgt.append(hiddens[1:])
+
+            # Fusion layer hiddens (shifted same as h_in)
+            for fi, fh in enumerate(fusion_list):
+                all_fusion[fi].append(fh[:-1].cpu().half())
 
             logits = F.linear(hiddens[1:].float(), lm_head_weight.float())
             all_tok_tgt.append(logits.argmax(dim=-1))
@@ -420,6 +436,7 @@ def main():
     e_in = torch.cat(all_e_in, dim=0)
     h_tgt = torch.cat(all_h_tgt, dim=0)
     tok_tgt = torch.cat(all_tok_tgt, dim=0)
+    fusion_tensors = [torch.cat(af, dim=0) for af in all_fusion]  # 3 × (M, hidden)
 
     M = h_in.shape[0]
     split = int(M * (1 - args.test_split))
@@ -430,12 +447,21 @@ def main():
         "train_h_tgt": h_tgt[perm[:split]], "train_tok_tgt": tok_tgt[perm[:split]],
         "test_h_in": h_in[perm[split:]], "test_e_in": e_in[perm[split:]],
         "test_h_tgt": h_tgt[perm[split:]], "test_tok_tgt": tok_tgt[perm[split:]],
+        # Fusion layer hiddens (L8, L17, L34)
+        "train_fusion_L8":  fusion_tensors[0][perm[:split]],
+        "train_fusion_L17": fusion_tensors[1][perm[:split]],
+        "train_fusion_L34": fusion_tensors[2][perm[:split]],
+        "test_fusion_L8":   fusion_tensors[0][perm[split:]],
+        "test_fusion_L17":  fusion_tensors[1][perm[split:]],
+        "test_fusion_L34":  fusion_tensors[2][perm[split:]],
+        "fusion_layers": [8, 17, 34],
         "lm_head_weight": lm_head_weight,
         "embed_scale": embed_scale,
         "hidden_size": hidden_size,
         "meta": {
             "model_id": "custom_gemma4_model",
             "teacher": "Gemma4Model (Conv2d, same as CoreML chunks)",
+            "fusion_layers": [8, 17, 34],
             "num_sequences": collected,
             "seq_len": args.seq_len,
             "total_pairs": M,
