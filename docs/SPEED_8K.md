@@ -1,8 +1,8 @@
 # 8K Context Speed — Exhaustive Research & Roadmap (v3)
 
-**Status:** ctx=2048 ships at 31 tok/s · ctx=8192 currently 15 tok/s · WFA rejected on quality · EAGLE-3 in training.
+**Status:** ctx=2048 ships at 31 tok/s · ctx=8192 = **14.5 tok/s on iPhone 17 Pro** (measured 2026-04-13) · WFA rejected on quality · W8A8 rejected (ANE compile fails on iPhone) · EAGLE-3 in training.
 **Goal:** 8K @ 50+ tok/s *without quality loss*, with a documented path to 80+.
-**Updated:** 2026-04-12. Code unchanged by this doc.
+**Updated:** 2026-04-13. iPhone 8K baseline measured. W8A8 confirmed dead on ANE.
 
 
 ## Primary design principle: **ANE execution is the product**
@@ -53,8 +53,8 @@ Sorted by ANE feasibility × quality-preservation × ROI. All numbers are from c
 - **Idea**: per-channel for Key, per-token for Value, symmetric INT2. Zero fine-tune.
 - **Numbers (GPU)**: 2.6× memory, **2.35-3.47× throughput**, <2% accuracy loss on Llama/Mistral.
 - **ANE reality (measured)**: KV-only INT8 gives **~0 speedup on ANE** because the ANE compute pipeline is FP16-internal and CoreML dequantizes INT8 KV to FP16 before the matmul. The theoretical DRAM→SRAM bandwidth halving does NOT materialize as wall-clock speedup on ANE. Confirmed by our bench session.
-- **What DOES work on ANE**: full **W8A8** (weights + activations both INT8) opens the int8-int8 compute path on A17 Pro+. Partial INT8 (weights-only, KV-only) all stay on the FP16 path and give zero wall-clock gain.
-- **Conclusion**: skip KIVI on ANE. Invest in W8A8 calibration instead.
+- **W8A8 also fails on ANE** (see Tier D below): `linear_quantize_activations` quantize/dequantize MIL ops cause `ANECCompile() FAILED` on iPhone 17 Pro. No INT8 path works on ANE as of iOS 26 / coremltools 9.0.
+- **Conclusion**: skip all KV/activation quantization on ANE. Speedup must come from algorithmic changes (speculative decoding, sparse attention), not precision changes.
 - **Source**: [jy-yuan/KIVI](https://github.com/jy-yuan/KIVI) (GPU-focused)
 
 #### A3. TriForce — self-speculative with sparse KV draft (MLSys 2025)
@@ -100,7 +100,7 @@ Sorted by ANE feasibility × quality-preservation × ROI. All numbers are from c
 
 ### Tier D — Apple-specific levers
 
-- **W8A8 with real calibration** (128-512 Gemma-chat samples, seq=2048): opens ANE int8-int8 path. **1.3-1.6×**. Confirmed via Apple ResNet50.
+- **~~W8A8 with real calibration~~** — **REJECTED (2026-04-13)**. Built W4A8 (INT4 weights + INT8 activations) with proper 16-sample calibration pipeline (`build_w8a8_all.py` + `coremltools_tmp_cleanup.py`). Mac Studio M4 Max: compiles and runs but **0% speedup** (ANE still runs FP16 internally). **iPhone 17 Pro: `ANECCompile() FAILED`** — the `quantize`/`dequantize` MIL ops inserted by `coremltools.optimize.coreml.linear_quantize_activations` are not compilable by the iPhone ANE compiler. Tested with clean file push (no file-mismatch), error reproducible. Apple's ResNet50 INT8 claim may only apply to models built with Apple's internal training pipeline, not coremltools post-training quantization. **Dead end.**
 - **EnumeratedShapes {2048, 8192}**: single mlpackage, ANE-safe for all shapes. Ship "fast mode" (2K) + "long mode" (8K) under one binary.
 - **Prefix caching / persistent KV**: for repeated system prompts. **4-35× TTFT on cache hits at 1-4K, up to 136× at 32K** (safetensors-based, survives reboot). Not decode throughput but huge UX win.
 - **A19 Pro GPU tensor cores** (Metal Performance Primitives, Xcode 26.1+): 7.5 TFLOPS FP16 / 13.5 TOPS INT8. Argmax-bench: 2.5-3.1× vs A18 Pro GPU. **Route prefill (compute-bound) to GPU**; keep decode (bandwidth-bound) on ANE.
