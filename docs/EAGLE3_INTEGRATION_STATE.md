@@ -104,6 +104,17 @@ Argmax-chain generations diverge too: HF produces gibberish (`'    '`, `'**'`, `
 
 **Either way, the trained draft no longer matches the target we deploy → must retrain against our custom target.**
 
+### ⚠️ Correction (2026-04-13): L34 divergence was a measurement error
+
+The "94% rel diff at L34" reported above was a **FALSE ALARM** caused by an indexing artifact in the comparison harness:
+
+1. HF's `output_hidden_states[35]` is the **post-norm output** (after the final RMSNorm), NOT L34's raw hidden-state output. Comparing it against our L34 pre-norm output produced the spurious 4.4× magnitude gap.
+2. After correcting the indexing, our `Gemma4Model` forward **matches HF (`cache=True`) at ALL 35 layers** with `rel_diff < 1e-5` in fp32.
+3. Verified via `conversion/debug_l34_parity.py`.
+4. The EAGLE-3 Blocker 1 draft/target mismatch is now believed to be caused by the training data collection step running HF with `use_cache=False`, which **does not perform KV-sharing for L15+** (global attention layers). This means the hidden states the draft was trained on differ from what the target produces at inference time with `use_cache=True`.
+
+The conclusion that the draft must be retrained still holds, but the root cause is the `use_cache=False` training corpus — not a bug in our custom `Gemma4Model`.
+
 ### Blocker 2: `commitAccepted` re-runs T=1 decode per accepted token
 
 Even with a perfect draft, current implementation cannot beat baseline:
