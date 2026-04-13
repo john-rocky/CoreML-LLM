@@ -448,3 +448,322 @@ class SWAChunk4(nn.Module):
         # Output normed hidden state for Medusa speculative decoding heads.
         # Shape: (1, 1, hidden_size) — the last hidden state before lm_head.
         return token_id, token_logit, normed
+
+
+# ============================================================
+# Verify mode: Q=K batched speculative verification (read-only KV)
+# ============================================================
+
+def _run_layer_verify(
+    layer, layer_idx, hidden_states, seq_len,
+    cos_s, sin_s, cos_f, sin_f,
+    causal_mask_full, causal_mask_sliding,
+    K_for_attn, V_for_attn,
+    config, per_layer_combined,
+):
+    """Run one layer in verify mode (Q=seq_len, read-only KV cache).
+
+    Unlike _run_layer_swa, this does NOT compute K/V projections or update
+    the KV cache. The cached K/V (already with k_norm, v_norm, RoPE applied)
+    are used directly for attention.
+
+    Args:
+        hidden_states: (1, seq_len, hidden)
+        seq_len: number of query positions (K draft tokens), fixed at trace time
+        cos_s/sin_s: (1, 1, seq_len, 256) sliding RoPE for K positions
+        cos_f/sin_f: (1, 1, seq_len, 512) full RoPE for K positions
+        causal_mask_full: (1, 1, seq_len, ctx)
+        causal_mask_sliding: (1, 1, seq_len, W)
+        K_for_attn: (1, kv_heads, cache_len, hd) from cache (RoPE+norm already applied)
+        V_for_attn: (1, kv_heads, cache_len, hd) from cache (v_norm already applied)
+    """
+    num_heads = config.num_attention_heads
+    num_kv_heads = config.num_key_value_heads
+    n_rep = num_heads // num_kv_heads
+    hd = config.get_head_dim(layer_idx)
+    is_full = config.is_full_attention(layer_idx)
+
+    residual = hidden_states
+    h = layer.input_layernorm(hidden_states)
+    x = h.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)  # (1, hidden, 1, seq_len)
+
+    # Q projection: (1, num_heads*hd, 1, seq_len) -> (1, num_heads, seq_len, hd)
+    q = layer.self_attn["q_proj"](x)
+    q = q.view(1, num_heads, hd, seq_len).permute(0, 1, 3, 2).to(MODEL_DTYPE)
+
+    # Q norm: merge seq_len into batch dim for per-position normalization
+    q = q.permute(0, 2, 1, 3).contiguous().view(seq_len, num_heads, hd)
+    q = layer.self_attn["q_norm"](q)
+    q = q.view(1, seq_len, num_heads, hd).permute(0, 2, 1, 3)
+
+    # RoPE on Q only (cached K already has RoPE applied)
+    if is_full:
+        q, _ = apply_rotary_pos_emb(q, q, cos_f, sin_f)
+    else:
+        q, _ = apply_rotary_pos_emb(q, q, cos_s, sin_s)
+
+    # GQA expansion of cached K/V
+    K_expanded = K_for_attn.repeat_interleave(n_rep, dim=1)
+    V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
+
+    # Attention: (1, heads, seq_len, hd) @ (1, heads, hd, cache_len) = (1, heads, seq_len, cache_len)
+    mask = causal_mask_full if is_full else causal_mask_sliding
+    attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
+    attn_weights = attn_weights + mask
+    attn_weights = ane_softmax(attn_weights, dim=-1)
+    attn_output = torch.matmul(attn_weights, V_expanded)
+
+    # Output projection: (1, heads, seq_len, hd) -> (1, seq_len, hidden)
+    attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(1, seq_len, -1)
+    attn_output = layer.self_attn["o_proj"](
+        attn_output.permute(0, 2, 1).unsqueeze(2)
+    ).squeeze(2).permute(0, 2, 1)
+    attn_output = layer.post_attention_layernorm(attn_output)
+    hidden_states = residual + attn_output
+
+    # MLP (Conv2d-based, operates per-token — handles any seq_len naturally)
+    residual = hidden_states
+    h = layer.pre_feedforward_layernorm(hidden_states)
+    x_mlp = h.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
+    gate = layer.mlp["gate_proj"](x_mlp)
+    up = layer.mlp["up_proj"](x_mlp)
+    gate = F.gelu(gate, approximate="tanh")
+    mlp_out = layer.mlp["down_proj"](gate * up)
+    hidden_states = mlp_out.squeeze(2).permute(0, 2, 1)
+    hidden_states = layer.post_feedforward_layernorm(hidden_states)
+    hidden_states = residual + hidden_states
+
+    # Per-layer input (Conv2d-based, handles any seq_len)
+    residual_pl = hidden_states
+    s = layer_idx * config.hidden_size_per_layer_input
+    e = s + config.hidden_size_per_layer_input
+    per_layer_slice = per_layer_combined[:, :, s:e]
+    hs_conv = hidden_states.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
+    gated = layer.per_layer_input_gate(hs_conv)
+    gated = F.gelu(gated, approximate="tanh")
+    per_layer_slice_conv = per_layer_slice.permute(0, 2, 1).unsqueeze(2)
+    gated = gated * per_layer_slice_conv
+    gated = layer.per_layer_projection(gated)
+    gated = gated.squeeze(2).permute(0, 2, 1)
+    hidden_states = layer.post_per_layer_input_norm(gated)
+    hidden_states = residual_pl + hidden_states
+    hidden_states = hidden_states * layer.layer_scalar.to(MODEL_DTYPE)
+
+    return hidden_states
+
+
+class SWAVerifyChunk1(nn.Module):
+    """Verify version of chunk1 (L0-7): Q=K queries against read-only KV cache.
+
+    No KV cache updates — just computes target predictions for K draft tokens.
+    Outputs hidden_states and per_layer_combined (needed by subsequent chunks).
+    """
+    START, END = 0, 8
+
+    def __init__(self, model: Gemma4Model, seq_len: int):
+        super().__init__()
+        self.config = model.config
+        self.seq_len = seq_len
+        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
+        self.sliding_map, self.full_map = _layer_kv_map(self.START, self.END, model.config)
+        # PLE modules (same weights as decode chunk1)
+        self.per_layer_model_projection = model.per_layer_model_projection
+        self.per_layer_projection_norm = model.per_layer_projection_norm
+        self.per_layer_model_projection_scale = model.per_layer_model_projection_scale
+        self.per_layer_input_scale = model.per_layer_input_scale
+        self.per_layer_dim = model.config.hidden_size_per_layer_input
+        self.num_layers_total = model.config.num_hidden_layers
+
+    def _compute_ple(self, hidden_states, per_layer_raw):
+        """PLE computation for K tokens.
+
+        hidden_states: (1, K, hidden)
+        per_layer_raw: (1, K, nlayers * pld)
+        Returns: (1, K, nlayers * pld)
+        """
+        K = self.seq_len
+        h_conv = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
+        proj = self.per_layer_model_projection(h_conv) * self.per_layer_model_projection_scale
+        proj = proj.squeeze(2).permute(0, 2, 1)  # (1, K, total_pld)
+        proj_grouped = proj.contiguous().view(K, self.num_layers_total, self.per_layer_dim)
+
+        norm_w = self.per_layer_projection_norm.weight
+        eps = float(self.per_layer_projection_norm.eps)
+        doubled = torch.cat([proj_grouped, -proj_grouped], dim=-1)
+        normed = F.layer_norm(doubled, normalized_shape=(2 * self.per_layer_dim,),
+                              weight=None, bias=None, eps=eps)
+        normed, _ = torch.chunk(normed, 2, dim=-1)
+        proj_normed = (normed * norm_w).view(1, K, self.num_layers_total * self.per_layer_dim)
+
+        return (proj_normed + per_layer_raw) * self.per_layer_input_scale
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                per_layer_raw, cos_s, sin_s, cos_f, sin_f,
+                K_sliding_in, V_sliding_in, K_full_in, V_full_in):
+        config = self.config
+        K = self.seq_len
+        per_layer_combined = self._compute_ple(hidden_states, per_layer_raw)
+
+        for local_idx in range(self.END - self.START):
+            layer_idx = self.START + local_idx
+            is_full = config.is_full_attention(layer_idx)
+            hd = config.get_head_dim(layer_idx)
+
+            if is_full:
+                fi = self.full_map[layer_idx]
+                K_for_attn = K_full_in[fi].unsqueeze(0)[..., :hd]
+                V_for_attn = V_full_in[fi].unsqueeze(0)[..., :hd]
+            else:
+                si = self.sliding_map[layer_idx]
+                K_for_attn = K_sliding_in[si].unsqueeze(0)[..., :hd]
+                V_for_attn = V_sliding_in[si].unsqueeze(0)[..., :hd]
+
+            hidden_states = _run_layer_verify(
+                self.layers[local_idx], layer_idx, hidden_states, K,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                K_for_attn, V_for_attn,
+                config, per_layer_combined,
+            )
+
+        return hidden_states, per_layer_combined
+
+
+class SWAVerifyChunk2(nn.Module):
+    """Verify version of chunk2 (L8-14): Q=K, read-only KV cache.
+
+    Extracts kv13/kv14 from the cache inputs (needed by chunks 3-4).
+    """
+    START, END = 8, 15
+
+    def __init__(self, model: Gemma4Model, seq_len: int):
+        super().__init__()
+        self.config = model.config
+        self.seq_len = seq_len
+        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
+        self.sliding_map, self.full_map = _layer_kv_map(self.START, self.END, model.config)
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                per_layer_combined, cos_s, sin_s, cos_f, sin_f,
+                K_sliding_in, V_sliding_in, K_full_in, V_full_in):
+        config = self.config
+        K = self.seq_len
+
+        # Extract kv13/kv14 from existing cache (read-only)
+        # L13 sliding slot = sliding_map[13], L14 full slot = full_map[14]
+        kv13_k = K_sliding_in[self.sliding_map[13]].unsqueeze(0)[..., :256]
+        kv13_v = V_sliding_in[self.sliding_map[13]].unsqueeze(0)[..., :256]
+        kv14_k = K_full_in[self.full_map[14]].unsqueeze(0)[..., :512]
+        kv14_v = V_full_in[self.full_map[14]].unsqueeze(0)[..., :512]
+
+        for local_idx in range(self.END - self.START):
+            layer_idx = self.START + local_idx
+            is_full = config.is_full_attention(layer_idx)
+            hd = config.get_head_dim(layer_idx)
+
+            if is_full:
+                fi = self.full_map[layer_idx]
+                K_for_attn = K_full_in[fi].unsqueeze(0)[..., :hd]
+                V_for_attn = V_full_in[fi].unsqueeze(0)[..., :hd]
+            else:
+                si = self.sliding_map[layer_idx]
+                K_for_attn = K_sliding_in[si].unsqueeze(0)[..., :hd]
+                V_for_attn = V_sliding_in[si].unsqueeze(0)[..., :hd]
+
+            hidden_states = _run_layer_verify(
+                self.layers[local_idx], layer_idx, hidden_states, K,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                K_for_attn, V_for_attn,
+                config, per_layer_combined,
+            )
+
+        return hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+
+
+class SWAVerifyChunk3(nn.Module):
+    """Verify version of chunk3 (L15-24): Q=K, shared KV from kv13/kv14."""
+    START, END = 15, 25
+
+    def __init__(self, model: Gemma4Model, seq_len: int):
+        super().__init__()
+        self.config = model.config
+        self.seq_len = seq_len
+        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                per_layer_combined, cos_s, sin_s, cos_f, sin_f,
+                kv13_k, kv13_v, kv14_k, kv14_v):
+        config = self.config
+        K = self.seq_len
+
+        for local_idx in range(self.END - self.START):
+            layer_idx = self.START + local_idx
+            is_full = config.is_full_attention(layer_idx)
+
+            if is_full:
+                K_for_attn, V_for_attn = kv14_k, kv14_v
+            else:
+                K_for_attn, V_for_attn = kv13_k, kv13_v
+
+            hidden_states = _run_layer_verify(
+                self.layers[local_idx], layer_idx, hidden_states, K,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                K_for_attn, V_for_attn,
+                config, per_layer_combined,
+            )
+
+        return hidden_states
+
+
+class SWAVerifyChunk4(nn.Module):
+    """Verify version of chunk4 (L25-34): Q=K, shared KV + norm + lm_head.
+
+    Outputs per-position token IDs (1, K) as int32.
+    """
+    START, END = 25, 35
+
+    def __init__(self, model: Gemma4Model, seq_len: int):
+        super().__init__()
+        self.config = model.config
+        self.seq_len = seq_len
+        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
+        self.norm = model.norm
+        self.lm_head = nn.Conv2d(model.lm_head.in_channels, model.lm_head.out_channels,
+                                  kernel_size=1, bias=False)
+        self.lm_head.weight.data = model.lm_head.weight.data.clone()
+        self.softcap = model.softcap
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                per_layer_combined, cos_s, sin_s, cos_f, sin_f,
+                kv13_k, kv13_v, kv14_k, kv14_v):
+        config = self.config
+        K = self.seq_len
+
+        for local_idx in range(self.END - self.START):
+            layer_idx = self.START + local_idx
+            is_full = config.is_full_attention(layer_idx)
+
+            if is_full:
+                K_for_attn, V_for_attn = kv14_k, kv14_v
+            else:
+                K_for_attn, V_for_attn = kv13_k, kv13_v
+
+            hidden_states = _run_layer_verify(
+                self.layers[local_idx], layer_idx, hidden_states, K,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                K_for_attn, V_for_attn,
+                config, per_layer_combined,
+            )
+
+        # Final norm + LM head: operates per-token (1, K, hidden)
+        normed = self.norm(hidden_states)
+        x = normed.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)  # (1, hidden, 1, K)
+        logits = self.lm_head(x).squeeze(2).permute(0, 2, 1)  # (1, K, vocab)
+        if self.softcap > 0:
+            logits = torch.tanh(logits / self.softcap) * self.softcap
+        # Per-position argmax
+        token_ids = torch.argmax(logits, dim=-1).to(torch.int32)  # (1, K)
+        return token_ids
