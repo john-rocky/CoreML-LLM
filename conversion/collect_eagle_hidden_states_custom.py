@@ -98,41 +98,33 @@ def forward_all(model, input_ids, position):
     update_mask[0, 0, min(position, ctx - 1), 0] = 1.0
 
     # KV cache (persistent across calls — stored on model)
-    if not hasattr(model, '_kv_sliding') or model._kv_sliding is None:
-        model._kv_sliding = {}
-        model._kv_full = {}
-        model._kv13 = [None, None]
-        model._kv14 = [None, None]
+    # _run_layer_swa expects 4 separate args: K_sliding, V_sliding, K_full, V_full
+    # Each is (1, num_kv_heads, seq_dim, max_hd) per non-shared layer
+    if not hasattr(model, '_kv_cache') or model._kv_cache is None:
+        nkv = config.num_key_value_heads
+        model._kv_cache = {}
+        for i in range(nlayers):
+            if not config.is_kv_shared(i):
+                model._kv_cache[i] = {
+                    'ks': torch.zeros(1, nkv, W, max_hd, dtype=MODEL_DTYPE, device=hidden.device),
+                    'vs': torch.zeros(1, nkv, W, max_hd, dtype=MODEL_DTYPE, device=hidden.device),
+                    'kf': torch.zeros(1, nkv, ctx, max_hd, dtype=MODEL_DTYPE, device=hidden.device),
+                    'vf': torch.zeros(1, nkv, ctx, max_hd, dtype=MODEL_DTYPE, device=hidden.device),
+                }
+        model._kv13_k = None
+        model._kv13_v = None
+        model._kv14_k = None
+        model._kv14_v = None
 
     # Run all layers
     for i in range(nlayers):
         is_kv_shared = config.is_kv_shared(i)
-        is_full = config.is_full_attention(i)
 
-        # Get or init KV slots
         if not is_kv_shared:
-            if i not in model._kv_sliding:
-                model._kv_sliding[i] = torch.zeros(1, config.num_key_value_heads, W, max_hd,
-                                                     dtype=MODEL_DTYPE, device=hidden.device)
-                model._kv_full[i] = torch.zeros(1, config.num_key_value_heads, ctx, max_hd,
-                                                  dtype=MODEL_DTYPE, device=hidden.device)
-            ks = model._kv_sliding[i]
-            vs = model._kv_sliding.get(f"{i}_v",
-                    torch.zeros_like(model._kv_sliding[i]))
-            if f"{i}_v" not in model._kv_sliding:
-                model._kv_sliding[f"{i}_v"] = vs
-            kf = model._kv_full[i]
-            vf = model._kv_full.get(f"{i}_v",
-                    torch.zeros_like(model._kv_full[i]))
-            if f"{i}_v" not in model._kv_full:
-                model._kv_full[f"{i}_v"] = vf
+            c = model._kv_cache[i]
+            ks, vs, kf, vf = c['ks'], c['vs'], c['kf'], c['vf']
         else:
             ks = vs = kf = vf = None
-
-        kv13_k = model._kv13[0]
-        kv13_v = model._kv13[1]
-        kv14_k = model._kv14[0]
-        kv14_v = model._kv14[1]
 
         result = _run_layer_swa(
             model.layers[i], i, hidden,
@@ -140,17 +132,19 @@ def forward_all(model, input_ids, position):
             mask_full, mask_sliding, update_mask,
             ks, vs, kf, vf,
             config, per_layer_combined,
-            kv13_k, kv13_v, kv14_k, kv14_v,
+            model._kv13_k, model._kv13_v, model._kv14_k, model._kv14_v,
         )
         hidden = result[0]
 
         if not is_kv_shared:
-            model._kv_sliding[i] = result[1]
-            model._kv_sliding[f"{i}_v"] = result[2]
-            model._kv_full[i] = result[3]
-            model._kv_full[f"{i}_v"] = result[4]
-        model._kv13 = [result[5], result[6]]
-        model._kv14 = [result[7], result[8]]
+            model._kv_cache[i]['ks'] = result[1]
+            model._kv_cache[i]['vs'] = result[2]
+            model._kv_cache[i]['kf'] = result[3]
+            model._kv_cache[i]['vf'] = result[4]
+        model._kv13_k = result[5]
+        model._kv13_v = result[6]
+        model._kv14_k = result[7]
+        model._kv14_v = result[8]
 
     # Final norm
     hidden = model.norm(hidden)
@@ -158,10 +152,11 @@ def forward_all(model, input_ids, position):
 
 
 def reset_kv(model):
-    model._kv_sliding = None
-    model._kv_full = None
-    model._kv13 = [None, None]
-    model._kv14 = [None, None]
+    model._kv_cache = None
+    model._kv13_k = None
+    model._kv13_v = None
+    model._kv14_k = None
+    model._kv14_v = None
 
 
 def main():
