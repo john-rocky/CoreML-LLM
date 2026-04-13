@@ -120,8 +120,11 @@ public final class CoreMLLLM: @unchecked Sendable {
             llm.chunkedEngine = try await ChunkedEngine.load(
                 from: directory, config: config, computeUnits: computeUnits)
             // Auto-enable SuffixDecoding for T=1 instrumentation
-            llm.suffixDecoding = SuffixDecoding(maxNodes: 50_000)
-            print("[SuffixDecoding] enabled — T=1 instrumentation active (maxNodes=50k)")
+            llm.suffixDecoding = SuffixDecoding(
+                tree: SuffixTree(maxDepth: 8),
+                maxNodes: 20_000
+            )
+            print("[SuffixDecoding] enabled — T=1 mode (maxDepth=8, maxNodes=20k)")
         } else {
             let mlConfig = MLModelConfiguration()
             mlConfig.computeUnits = computeUnits
