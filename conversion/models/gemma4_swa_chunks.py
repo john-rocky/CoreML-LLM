@@ -128,19 +128,19 @@ def _run_layer_swa(
             K_for_attn = kv_store_13_k  # W-sized now!
             V_for_attn = kv_store_13_v
 
-    # GQA
-    K_expanded = K_for_attn.repeat_interleave(n_rep, dim=1)
-    V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
+    # GQA via broadcast matmul — avoids materializing the n_rep expansion.
+    # q: (1, num_heads, 1, hd) → (1, num_kv, n_rep, 1, hd)
+    # K/V: (1, num_kv, S, hd) → (1, num_kv, 1, S, hd) — broadcast on rep dim
+    q_grouped = q.view(1, num_kv_heads, n_rep, 1, hd)
+    K_b = K_for_attn.unsqueeze(2)   # (1, kv, 1, S, hd)
+    V_b = V_for_attn.unsqueeze(2)   # (1, kv, 1, S, hd)
 
-    # Manual attention with scale=1.0 (Gemma 4's effective scale after q_norm/k_norm).
-    # SDPA fusion was attempted with d^(1/4) pre-scaling but CoreML's SDPA
-    # decomposition produces slightly different results from manual attention,
-    # causing wrong token predictions. Keeping manual attention for correctness.
     mask = causal_mask_full if is_full else causal_mask_sliding
-    attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
+    attn_weights = torch.matmul(q_grouped, K_b.transpose(-1, -2))  # (1, kv, rep, 1, S)
     attn_weights = attn_weights + mask
     attn_weights = ane_softmax(attn_weights, dim=-1)
-    attn_output = torch.matmul(attn_weights, V_expanded)
+    attn_output = torch.matmul(attn_weights, V_b)  # (1, kv, rep, 1, hd)
+    attn_output = attn_output.view(1, num_heads, 1, hd)
 
     attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(1, 1, -1)
     attn_output = layer.self_attn["o_proj"](
@@ -149,14 +149,16 @@ def _run_layer_swa(
     attn_output = layer.post_attention_layernorm(attn_output)
     hidden_states = residual + attn_output
 
-    # MLP
+    # MLP — tile (B,C,1,1) → (B,C,8,8) for ANE PE utilization
     residual = hidden_states
     h = layer.pre_feedforward_layernorm(hidden_states)
-    x_mlp = h.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
+    x_mlp = h.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)  # (1, C, 1, 1)
+    x_mlp = x_mlp.expand(1, -1, 8, 8)  # (1, C, 8, 8) — fills ANE spatial PEs
     gate = layer.mlp["gate_proj"](x_mlp)
     up = layer.mlp["up_proj"](x_mlp)
     gate = F.gelu(gate, approximate="tanh")
-    mlp_out = layer.mlp["down_proj"](gate * up)
+    mlp_out = layer.mlp["down_proj"](gate * up)  # (1, C, 8, 8)
+    mlp_out = mlp_out[:, :, :1, :1]  # back to (1, C, 1, 1)
     hidden_states = mlp_out.squeeze(2).permute(0, 2, 1)
     hidden_states = layer.post_feedforward_layernorm(hidden_states)
     hidden_states = residual + hidden_states

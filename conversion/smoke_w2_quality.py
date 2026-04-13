@@ -1,262 +1,283 @@
 #!/usr/bin/env python3
-"""Quick W2 vs INT4 quality smoke test on Mac.
+"""Smoke test: verify ANE micro-optimizations are numerically equivalent.
 
-Loads both chunk sets, runs autoregressive generation with real embeddings
-from the HF model, and prints side-by-side output for visual comparison.
+Tests three changes:
+1. exp2 softmax: ane_softmax (exp2) vs reference (exp)
+2. MLP tile: (B,C,8,8) reshape vs (B,C,1,1) original
+3. GQA broadcast: 5D broadcast matmul vs repeat_interleave
 
-Usage:
-    python smoke_w2_quality.py \
-        --w2-dir /tmp/w2-8k \
-        --int4-dir output/all_chunks_8k \
-        --steps 40
+Run:
+    python smoke_w2_quality.py                     # unit tests only
+    python smoke_w2_quality.py --full-model        # also run full model comparison
 """
 from __future__ import annotations
-
-import argparse
-import os
-import sys
-import time
-
-import coremltools as ct
-import numpy as np
+import argparse, sys, os
+import torch
+import torch.nn.functional as F
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
-EMB_DIR = os.path.join(ROOT, "output/iphone_8k")
-HF_DIR = os.path.join(ROOT, "output/gemma4-e2b-final/hf_model")
-
-# Architecture constants
-CTX = 8192
-W = 512
-HIDDEN = 1536
-NLAYERS = 35
-PLD = 256
-MAX_HD = 512
-TOTAL_PLD = NLAYERS * PLD
-VOCAB = 262144
-EMBED_SCALE = 39.191835403442383  # sqrt(hidden_size) for Gemma 4
+from ane_ops import MODEL_DTYPE, _LOG2_E, ane_softmax
 
 
-def load_embeddings():
-    """Load INT8 quantized embedding + per-layer embedding from disk."""
-    embed_q8 = np.fromfile(os.path.join(EMB_DIR, "embed_tokens_q8.bin"), dtype=np.int8)
-    embed_q8 = embed_q8.reshape(VOCAB, HIDDEN)
-    embed_scales = np.fromfile(os.path.join(EMB_DIR, "embed_tokens_scales.bin"), dtype=np.float16)
-
-    pl_q8 = np.fromfile(os.path.join(EMB_DIR, "embed_tokens_per_layer_q8.bin"), dtype=np.int8)
-    pl_q8 = pl_q8.reshape(VOCAB, TOTAL_PLD)
-    pl_scales = np.fromfile(os.path.join(EMB_DIR, "embed_tokens_per_layer_scales.bin"), dtype=np.float16)
-
-    return embed_q8, embed_scales, pl_q8, pl_scales
+def ref_softmax(x, dim=-1):
+    """Reference softmax using torch.exp (pre-optimization)."""
+    x = x.to(MODEL_DTYPE)
+    x_max = x.max(dim=dim, keepdim=True).values.to(MODEL_DTYPE)
+    x_shifted = (x - x_max).to(MODEL_DTYPE)
+    exp_x = torch.exp(x_shifted).to(MODEL_DTYPE)
+    exp_sum = exp_x.sum(dim=dim, keepdim=True).to(MODEL_DTYPE)
+    return (exp_x / exp_sum).to(MODEL_DTYPE)
 
 
-def dequant_embed(q8, scales, token_id):
-    """Dequantize INT8 embedding for a single token."""
-    row = q8[token_id].astype(np.float32)
-    s = float(scales[token_id])
-    out = (row * (s / 127.0) * EMBED_SCALE).astype(np.float16)
-    return out.reshape(1, 1, -1)
+def test_exp2_softmax():
+    """Verify exp2-based softmax matches exp-based softmax."""
+    print("=== Test 1: exp2 softmax ===")
+    torch.manual_seed(42)
+
+    for shape_name, shape in [
+        ("sliding (1,8,1,512)", (1, 8, 1, 512)),
+        ("full (1,8,1,8192)", (1, 8, 1, 8192)),
+        ("5D broadcast (1,1,8,1,512)", (1, 1, 8, 1, 512)),
+        ("5D broadcast (1,1,8,1,8192)", (1, 1, 8, 1, 8192)),
+    ]:
+        x = torch.randn(shape, dtype=MODEL_DTYPE)
+        # Add large negative mask to simulate causal masking
+        mask = torch.zeros(shape, dtype=MODEL_DTYPE)
+        mask[..., shape[-1]//2:] = -65504.0
+        x = x + mask
+
+        new = ane_softmax(x, dim=-1)
+        ref = ref_softmax(x, dim=-1)
+
+        cos = F.cosine_similarity(new.flatten().float(), ref.flatten().float(), dim=0)
+        max_diff = (new.float() - ref.float()).abs().max().item()
+        print(f"  {shape_name}: cos={cos:.8f}  max_diff={max_diff:.2e}  "
+              f"{'PASS' if cos > 0.99999 else 'FAIL'}")
+    print()
 
 
-def dequant_perlayer(pl_q8, pl_scales, token_id):
-    """Dequantize per-layer embedding."""
-    row = pl_q8[token_id].astype(np.float32)
-    s = float(pl_scales[token_id])
-    out = (row * (s / 127.0) * EMBED_SCALE).astype(np.float16)
-    return out.reshape(1, 1, -1)
+def test_mlp_tile():
+    """Verify (B,C,8,8) tiled MLP produces identical output to (B,C,1,1)."""
+    print("=== Test 2: MLP tile reshape ===")
+    torch.manual_seed(42)
+
+    C_in, C_mid, C_out = 1536, 6144, 1536
+    gate_proj = torch.nn.Conv2d(C_in, C_mid, 1, bias=False, dtype=MODEL_DTYPE)
+    up_proj = torch.nn.Conv2d(C_in, C_mid, 1, bias=False, dtype=MODEL_DTYPE)
+    down_proj = torch.nn.Conv2d(C_mid, C_out, 1, bias=False, dtype=MODEL_DTYPE)
+
+    x = torch.randn(1, C_in, 1, 1, dtype=MODEL_DTYPE)
+
+    # Reference: (1, C, 1, 1) path
+    with torch.no_grad():
+        g_ref = gate_proj(x)
+        u_ref = up_proj(x)
+        g_ref = F.gelu(g_ref, approximate="tanh")
+        ref_out = down_proj(g_ref * u_ref)  # (1, C_out, 1, 1)
+
+    # New: (1, C, 8, 8) tiled path
+    with torch.no_grad():
+        x_tiled = x.expand(1, -1, 8, 8)
+        g_new = gate_proj(x_tiled)
+        u_new = up_proj(x_tiled)
+        g_new = F.gelu(g_new, approximate="tanh")
+        new_out = down_proj(g_new * u_new)[:, :, :1, :1]  # slice back
+
+    cos = F.cosine_similarity(new_out.flatten().float(), ref_out.flatten().float(), dim=0)
+    max_diff = (new_out.float() - ref_out.float()).abs().max().item()
+    print(f"  MLP (1536→6144→1536): cos={cos:.8f}  max_diff={max_diff:.2e}  "
+          f"{'PASS' if cos > 0.99999 else 'FAIL'}")
+
+    # Also test double-wide MLP (KV-shared layers)
+    C_mid2 = 12288
+    gate_proj2 = torch.nn.Conv2d(C_in, C_mid2, 1, bias=False, dtype=MODEL_DTYPE)
+    up_proj2 = torch.nn.Conv2d(C_in, C_mid2, 1, bias=False, dtype=MODEL_DTYPE)
+    down_proj2 = torch.nn.Conv2d(C_mid2, C_out, 1, bias=False, dtype=MODEL_DTYPE)
+
+    with torch.no_grad():
+        ref_out2 = down_proj2(F.gelu(gate_proj2(x), approximate="tanh") * up_proj2(x))
+        x_t2 = x.expand(1, -1, 8, 8)
+        new_out2 = down_proj2(F.gelu(gate_proj2(x_t2), approximate="tanh") * up_proj2(x_t2))[:, :, :1, :1]
+
+    cos2 = F.cosine_similarity(new_out2.flatten().float(), ref_out2.flatten().float(), dim=0)
+    max_diff2 = (new_out2.float() - ref_out2.float()).abs().max().item()
+    print(f"  MLP (1536→12288→1536 double-wide): cos={cos2:.8f}  max_diff={max_diff2:.2e}  "
+          f"{'PASS' if cos2 > 0.99999 else 'FAIL'}")
+    print()
 
 
-def load_rope():
-    """Load precomputed RoPE tables."""
-    cos_f = np.load(os.path.join(EMB_DIR, "cos_full.npy"))   # (8192, 512)
-    sin_f = np.load(os.path.join(EMB_DIR, "sin_full.npy"))
-    cos_s = np.load(os.path.join(EMB_DIR, "cos_sliding.npy"))  # (8192, 256)
-    sin_s = np.load(os.path.join(EMB_DIR, "sin_sliding.npy"))
-    return cos_s, sin_s, cos_f, sin_f
+def test_gqa_broadcast():
+    """Verify broadcast matmul matches repeat_interleave for GQA."""
+    print("=== Test 3: GQA broadcast matmul ===")
+    torch.manual_seed(42)
+
+    num_kv = 1
+    n_rep = 8
+    num_heads = num_kv * n_rep
+
+    for desc, seq_len, hd in [
+        ("sliding (W=512, hd=256)", 512, 256),
+        ("full (ctx=8192, hd=512)", 8192, 512),
+    ]:
+        q = torch.randn(1, num_heads, 1, hd, dtype=MODEL_DTYPE)
+        K = torch.randn(1, num_kv, seq_len, hd, dtype=MODEL_DTYPE) * 0.1
+        V = torch.randn(1, num_kv, seq_len, hd, dtype=MODEL_DTYPE) * 0.1
+
+        mask = torch.zeros(1, 1, 1, seq_len, dtype=MODEL_DTYPE)
+        mask[..., seq_len//2:] = -65504.0
+
+        # Reference: repeat_interleave + 4D matmul
+        K_exp = K.repeat_interleave(n_rep, dim=1)
+        V_exp = V.repeat_interleave(n_rep, dim=1)
+        aw_ref = torch.matmul(q, K_exp.transpose(-1, -2))
+        aw_ref = aw_ref + mask
+        aw_ref = ref_softmax(aw_ref, dim=-1)
+        ref_out = torch.matmul(aw_ref, V_exp)  # (1, 8, 1, hd)
+
+        # New: 5D broadcast matmul
+        q_g = q.view(1, num_kv, n_rep, 1, hd)
+        K_b = K.unsqueeze(2)   # (1, 1, 1, S, hd)
+        V_b = V.unsqueeze(2)   # (1, 1, 1, S, hd)
+        aw_new = torch.matmul(q_g, K_b.transpose(-1, -2))  # (1,1,8,1,S)
+        aw_new = aw_new + mask  # 4D mask broadcasts to 5D
+        aw_new = ane_softmax(aw_new, dim=-1)
+        new_out = torch.matmul(aw_new, V_b)  # (1,1,8,1,hd)
+        new_out = new_out.view(1, num_heads, 1, hd)
+
+        cos = F.cosine_similarity(new_out.flatten().float(), ref_out.flatten().float(), dim=0)
+        max_diff = (new_out.float() - ref_out.float()).abs().max().item()
+        print(f"  {desc}: cos={cos:.8f}  max_diff={max_diff:.2e}  "
+              f"{'PASS' if cos > 0.9999 else 'FAIL'}")
+    print()
 
 
-def load_chunks(chunks_dir, cu):
-    """Load 4 CoreML chunks."""
-    chunks = []
-    for i in range(1, 5):
-        p = os.path.join(chunks_dir, f"chunk{i}.mlpackage")
-        if not os.path.exists(p):
-            p = os.path.join(chunks_dir, f"chunk{i}.mlmodelc")
-        t = time.time()
-        m = ct.models.MLModel(p, compute_units=cu)
-        print(f"  chunk{i}: {time.time()-t:.1f}s")
-        chunks.append(m)
-    return chunks
+def test_flash_broadcast():
+    """Verify flash decoding with broadcast GQA matches reference."""
+    print("=== Test 4: Flash decoding + broadcast GQA ===")
+    torch.manual_seed(42)
+
+    sys.path.insert(0, os.path.join(ROOT, "models"))
+    from models.gemma4_swa_flash import flash_decode_attention, _flash_one_chunk
+
+    num_kv = 1
+    n_rep = 8
+    num_heads = num_kv * n_rep
+    hd = 512
+    ctx = 8192
+    num_chunks = 8
+
+    q = torch.randn(1, num_heads, 1, hd, dtype=MODEL_DTYPE)
+    K = torch.randn(1, num_kv, ctx, hd, dtype=MODEL_DTYPE) * 0.1
+    V = torch.randn(1, num_kv, ctx, hd, dtype=MODEL_DTYPE) * 0.1
+    mask = torch.zeros(1, 1, 1, ctx, dtype=MODEL_DTYPE)
+    mask[..., ctx//2:] = -65504.0
+
+    # Reference: repeat_interleave + standard attention
+    K_exp = K.repeat_interleave(n_rep, dim=1)
+    V_exp = V.repeat_interleave(n_rep, dim=1)
+    aw_ref = torch.matmul(q, K_exp.transpose(-1, -2)) + mask
+    aw_ref = ref_softmax(aw_ref, dim=-1)
+    ref_out = torch.matmul(aw_ref, V_exp)
+
+    # New: flash decode with broadcast
+    q_g = q.view(1, num_kv, n_rep, 1, hd)
+    K_b = K.unsqueeze(2)
+    V_b = V.unsqueeze(2)
+    new_out = flash_decode_attention(q_g, K_b, V_b, mask, num_chunks, num_kv, n_rep, hd)
+
+    cos = F.cosine_similarity(new_out.flatten().float(), ref_out.flatten().float(), dim=0)
+    max_diff = (new_out.float() - ref_out.float()).abs().max().item()
+    print(f"  Flash 8-chunk (ctx=8192, hd=512): cos={cos:.8f}  max_diff={max_diff:.2e}  "
+          f"{'PASS' if cos > 0.999 else 'FAIL'}")
+    print()
 
 
-def generate(chunks, embed_q8, embed_scales, pl_q8, pl_scales,
-             cos_s_tbl, sin_s_tbl, cos_f_tbl, sin_f_tbl,
-             prompt_ids, max_steps):
-    """Autoregressive generation using 4 CoreML chunks."""
-    c1, c2, c3, c4 = chunks
+def test_full_model():
+    """End-to-end: load model, run forward, check output sanity."""
+    print("=== Test 5: Full model forward pass ===")
+    from models.gemma4 import Gemma4Model
+    from models.gemma4_swa_flash import FlashChunk1, FlashChunk2, FlashChunk3, FlashChunk4
 
-    # KV cache
-    kSliding1 = np.zeros((7, 1, W, MAX_HD), dtype=np.float16)
-    vSliding1 = np.zeros((7, 1, W, MAX_HD), dtype=np.float16)
-    kFull1 = np.zeros((1, 1, CTX, MAX_HD), dtype=np.float16)
-    vFull1 = np.zeros((1, 1, CTX, MAX_HD), dtype=np.float16)
-    kSliding2 = np.zeros((5, 1, W, MAX_HD), dtype=np.float16)
-    vSliding2 = np.zeros((5, 1, W, MAX_HD), dtype=np.float16)
-    kFull2 = np.zeros((2, 1, CTX, MAX_HD), dtype=np.float16)
-    vFull2 = np.zeros((2, 1, CTX, MAX_HD), dtype=np.float16)
+    HF_DIR = f"{ROOT}/output/gemma4-e2b-final/hf_model"
+    CTX = 8192
+    W = 512
 
-    output_ids = list(prompt_ids)
-    next_token = prompt_ids[-1]
+    if not os.path.isdir(HF_DIR):
+        print(f"  SKIP: model weights not found at {HF_DIR}")
+        return
 
-    for step in range(len(prompt_ids) - 1 + max_steps):
-        if step < len(prompt_ids) - 1:
-            # Prefill: feed prompt tokens one by one
-            tok = prompt_ids[step]
-        else:
-            tok = next_token
+    print("  Loading model...")
+    base = Gemma4Model.from_pretrained(HF_DIR, context_length=CTX)
+    base.eval()
 
-        pos = step
+    c1 = FlashChunk1(base).eval()
+    c2 = FlashChunk2(base).eval()
+    c3 = FlashChunk3(base).eval()
+    c4 = FlashChunk4(base).eval()
 
-        # Embeddings
-        h_in = dequant_embed(embed_q8, embed_scales, tok)
-        plr = dequant_perlayer(pl_q8, pl_scales, tok)
+    config = base.config
+    hidden = config.hidden_size
+    pld = config.hidden_size_per_layer_input
+    nlayers = config.num_hidden_layers
+    max_hd = 512
 
-        # Masks
-        mask_full = np.full((1, 1, 1, CTX), -65504.0, dtype=np.float16)
-        mask_full[0, 0, 0, :pos + 1] = 0
-        mask_sliding = np.full((1, 1, 1, W), -65504.0, dtype=np.float16)
-        valid = min(pos + 1, W)
-        mask_sliding[0, 0, 0, W - valid:] = 0
-        umask = np.zeros((1, 1, CTX, 1), dtype=np.float16)
-        umask[0, 0, min(pos, CTX - 1), 0] = 1.0
+    with torch.no_grad():
+        hs = torch.randn(1, 1, hidden, dtype=MODEL_DTYPE) * 0.01
+        cm_full = torch.zeros(1, 1, 1, CTX, dtype=MODEL_DTYPE)
+        cm_full[..., 1:] = -65504.0  # position 0 visible only
+        cm_slide = torch.zeros(1, 1, 1, W, dtype=MODEL_DTYPE)
+        cm_slide[..., 1:] = -65504.0
+        um = torch.zeros(1, 1, CTX, 1, dtype=MODEL_DTYPE)
+        um[:, :, 0, :] = 1.0
+        plr = torch.randn(1, 1, nlayers * pld, dtype=MODEL_DTYPE) * 0.01
+        cos_s = torch.randn(1, 1, 1, 256, dtype=MODEL_DTYPE)
+        sin_s = torch.randn(1, 1, 1, 256, dtype=MODEL_DTYPE)
+        cos_f = torch.randn(1, 1, 1, 512, dtype=MODEL_DTYPE)
+        sin_f = torch.randn(1, 1, 1, 512, dtype=MODEL_DTYPE)
+        Ks = torch.zeros(7, 1, W, max_hd, dtype=MODEL_DTYPE)
+        Vs = torch.zeros(7, 1, W, max_hd, dtype=MODEL_DTYPE)
+        Kf = torch.zeros(1, 1, CTX, max_hd, dtype=MODEL_DTYPE)
+        Vf = torch.zeros(1, 1, CTX, max_hd, dtype=MODEL_DTYPE)
 
-        # RoPE
-        cos_s = cos_s_tbl[pos].reshape(1, 1, 1, 256).astype(np.float16)
-        sin_s = sin_s_tbl[pos].reshape(1, 1, 1, 256).astype(np.float16)
-        cos_f = cos_f_tbl[pos].reshape(1, 1, 1, 512).astype(np.float16)
-        sin_f = sin_f_tbl[pos].reshape(1, 1, 1, 512).astype(np.float16)
+        hs, Ks, Vs, Kf, Vf, plc = c1(hs, cm_full, cm_slide, um, plr,
+                                       cos_s, sin_s, cos_f, sin_f, Ks, Vs, Kf, Vf)
+        print(f"  Chunk1: hs norm={hs.norm():.4f}, no NaN={not hs.isnan().any()}")
 
-        # Chunk 1
-        out1 = c1.predict({
-            "hidden_states": h_in,
-            "causal_mask_full": mask_full,
-            "causal_mask_sliding": mask_sliding,
-            "update_mask": umask,
-            "per_layer_raw": plr,
-            "cos_s": cos_s, "sin_s": sin_s,
-            "cos_f": cos_f, "sin_f": sin_f,
-            "K_sliding_in": kSliding1, "V_sliding_in": vSliding1,
-            "K_full_in": kFull1, "V_full_in": vFull1,
-        })
-        h1 = out1["hidden_states_out"]
-        plc = out1["per_layer_combined_out"]
-        kSliding1 = out1["K_sliding_out"]
-        vSliding1 = out1["V_sliding_out"]
-        kFull1 = out1["K_full_out"]
-        vFull1 = out1["V_full_out"]
+        Ks2 = torch.zeros(5, 1, W, max_hd, dtype=MODEL_DTYPE)
+        Vs2 = torch.zeros(5, 1, W, max_hd, dtype=MODEL_DTYPE)
+        Kf2 = torch.zeros(2, 1, CTX, max_hd, dtype=MODEL_DTYPE)
+        Vf2 = torch.zeros(2, 1, CTX, max_hd, dtype=MODEL_DTYPE)
+        hs, Ks2, Vs2, Kf2, Vf2, kv13k, kv13v, kv14k, kv14v = c2(
+            hs, cm_full, cm_slide, um, plc, cos_s, sin_s, cos_f, sin_f, Ks2, Vs2, Kf2, Vf2)
+        print(f"  Chunk2: hs norm={hs.norm():.4f}, no NaN={not hs.isnan().any()}")
 
-        # Chunk 2
-        out2 = c2.predict({
-            "hidden_states": h1,
-            "causal_mask_full": mask_full,
-            "causal_mask_sliding": mask_sliding,
-            "update_mask": umask,
-            "per_layer_combined": plc,
-            "cos_s": cos_s, "sin_s": sin_s,
-            "cos_f": cos_f, "sin_f": sin_f,
-            "K_sliding_in": kSliding2, "V_sliding_in": vSliding2,
-            "K_full_in": kFull2, "V_full_in": vFull2,
-        })
-        h2 = out2["hidden_states_out"]
-        kSliding2 = out2["K_sliding_out"]
-        vSliding2 = out2["V_sliding_out"]
-        kFull2 = out2["K_full_out"]
-        vFull2 = out2["V_full_out"]
-        kv13_k = out2["kv13_k"]
-        kv13_v = out2["kv13_v"]
-        kv14_k = out2["kv14_k"]
-        kv14_v = out2["kv14_v"]
+        hs = c3(hs, cm_full, cm_slide, um, plc, cos_s, sin_s, cos_f, sin_f,
+                kv13k, kv13v, kv14k, kv14v)
+        print(f"  Chunk3: hs norm={hs.norm():.4f}, no NaN={not hs.isnan().any()}")
 
-        shared = {
-            "causal_mask_full": mask_full,
-            "causal_mask_sliding": mask_sliding,
-            "update_mask": umask,
-            "per_layer_combined": plc,
-            "cos_s": cos_s, "sin_s": sin_s,
-            "cos_f": cos_f, "sin_f": sin_f,
-            "kv13_k": kv13_k, "kv13_v": kv13_v,
-            "kv14_k": kv14_k, "kv14_v": kv14_v,
-        }
-
-        # Chunk 3
-        d3 = dict(shared)
-        d3["hidden_states"] = h2
-        out3 = c3.predict(d3)
-        h3 = out3["hidden_states_out"]
-
-        # Chunk 4
-        d4 = dict(shared)
-        d4["hidden_states"] = h3
-        out4 = c4.predict(d4)
-
-        tid = out4["token_id"]
-        next_token = int(tid.flat[0]) if hasattr(tid, 'flat') else int(tid)
-
-        if step >= len(prompt_ids) - 1:
-            output_ids.append(next_token)
-            # EOS check
-            if next_token in (1, 107):  # Gemma EOS / <end_of_turn>
-                break
-
-    return output_ids[len(prompt_ids):]
+        tid, tlogit, normed = c4(hs, cm_full, cm_slide, um, plc, cos_s, sin_s, cos_f, sin_f,
+                                  kv13k, kv13v, kv14k, kv14v)
+        print(f"  Chunk4: token_id={tid.item()}, logit={tlogit.item():.4f}, no NaN={not normed.isnan().any()}")
+    print()
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--w2-dir", type=str, default="/tmp/w2-8k")
-    parser.add_argument("--int4-dir", type=str, default=os.path.join(ROOT, "output/all_chunks_8k"))
-    parser.add_argument("--steps", type=int, default=40)
+    parser = argparse.ArgumentParser(description="Smoke test for ANE micro-optimizations")
+    parser.add_argument("--full-model", action="store_true", help="Run full model forward pass")
     args = parser.parse_args()
 
-    print("Loading embeddings...")
-    embed_q8, embed_scales, pl_q8, pl_scales = load_embeddings()
+    test_exp2_softmax()
+    test_mlp_tile()
+    test_gqa_broadcast()
+    test_flash_broadcast()
 
-    print("Loading RoPE tables...")
-    cos_s, sin_s, cos_f, sin_f = load_rope()
+    if args.full_model:
+        test_full_model()
 
-    print("Loading tokenizer...")
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(HF_DIR)
-
-    # Test prompts
-    prompts = [
-        "<start_of_turn>user\nWhat is the capital of France?<end_of_turn>\n<start_of_turn>model\n",
-        "<start_of_turn>user\nExplain photosynthesis in two sentences.<end_of_turn>\n<start_of_turn>model\n",
-        "<start_of_turn>user\nWrite a haiku about the ocean.<end_of_turn>\n<start_of_turn>model\n",
-    ]
-
-    cu = ct.ComputeUnit.CPU_ONLY
-
-    for label, chunks_dir in [("INT4", args.int4_dir), ("W2", args.w2_dir)]:
-        print(f"\n{'='*60}")
-        print(f"Loading {label} chunks from {chunks_dir}")
-        print(f"{'='*60}")
-        chunks = load_chunks(chunks_dir, cu)
-
-        for prompt in prompts:
-            ids = tokenizer.encode(prompt)
-            print(f"\nPrompt: {prompt.strip()[-60:]}")
-            t0 = time.time()
-            out_ids = generate(
-                chunks, embed_q8, embed_scales, pl_q8, pl_scales,
-                cos_s, sin_s, cos_f, sin_f,
-                ids, args.steps,
-            )
-            dt = time.time() - t0
-            text = tokenizer.decode(out_ids, skip_special_tokens=True)
-            print(f"[{label}] ({dt:.1f}s, {len(out_ids)} tok): {text}")
+    print("All unit tests complete.")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
