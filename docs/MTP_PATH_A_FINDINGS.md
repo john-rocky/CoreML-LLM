@@ -243,13 +243,23 @@ Primary risk: the drafter's `embedder.decode` head (Linear 256→262144) may be 
 
 ---
 
-## 7. Recommended next move
+## 7. Implementation strategy — primary path + fallback
 
-**L34 blocker: ELIMINATED.** E2B extraction: **DONE.** Both former prerequisites are cleared. This is a session-boundary-appropriate stopping point.
+**L34 blocker: ELIMINATED.** E2B extraction: **DONE.** Both former prerequisites are cleared.
+
+### Conceptual framing: model layer vs runtime layer
+
+MTP implementation has two distinct layers (per external review):
+1. **Model layer** — the artifact that produces draft tokens (MTP head, drafter branch, etc.)
+2. **Runtime layer** — speculative decode loop + verifier (draft → verify → accept prefix)
+
+Our runtime layer is largely in place (`SpeculativeLoop.swift`, verify chunks on `feature/eagle3-speculative`). The remaining work is the model layer.
+
+### Primary path: extract Google's pre-trained drafter (Path A)
+
+Google ships a **separate 4-layer drafter** (not "heads on trunk") that reads the target's hidden + shared KV. We have extracted it (44.3 MB, `output/mtp_probe/section_10.tflite`). This is architecturally closer to a lightweight EAGLE-style drafter branch than to the "parallel multi-head MTP" described in the Apple 2025 paper — despite Google calling it `mtp_drafter`.
 
 **Next session starts directly with PyTorch reimplementation (step 4.2).**
-
-Remaining sequence:
 
 | Step | Effort |
 |---|---|
@@ -259,8 +269,24 @@ Remaining sequence:
 | On-device bench | 0.5 day |
 | **Total** | **3–4 days** |
 
-**Biggest unknown:** the `activations` input dimension is 3072 = 2× E2B `hidden_size` (1536). The drafter concatenates two 1536-dim vectors. The second half is either:
-1. The **embedding of the draft token** (token embedding looked up for the predicted next token), or
-2. The **`projected_activations` from the previous MTP step** (the drafter's own carry state fed back in).
+**Go/no-go gate**: after step 4.2, run the PyTorch drafter on a test prompt and compare argmax output against TFLite interpreter. If parity holds → proceed. If not → evaluate fallback.
 
-This must be determined at the start of PyTorch reimplementation — it dictates the drafter's input wiring and whether the first MTP step needs a special "no previous activations" initialization path. Inspecting the TFLite graph's input naming or running a probe with known inputs should resolve it quickly.
+**Biggest unknown:** the `activations` input dimension is 3072 = 2× E2B `hidden_size` (1536). The drafter concatenates two 1536-dim vectors. The second half is either:
+1. The **embedding of the draft token** (scaled by `sqrt(hidden_size)`, analogous to EAGLE's `[h, e(t+1)]`), or
+2. The **`projected_activations` from the previous MTP step** (the drafter's carry state fed back).
+
+This must be determined at the start of PyTorch reimplementation. Inspecting the TFLite graph's input naming or running a probe with known inputs should resolve it quickly.
+
+### Fallback: self-trained MTP heads (if Path A fails)
+
+If TFLite→PyTorch weight migration fails parity (e.g. Google's LiteRT forward diverges from our CoreML forward at the hidden-state level), fall back to training our own MTP heads:
+
+1. Freeze the Gemma 4 trunk (our existing chunks, unchanged).
+2. Add 2–3 lightweight future-token heads on the final hidden state.
+3. Train with composite loss: `CE(next) + λ₁·CE(t+2) + λ₂·CE(t+3)`.
+4. Export heads only to CoreML; trunk stays identical.
+5. Runtime verify loop is the same either way.
+
+This is more work (requires A100 GPU time, ~3–5 days including training) but architecturally simpler — we control every weight and know exactly what the heads are trained against. The Apple 2025 paper's gated LoRA + consistency loss is an available refinement if quality degrades.
+
+**Note on V5 doc accuracy**: our V5 doc (`UNEXPLORED_APPROACHES_V5.md §1`) described MTP as "multi-head, no separate model." This was imprecise. Google's actual implementation is a separate drafter branch, not heads on trunk. Both are valid forms of "MTP" but they differ architecturally. The V5 doc's ANE compatibility analysis and composability notes remain correct.
