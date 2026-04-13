@@ -197,6 +197,11 @@ queries but read K/V directly from `kv_cache_k_13` (SWA) and `kv_cache_k_14`
 (full). No K/V projections exist in these layers. This is how Gemma 4 achieves
 35 layers of context with only 15 KV cache entries.
 
+**Sparse attention:** No sparse attention patterns exist for full-attention layers.
+The full-attention Q·K subgraph (`runtime_bmm.impl_1042_0`) dequantizes the
+**entire** K cache and performs a dense matmul against all 32003 context positions.
+No block-sparse, top-k retrieval, or TriForce-style eviction is applied.
+
 **Op code remapping (Google-internal):** Google repurposes TFLite op codes:
 - `STABLEHLO_SHIFT_RIGHT_LOGICAL` → composite subgraph call dispatcher
 - `MEAN` → sin, `TANH` → cos (for RoPE)
@@ -424,8 +429,22 @@ No separate drafter KV cache.
 - K axis 2, V axis 3 (consistent with transposed-V layout)
 - No ring buffer — simple shift/drop operation
 
+**Full-attention KV eviction:** No eviction or compression strategy exists for
+full-attention layers. The cache shape is hard-capped at 32003 positions. The
+`DeleteTokensFromKvCache` function applies only to SWA cache layers. Full-attention
+layers (L4, L9, L14) grow monotonically until the 32003 cap is reached.
+At max context, the runtime does not evict, compress, or page full-attention KV —
+inference simply operates with the full cache.
+
 **INT8 KV cache:** All KV caches are INT8 quantized. The dequantization is handled
 at the model level (DEQUANTIZE op in the TFLite graph).
+
+**Memory reuse between prefill and decode:** Prefill and decode share the same
+physical KV cache buffer allocations — both signatures reference the same
+`input_kv_cache_buffers` / `output_kv_cache_buffers` maps. No buffer reallocation
+or memory reclamation occurs at the prefill→decode transition. The double-buffer
+swap is a pointer swap, not a copy. For the dynamic executor, KV cache grows
+incrementally by `kv_increment_size` (default 16 tokens) via `ResizeTensorBuffer`.
 
 ### B3. Prefill vs Decode
 
