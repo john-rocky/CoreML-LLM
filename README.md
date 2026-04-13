@@ -4,23 +4,23 @@
 
 CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a good fit for always-on, battery-friendly inference. [MLX Swift](https://github.com/ml-explore/mlx-swift) is the best choice when you want maximum throughput from the GPU; CoreML-LLM is the answer when you want the LLM to live on the ANE so the GPU stays free.
 
-> **v0.5.0** — 31 tok/s decode (+11%), 154 tok/s prefill (+60%), IOSurface KV cache, vectorized embeddings. See [What's new](#whats-new-in-v050).
+> **v0.6.0** — Audio multimodal (Gemma 4 E2B speech understanding), library-side `ModelDownloader`, 404-tolerant downloads. See [What's new](#whats-new-in-v060).
 
-| Text | Multimodal |
-|------|------------|
-| ![text](https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a) | ![multimodal](https://github.com/user-attachments/assets/2a869bf5-8315-422d-8b06-a4a7edecd173) |
+| Text | Image | Audio (v0.6) |
+|------|-------|--------------|
+| ![text](https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a) | ![multimodal](https://github.com/user-attachments/assets/2a869bf5-8315-422d-8b06-a4a7edecd173) | <video src="https://github.com/user-attachments/assets/e8deb6d0-d8b0-4210-885c-5d7a7ddc7ad3" controls></video> |
 
 ## Performance (Gemma 4 E2B, iPhone 17 Pro)
 
-| | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | **v0.5.0** |
-|---|---:|---:|---:|---:|---:|
-| Context length | 512 | 2048 | 2048 | 2048 | **2048** |
-| Decode speed | ~11 tok/s | ~11 tok/s | ~28 tok/s | ~28 tok/s | **~31 tok/s** |
-| Prefill | ~11 tok/s | ~175 tok/s | ~96 tok/s | ~96 tok/s | **~154 tok/s** |
-| Multimodal (image) | — | — | broken | working | **working** |
-| Multimodal (audio) | — | — | — | — | **working** |
-| ANE placement | — | — | 99.78% | 99.78% | **99.78%** |
-| Memory (`phys_footprint`) | — | — | — | ~1 GB | **~1 GB** |
+| | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | v0.5.0 | **v0.6.0** |
+|---|---:|---:|---:|---:|---:|---:|
+| Context length | 512 | 2048 | 2048 | 2048 | 2048 | **2048** |
+| Decode speed | ~11 tok/s | ~11 tok/s | ~28 tok/s | ~28 tok/s | ~31 tok/s | **~31 tok/s** |
+| Prefill | ~11 tok/s | ~175 tok/s | ~96 tok/s | ~96 tok/s | ~154 tok/s | **~154 tok/s** |
+| Multimodal (image) | — | — | broken | working | working | **working** |
+| Multimodal (audio) | — | — | — | — | — | **working** |
+| ANE placement | — | — | 99.78% | 99.78% | 99.78% | **99.78%** |
+| Memory (`phys_footprint`) | — | — | — | ~1 GB | ~1 GB | **~1 GB** |
 
 Context length is 2048. Extended context (8K) is under active development (see `docs/SPEED_8K.md` for the roadmap) but not yet stable for shipping: 8K chunk conversion and the inference path are still in flight. The shipped model on HuggingFace is ctx=2048.
 
@@ -53,7 +53,7 @@ The app uses `.cpuAndNeuralEngine` to force ANE execution.
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/john-rocky/CoreML-LLM", from: "0.5.0"),
+    .package(url: "https://github.com/john-rocky/CoreML-LLM", from: "0.6.0"),
 ]
 ```
 
@@ -128,6 +128,55 @@ python convert.py --model gemma4-e2b --output ./output/gemma4-e2b
 # List available models
 python convert.py --list
 ```
+
+## What's new in v0.6.0
+
+### Audio multimodal
+Gemma 4 E2B can hear. Record on the phone, send, get an answer.
+
+```
+PCM (16 kHz mono) → Swift mel spectrogram → audio.mlmodelc (12-layer
+Conformer, ANE) → 250-token, 1536-dim audio features → injected at
+<|audio|> placeholder positions in the LLM prefill → streaming text.
+```
+
+- **Encoder**: 12-layer Conformer, INT4-palettized, ANE-resident. Input
+  (1, 1000, 128) mel fp16; output (1, 250, 1536) features fp16 with the
+  `output_proj + RMSNorm + embed_proj` projection fused into the graph.
+- **Feature injection**: same mechanism as the vision path — per-layer-raw
+  zeroed at audio placeholder positions to avoid PLE corruption.
+- **Recorder**: `AudioRecorder.swift` (AVAudioEngine, mono 16 kHz, max
+  duration synced from the model's `mel_frames`).
+- **UI**: mic button in `CoreMLLLMChat` gated on `supportsAudio`. Audio-only
+  sends (no text) pass an empty prompt so the model treats the audio
+  contents as the user's utterance instead of a sound to describe.
+
+### `ModelDownloader` promoted to the library
+Previously a file in the example app; now in `Sources/CoreMLLLM/`. Other
+apps linking the Swift package get it via `ModelDownloader.shared`.
+
+### 404-tolerant downloads
+A 404 on `*.mlmodelc/metadata.json` or `*.mlmodelc/analytics/coremldata.bin`
+no longer aborts the whole session — these are descriptive, not required
+by CoreML. Required files (`coremldata.bin`, `model.mil`,
+`weights/weight.bin`) still hard-fail.
+
+### Experimental scaffolds (dormant, not wired to the UI)
+Library-side files to support future work on other branches. Nothing is
+on by default.
+
+- `MirrorSpeculativeLoop.swift` — parallel NPU+GPU speculative decoding.
+- `SpeculativeLoop.swift` — EAGLE-3 draft / fusion / verify wiring.
+- `PrefixKVCache.swift` — persistent prefix KV cache for fast TTFT.
+- `ComputePreferenceLoader.swift` — sidecar dual ANE/GPU mlpackage loader.
+
+### Docs
+- `docs/AUDIO.md` — audio pipeline architecture and conversion notes
+- `docs/SPEED_8K.md` — 8K-context roadmap (W8A8, DuoAttention, TriForce)
+- `docs/UNEXPLORED_APPROACHES.md` — six unexplored directions with
+  effort/payoff estimates
+- `docs/POST_BENCH_PRIORITIES.md` — performance-first priority ordering
+  after the on-device EAGLE-3 bench
 
 ## What's new in v0.5.0
 
