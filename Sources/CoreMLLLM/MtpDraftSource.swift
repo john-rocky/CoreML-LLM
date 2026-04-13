@@ -136,6 +136,48 @@ public final class MtpDraftSource {
         return (proposals, projAct)
     }
 
+    /// Single-step draft: run the drafter model once with given inputs.
+    /// Used by MtpSpeculativeEngine for per-step RoPE/mask updates.
+    public func draftOne(
+        embedToken: MLMultiArray,
+        projAct: MLMultiArray,
+        kv13K: MLMultiArray,
+        kv13V: MLMultiArray,
+        kv14K: MLMultiArray,
+        kv14V: MLMultiArray,
+        cosSwa: MLMultiArray,
+        sinSwa: MLMultiArray,
+        cosFull: MLMultiArray,
+        sinFull: MLMultiArray,
+        maskSwa: MLMultiArray,
+        maskFull: MLMultiArray
+    ) throws -> (tokenID: Int32, projActOut: MLMultiArray) {
+        let input = try MLDictionaryFeatureProvider(dictionary: [
+            "embed_token": embedToken,
+            "proj_act": projAct,
+            "kv13_k": kv13K,
+            "kv13_v": kv13V,
+            "kv14_k": kv14K,
+            "kv14_v": kv14V,
+            "cos_swa": cosSwa,
+            "sin_swa": sinSwa,
+            "cos_full": cosFull,
+            "sin_full": sinFull,
+            "mask_swa": maskSwa,
+            "mask_full": maskFull,
+        ])
+        let output = try model.prediction(from: input)
+        guard let topKIds = output.featureValue(for: "top_k_indices")?.multiArrayValue,
+              let projActOut = output.featureValue(for: "proj_act_out")?.multiArrayValue
+        else {
+            throw SpeculativeError.verifyFailed("MTP drafter missing outputs")
+        }
+        let tokenId: Int32 = topKIds.dataPointer
+            .bindMemory(to: Int32.self, capacity: 1)
+            .pointee
+        return (tokenId, projActOut)
+    }
+
     /// Full speculative decode burst: draft → verify → accept.
     public func drawBurst(
         target: SpeculativeTarget,

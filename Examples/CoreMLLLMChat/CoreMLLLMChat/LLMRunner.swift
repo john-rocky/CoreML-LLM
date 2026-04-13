@@ -20,6 +20,11 @@ final class LLMRunner {
     var hasAudio = false
     var maxAudioDuration: TimeInterval = 10.0
 
+    // MTP speculation metrics
+    var mtpAcceptanceRate: Double = 0
+    var mtpTokensPerRound: Double = 0
+    var hasMTP: Bool { llm?.mtpAcceptanceRate != nil }
+
     private var llm: CoreMLLLM?
     private var modelFolderURL: URL?
 
@@ -76,6 +81,8 @@ final class LLMRunner {
                 for await token in innerStream {
                     continuation.yield(token)
                     runner.tokensPerSecond = engine.tokensPerSecond
+                    runner.mtpAcceptanceRate = engine.mtpAcceptanceRate
+                    runner.mtpTokensPerRound = engine.mtpTokensPerRound
                 }
                 runner.loadingStatus = "Ready"
                 continuation.finish()

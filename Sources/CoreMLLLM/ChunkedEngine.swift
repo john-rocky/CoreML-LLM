@@ -75,6 +75,12 @@ final class ChunkedEngine {
     /// Used as MTP drafter carry state — extract at the last accepted position.
     public private(set) var lastVerifyHiddenStates: MLMultiArray?
 
+    /// Last computed kv13/kv14 from chunk2 output (for MTP drafter access).
+    private(set) var lastKV13K: MLMultiArray?
+    private(set) var lastKV13V: MLMultiArray?
+    private(set) var lastKV14K: MLMultiArray?
+    private(set) var lastKV14V: MLMultiArray?
+
     // MARK: - Loading
 
     static func load(from directory: URL, config: ModelConfig,
@@ -436,6 +442,8 @@ final class ChunkedEngine {
         let kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
         let kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
         let kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
+        lastKV13K = kv13_k; lastKV13V = kv13_v
+        lastKV14K = kv14_k; lastKV14V = kv14_v
         let tC2End = CFAbsoluteTimeGetCurrent()
         profileC2 += (tC2End - tC2Start)
 
@@ -554,6 +562,8 @@ final class ChunkedEngine {
         let kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
         let kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
         let kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
+        lastKV13K = kv13_k; lastKV13V = kv13_v
+        lastKV14K = kv14_k; lastKV14V = kv14_v
 
         let sharedKV: [String: MLFeatureValue] = [
             "kv13_k": MLFeatureValue(multiArray: kv13_k), "kv13_v": MLFeatureValue(multiArray: kv13_v),
@@ -681,6 +691,8 @@ final class ChunkedEngine {
         let kv13v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
         let kv14k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
         let kv14v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
+        lastKV13K = kv13k; lastKV13V = kv13v
+        lastKV14K = kv14k; lastKV14V = kv14v
 
         let shared: [String: MLFeatureValue] = [
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
@@ -1065,6 +1077,37 @@ final class ChunkedEngine {
         let d = r.dataPointer.bindMemory(to: UInt16.self, capacity: hs)
         memcpy(d, s.advanced(by: index * hs), hs * MemoryLayout<UInt16>.stride)
         return r
+    }
+
+    // MARK: - MTP drafter support
+
+    /// Raw (unscaled) token embedding for MTP drafter.
+    func lookupRawEmbed(_ tokenID: Int32) throws -> MLMultiArray {
+        let hidden = config.hiddenSize
+        return try embedTokens.lookupUnscaled(Int(tokenID),
+            shape: [1, 1, NSNumber(value: hidden)])
+    }
+
+    /// RoPE cos/sin lookups at a specific position (exposed for drafter).
+    func lookupCosSWA(position: Int) throws -> MLMultiArray {
+        try lookupRoPE(table: cosSlidingTable, position: position, dim: 256)
+    }
+    func lookupSinSWA(position: Int) throws -> MLMultiArray {
+        try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
+    }
+    func lookupCosFull(position: Int) throws -> MLMultiArray {
+        try lookupRoPE(table: cosFullTable, position: position, dim: 512)
+    }
+    func lookupSinFull(position: Int) throws -> MLMultiArray {
+        try lookupRoPE(table: sinFullTable, position: position, dim: 512)
+    }
+
+    /// Causal masks for drafter (exposed wrappers).
+    func makeDrafterSWAMask(position: Int) throws -> MLMultiArray {
+        try makeSlidingCausalMask(position: position, W: config.slidingWindow)
+    }
+    func makeDrafterFullMask(position: Int) throws -> MLMultiArray {
+        try makeCausalMask(position: position, length: config.contextLength)
     }
 }
 
