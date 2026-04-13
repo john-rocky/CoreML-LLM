@@ -119,6 +119,9 @@ public final class CoreMLLLM: @unchecked Sendable {
             onProgress?("Loading chunks (first run = ANE compile, can take 1-2 min)...")
             llm.chunkedEngine = try await ChunkedEngine.load(
                 from: directory, config: config, computeUnits: computeUnits)
+            // Auto-enable SuffixDecoding for T=1 instrumentation
+            llm.suffixDecoding = SuffixDecoding()
+            print("[SuffixDecoding] enabled — T=1 instrumentation active")
         } else {
             let mlConfig = MLModelConfiguration()
             mlConfig.computeUnits = computeUnits
