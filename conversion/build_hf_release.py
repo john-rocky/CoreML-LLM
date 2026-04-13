@@ -41,7 +41,7 @@ The resulting manifest.json format:
     "model_id": "gemma-4-E2B-coreml",
     "mode": "per-file",     // or "zip"
     "files": [
-      { "path": "sdpa-8k/swa/chunk1.mlmodelc/weights/weight.bin",
+      { "path": "sdpa/swa/chunk1.mlmodelc/weights/weight.bin",
         "url":  "https://huggingface.co/.../weights/weight.bin",
         "size_bytes": 155436864,
         "sha256": "<hex>" },
