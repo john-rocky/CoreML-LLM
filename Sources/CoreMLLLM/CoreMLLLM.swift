@@ -120,8 +120,8 @@ public final class CoreMLLLM: @unchecked Sendable {
             llm.chunkedEngine = try await ChunkedEngine.load(
                 from: directory, config: config, computeUnits: computeUnits)
             // Auto-enable SuffixDecoding for T=1 instrumentation
-            llm.suffixDecoding = SuffixDecoding()
-            print("[SuffixDecoding] enabled — T=1 instrumentation active")
+            llm.suffixDecoding = SuffixDecoding(maxNodes: 50_000)
+            print("[SuffixDecoding] enabled — T=1 instrumentation active (maxNodes=50k)")
         } else {
             let mlConfig = MLModelConfiguration()
             mlConfig.computeUnits = computeUnits
@@ -404,13 +404,14 @@ public final class CoreMLLLM: @unchecked Sendable {
                             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                             if elapsed > 0 { mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed }
                             sd?.appendToken(Int32(nextID))
-                            let draftNext = sd?.draft().first
+                            // Only draft every 4th token to limit CPU overhead during T=1 instrumentation
+                            let draftNext: Int32? = (tokenCount % 4 == 0) ? sd?.draft().first : nil
                             try autoreleasepool {
                                 nextID = try engine.predictStep(tokenID: nextID,
                                                                  position: engine.currentPosition)
                             }
                             engine.currentPosition += 1
-                            sd?.recordT1(predicted: draftNext, actual: Int32(nextID))
+                            if draftNext != nil { sd?.recordT1(predicted: draftNext, actual: Int32(nextID)) }
                         }
                         sd?.endGeneration()
                         if let sd, sd.t1Attempts > 0 { print(sd.statsSummary) }
