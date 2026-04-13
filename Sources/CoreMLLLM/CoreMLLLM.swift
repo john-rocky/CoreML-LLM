@@ -55,6 +55,9 @@ public final class CoreMLLLM: @unchecked Sendable {
     // Multi-turn: cache image features across turns
     private var cachedImageFeatures: MLMultiArray?
 
+    // Suffix decoding (CPU-side draft, optional)
+    public var suffixDecoding: SuffixDecoding?
+
     // Generation metrics
     public private(set) var tokensPerSecond: Double = 0
 
@@ -336,6 +339,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                     }
 
                     let engine = mutableSelf.chunkedEngine
+                    let sd = mutableSelf.suffixDecoding
 
                     if let engine {
                         let prefillLen = min(tokens.count, engine.prefillN)
@@ -382,6 +386,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                         }
 
                         // Decode loop with tok/s tracking
+                        sd?.resetContext()
                         let eosIDs: Set<Int> = [1, 106, 151645]
                         let startTime = CFAbsoluteTimeGetCurrent()
                         var tokenCount = 0
@@ -395,12 +400,17 @@ public final class CoreMLLLM: @unchecked Sendable {
                             tokenCount += 1
                             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                             if elapsed > 0 { mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed }
+                            sd?.appendToken(Int32(nextID))
+                            let draftNext = sd?.draft().first
                             try autoreleasepool {
                                 nextID = try engine.predictStep(tokenID: nextID,
                                                                  position: engine.currentPosition)
                             }
                             engine.currentPosition += 1
+                            sd?.recordT1(predicted: draftNext, actual: Int32(nextID))
                         }
+                        sd?.endGeneration()
+                        if let sd, sd.t1Attempts > 0 { print(sd.statsSummary) }
                     } else {
                         // Monolithic path
                         for (step, tid) in tokens.enumerated() {
@@ -414,6 +424,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                                 }
                             }
                         }
+                        sd?.resetContext()
                         let eosIDs: Set<Int> = [1, 106, 151645]
                         let startTime = CFAbsoluteTimeGetCurrent()
                         var pos = tokens.count
@@ -426,12 +437,17 @@ public final class CoreMLLLM: @unchecked Sendable {
                             tokenCount += 1
                             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                             if elapsed > 0 { mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed }
+                            sd?.appendToken(Int32(nextID))
+                            let draftNext = sd?.draft().first
                             try autoreleasepool {
                                 nextID = try mutableSelf.predictMonolithic(
                                     tokenID: nextID, position: pos)
                             }
                             pos += 1
+                            sd?.recordT1(predicted: draftNext, actual: Int32(nextID))
                         }
+                        sd?.endGeneration()
+                        if let sd, sd.t1Attempts > 0 { print(sd.statsSummary) }
                     }
                 } catch {
                     print("[CoreMLLLM] Error: \(error)")
@@ -448,6 +464,7 @@ public final class CoreMLLLM: @unchecked Sendable {
         } else {
             monolithicState = monolithicModel?.makeState()
         }
+        suffixDecoding?.resetContext()
         tokensPerSecond = 0
     }
 
