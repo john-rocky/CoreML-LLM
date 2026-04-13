@@ -36,6 +36,7 @@ public final class SuffixTree {
     }
 
     let root = Node()
+    private let lock = NSLock()
 
     /// Maximum suffix depth to insert (bounds memory growth per sequence).
     public let maxDepth: Int
@@ -58,6 +59,8 @@ public final class SuffixTree {
     /// this is O(N × maxDepth) node visits.
     public func insert(sequence: [Int32]) {
         guard !sequence.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
         for start in 0..<sequence.count {
             let end = min(start + maxDepth, sequence.count)
             var node = root
@@ -94,6 +97,8 @@ public final class SuffixTree {
     public func lookup(context: [Int32], maxLength: Int,
                        minCount: Int32 = 1) -> [Int32] {
         guard !context.isEmpty else { return [] }
+        lock.lock()
+        defer { lock.unlock() }
 
         let maxCtx = min(context.count, maxDepth - 1)
 

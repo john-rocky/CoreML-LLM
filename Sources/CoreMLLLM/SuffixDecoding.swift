@@ -189,15 +189,21 @@ public final class SuffixDecoding {
 
     /// Call when a generation completes. Ingests the full output into the tree
     /// for future draft lookups. Auto-prunes if maxNodes is exceeded.
+    /// Insert runs on a background queue to avoid blocking the next generation.
     public func endGeneration() {
-        if !currentGeneration.isEmpty {
-            tree.insert(sequence: currentGeneration)
-            currentGeneration = []
-        }
+        let tokens = currentGeneration
+        currentGeneration = []
         recentTokens = []
 
-        if tree.nodeCount > maxNodes {
-            tree.prune(minCount: 2)
+        if !tokens.isEmpty {
+            let t = tree
+            let maxN = maxNodes
+            DispatchQueue.global(qos: .utility).async {
+                t.insert(sequence: tokens)
+                if t.nodeCount > maxN {
+                    t.prune(minCount: 2)
+                }
+            }
         }
     }
 
