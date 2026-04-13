@@ -72,7 +72,7 @@ def run_pytorch(pt_path: str, activations: np.ndarray, input_pos: np.ndarray,
 
 
 def main():
-    tflite_path = "output/mtp_probe/section_9.tflite"
+    tflite_path = "output/mtp_probe/section_10.tflite"
     pt_path = "output/mtp_probe/mtp_drafter.pt"
 
     ctx = 32003

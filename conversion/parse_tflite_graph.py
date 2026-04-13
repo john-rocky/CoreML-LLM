@@ -10,7 +10,7 @@ import tflite
 
 
 def main():
-    tflite_path = "output/mtp_probe/section_9.tflite"
+    tflite_path = "output/mtp_probe/section_10.tflite"
 
     with open(tflite_path, "rb") as f:
         buf = f.read()
