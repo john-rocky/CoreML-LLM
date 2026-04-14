@@ -104,6 +104,15 @@ public final class MtpSpeculativeEngine {
         var embedToken = try engine.lookupRawEmbed(nextID)
         var projAct = carryState!
 
+        // Diagnostic: print magnitudes on first round
+        if totalRounds == 0 {
+            let eNorm = l2Norm(embedToken)
+            let pNorm = l2Norm(projAct)
+            let vhsState = engine.lastVerifyHiddenStates == nil ? "nil" : "populated"
+            print("[MTP-DIAG] round=0 embedNorm=\(String(format: "%.3f", eNorm)) " +
+                  "carryNorm=\(String(format: "%.3f", pNorm)) verifyHS=\(vhsState)")
+        }
+
         for k in 0..<K {
             let draftPos = pos + k
             // Target RoPE tables store (1,1,1,dim) with duplicated halves:
@@ -210,6 +219,18 @@ public final class MtpSpeculativeEngine {
         nextID = Int32(newNext)
         isBootstrapped = true
         return [emitted]
+    }
+
+    /// Compute L2 norm of an fp16 MLMultiArray.
+    private func l2Norm(_ arr: MLMultiArray) -> Float {
+        let n = arr.count
+        let ptr = arr.dataPointer.bindMemory(to: UInt16.self, capacity: n)
+        var sum: Float = 0
+        for i in 0..<n {
+            let v = fp16ToF32(ptr[i])
+            sum += v * v
+        }
+        return sqrt(sum)
     }
 
     /// Transpose last two dims of a (1, 1, N, M) fp16 MLMultiArray → (1, 1, M, N).
