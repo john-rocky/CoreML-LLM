@@ -263,8 +263,49 @@ public final class ModelDownloader: NSObject {
             cancelDownload()
         }
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
-        if fileManager.fileExists(atPath: dir.path) { try fileManager.removeItem(at: dir) }
-        refreshTrigger += 1
+        defer { refreshTrigger += 1 }
+        guard fileManager.fileExists(atPath: dir.path) else { return }
+        // Primary path: remove the whole directory tree.
+        do {
+            try fileManager.removeItem(at: dir)
+            return
+        } catch {
+            // Fallback: some items (e.g., bundles left in an unusual state by
+            // a previous app version) can resist a single removeItem call on
+            // the parent. Remove children individually, then retry the dir.
+            if let children = try? fileManager.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]) {
+                for child in children {
+                    try? fileManager.removeItem(at: child)
+                }
+            }
+            try fileManager.removeItem(at: dir)
+        }
+    }
+
+    /// Remove every model folder under `modelsDirectory`. Used as an escape
+    /// hatch when a stale/incompatible artifact from a prior app version
+    /// can't be deleted via the per-model trash button.
+    public func resetAllModels() throws {
+        cancelDownload()
+        defer { refreshTrigger += 1 }
+        guard fileManager.fileExists(atPath: modelsDirectory.path) else { return }
+        let children = (try? fileManager.contentsOfDirectory(
+            at: modelsDirectory, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles])) ?? []
+        for child in children {
+            do {
+                try fileManager.removeItem(at: child)
+            } catch {
+                if let grandchildren = try? fileManager.contentsOfDirectory(
+                    at: child, includingPropertiesForKeys: nil,
+                    options: [.skipsHiddenFiles]) {
+                    for g in grandchildren { try? fileManager.removeItem(at: g) }
+                }
+                try? fileManager.removeItem(at: child)
+            }
+        }
     }
 
     // MARK: - Parallel Download Scheduling
