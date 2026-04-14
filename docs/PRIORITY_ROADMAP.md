@@ -224,7 +224,7 @@ for repetitive / long-prompt workloads.**
 
 | What | Why | Date |
 |---|---|---|
-| PR #17 bundle: MLP tile (B,C,8,8) + GQA broadcast matmul + exp2 softmax | Smoke tests passed (cos > 0.99999) but on-device 8K bench: 15.0 → 2.7 tok/s (5.5× slower across all chunks) on iPhone 17 Pro. Root cause not triaged — likely one of the three ops falls off the ANE fast path on A19. | 2026-04-14 |
+| PR #17 bundle: MLP tile (B,C,8,8) + GQA broadcast matmul + exp2 softmax | Smoke tests passed (cos > 0.99999) but on-device 8K bench: 15.0 → 2.7 tok/s (5.5× slower across all chunks) on iPhone 17 Pro. MLComputePlan audit on the PR #17 chunks showed **~80 % ANE placement** vs baseline's ~100 %, confirming ~20 % of ops fell off the ANE fast path onto CPU/GPU. Not triaged which of the three ops individually is the culprit. | 2026-04-14 |
 | W2A16/W3A16 post-training palettization | Complete gibberish. QAT required for sub-4-bit. | 2026-04-13 |
 | MLState stateful KV | `coreml_update_state` → error -14 on ANE (Mac + iPhone). GPU-only. | 2026-04-13 |
 | W8A8 (coremltools activation quant) | `ANECCompile() FAILED` on iPhone 17 Pro | 2026-04-13 |
