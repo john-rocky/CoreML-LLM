@@ -1,5 +1,6 @@
 import SwiftUI
 import PhotosUI
+import CoreMLLLM
 
 struct ChatView: View {
     @State private var runner = LLMRunner()
@@ -10,6 +11,13 @@ struct ChatView: View {
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var selectedImage: CGImage?
     @State private var selectedImageData: Data?
+
+    // Video picker (Gemma 4 video path)
+    @State private var selectedVideoItem: PhotosPickerItem?
+    @State private var selectedVideoURL: URL?
+    @State private var selectedVideoLabel: String?
+    @State private var videoFrames: Int = 6
+    @State private var videoIncludeAudio: Bool = false
 
     // Audio recording
     @State private var audioRecorder = AudioRecorder()
@@ -93,6 +101,38 @@ struct ChatView: View {
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
+                    }
+                    .padding(.horizontal)
+                    .padding(.top, 4)
+                }
+
+                // Video preview
+                if let label = selectedVideoLabel {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Image(systemName: "video.fill")
+                                .foregroundStyle(.blue)
+                            Text(label)
+                                .font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Button { clearVideo() } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        HStack(spacing: 12) {
+                            Stepper("frames: \(videoFrames)",
+                                    value: $videoFrames, in: 1...24)
+                                .font(.caption)
+                                .fixedSize()
+                            if runner.hasAudio {
+                                Toggle("audio", isOn: $videoIncludeAudio)
+                                    .toggleStyle(.switch)
+                                    .font(.caption)
+                                    .fixedSize()
+                            }
+                            Spacer()
+                        }
                     }
                     .padding(.horizontal)
                     .padding(.top, 4)
@@ -194,6 +234,9 @@ struct ChatView: View {
             .onChange(of: selectedPhoto) {
                 loadPhoto()
             }
+            .onChange(of: selectedVideoItem) {
+                loadVideo()
+            }
         }
     }
 
@@ -220,6 +263,15 @@ struct ChatView: View {
                 .disabled(runner.isGenerating)
             }
 
+            // Video picker (Gemma 4 video path)
+            if runner.hasVision {
+                PhotosPicker(selection: $selectedVideoItem, matching: .videos) {
+                    Image(systemName: "video")
+                        .font(.title3)
+                }
+                .disabled(runner.isGenerating)
+            }
+
             // Mic button (only for audio-capable models)
             if runner.hasAudio {
                 Button { toggleRecording() } label: {
@@ -240,7 +292,8 @@ struct ChatView: View {
                     .font(.title2)
             }
             .disabled((inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        && audioRecorder.recordedSamples == nil)
+                        && audioRecorder.recordedSamples == nil
+                        && selectedVideoURL == nil)
                        || !runner.isLoaded || runner.isGenerating)
         }
         .padding()
@@ -275,19 +328,18 @@ struct ChatView: View {
     private func sendMessage() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let audio = audioRecorder.recordedSamples
-        print("[ChatView] sendMessage: text='\(text.prefix(30))', audio=\(audio != nil ? "\(audio!.count) samples" : "nil"), isRecording=\(audioRecorder.isRecording)")
+        let videoURL = selectedVideoURL
+        print("[ChatView] sendMessage: text='\(text.prefix(30))', audio=\(audio != nil ? "\(audio!.count) samples" : "nil"), video=\(videoURL?.lastPathComponent ?? "nil")")
 
-        // Audio-only sends were previously auto-filled with
-        //   "What do you hear in this audio?"
-        // which forced the model into transcription/description mode. Gemma 4's
-        // audio tower can interpret the audio content as the user's utterance
-        // directly, so we now pass an empty text prompt and let the model
-        // respond to *what was said*, not describe *what was heard*.
-        guard !text.isEmpty || audio != nil else { return }
+        guard !text.isEmpty || audio != nil || videoURL != nil else { return }
 
         let attachedImageData = selectedImageData
         let content: String
-        if audio != nil && text.isEmpty {
+        if videoURL != nil && text.isEmpty {
+            content = "[Video]"
+        } else if videoURL != nil {
+            content = "[Video] " + text
+        } else if audio != nil && text.isEmpty {
             content = "[Audio]"
         } else if audio != nil {
             content = "[Audio] " + text
@@ -299,14 +351,24 @@ struct ChatView: View {
         streamingText = ""
 
         let image = selectedImage
+        let frames = videoFrames
+        let includeAudio = videoIncludeAudio
         clearImage()
         audioRecorder.clear()
 
         Task {
             do {
-                print("[ChatView] calling generate with audio=\(audio != nil ? "\(audio!.count)" : "nil")")
-                let stream = try await runner.generate(messages: messages, image: image,
-                                                        audio: audio)
+                let stream: AsyncStream<String>
+                if let videoURL {
+                    let opts = VideoProcessor.Options(
+                        fps: 1.0, maxFrames: frames,
+                        includeAudio: includeAudio)
+                    stream = try await runner.generate(
+                        messages: messages, videoURL: videoURL, videoOptions: opts)
+                } else {
+                    stream = try await runner.generate(
+                        messages: messages, image: image, audio: audio)
+                }
                 for await token in stream {
                     streamingText += token
                 }
@@ -314,10 +376,47 @@ struct ChatView: View {
                     messages.append(ChatMessage(role: .assistant, content: streamingText))
                     streamingText = ""
                 }
+                if videoURL != nil { await MainActor.run { clearVideo() } }
             } catch {
                 messages.append(ChatMessage(role: .system, content: "Error: \(error.localizedDescription)"))
             }
         }
+    }
+
+    private func loadVideo() {
+        guard let item = selectedVideoItem else { return }
+        Task {
+            do {
+                guard let data = try await item.loadTransferable(type: Data.self) else {
+                    await MainActor.run {
+                        messages.append(ChatMessage(role: .system,
+                            content: "Video load failed (no data)."))
+                    }
+                    return
+                }
+                let ext = "mov"
+                let tmp = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("picked-\(UUID().uuidString).\(ext)")
+                try data.write(to: tmp)
+                let mb = Double(data.count) / 1_048_576.0
+                await MainActor.run {
+                    selectedVideoURL = tmp
+                    selectedVideoLabel = String(format: "Video ready (%.1f MB)", mb)
+                }
+            } catch {
+                await MainActor.run {
+                    messages.append(ChatMessage(role: .system,
+                        content: "Video load error: \(error.localizedDescription)"))
+                }
+            }
+        }
+    }
+
+    private func clearVideo() {
+        if let url = selectedVideoURL { try? FileManager.default.removeItem(at: url) }
+        selectedVideoURL = nil
+        selectedVideoLabel = nil
+        selectedVideoItem = nil
     }
 
     private func toggleRecording() {

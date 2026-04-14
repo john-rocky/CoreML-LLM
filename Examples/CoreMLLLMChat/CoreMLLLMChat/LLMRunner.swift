@@ -62,23 +62,47 @@ final class LLMRunner {
         isGenerating = true
         tokensPerSecond = 0
 
-        // Convert app ChatMessage → CoreMLLLM.Message
-        let coreMessages = messages.compactMap { m -> CoreMLLLM.Message? in
+        let coreMessages = toCoreMessages(messages)
+        let innerStream = try await llm.stream(coreMessages, image: image, audio: audio)
+        return wrapStream(innerStream, engine: llm)
+    }
+
+    /// Variant that routes through Gemma 4's video chat template:
+    /// frames sampled at `videoOptions.fps` (capped by `maxFrames`),
+    /// optional audio from the same clip if `includeAudio` is set.
+    func generate(messages: [ChatMessage], videoURL: URL,
+                  videoOptions: VideoProcessor.Options) async throws -> AsyncStream<String> {
+        guard let llm else {
+            throw NSError(domain: "LLMRunner", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Model not loaded"])
+        }
+
+        isGenerating = true
+        tokensPerSecond = 0
+
+        let coreMessages = toCoreMessages(messages)
+        let innerStream = try await llm.stream(
+            coreMessages, videoURL: videoURL, videoOptions: videoOptions)
+        return wrapStream(innerStream, engine: llm)
+    }
+
+    private func toCoreMessages(_ messages: [ChatMessage]) -> [CoreMLLLM.Message] {
+        messages.compactMap { m -> CoreMLLLM.Message? in
             switch m.role {
             case .user: return .init(role: .user, content: m.content)
             case .assistant: return .init(role: .assistant, content: m.content)
             case .system: return nil
             }
         }
+    }
 
-        let innerStream = try await llm.stream(coreMessages, image: image, audio: audio)
+    private func wrapStream(_ inner: AsyncStream<String>,
+                             engine: CoreMLLLM) -> AsyncStream<String> {
         let runner = self
-        let engine = llm
-
         return AsyncStream { continuation in
             Task {
                 defer { runner.isGenerating = false }
-                for await token in innerStream {
+                for await token in inner {
                     continuation.yield(token)
                     runner.tokensPerSecond = engine.tokensPerSecond
                     runner.mtpAcceptanceRate = engine.mtpAcceptanceRate

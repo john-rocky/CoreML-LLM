@@ -527,6 +527,7 @@ final class ChunkedEngine {
     // MARK: - Batched prefill (seq=N)
 
     func runPrefill(tokenIDs: [Int], imageFeatures: MLMultiArray? = nil,
+                    imageNumTokens: Int = 256,
                     audioFeatures: MLMultiArray? = nil, audioNumTokens: Int = 50) throws -> Int {
         guard let p1 = prefillChunk1, let p2 = prefillChunk2,
               let p3 = prefillChunk3, let p4 = prefillChunk4 else {
@@ -539,6 +540,7 @@ final class ChunkedEngine {
         reset()
 
         let hiddenIn = try buildPrefillHidden(tokenIDs: tokenIDs, N: N, imageFeatures: imageFeatures,
+                                                imageNumTokens: imageNumTokens,
                                                 audioFeatures: audioFeatures, audioNumTokens: audioNumTokens)
         let plRaw = try buildPrefillPLR(tokenIDs: tokenIDs, N: N)
         let causal = try makePrefillCausalMask(N: N)
@@ -963,6 +965,7 @@ final class ChunkedEngine {
 
     private func buildPrefillHidden(tokenIDs: [Int], N: Int,
                                      imageFeatures: MLMultiArray? = nil,
+                                     imageNumTokens: Int = 256,
                                      audioFeatures: MLMultiArray? = nil,
                                      audioNumTokens: Int = 50) throws -> MLMultiArray {
         let IMAGE_TOKEN_ID = 258880
@@ -976,7 +979,7 @@ final class ChunkedEngine {
         var imageIdx = 0
         var audioIdx = 0
         for (i, tid) in tokenIDs.enumerated() {
-            if tid == IMAGE_TOKEN_ID, let fp = imgPtr, imageIdx < 256 {
+            if tid == IMAGE_TOKEN_ID, let fp = imgPtr, imageIdx < imageNumTokens {
                 memcpy(dst.advanced(by: i * hidden), fp.advanced(by: imageIdx * hidden),
                        hidden * MemoryLayout<UInt16>.stride)
                 imageIdx += 1

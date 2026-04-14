@@ -1,6 +1,6 @@
-# Multimodal (Image Understanding) — Architecture & Debugging Notes
+# Multimodal (Image / Video / Audio) — Architecture & Debugging Notes
 
-How Gemma 4 E2B processes images on-device via CoreML, and what went wrong along the way.
+How Gemma 4 E2B processes images, video, and audio on-device via CoreML, and what went wrong along the way.
 
 ## Architecture Overview
 
@@ -112,11 +112,107 @@ Matches HuggingFace `Gemma3nImageProcessor` (`processor_config.json`):
 - Patch extraction: 16×16, channels-last, row-major
 - Position IDs: meshgrid (x, y) = (px, py), padding positions = -1
 
+## Video (v0.4.0 — Phase 1, mobile-scoped)
+
+Gemma 4's video path is conceptually "a sequence of image frames, each with a
+timestamp, optionally plus an audio track." No new CoreML model is required
+on our side — the existing `vision.mlpackage` runs per frame and the existing
+`audio.mlpackage` handles the soundtrack.
+
+### Pipeline
+
+```
+video.mp4 / .mov
+    │
+    ▼
+VideoProcessor.extractFrames(options.fps, options.maxFrames)
+    │  AVAssetImageGenerator, aspect-ratio preserving, 1 fps default
+    │
+    ▼
+ImageProcessor.process() × N frames       (optional audio branch)
+    │                                     VideoProcessor.extractAudioPCM16k
+    │                                     AudioProcessor.process
+    ▼
+concatFrameFeatures() → (1, N×256, 1536)  audio_features
+    │
+    ▼
+Gemma video chat template:
+  MM:SS <|image><|image|>×256<image|>  MM:SS <|image>…<image|>  ...
+  (frames space-joined; audio block appended if present)
+    │
+    ▼
+ChunkedEngine prefill/decode with imageNumTokens = N×256
+```
+
+### Per-frame chat-template block
+
+Matching HF `Gemma4Processor.apply_chat_template` for video messages:
+
+```
+{MM:SS} <|image><|image|>×n_tokens<image|>
+```
+
+Frames are joined by single spaces, audio block (if any) goes after.
+
+### Why `n_tokens = 64` (not 256)
+
+Gemma 4's processor config exposes two separate token budgets:
+
+| processor        | `max_soft_tokens` | ≈ real tokens/frame (square) |
+|------------------|-------------------|------------------------------|
+| `image_processor` | 280              | 256 (16×16 grid)             |
+| `video_processor` | 70               | 64  (8×8 grid)               |
+
+The shipped `vision.mlpackage` was built for the still-image path, so it
+always emits 280 tokens per frame (256 real). Feeding those 256 tokens per
+frame into the LLM as if they were video produced garbage output — the
+model was trained expecting ~64 tokens per frame for video and got
+confused by ×4 the expected density, emitting EOS after ~100 characters.
+
+The current workaround (`tokensPerFrame = 64`, default) 2×2-average-pools
+each frame's 16×16 token grid down to 8×8 in fp32 on-the-fly in Swift.
+Output length jumps from ~100 chars to ~900, and the model starts
+explicitly referencing frames by their `MM:SS` timestamps and reasoning
+about temporal progression. Phase 2 will replace this pool with a
+purpose-built `vision_video.mlpackage` (`max_soft_tokens=70`) so the
+downsampling happens inside the encoder rather than after it.
+
+### Mobile context-length budget
+
+Each frame costs ~261 tokens (256 placeholders + BOI + EOI + `MM:SS` + space).
+
+| Chunk size | Usable frames @ 1 fps | Recommended `maxFrames` |
+|------------|------------------------|--------------------------|
+| 512        | ~1                     | 1 (use the still-image path instead) |
+| 2048       | ~7                     | 6                        |
+| 8192       | ~30                    | 24                       |
+
+`VideoProcessor.Options(fps:maxFrames:includeAudio:)` defaults to
+`fps=1.0, maxFrames=8, includeAudio=false` — safe on a 2K chunk.
+
+For longer clips on mobile, Phase 2 will add a low-token-budget vision
+encoder variant (`max_soft_tokens=64`, Gemma's `token_budget=70`) so that
+30–60 s at 1 fps fits in 8K. That requires re-running `gemma4_vision.py`
+with a different pooler config and is tracked separately.
+
+### Usage
+
+```swift
+let llm = try await CoreMLLLM.load(model: .gemma4e2b)
+let answer = try await llm.generate(
+    "What is happening in this clip?",
+    videoURL: URL(fileURLWithPath: "/tmp/clip.mp4"),
+    videoOptions: .init(fps: 1.0, maxFrames: 6, includeAudio: true)
+)
+```
+
 ## Files
 
 | File | What |
 |------|------|
 | `Sources/CoreMLLLM/ImageProcessor.swift` | Image preprocessing + vision encoder call |
+| `Sources/CoreMLLLM/AudioProcessor.swift` | Mel spectrogram + Conformer + projection |
+| `Sources/CoreMLLLM/VideoProcessor.swift` | AVFoundation frame + audio extraction |
 | `Sources/CoreMLLLM/ChunkedEngine.swift` | Feature injection in decode/prefill paths |
 | `conversion/models/gemma4_vision.py` | Vision weight extraction (not CoreML conversion) |
 | `conversion/output/gemma4-mobile/vision.mlpackage` | CoreML vision encoder |

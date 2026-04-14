@@ -9,6 +9,7 @@ let package = Package(
     ],
     products: [
         .library(name: "CoreMLLLM", targets: ["CoreMLLLM"]),
+        .executable(name: "video-test", targets: ["VideoTest"]),
     ],
     dependencies: [
         .package(url: "https://github.com/huggingface/swift-transformers", from: "0.1.12"),
@@ -19,6 +20,11 @@ let package = Package(
             dependencies: [
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .executableTarget(
+            name: "VideoTest",
+            dependencies: ["CoreMLLLM"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
