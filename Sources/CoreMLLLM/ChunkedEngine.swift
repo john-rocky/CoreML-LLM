@@ -302,7 +302,7 @@ final class ChunkedEngine {
         }
         print("[KV] Allocating IOSurface-backed KV cache buffers (ctx=\(ctx))")
 
-        return try ChunkedEngine(
+        let engine = try ChunkedEngine(
             chunk1: c1, chunk2: c2, chunk3: c3, chunk4: c4,
             prefillChunk1: p1, prefillChunk2: p2, prefillChunk3: p3, prefillChunk4: p4,
             verifyChunk1: v1, verifyChunk2: v2, verifyChunk3: v3, verifyChunk4: v4,
@@ -316,6 +316,20 @@ final class ChunkedEngine {
             kSliding2: ioSurfaceArray(slots: 5, seqLen: W), vSliding2: ioSurfaceArray(slots: 5, seqLen: W),
             kFull2: ioSurfaceArray(slots: 2, seqLen: ctx), vFull2: ioSurfaceArray(slots: 2, seqLen: ctx),
             config: config, prefillN: prefillN)
+
+        // ANE pipeline prewarm (Phase 0b): four dummy decode steps at load
+        // time force the ANE compiler to finalize dispatch schedules and
+        // resident weight layouts before the first user token arrives —
+        // eliminating the ~0.5-1.5s first-token stall. KV cache is reset
+        // afterwards so the dummy tokens leave no state behind.
+        let warmT0 = CFAbsoluteTimeGetCurrent()
+        for i in 0..<4 {
+            _ = try engine.predictStep(tokenID: 0, position: i)
+        }
+        engine.reset()
+        print("[Load] ANE prewarm (4 steps) done in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - warmT0))s")
+
+        return engine
     }
 
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
