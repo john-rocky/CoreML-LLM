@@ -122,9 +122,9 @@ class ModuleAttention(nn.Module):
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        # RoPE
-        cos_pos = cos[positions]
-        sin_pos = sin[positions]
+        # RoPE — cast cos/sin to q's dtype to avoid auto-promotion mismatch with v
+        cos_pos = cos[positions].to(q.dtype)
+        sin_pos = sin[positions].to(q.dtype)
         q = _apply_rope_q(q, cos_pos, sin_pos)
         k = _apply_rope_q(k, cos_pos, sin_pos)
 
@@ -134,10 +134,12 @@ class ModuleAttention(nn.Module):
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
 
+        # Ensure consistent dtype throughout attention
+        attn_dtype = q.dtype
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, nh, T, T)
-        attn = attn + causal_mask
+        attn = attn + causal_mask.to(attn_dtype)
         attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)  # (B, nh, T, hd)
+        out = torch.matmul(attn, v.to(attn_dtype))  # (B, nh, T, hd)
 
         out = out.permute(0, 2, 1, 3).reshape(B, T, self.nh * self.hd)
         return self.o_proj(out)
