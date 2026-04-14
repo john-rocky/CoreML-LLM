@@ -180,52 +180,64 @@ def main():
         buf_hiddens = []
 
     print(f"\nDatasets: {args.dataset}")
-    # Accumulate tokens across ALL examples, THEN chunk into seq_len windows.
-    # Per-example chunking fails for short entries like wikitext (lines, not docs).
+    # Per-dataset processing: tokenize → chunk → trunk forward → save shards.
+    # Crashes in dataset N don't lose datasets 0..N-1 (already flushed to disk).
     bos = tok.bos_token_id
-    all_tokens = [bos] if bos is not None else []
-    total_samples = 0
+    grand_total_tokens = 0
+    grand_total_chunks = 0
+
     for ds_name in args.dataset:
+        print(f"\n=== Dataset: {ds_name} ===")
         print(f"  Streaming {ds_name} (max {args.samples_per_dataset} samples)...")
-        ds_tokens_before = len(all_tokens)
+        ds_tokens = [bos] if bos is not None else []
         ds_samples = 0
-        for ex in iter_hf_dataset(ds_name, streaming=True, max_samples=args.samples_per_dataset):
-            text = ex.get("text") or ex.get("content", "")
-            if not text:
-                continue
-            ids = tok(text, add_special_tokens=False).input_ids
-            all_tokens.extend(ids)
-            ds_samples += 1
-        ds_tokens = len(all_tokens) - ds_tokens_before
-        total_samples += ds_samples
-        print(f"    {ds_name}: {ds_samples} samples, {ds_tokens:,} tokens")
+        try:
+            for ex in iter_hf_dataset(ds_name, streaming=True, max_samples=args.samples_per_dataset):
+                text = ex.get("text") or ex.get("content", "")
+                if not text:
+                    continue
+                ids = tok(text, add_special_tokens=False).input_ids
+                ds_tokens.extend(ids)
+                ds_samples += 1
+        except Exception as e:
+            print(f"  ERROR loading {ds_name}: {e}")
+            print(f"  Skipping; previous datasets' shards are safely on disk.")
+            continue
 
-    # Chunk into seq_len windows
-    all_chunks = []
-    for i in range(0, len(all_tokens) - args.seq_len + 1, args.seq_len):
-        all_chunks.append(all_tokens[i:i + args.seq_len])
+        print(f"  Collected: {ds_samples} samples, {len(ds_tokens):,} tokens")
 
-    print(f"\nTotal: {total_samples} samples → {len(all_tokens):,} tokens → "
-          f"{len(all_chunks)} chunks of {args.seq_len}")
+        # Chunk this dataset's tokens into seq_len windows
+        ds_chunks = []
+        for i in range(0, len(ds_tokens) - args.seq_len + 1, args.seq_len):
+            ds_chunks.append(ds_tokens[i:i + args.seq_len])
+        print(f"  {len(ds_chunks)} chunks of {args.seq_len}")
 
-    with torch.inference_mode():
-        for i, chunk in enumerate(all_chunks):
-            ids = torch.tensor([chunk], dtype=torch.long, device=args.device)
-            out = lm(input_ids=ids, output_hidden_states=True, use_cache=False)
-            # L34 raw hidden = hidden_states[-2]  (last is post-norm; -2 is raw L34 output)
-            l34 = out.hidden_states[-2][0].to(torch.float16).cpu().numpy()  # (T, H)
-            buf_tokens.append(np.array(chunk, dtype=np.int32))
-            buf_hiddens.append(l34)
-            total_tokens += len(chunk)
+        if not ds_chunks:
+            print(f"  (too few tokens to form even one chunk; skipping)")
+            continue
 
-            if len(buf_tokens) >= args.shard_size:
-                flush()
+        # Trunk forward + save per-dataset
+        with torch.inference_mode():
+            for i, chunk in enumerate(ds_chunks):
+                ids = torch.tensor([chunk], dtype=torch.long, device=args.device)
+                out = lm(input_ids=ids, output_hidden_states=True, use_cache=False)
+                l34 = out.hidden_states[-2][0].to(torch.float16).cpu().numpy()
+                buf_tokens.append(np.array(chunk, dtype=np.int32))
+                buf_hiddens.append(l34)
+                total_tokens += len(chunk)
 
-            if (i + 1) % 10 == 0:
-                print(f"  Processed {i+1}/{len(all_chunks)} chunks, "
-                      f"{total_tokens:,} tokens")
+                if len(buf_tokens) >= args.shard_size:
+                    flush()
 
-    flush()
+                if (i + 1) % 50 == 0:
+                    print(f"    Processed {i+1}/{len(ds_chunks)} chunks of {ds_name}, "
+                          f"{total_tokens:,} total tokens")
+
+        # Flush any remaining buffer for this dataset so its shards are
+        # independent from the next dataset's (crash-safety).
+        flush()
+        grand_total_tokens += len(ds_tokens)
+        grand_total_chunks += len(ds_chunks)
 
     print(f"\nDONE. Total tokens: {total_tokens:,} across {shard_idx} shards.")
     print(f"Storage: {sum(f.stat().st_size for f in out_dir.rglob('*')) / 1e9:.2f} GB")
