@@ -48,6 +48,8 @@ Run these **now**, before any speculative or conversion work. They either
 | **0e** | **Output buffer pooling** — reuse MLMultiArray via NSCache | −1–2 ms/step | 0.5 day Swift | ANE_SURVEY |
 | **0f** | **Ping-pong buffer audit** — 2-deep sync between consecutive chunks (ANE async safety) | correctness | 0.5 day | ANE_SURVEY (ANEMLL) |
 | **0g** | **SRAM 32 MB working-set check** — tune prefillN per chunk to avoid 30% cliff | avoid 30% drop | 0.5 day analysis | SOURCES (Orion) |
+| **0h** | **`reshapeFrequency = .infrequent` hint** (iOS 18.2+) — skip per-call shape-trace | ~0.5 ms/step | 0.5 day Swift | V6 §V6-1 |
+| **0i** | **MLComputePlan warm-pool** — materialize plan once, reuse across predictions | ~0.8 ms first-call, cold-path shaves | 1 day Swift | V6 §V6-2 |
 
 0a result: no compute-op fallback to fix. Bottleneck is 4× per-step
 dispatch overhead, not per-op device placement.
@@ -71,6 +73,8 @@ Ship without draft model. Most batchable in a single reconversion pass.
 | **5e** | **SDPA fusion re-test** — iOS 18 native fused op may have fixed QK-norm scale=1.0 | 5–10% attn if fused | 1 day + reconvert | exact (if works) | ANE_SURVEY §4b |
 | **5f** | **Draft & Verify (training-free self-spec)** — exit at L14 → LM head | ×1.5–2.0 | 2 days | yes | V5 |
 | **5g** | **Kangaroo (lightweight adapter self-spec)** | ×1.68 | 2 days | yes | V5 |
+| **5h** | **Blockwise-32 per-block W4 palettization** — coremltools 8.1 `granularity="per_block"` — strictly finer-grained than current per-channel | quality-neutral-or-+ | 1 day + reconvert | exact bits, lower quant error | V6 §V6-3 |
+| **5i** | **SpinQuant / QuaRot rotation before palettization** — Hadamard rotation smears outliers so INT4 buckets cover less range | −0.3–0.5 PPL free | 2–3 days | near-lossless | V6 §V6-6 |
 
 **PR #17 bench result (2026-04-14)**: items 3, 4, 5b bundled and reconverted.
 8K baseline = 15.0 tok/s (c1=12.3, c2=20.7, c3=15.2, c4=17.3 ms). 8K with
@@ -120,6 +124,10 @@ active. Retrain with `use_cache=True` traces should fix acceptance.
 |---|---|---|---|---|
 | **6B** | **EAGLE-3 retrain** with correct forward-mode traces | fixes Blocker 1 | Colab 2–4 h | EAGLE3_STATE |
 | **6C** | **DistillSpec** divergence-aware training (JSD/FKL/RKL) | +10–45% on retrained EAGLE-3 | +2–3 days GPU | SOURCES |
+| **6D** | **HASS** — EAGLE train/infer mismatch fix, trains drafter against inference-mode target outputs (directly addresses Blocker 1's root cause) | +10–15% accept vs vanilla EAGLE | 1 A6000-day + 2 days | V6 §V6-7 |
+| **6E** | **GliDe + CaPE** — drafter shares target's KV cache, zero drafter-side KV memory | drafter memory to ~0; verify-lossless | 4 days + ~8 A100-hours | V6 §V6-5 |
+| **6F** | **Harmony-Decoding (HD)** — training-free self-speculative using target's own shallow layers with smart phase gate (not naive LayerSkip) | unmeasured on our weights | 6 days | V6 §V6-8 |
+| **6G** | **Clover-2** — RNN drafter at 1/3 EAGLE params (smaller drafter = less ANE dispatch per spec step) | drafter ×0.33 size | 7 days + train | V6 §V6-9 |
 
 ### Shared infrastructure (both tracks need these)
 
@@ -136,9 +144,10 @@ active. Retrain with `use_cache=True` traces should fix acceptance.
 
 | Priority | What | Gain | Effort | Source |
 |---|---|---|---|---|
-| **12** | **Prompt Lookup Decoding** — ~20 LoC n-gram retrieval | ×2.4 (summaries/QA), 0× on chat | 0.5 day | SOURCES |
+| **12** | **Prompt Lookup Decoding** — algorithm merged in PR #36; wiring pending | ×2.4 (summaries/QA), 0× on chat | 0.5 day wiring | SOURCES, V6 §V6-4 |
 | **13** | **Cross-vocabulary SD (Qwen 2.5 0.5B drafter)** — already bundled | ×1.5–2.5 | 3–4 days | V5 |
 | **14** | **SuffixDecoding** (measured T1=18%, hit=48% after 4 turns) | +10–30% repetitive workloads | 1 day wiring | FUND §1 |
+| **14b** | **Union-of-drafters**: Prompt Lookup ∪ SuffixDecoding ∪ {HASS \| EAGLE-3} gated by max-accept-length; single verify pass when all miss | +30–40% over best single source | 6 days (after 12 + one drafter) | V6 §V6-11 |
 
 **EAGLE-3 training targets (if Track B chosen)**: acc0 ≥ 50% → Q=K →
 KV direct-write → **40–60 tok/s @ 2K, 25–35 tok/s @ 8K**.
@@ -168,6 +177,7 @@ KV direct-write → **40–60 tok/s @ 2K, 25–35 tok/s @ 8K**.
 | **24** | **Cascading KV Cache** — training-free 8K quality | 8K ≈ 2K cost | 2–3 days | near | UNEXP §C |
 | **25** | **TransMLA** — post-training MLA retrofit | ×10.6 @ 93% KV | 2–3 days + QLoRA | near | V3 §D3 |
 | **26** | **Residual/Lazy KV allocation** — PagedAttention concept adapted | memory on 8K | 1–2 days | yes | SOURCES |
+| **27** | **Per-head-scaled INT8 KV** (llama.cpp-style, quality-safe variant of rejected naive INT8 KV) | KV ×0.5 mem (fp16 compute preserved) | 3 days | near | V6 §V6-10 |
 
 ---
 
@@ -261,6 +271,12 @@ for repetitive / long-prompt workloads.**
 - **UNEXPLORED_APPROACHES_V3.md** (Round 4): Speculative sweep, ANE micro-opts → absorbed.
 - **UNEXPLORED_APPROACHES_V5.md** (Round 5): MTP/Draft&Verify/Kangaroo/
   Cross-vocab/DISCO/SAM/Lookahead/Streaming → absorbed (Phase 2/3).
+- **UNEXPLORED_APPROACHES_V6.md** (Round 6, lossless-only): iOS 18.2
+  runtime hints (0h, 0i), blockwise-32 palettization (5h), SpinQuant/QuaRot
+  rotation (5i), HASS (6D), GliDe + CaPE (6E), Harmony-Decoding (6F),
+  Clover-2 (6G), union-of-drafters composition (14b), per-head INT8 KV
+  (27) → absorbed. Lossy items (TEAL, RWKV-7, PowerInfer-2) listed there
+  but held out of the phase tables.
 - **UNEXPLORED_SOURCES.md**: gap analysis — KV INT8 TurboQuant, IQ mixed-bit,
   DistillSpec, Prompt Lookup, SRAM tuning, Residual alloc, system-prompt KV → absorbed.
 - **FUNDAMENTAL_UNTRIED.md** (Round 3): SuffixDecoding, MLState, W2A16, LayerSkip → absorbed.
