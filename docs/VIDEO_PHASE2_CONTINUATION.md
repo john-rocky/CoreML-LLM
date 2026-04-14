@@ -305,6 +305,41 @@ macro content (object names, motion direction) even if phrasing differs.
     either (a) patch that node's handler in
     `coremltools/converters/mil/frontend/torch/ops.py`, or (b)
     rewrite the vision tower's `rotary_emb` path to avoid the cast.
+
+### Reproduce the exact state Phase 2 stopped at
+
+```bash
+# 1. env
+uv venv --python 3.11 /tmp/gemma4-venv
+source /tmp/gemma4-venv/bin/activate
+uv pip install 'git+https://github.com/huggingface/transformers@main' \
+               torch==2.7.0 coremltools==9.0 accelerate pillow numpy
+
+# 2. weights (safetensors, ~9.5 GB)
+python -c "from huggingface_hub import snapshot_download; \
+  snapshot_download('google/gemma-4-E2B-it', \
+    local_dir='$HOME/Documents/Models/gemma4-e2b/hf_model', \
+    allow_patterns=['*.safetensors','*.json','tokenizer*','*.jinja'])"
+
+# 3. reproduce the failure
+python conversion/phase2/trace_video_vision.py
+```
+
+Expected output (last lines):
+
+```
+reference forward...
+  ref shape: (1, 64, 1536)          ← ✓ model forward correct
+tracing (with patched vision encoder)...   ← ✓ jit.trace OK
+converting via coremltools (jit)...
+...
+File "coremltools/.../torch/ops.py", line 3048, in _cast
+    res = mb.const(val=dtype(x.val), name=node.name)
+                       ^^^^^^^^^^^^
+TypeError: only 0-dimensional arrays can be converted to Python scalars
+```
+
+That `_cast` failure is the single remaining blocker.
 - **ANE placement**: the still-image encoder runs `.cpuAndGPU` by design
   (see BENCHMARKING.md). The video encoder inherits the same constraint
   unless ANE-friendly ops can be substituted. Do not chase ANE placement
