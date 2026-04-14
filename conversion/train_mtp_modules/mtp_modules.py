@@ -235,8 +235,11 @@ class MtpStack(nn.Module):
         return F.embedding(ids, self.embed_weight) * self.embed_scale
 
     def _lm_head(self, h: torch.Tensor) -> torch.Tensor:
-        """Apply tied LM head + softcap."""
-        logits = F.linear(h.float(), self.lm_head_weight.float())
+        """Apply tied LM head + softcap. Stays in h's dtype (bf16/fp16) to
+        avoid doubling memory via fp32 cast of the (B, T, V) logits tensor.
+        For V=262144 and T=1022 this saves 4-8 GB per forward on A100."""
+        w = self.lm_head_weight.to(h.dtype)
+        logits = F.linear(h, w)
         return torch.tanh(logits / self.cfg.logit_softcap) * self.cfg.logit_softcap
 
     def forward(
