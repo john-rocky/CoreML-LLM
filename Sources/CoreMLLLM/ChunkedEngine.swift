@@ -57,6 +57,22 @@ final class ChunkedEngine {
     private var kFull2: MLMultiArray     // (2, 1, ctx, maxHd)
     private var vFull2: MLMultiArray
 
+    // Phase 0e scratch pool: buffers rewritten each decode step instead of
+    // freshly allocated. Holds the three largest per-step masks; smaller
+    // buffers (RoPE rows, embeddings, plRaw) keep the allocating path since
+    // their Foundation overhead is negligible relative to the savings here.
+    // All reads/writes happen before a synchronous prediction call, so
+    // per-step reuse is race-free.
+    private lazy var scratchMaskFull: MLMultiArray = {
+        try! MLMultiArray(shape: [1, 1, 1, NSNumber(value: config.contextLength)], dataType: .float16)
+    }()
+    private lazy var scratchMaskSliding: MLMultiArray = {
+        try! MLMultiArray(shape: [1, 1, 1, NSNumber(value: config.slidingWindow)], dataType: .float16)
+    }()
+    private lazy var scratchUpdateMask: MLMultiArray = {
+        try! MLMultiArray(shape: [1, 1, NSNumber(value: config.contextLength), 1], dataType: .float16)
+    }()
+
     let config: ModelConfig
     let prefillN: Int
     var currentPosition: Int = 0
@@ -870,15 +886,29 @@ final class ChunkedEngine {
         return result
     }
 
+    /// Fill the decode-step full causal mask. Reuses scratchMaskFull when
+    /// `length` matches the configured context; falls back to fresh
+    /// allocation for verify / custom lengths to keep those call sites
+    /// independent of the pooled buffer's lifetime.
     private func makeCausalMask(position: Int, length: Int) throws -> MLMultiArray {
-        let mask = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: length)], dataType: .float16)
+        let mask: MLMultiArray
+        if length == config.contextLength {
+            mask = scratchMaskFull
+        } else {
+            mask = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: length)], dataType: .float16)
+        }
         let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: length)
         for i in 0..<length { mp[i] = i <= position ? 0 : 0xFC00 }
         return mask
     }
 
     private func makeSlidingCausalMask(position: Int, W: Int) throws -> MLMultiArray {
-        let mask = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: W)], dataType: .float16)
+        let mask: MLMultiArray
+        if W == config.slidingWindow {
+            mask = scratchMaskSliding
+        } else {
+            mask = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: W)], dataType: .float16)
+        }
         let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: W)
         let valid = min(position + 1, W)
         let start = W - valid
@@ -887,7 +917,12 @@ final class ChunkedEngine {
     }
 
     private func makeUpdateMask(position: Int, length: Int) throws -> MLMultiArray {
-        let umask = try MLMultiArray(shape: [1, 1, NSNumber(value: length), 1], dataType: .float16)
+        let umask: MLMultiArray
+        if length == config.contextLength {
+            umask = scratchUpdateMask
+        } else {
+            umask = try MLMultiArray(shape: [1, 1, NSNumber(value: length), 1], dataType: .float16)
+        }
         let up = umask.dataPointer.bindMemory(to: UInt16.self, capacity: length)
         memset(up, 0, length * MemoryLayout<UInt16>.stride)
         up[min(position, length - 1)] = 0x3C00

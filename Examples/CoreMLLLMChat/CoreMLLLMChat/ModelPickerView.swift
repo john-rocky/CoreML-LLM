@@ -29,8 +29,12 @@ struct ModelPickerView: View {
                             onResume: { downloadAndLoad(model) },
                             onCancel: { downloader.cancelDownload() },
                             onDelete: {
-                                try? downloader.delete(model)
-                                downloader.status = "Deleted \(model.name)"
+                                do {
+                                    try downloader.delete(model)
+                                    downloader.status = "Deleted \(model.name)"
+                                } catch {
+                                    downloader.status = "Delete failed: \(error.localizedDescription)"
+                                }
                             }
                         )
                     }
@@ -49,6 +53,25 @@ struct ModelPickerView: View {
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
+                    }
+                } else if !downloader.status.isEmpty {
+                    Section {
+                        Text(downloader.status)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Section("Troubleshooting") {
+                    Button(role: .destructive) {
+                        do {
+                            try downloader.resetAllModels()
+                            downloader.status = "Cleared all model files"
+                        } catch {
+                            downloader.status = "Reset failed: \(error.localizedDescription)"
+                        }
+                    } label: {
+                        Label("Clear all cached models", systemImage: "exclamationmark.triangle")
                     }
                 }
             }

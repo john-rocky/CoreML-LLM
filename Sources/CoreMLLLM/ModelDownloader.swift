@@ -89,6 +89,7 @@ public final class ModelDownloader: NSObject {
 
     override init() {
         super.init()
+        cleanGraveyard()
         restorePendingDownload()
         let config = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
         config.isDiscretionary = false
@@ -263,8 +264,58 @@ public final class ModelDownloader: NSObject {
             cancelDownload()
         }
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
-        if fileManager.fileExists(atPath: dir.path) { try fileManager.removeItem(at: dir) }
-        refreshTrigger += 1
+        defer { refreshTrigger += 1 }
+        guard fileManager.fileExists(atPath: dir.path) else { return }
+        try evictToGraveyard(dir)
+    }
+
+    /// Remove every model folder under `modelsDirectory`. Used as an escape
+    /// hatch when a stale/incompatible artifact from a prior app version
+    /// can't be deleted via the per-model trash button.
+    public func resetAllModels() throws {
+        cancelDownload()
+        defer { refreshTrigger += 1 }
+        guard fileManager.fileExists(atPath: modelsDirectory.path) else { return }
+        let children = (try? fileManager.contentsOfDirectory(
+            at: modelsDirectory, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles])) ?? []
+        var firstError: Error?
+        for child in children {
+            // Skip the graveyard itself — it gets cleaned asynchronously.
+            if child.lastPathComponent.hasPrefix(".graveyard-") { continue }
+            do { try evictToGraveyard(child) }
+            catch { if firstError == nil { firstError = error } }
+        }
+        if let e = firstError { throw e }
+    }
+
+    /// Move a file / directory out of sight by renaming it into a hidden
+    /// graveyard folder, then best-effort delete. Rename succeeds on APFS
+    /// even when URLSession background tasks still hold open handles to
+    /// files inside — whereas `removeItem` on the same path fails with
+    /// "no permission to access" because of those handles.
+    ///
+    /// The visible model folder disappears immediately. Remaining graveyard
+    /// bytes are swept up by `cleanGraveyard` at the next init.
+    private func evictToGraveyard(_ url: URL) throws {
+        let graveRoot = modelsDirectory.appendingPathComponent(".graveyard", isDirectory: true)
+        try? fileManager.createDirectory(at: graveRoot, withIntermediateDirectories: true)
+        let grave = graveRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fileManager.moveItem(at: url, to: grave)
+        try? fileManager.removeItem(at: grave)  // best-effort; leftovers cleaned next launch
+    }
+
+    /// Best-effort removal of any graveyard residue from prior sessions.
+    /// Called on init — by then the URLSession daemon from the prior app
+    /// run has released its file handles, so removeItem usually succeeds.
+    private func cleanGraveyard() {
+        let graveRoot = modelsDirectory.appendingPathComponent(".graveyard", isDirectory: true)
+        guard fileManager.fileExists(atPath: graveRoot.path) else { return }
+        if let children = try? fileManager.contentsOfDirectory(
+            at: graveRoot, includingPropertiesForKeys: nil, options: []) {
+            for c in children { try? fileManager.removeItem(at: c) }
+        }
+        try? fileManager.removeItem(at: graveRoot)
     }
 
     // MARK: - Parallel Download Scheduling
