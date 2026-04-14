@@ -113,6 +113,14 @@ public final class ModelDownloader: NSObject {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
         let chunk1 = dir.appendingPathComponent("chunk1.mlmodelc")
         if fileManager.fileExists(atPath: chunk1.appendingPathComponent("weights/weight.bin").path) {
+            // Invalidate cache if the chunk's declared ctx doesn't match
+            // model_config.json (e.g., v0.6.0/0.6.1 downloaded 8K chunks but
+            // shipped a 2K model_config). This prevents a load-time error
+            // that would otherwise require the user to manually delete.
+            if isChunkCtxMismatched(modelDir: dir, chunk1Dir: chunk1) {
+                try? fileManager.removeItem(at: dir)
+                return nil
+            }
             return chunk1
         }
         let modelc = dir.appendingPathComponent("model.mlmodelc")
@@ -124,6 +132,32 @@ public final class ModelDownloader: NSObject {
             return pkg
         }
         return nil
+    }
+
+    /// Compare chunk1's declared `causal_mask_full` ctx (from model.mil) against
+    /// model_config.json's context_length. Returns true on mismatch so callers
+    /// can invalidate the cache and force a fresh download.
+    private func isChunkCtxMismatched(modelDir: URL, chunk1Dir: URL) -> Bool {
+        guard let configData = try? Data(contentsOf: modelDir.appendingPathComponent("model_config.json")),
+              let json = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+              let expected = json["context_length"] as? Int else {
+            return false  // no config to compare against; leave cache alone
+        }
+        let milURL = chunk1Dir.appendingPathComponent("model.mil")
+        guard let mil = try? String(contentsOf: milURL, encoding: .utf8) else {
+            return false
+        }
+        // Look for the causal_mask_full tensor declaration. The shape's last
+        // dimension is ctx: e.g. `tensor<fp16, [1, 1, 1, 2048]> causal_mask_full`.
+        let pattern = #"tensor<fp16,\s*\[\s*1,\s*1,\s*1,\s*(\d+)\s*\]>\s*causal_mask_full"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: mil, range: NSRange(mil.startIndex..., in: mil)),
+              match.numberOfRanges >= 2,
+              let range = Range(match.range(at: 1), in: mil),
+              let actual = Int(mil[range]) else {
+            return false
+        }
+        return actual != expected
     }
 
     /// Download a model, skipping files that already exist on disk.
