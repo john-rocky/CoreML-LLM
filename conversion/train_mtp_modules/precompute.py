@@ -70,15 +70,19 @@ def iter_hf_dataset(name_or_path: str, streaming: bool = True, max_samples: int 
             if max_samples and count >= max_samples: break
         return
 
-    # Common chat/code datasets
+    # Common chat/code datasets. Open (no gating) unless noted.
     dataset_presets = {
-        "lmsys-chat": ("lmsys/lmsys-chat-1m", "train", ["conversation"]),
-        "oasst-ja": ("kunishou/oasst1-89k-ja", "train", ["text", "conversation"]),
+        # Guaranteed-open (good for first runs)
+        "wikitext":    ("Salesforce/wikitext", "train", ["text"]),  # tiny, always works
+        "fineweb-edu": ("HuggingFaceFW/fineweb-edu", "train", ["text"]),  # high quality EN
+        "oasst1":      ("OpenAssistant/oasst1", "train", ["text"]),  # EN chat
+        "stack-small": ("bigcode/the-stack-smol", "train", ["content"]),  # code
+        "codealpaca":  ("sahil2801/CodeAlpaca-20k", "train", ["instruction", "input", "output"]),
+        # Gated/limited — fall back if these fail
+        "lmsys-chat":  ("lmsys/lmsys-chat-1m", "train", ["conversation"]),
+        "c4-en":       ("allenai/c4", "train", ["text"]),  # needs subset 'en'
+        "c4-ja":       ("allenai/c4", "train", ["text"]),  # needs subset 'ja'
         "sharegpt-ja": ("philschmid/sharegpt-raw", "train", ["conversations"]),
-        "c4-en": ("allenai/c4", "train", ["text"]),
-        "c4-ja": ("allenai/c4", "train", ["text"]),
-        "codealpaca": ("sahil2801/CodeAlpaca-20k", "train", ["instruction", "input", "output"]),
-        "stack-small": ("bigcode/the-stack-smol", "train", ["content"]),
     }
     if name_or_path in dataset_presets:
         repo, split, text_keys = dataset_presets[name_or_path]
@@ -87,6 +91,11 @@ def iter_hf_dataset(name_or_path: str, streaming: bool = True, max_samples: int 
             kwargs["name"] = "en"
         if name_or_path == "c4-ja":
             kwargs["name"] = "ja"
+        if name_or_path == "wikitext":
+            kwargs["name"] = "wikitext-103-raw-v1"
+        if name_or_path == "oasst1":
+            # oasst1 field is "text" but only if role=='assistant'; just take all text
+            pass
         ds = load_dataset(repo, split=split, **kwargs)
         count = 0
         for ex in ds:
