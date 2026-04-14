@@ -591,26 +591,37 @@ final class ChunkedEngine {
                                      realLen: realLen, hd: hd)
         }
 
-        let kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
-        let kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
-        let kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
-        let kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
-        lastKV13K = kv13_k; lastKV13V = kv13_v
-        lastKV14K = kv14_k; lastKV14V = kv14_v
+        let pKv13K = out2.featureValue(for: "kv13_k")!.multiArrayValue!
+        let pKv13V = out2.featureValue(for: "kv13_v")!.multiArrayValue!
+        let pKv14K = out2.featureValue(for: "kv14_k")!.multiArrayValue!
+        let pKv14V = out2.featureValue(for: "kv14_v")!.multiArrayValue!
+        lastKV13K = pKv13K; lastKV13V = pKv13V
+        lastKV14K = pKv14K; lastKV14V = pKv14V
 
         // Phase 0d: Prefill bypass for L15-L34.
-        // chunk3 (L15-24) and chunk4 (L25-34) are Q-only — they read the shared
-        // kv13/kv14 produced by chunk2 but never write new KV. During prefill
-        // the only output needed from these layers is the argmax at the last
-        // real position (realLen-1). Run single-token decode chunk3/chunk4 at
-        // that position instead of the N-batched prefill_chunk3 + prefill_chunk4
-        // which throws away N-1 positions. Saves ~47% of per-layer prefill
-        // compute.
-        _ = p3; _ = p4  // loaded but unused by bypass; kept to enforce "all 4 prefill chunks present" invariant on entry
+        // chunk3/chunk4 are Q-only and read shared kv13/kv14 produced by
+        // chunk2. The only output needed from these layers at prefill time
+        // is the argmax at the last real position (realLen-1). Replace the
+        // N-batched prefill_chunk3 + prefill_chunk4 with single-token decode
+        // chunk3/chunk4 at that position.
+        //
+        // chunk2's kv13_k/kv14_k outputs are in prefill batch layout
+        // (1,1,N,lastDim), but decode chunk3 expects decode layout
+        // (1,1,W,256) for kv13 (right-aligned ring buffer) and
+        // (1,1,ctx,512) for kv14 (absolute positions). writeSlidingFromPrefill
+        // and writeFullFromPrefill have just populated kSliding2[slot 4] and
+        // kFull2[slot 1] with the caches in that exact decode format, so
+        // slice those out instead of re-laying out the prefill outputs.
+        _ = p3; _ = p4  // loaded but unused; enforces "all 4 prefill chunks present" invariant
         let lastPos = realLen - 1
         let lastHidden = try sliceSeqPosition(h2, atPos: lastPos, lastDim: hidden)
         let pldTotal = config.numLayers * config.perLayerDim
         let lastPLC = try sliceSeqPosition(plc, atPos: lastPos, lastDim: pldTotal)
+
+        let kv13KDecode = try extractSlidingSlot(kSliding2, slot: 4, hd: 256)
+        let kv13VDecode = try extractSlidingSlot(vSliding2, slot: 4, hd: 256)
+        let kv14KDecode = try extractFullSlot(kFull2, slot: 1, hd: 512)
+        let kv14VDecode = try extractFullSlot(vFull2, slot: 1, hd: 512)
 
         let maskFullD = try makeCausalMask(position: lastPos, length: ctx)
         let maskSlidingD = try makeSlidingCausalMask(position: lastPos, W: W)
@@ -627,8 +638,10 @@ final class ChunkedEngine {
             "per_layer_combined": MLFeatureValue(multiArray: lastPLC),
             "cos_s": MLFeatureValue(multiArray: cosSD), "sin_s": MLFeatureValue(multiArray: sinSD),
             "cos_f": MLFeatureValue(multiArray: cosFD), "sin_f": MLFeatureValue(multiArray: sinFD),
-            "kv13_k": MLFeatureValue(multiArray: kv13_k), "kv13_v": MLFeatureValue(multiArray: kv13_v),
-            "kv14_k": MLFeatureValue(multiArray: kv14_k), "kv14_v": MLFeatureValue(multiArray: kv14_v),
+            "kv13_k": MLFeatureValue(multiArray: kv13KDecode),
+            "kv13_v": MLFeatureValue(multiArray: kv13VDecode),
+            "kv14_k": MLFeatureValue(multiArray: kv14KDecode),
+            "kv14_v": MLFeatureValue(multiArray: kv14VDecode),
         ]
 
         var d3 = sharedDecode
@@ -650,6 +663,54 @@ final class ChunkedEngine {
         let srcPtr = src.dataPointer.assumingMemoryBound(to: UInt16.self)
         let dstPtr = out.dataPointer.assumingMemoryBound(to: UInt16.self)
         memcpy(dstPtr, srcPtr.advanced(by: pos * lastDim), lastDim * MemoryLayout<UInt16>.stride)
+        return out
+    }
+
+    /// Extract one sliding slot (1, 1, W, hd) from the multi-slot kSliding
+    /// cache (slots, 1, W, maxHd=512). Strips the padded tail bytes when the
+    /// layer's head_dim is smaller than the shared buffer's maxHd (e.g. 256
+    /// for SWA layers inside a 512-wide buffer).
+    private func extractSlidingSlot(_ cache: MLMultiArray, slot: Int, hd: Int) throws -> MLMultiArray {
+        let W = config.slidingWindow
+        let cacheShape = cache.shape.map { $0.intValue }
+        let maxHd = cacheShape[3]
+        let out = try MLMultiArray(shape: [1, 1, NSNumber(value: W), NSNumber(value: hd)],
+                                    dataType: .float16)
+        let src = cache.dataPointer.assumingMemoryBound(to: UInt16.self)
+            .advanced(by: slot * W * maxHd)
+        let dst = out.dataPointer.assumingMemoryBound(to: UInt16.self)
+        if hd == maxHd {
+            memcpy(dst, src, W * hd * MemoryLayout<UInt16>.stride)
+        } else {
+            for i in 0..<W {
+                memcpy(dst.advanced(by: i * hd),
+                       src.advanced(by: i * maxHd),
+                       hd * MemoryLayout<UInt16>.stride)
+            }
+        }
+        return out
+    }
+
+    /// Extract one full-attn slot (1, 1, ctx, hd) from the multi-slot kFull
+    /// cache (slots, 1, ctx, maxHd=512).
+    private func extractFullSlot(_ cache: MLMultiArray, slot: Int, hd: Int) throws -> MLMultiArray {
+        let ctx = config.contextLength
+        let cacheShape = cache.shape.map { $0.intValue }
+        let maxHd = cacheShape[3]
+        let out = try MLMultiArray(shape: [1, 1, NSNumber(value: ctx), NSNumber(value: hd)],
+                                    dataType: .float16)
+        let src = cache.dataPointer.assumingMemoryBound(to: UInt16.self)
+            .advanced(by: slot * ctx * maxHd)
+        let dst = out.dataPointer.assumingMemoryBound(to: UInt16.self)
+        if hd == maxHd {
+            memcpy(dst, src, ctx * hd * MemoryLayout<UInt16>.stride)
+        } else {
+            for i in 0..<ctx {
+                memcpy(dst.advanced(by: i * hd),
+                       src.advanced(by: i * maxHd),
+                       hd * MemoryLayout<UInt16>.stride)
+            }
+        }
         return out
     }
 
