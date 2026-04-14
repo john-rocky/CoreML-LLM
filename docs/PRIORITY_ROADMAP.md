@@ -28,11 +28,11 @@ Run these **now**, before any speculative or conversion work. They either
 | # | What | Gain | Effort | Source |
 |---|---|---|---|---|
 | ~~**0a**~~ | ~~**MLComputePlan audit**~~ | **DONE (2026-04-13)** — chunk1-3 = 100% ANE. chunk4 = 8 CPU ops in InModelArgmax tail (~1-3% of step). Dispatch-overhead hypothesis confirmed. | — | V2 §G2, EXPERIMENTS.md |
-| **0b** | **ANE pipeline prewarming** — 4× dummy predictions at load | first-token fix | 10 LoC Swift | V3 §B4 |
+| ~~**0b**~~ | ~~**ANE pipeline prewarming**~~ | **PR #32 (2026-04-14)** — 4 dummy decode steps at load; awaits on-device measurement | 10 LoC Swift | V3 §B4 |
 | **0c** | **exp2 softmax** — replace torch.exp → torch.exp2 (ANE native) | 0–5% free | 2 LoC + reconvert | V3 §B1 |
-| **0d** | **Prefill bypass** — skip chunk3+4 for N-1 prompt tokens (Q-only layers never produce KV) | TTFT −47% | 0.5 day Swift | ANE_SURVEY §1 |
-| **0e** | **Output buffer pooling** — reuse MLMultiArray via NSCache | −1–2 ms/step | 0.5 day Swift | ANE_SURVEY |
-| **0f** | **Ping-pong buffer audit** — 2-deep sync between consecutive chunks (ANE async safety) | correctness | 0.5 day | ANE_SURVEY (ANEMLL) |
+| ~~**0d**~~ | ~~**Prefill bypass**~~ | **PR #33 (2026-04-14)** — chunk3+4 (L15-34) switched to single-token decode at last position; awaits on-device measurement | 0.5 day Swift | ANE_SURVEY §1 |
+| ~~**0e**~~ | ~~**Output buffer pooling**~~ | **PR (2026-04-14)** — scratch pool for maskFull/maskSliding/updateMask (~33 KB/step reuse); awaits on-device measurement | 0.5 day Swift | ANE_SURVEY |
+| ~~**0f**~~ | ~~**Ping-pong buffer audit**~~ | **DONE (2026-04-14)** — decode and drawBurst are fully synchronous (`prediction(from:)` blocks, KV `copyBack` is memcpy). No concurrent dispatch → ANEMLL's ping-pong race does not apply. No code change. | — | ANE_SURVEY (ANEMLL) |
 | **0g** | **SRAM 32 MB working-set check** — tune prefillN per chunk to avoid 30% cliff | avoid 30% drop | 0.5 day analysis | SOURCES (Orion) |
 
 0a result: no compute-op fallback to fix. Bottleneck is 4× per-step
