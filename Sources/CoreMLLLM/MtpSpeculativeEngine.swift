@@ -46,12 +46,12 @@ public final class MtpSpeculativeEngine: SpeculativeDrafterEngine {
     private(set) var totalEmitted = 0
 
     /// acc0 = num_accepted / (num_rounds * K)
-    var acceptanceRate: Double {
+    public var acceptanceRate: Double {
         totalRounds == 0 ? 0 : Double(totalAccepted) / Double(totalRounds * K)
     }
 
     /// Average tokens emitted per round (includes tTokNext + bonus/correction)
-    var tokensPerRound: Double {
+    public var tokensPerRound: Double {
         totalRounds == 0 ? 0 : Double(totalEmitted) / Double(totalRounds)
     }
 
@@ -76,7 +76,7 @@ public final class MtpSpeculativeEngine: SpeculativeDrafterEngine {
     /// - Parameter nextID: the token predicted from the last decode/verify.
     ///   Updated in-place to the next token for the following cycle.
     /// - Returns: tokens to emit to the output stream.
-    func speculateStep(nextID: inout Int32) throws -> [Int32] {
+    public func speculateStep(nextID: inout Int32) throws -> [Int32] {
         // Bootstrap: first call does a normal decode to populate kv13/kv14
         if !isBootstrapped {
             return try bootstrapStep(nextID: &nextID)
@@ -212,12 +212,12 @@ public final class MtpSpeculativeEngine: SpeculativeDrafterEngine {
     }
 
     /// Whether speculation should be used for the next cycle.
-    var shouldSpeculate: Bool {
+    public var shouldSpeculate: Bool {
         drafter.shouldSpeculate
     }
 
     /// Reset state for new conversation.
-    func reset() {
+    public func reset() {
         carryState = nil
         isBootstrapped = false
         totalRounds = 0

@@ -65,15 +65,15 @@ public final class MtpModuleStackEngine: SpeculativeDrafterEngine {
     private(set) var totalAccepted = 0
     private(set) var totalEmitted = 0
 
-    var acceptanceRate: Double {
+    public var acceptanceRate: Double {
         totalRounds == 0 ? 0 : Double(totalAccepted) / Double(totalRounds * K)
     }
-    var tokensPerRound: Double {
+    public var tokensPerRound: Double {
         totalRounds == 0 ? 0 : Double(totalEmitted) / Double(totalRounds)
     }
 
     /// Always speculate (for simplicity in v1 — no rolling acceptance gate).
-    var shouldSpeculate: Bool { true }
+    public var shouldSpeculate: Bool { true }
 
     // MARK: - Init
 
@@ -114,7 +114,7 @@ public final class MtpModuleStackEngine: SpeculativeDrafterEngine {
     /// Execute one speculative cycle. On first call runs a normal decode
     /// (bootstrap to warm target KV). Subsequent calls produce K+1 tokens
     /// per cycle on average (1 + matched drafts + bonus if all match).
-    func speculateStep(nextID: inout Int32) throws -> [Int32] {
+    public func speculateStep(nextID: inout Int32) throws -> [Int32] {
         if !isBootstrapped {
             return try bootstrapStep(nextID: &nextID)
         }
@@ -226,7 +226,7 @@ public final class MtpModuleStackEngine: SpeculativeDrafterEngine {
         return emitted
     }
 
-    func reset() {
+    public func reset() {
         carryL34 = nil
         m0Pos = 0
         m1Pos = 0
