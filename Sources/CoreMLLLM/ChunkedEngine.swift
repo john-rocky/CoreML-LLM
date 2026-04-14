@@ -506,6 +506,10 @@ final class ChunkedEngine {
         let realLen = tokenIDs.count
         precondition(realLen > 0 && realLen <= N)
 
+        let ctx = config.contextLength
+        let W = config.slidingWindow
+        let hidden = config.hiddenSize
+
         reset()
 
         let hiddenIn = try buildPrefillHidden(tokenIDs: tokenIDs, N: N, imageFeatures: imageFeatures,
@@ -516,7 +520,6 @@ final class ChunkedEngine {
         let sinS = try buildPrefillRoPE(table: sinSlidingTable, N: N, dim: 256)
         let cosF = try buildPrefillRoPE(table: cosFullTable, N: N, dim: 512)
         let sinF = try buildPrefillRoPE(table: sinFullTable, N: N, dim: 512)
-        let lastMask = try makeLastPositionMask(N: N, realLen: realLen)
 
         // Prefill chunk 1
         let out1 = try p1.prediction(from: MLDictionaryFeatureProvider(dictionary: [
@@ -565,37 +568,59 @@ final class ChunkedEngine {
         lastKV13K = kv13_k; lastKV13V = kv13_v
         lastKV14K = kv14_k; lastKV14V = kv14_v
 
-        let sharedKV: [String: MLFeatureValue] = [
+        // Phase 0d: Prefill bypass for L15-L34.
+        // chunk3 (L15-24) and chunk4 (L25-34) are Q-only — they read the shared
+        // kv13/kv14 produced by chunk2 but never write new KV. During prefill
+        // the only output needed from these layers is the argmax at the last
+        // real position (realLen-1). Run single-token decode chunk3/chunk4 at
+        // that position instead of the N-batched prefill_chunk3 + prefill_chunk4
+        // which throws away N-1 positions. Saves ~47% of per-layer prefill
+        // compute.
+        _ = p3; _ = p4  // loaded but unused by bypass; kept to enforce "all 4 prefill chunks present" invariant on entry
+        let lastPos = realLen - 1
+        let lastHidden = try sliceSeqPosition(h2, atPos: lastPos, lastDim: hidden)
+        let pldTotal = config.numLayers * config.perLayerDim
+        let lastPLC = try sliceSeqPosition(plc, atPos: lastPos, lastDim: pldTotal)
+
+        let maskFullD = try makeCausalMask(position: lastPos, length: ctx)
+        let maskSlidingD = try makeSlidingCausalMask(position: lastPos, W: W)
+        let umask = try makeUpdateMask(position: lastPos, length: ctx)
+        let cosSD = try lookupRoPE(table: cosSlidingTable, position: lastPos, dim: 256)
+        let sinSD = try lookupRoPE(table: sinSlidingTable, position: lastPos, dim: 256)
+        let cosFD = try lookupRoPE(table: cosFullTable, position: lastPos, dim: 512)
+        let sinFD = try lookupRoPE(table: sinFullTable, position: lastPos, dim: 512)
+
+        let sharedDecode: [String: MLFeatureValue] = [
+            "causal_mask_full": MLFeatureValue(multiArray: maskFullD),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSlidingD),
+            "update_mask": MLFeatureValue(multiArray: umask),
+            "per_layer_combined": MLFeatureValue(multiArray: lastPLC),
+            "cos_s": MLFeatureValue(multiArray: cosSD), "sin_s": MLFeatureValue(multiArray: sinSD),
+            "cos_f": MLFeatureValue(multiArray: cosFD), "sin_f": MLFeatureValue(multiArray: sinFD),
             "kv13_k": MLFeatureValue(multiArray: kv13_k), "kv13_v": MLFeatureValue(multiArray: kv13_v),
             "kv14_k": MLFeatureValue(multiArray: kv14_k), "kv14_v": MLFeatureValue(multiArray: kv14_v),
         ]
-        let sharedRoPE: [String: MLFeatureValue] = [
-            "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
-            "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
-        ]
 
-        // Prefill chunk 3
-        var d3: [String: MLFeatureValue] = [
-            "hidden_states": MLFeatureValue(multiArray: h2),
-            "causal_mask": MLFeatureValue(multiArray: causal),
-            "per_layer_combined": MLFeatureValue(multiArray: plc),
-        ]
-        d3.merge(sharedRoPE) { _, b in b }
-        d3.merge(sharedKV) { _, b in b }
-        let h3 = try p3.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
+        var d3 = sharedDecode
+        d3["hidden_states"] = MLFeatureValue(multiArray: lastHidden)
+        let h3 = try chunk3.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
             .featureValue(for: "hidden_states_out")!.multiArrayValue!
 
-        // Prefill chunk 4
-        var d4: [String: MLFeatureValue] = [
-            "hidden_states": MLFeatureValue(multiArray: h3),
-            "causal_mask": MLFeatureValue(multiArray: causal),
-            "per_layer_combined": MLFeatureValue(multiArray: plc),
-            "last_position_mask": MLFeatureValue(multiArray: lastMask),
-        ]
-        d4.merge(sharedRoPE) { _, b in b }
-        d4.merge(sharedKV) { _, b in b }
-        let out4 = try p4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4))
+        var d4 = sharedDecode
+        d4["hidden_states"] = MLFeatureValue(multiArray: h3)
+        let out4 = try chunk4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4))
         return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+    }
+
+    /// Extract one sequence position from a (1, seq, lastDim) fp16 array as a
+    /// new (1, 1, lastDim) array. Used by prefill bypass to feed the last real
+    /// position of chunk2's output into single-token decode chunks.
+    private func sliceSeqPosition(_ src: MLMultiArray, atPos pos: Int, lastDim: Int) throws -> MLMultiArray {
+        let out = try MLMultiArray(shape: [1, 1, NSNumber(value: lastDim)], dataType: .float16)
+        let srcPtr = src.dataPointer.assumingMemoryBound(to: UInt16.self)
+        let dstPtr = out.dataPointer.assumingMemoryBound(to: UInt16.self)
+        memcpy(dstPtr, srcPtr.advanced(by: pos * lastDim), lastDim * MemoryLayout<UInt16>.stride)
+        return out
     }
 
     // MARK: - Batched speculative verification (Q=K)
