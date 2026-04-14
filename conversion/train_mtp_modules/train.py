@@ -166,12 +166,17 @@ def main():
 
     start_step = 0
     if args.resume:
-        print(f"Resuming from {args.resume}")
+        # Load ONLY model weights. Fresh optimizer + scheduler (uses current
+        # --lr, --warmup-steps, --num-epochs as new hyperparams). This is the
+        # right behavior for finetune-style continuation where user wants a
+        # different LR schedule than the previous run.
+        print(f"Loading model weights from {args.resume} (fresh opt/sched)")
         ckpt = torch.load(args.resume, map_location=device)
         stack.load_state_dict(ckpt["model"], strict=False)
-        opt.load_state_dict(ckpt["opt"])
-        scheduler.load_state_dict(ckpt["sched"])
-        start_step = ckpt["step"]
+        if "step" in ckpt:
+            print(f"  prev run reached step {ckpt['step']}")
+        if "eval_acc" in ckpt:
+            print(f"  prev eval acc: {ckpt['eval_acc']}")
 
     # Training
     print("\n=== Training ===")
@@ -251,10 +256,15 @@ def main():
 
             step += 1
 
-    # Final save
+    # Final save (full state in case caller wants to resume with same schedule)
     ckpt_path = save_dir / "mtp_final.pt"
-    torch.save({"step": step, "model": stack.state_dict(), "config": vars(args)},
-               ckpt_path)
+    torch.save({
+        "step": step,
+        "model": stack.state_dict(),
+        "opt": opt.state_dict(),
+        "sched": scheduler.state_dict(),
+        "config": vars(args),
+    }, ckpt_path)
     print(f"\nFinal checkpoint saved: {ckpt_path}")
 
 
