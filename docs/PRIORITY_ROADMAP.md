@@ -43,7 +43,7 @@ Run these **now**, before any speculative or conversion work. They either
 |---|---|---|---|---|
 | ~~**0a**~~ | ~~**MLComputePlan audit**~~ | **DONE (2026-04-13)** — chunk1-3 = 100% ANE. chunk4 = 8 CPU ops in InModelArgmax tail (~1-3% of step). Dispatch-overhead hypothesis confirmed. | — | V2 §G2, EXPERIMENTS.md |
 | **0b** | **ANE pipeline prewarming** — 4× dummy predictions at load | first-token fix | 10 LoC Swift | V3 §B4 |
-| **0c** | **exp2 softmax** — replace torch.exp → torch.exp2 (ANE native) | 0–5% free | 2 LoC + reconvert | V3 §B1 |
+| ~~**0c**~~ | ~~**exp2 softmax**~~ | **REJECTED (2026-04-14)** — bundled in PR #17 and benched 5.5× slower on iPhone 17 Pro (see Phase 1 items 3/4/5b). | — | V3 §B1 |
 | **0d** | **Prefill bypass** — skip chunk3+4 for N-1 prompt tokens (Q-only layers never produce KV) | TTFT −47% | 0.5 day Swift | ANE_SURVEY §1 |
 | **0e** | **Output buffer pooling** — reuse MLMultiArray via NSCache | −1–2 ms/step | 0.5 day Swift | ANE_SURVEY |
 | **0f** | **Ping-pong buffer audit** — 2-deep sync between consecutive chunks (ANE async safety) | correctness | 0.5 day | ANE_SURVEY (ANEMLL) |
@@ -62,20 +62,30 @@ Ship without draft model. Most batchable in a single reconversion pass.
 |---|---|---|---|---|---|
 | ~~**1**~~ | ~~**W2A16 palettization**~~ | **REJECTED** — W2/W3 post-training = gibberish. QAT required. | — | — | FUND §3 |
 | ~~**2**~~ | ~~**MLState stateful KV**~~ | **REJECTED** — `coreml_update_state` error -14 on ANE (Mac+iPhone). GPU-only. | — | — | FUND §2 |
-| **3** | **MLP tile reshape (B,C,8,8)** — fill ANE spatial PEs | up to ×1.5 on FFN | 1 day + reconvert | exact | V3 §B2 |
-| **4** | **GQA broadcast matmul** — drop repeat_interleave | ×1.05–1.15 | 1 day + reconvert | exact | V2 §G3 |
+| ~~**3**~~ | ~~**MLP tile reshape (B,C,8,8)**~~ | **REJECTED (2026-04-14)** — PR #17 | — | — | V3 §B2 |
+| ~~**4**~~ | ~~**GQA broadcast matmul**~~ | **REJECTED (2026-04-14)** — PR #17 | — | — | V2 §G3 |
 | **5** | **KV-share Q-batching** — stack L19/24/29/34 Q | ×1.08 | ~40 LoC | yes | SPEED P2.2 |
-| **5b** | **exp2 softmax** — ANE native exp2 instruction | 0–5% | 2 LoC + reconvert | exact | V3 §B1 |
+| ~~**5b**~~ | ~~**exp2 softmax**~~ | **REJECTED (2026-04-14)** — PR #17 | — | — | V3 §B1 |
 | **5c** | **KV INT8 (TurboQuant)** — INT8 KV + fp16 residual window (128–256 recent) | 50% KV mem, long-ctx | 2–3 days | near (~0.1%) | SOURCES |
 | **5d** | **Mixed-bit palettization (IQ style)** — embed/lm_head 6-bit, FFN 2–4-bit | 20–30% size or +quality | 1–2 days | near | SOURCES, LITERT_CONTAINER |
 | **5e** | **SDPA fusion re-test** — iOS 18 native fused op may have fixed QK-norm scale=1.0 | 5–10% attn if fused | 1 day + reconvert | exact (if works) | ANE_SURVEY §4b |
 | **5f** | **Draft & Verify (training-free self-spec)** — exit at L14 → LM head | ×1.5–2.0 | 2 days | yes | V5 |
 | **5g** | **Kangaroo (lightweight adapter self-spec)** | ×1.68 | 2 days | yes | V5 |
 
-Items 3, 4, 5, 5b batchable in **single reconversion pass (PR #17 ready)**.
+**PR #17 bench result (2026-04-14)**: items 3, 4, 5b bundled and reconverted.
+8K baseline = 15.0 tok/s (c1=12.3, c2=20.7, c3=15.2, c4=17.3 ms). 8K with
+PR #17 opts applied = 2.7 tok/s (c1=87.8, c2=143.8, c3=64.4, c4=67.3 ms) —
+**5.5× slower across all four chunks**. Numerical parity held on Mac
+(smoke tests cos > 0.99999), so the regression is on-device scheduling, not
+correctness. Candidates for cause: MLP (B,C,8,8) tile falling off the ANE
+fast path, `exp2` not actually ANE-native on A19 Pro, or the 5-D broadcast
+matmul's intermediate blowing SRAM. Root-causing wasn't triaged since the
+magnitude makes the combined change unsalvageable as-shipped; an ANE?
+audit on the reconverted chunks would localise it if someone revisits.
 
-**Phase 1 stack (conservative)**: 14.5 × 1.10 × 1.08 × 1.05 ≈ **18 tok/s** (micro-opts
-alone). Real path to 50+ requires Phase 2.
+**Phase 1 stack (conservative)**: 14.5 × 1.08 ≈ **15.7 tok/s** (KV-share
+Q-batching alone; all reconversion-based opts rejected). Real path to 50+
+requires Phase 2.
 
 ---
 
@@ -180,14 +190,13 @@ Baseline (measured)                    14.5 tok/s @ 8K
 
 Phase 0: diagnostics + micro-opts
   MLComputePlan audit (DONE)           no fallback ops found
-  exp2 softmax (PR #17, unmeasured)    ×1.03  → 14.9
-  Output pooling + prewarm             ×1.03  → 15.4
-  Prefill bypass                       TTFT only, decode unchanged
+  Output pooling + prewarm (MERGED)    ×1.03  → 14.9
+  Prefill bypass                       draft, decode-regression blocker
 
-Phase 1: reconversion pass (PR #17 + follow-ups)
-  + MLP tile reshape                   ×1.10  → 16.9
-  + GQA broadcast + Q-batch            ×1.08  → 18.3
-  + KV INT8 (TurboQuant)               ×1.05  → 19.2  (mostly memory, small decode gain)
+Phase 1: reconversion-based micro-opts
+  PR #17 bundle (exp2 + MLP tile + GQA broadcast) REJECTED — 5.5× slower on device
+  + KV-share Q-batching                ×1.08  → 16.1 (only remaining reconversion-free item)
+  + KV INT8 (TurboQuant)               ×1.05  → 16.9  (mostly memory, small decode gain)
 
 Phase 2A: MTP Path A (primary)
   + MTP drafter @ 65% acc              ×1.45  → 27.8
@@ -215,6 +224,7 @@ for repetitive / long-prompt workloads.**
 
 | What | Why | Date |
 |---|---|---|
+| PR #17 bundle: MLP tile (B,C,8,8) + GQA broadcast matmul + exp2 softmax | Smoke tests passed (cos > 0.99999) but on-device 8K bench: 15.0 → 2.7 tok/s (5.5× slower across all chunks) on iPhone 17 Pro. Root cause not triaged — likely one of the three ops falls off the ANE fast path on A19. | 2026-04-14 |
 | W2A16/W3A16 post-training palettization | Complete gibberish. QAT required for sub-4-bit. | 2026-04-13 |
 | MLState stateful KV | `coreml_update_state` → error -14 on ANE (Mac + iPhone). GPU-only. | 2026-04-13 |
 | W8A8 (coremltools activation quant) | `ANECCompile() FAILED` on iPhone 17 Pro | 2026-04-13 |
