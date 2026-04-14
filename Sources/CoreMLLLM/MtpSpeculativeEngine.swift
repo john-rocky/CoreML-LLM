@@ -149,10 +149,15 @@ public final class MtpSpeculativeEngine {
             }
         }
 
-        // Commit: advance position by the verified prefix only.
-        // The correction/bonus token is NOT committed — its KV will be written
-        // in the next cycle's verify pass (overwriting any stale entry).
-        let committed = matchCount + 1 // tTokNext + matched drafts
+        // Commit: advance by positions whose KV was actually written by verify.
+        // Verify wrote KV at K positions (P..P+K-1) for inputs [nextID, d0..d_{K-2}].
+        // - Partial match at k: commit k+1 positions (nextID + k matched drafts).
+        //   Correction token at P+k+1 is NOT committed — its KV will be written
+        //   in the next cycle (overwriting the stale d_k KV at that position).
+        // - All K match: emitted has K+1 tokens, but d_{K-1} was never a verify
+        //   input — its KV is absent. Commit only K positions; d_{K-1} becomes
+        //   nextID for the next cycle (its KV written then).
+        let committed = min(matchCount + 1, K)
         engine.currentPosition = pos + committed
 
         // Extract carry state from verify hidden states.
@@ -164,6 +169,15 @@ public final class MtpSpeculativeEngine {
         totalRounds += 1
         totalAccepted += matchCount
         totalEmitted += emitted.count
+
+        // Diagnostic: first 5 rounds print match detail
+        if totalRounds <= 5 {
+            let draftsStr = proposals.map { "\($0)" }.joined(separator: ",")
+            let targetStr = targetArgmax.map { "\($0)" }.joined(separator: ",")
+            print("[MTP] round=\(totalRounds) pos=\(pos) nextID=\(nextID) " +
+                  "drafts=[\(draftsStr)] target=[\(targetStr)] " +
+                  "matched=\(matchCount)/\(K) committed=\(committed)")
+        }
 
         // nextID = last emitted token (correction or bonus, not yet committed)
         nextID = emitted.last!
