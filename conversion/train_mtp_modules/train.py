@@ -112,7 +112,10 @@ def main():
     # Data
     print("Loading precomputed shards...")
     full_ds = PrecomputedShardsDataset(args.cache_dir, k_depth=args.k_depth)
-    val_size = max(32, int(len(full_ds) * 0.02))
+    # Val split: 2% or 32 seqs, whichever is smaller; ensure train has >= 1 seq
+    val_size = max(1, min(32, int(len(full_ds) * 0.1)))
+    if val_size >= len(full_ds):
+        val_size = max(1, len(full_ds) // 5)
     train_size = len(full_ds) - val_size
     train_ds, val_ds = random_split(
         full_ds, [train_size, val_size],

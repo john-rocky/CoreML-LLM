@@ -254,6 +254,11 @@ class MtpStack(nn.Module):
         assert token_ids.shape[1] >= T + K, \
             f"Need T+K={T+K} tokens for K-depth MTP, got {token_ids.shape[1]}"
 
+        # Cast l34 to match module parameter dtype (modules may be bf16/fp16
+        # while precomputed hiddens on disk were fp32-loaded).
+        module_dtype = next(self.modules_list.parameters()).dtype
+        l34_hidden = l34_hidden.to(module_dtype)
+
         positions = torch.arange(T, device=l34_hidden.device)
         causal_mask = torch.zeros(B, 1, T, T, device=l34_hidden.device, dtype=torch.float32)
         # Standard causal: mask future positions
