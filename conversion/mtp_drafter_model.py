@@ -14,7 +14,7 @@ from the target model's kv_cache_13 (sliding) and kv_cache_14 (full attention).
 
 Usage:
     python conversion/mtp_drafter_model.py \
-        --tflite output/mtp_probe/section_9.tflite \
+        --tflite output/mtp_probe/section_10.tflite \
         --output output/mtp_probe/mtp_drafter.pt
 """
 
@@ -411,109 +411,6 @@ def _build_rename_map() -> dict[str, str]:
     return rename
 
 
-def _match_norm_weights(tflite_weights: dict[str, np.ndarray]) -> dict[str, str]:
-    """Match jax2tf_arg norm weights to PyTorch state_dict keys.
-
-    The norm weights follow a pattern: each layer has 4 norms accessible as
-    jax2tf_arg_{base + offset} where base increments by 11 per layer.
-
-    Layer 0: args 10-13 (all [256])
-    Layer 1: args 21-24
-    Layer 2: args 32-35
-    Layer 3: args 43-46
-
-    Within each layer, the order (by examining the graph flow) is:
-      arg_{base+0}: pre_attn_norm
-      arg_{base+1}: q_norm
-      arg_{base+2}: post_attn_norm (before MLP)
-      arg_{base+3}: (another norm, possibly v-related or post-attention)
-
-    arg_0: final_norm
-    arg_39: [512] — layer_3 q_norm (head_dim=512 for full attention)
-    """
-    norm_map = {}
-
-    # Final norm
-    norm_map["jax2tf_arg_0/ReadVariableOp"] = "final_norm.weight"
-
-    # Per-layer norms
-    # Based on tensor index ordering and graph structure:
-    # The jax2tf args within a layer appear near the operators they serve.
-    # From the weight listing, grouped by proximity to operators:
-    for i, base in enumerate([10, 21, 32, 43]):
-        prefix = f"layers.{i}"
-        norm_map[f"jax2tf_arg_{base}/ReadVariableOp"] = f"{prefix}.pre_attn_norm.weight"
-        if i < 3:
-            norm_map[f"jax2tf_arg_{base+1}/ReadVariableOp"] = f"{prefix}.attn.q_norm.weight"
-        else:
-            # Layer 3 uses arg_39 [512] for q_norm (different size)
-            pass
-        norm_map[f"jax2tf_arg_{base+2}/ReadVariableOp"] = f"{prefix}.post_attn_norm.weight"
-        # arg_{base+3} might be an additional norm we need to investigate
-
-    # Layer 3 q_norm is special: [512] instead of [256]
-    norm_map["jax2tf_arg_39/ReadVariableOp"] = "layers.3.attn.q_norm.weight"
-    # arg_44 for layer 3 might be q_norm [256]? No, arg_44 is [256].
-    # Let me assign arg_44 as q_norm for layer 3 only if 39 is not it
-    # Actually arg_39 is [512] which matches full_head_dim=512, so it IS the q_norm
-    norm_map["jax2tf_arg_44/ReadVariableOp"] = "layers.3.attn.q_norm.weight"  # override if needed
-
-    return norm_map
-
-
-def load_from_tflite(model: MtpDrafterModel, tflite_path: str) -> list[str]:
-    """Load weights from TFLite into PyTorch model. Returns list of unmatched keys."""
-    print(f"Extracting weights from {tflite_path}...")
-    tfl_weights = _extract_tflite_weights(tflite_path)
-    print(f"  Found {len(tfl_weights)} tensors total")
-
-    rename_map = _build_rename_map()
-    norm_map = _match_norm_weights(tfl_weights)
-
-    sd = model.state_dict()
-    matched = set()
-    unmatched_pt = []
-
-    # Match linear weights by substring
-    for tfl_name, arr in tfl_weights.items():
-        for pattern, pt_key in rename_map.items():
-            if pattern in tfl_name and pt_key in sd:
-                t = torch.from_numpy(arr).float()
-                if t.shape == sd[pt_key].shape:
-                    sd[pt_key] = t
-                    matched.add(pt_key)
-                    print(f"  {tfl_name[:60]:60s} → {pt_key} {tuple(t.shape)}")
-                else:
-                    print(f"  SHAPE MISMATCH: {tfl_name} {tuple(t.shape)} != {pt_key} {tuple(sd[pt_key].shape)}")
-                break
-
-    # Match norm weights
-    for tfl_name, arr in tfl_weights.items():
-        for pattern, pt_key in norm_map.items():
-            if tfl_name.startswith(pattern) and pt_key in sd and pt_key not in matched:
-                t = torch.from_numpy(arr).float()
-                if t.shape == sd[pt_key].shape:
-                    sd[pt_key] = t
-                    matched.add(pt_key)
-                    print(f"  {tfl_name[:60]:60s} → {pt_key} {tuple(t.shape)}")
-                elif pt_key not in matched:
-                    print(f"  NORM SHAPE MISMATCH: {tfl_name} {tuple(t.shape)} != {pt_key} {tuple(sd[pt_key].shape)}")
-                break
-
-    # Report unmatched
-    for key in sd:
-        if key not in matched and not key.startswith("swa_") and not key.startswith("full_"):
-            unmatched_pt.append(key)
-
-    if unmatched_pt:
-        print(f"\n  UNMATCHED PyTorch keys ({len(unmatched_pt)}):")
-        for k in unmatched_pt:
-            print(f"    {k} {tuple(sd[k].shape)}")
-
-    model.load_state_dict(sd, strict=False)
-    return unmatched_pt
-
-
 def load_from_tflite_auto(model: MtpDrafterModel, tflite_path: str) -> list[str]:
     """Auto-match TFLite weights to PyTorch model by shape + graph position."""
     print(f"Extracting weights from {tflite_path}...")
@@ -642,7 +539,7 @@ def load_from_tflite_auto(model: MtpDrafterModel, tflite_path: str) -> list[str]
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tflite", type=str, default="output/mtp_probe/section_9.tflite")
+    ap.add_argument("--tflite", type=str, default="output/mtp_probe/section_10.tflite")
     ap.add_argument("--output", type=str, default="output/mtp_probe/mtp_drafter.pt")
     args = ap.parse_args()
 
