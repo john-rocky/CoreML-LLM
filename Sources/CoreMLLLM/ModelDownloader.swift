@@ -389,32 +389,38 @@ public final class ModelDownloader: NSObject {
     // MARK: - HuggingFace File List
 
     private func buildHuggingFaceFileList(_ model: ModelInfo) {
-        // `sdpa/` is the 2K-context shipping model; `sdpa-8k/` also exists on
-        // HF but is slower (the 8K decode path is still being optimized —
-        // see docs/SPEED_8K.md). Keep this at 2K until the 8K roadmap lands.
-        let sdpaPrefix = "sdpa/"
+        // 2K-context shipping model lives at the repo root on HF:
+        //   - Decode chunks:  swa/chunk{1-4}.mlmodelc/
+        //   - Prefill chunks: prefill/chunk{1-4}.mlmodelc/  (remote name is
+        //     chunk1, local is prefill_chunk1 to avoid colliding with decode)
+        // NOTE: `sdpa/` on HF is actually 8K — its metadata.json says 2048
+        // but model.mil has ctx=8192 (authoritative). Don't use `sdpa/` or
+        // `sdpa-8k/` until the 8K decode path lands (see docs/SPEED_8K.md).
 
-        func mlc(_ sub: String, _ localName: String, weightSize: Int64) -> [DownloadFile] {
-            [.init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/weights/weight.bin",
+        func mlc(_ remoteDir: String, _ remoteName: String, _ localName: String, weightSize: Int64) -> [DownloadFile] {
+            [.init(remotePath: "\(remoteDir)/\(remoteName).mlmodelc/weights/weight.bin",
                    localPath: "\(localName).mlmodelc/weights/weight.bin", estimatedSize: weightSize),
-             .init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/coremldata.bin",
+             .init(remotePath: "\(remoteDir)/\(remoteName).mlmodelc/coremldata.bin",
                    localPath: "\(localName).mlmodelc/coremldata.bin", estimatedSize: 1_000),
-             .init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/model.mil",
+             .init(remotePath: "\(remoteDir)/\(remoteName).mlmodelc/model.mil",
                    localPath: "\(localName).mlmodelc/model.mil", estimatedSize: 450_000),
-             .init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/metadata.json",
+             .init(remotePath: "\(remoteDir)/\(remoteName).mlmodelc/metadata.json",
                    localPath: "\(localName).mlmodelc/metadata.json", estimatedSize: 8_000),
-             .init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/analytics/coremldata.bin",
+             .init(remotePath: "\(remoteDir)/\(remoteName).mlmodelc/analytics/coremldata.bin",
                    localPath: "\(localName).mlmodelc/analytics/coremldata.bin", estimatedSize: 250)]
         }
 
-        func prefillMeta(_ localName: String, _ decodeChunk: String) -> [DownloadFile] {
-            [.init(remotePath: "\(sdpaPrefix)prefill/\(localName).mlmodelc/coremldata.bin",
+        // Prefill metadata-only (weights are shared with decode chunks and
+        // copied in finishDownload). Remote name is `chunk1` under prefill/;
+        // local name is `prefill_chunk1` so it doesn't collide with decode.
+        func prefillMeta(_ remoteName: String, _ localName: String) -> [DownloadFile] {
+            [.init(remotePath: "prefill/\(remoteName).mlmodelc/coremldata.bin",
                    localPath: "\(localName).mlmodelc/coremldata.bin", estimatedSize: 1_000),
-             .init(remotePath: "\(sdpaPrefix)prefill/\(localName).mlmodelc/model.mil",
+             .init(remotePath: "prefill/\(remoteName).mlmodelc/model.mil",
                    localPath: "\(localName).mlmodelc/model.mil", estimatedSize: 450_000),
-             .init(remotePath: "\(sdpaPrefix)prefill/\(localName).mlmodelc/metadata.json",
+             .init(remotePath: "prefill/\(remoteName).mlmodelc/metadata.json",
                    localPath: "\(localName).mlmodelc/metadata.json", estimatedSize: 8_000),
-             .init(remotePath: "\(sdpaPrefix)prefill/\(localName).mlmodelc/analytics/coremldata.bin",
+             .init(remotePath: "prefill/\(remoteName).mlmodelc/analytics/coremldata.bin",
                    localPath: "\(localName).mlmodelc/analytics/coremldata.bin", estimatedSize: 250)]
         }
 
@@ -423,14 +429,14 @@ public final class ModelDownloader: NSObject {
         var largeFiles: [DownloadFile] = []
         var smallFiles: [DownloadFile] = []
 
-        let chunkFiles = mlc("swa", "chunk1", weightSize: 155_436_864)
-             + mlc("swa", "chunk2", weightSize: 133_963_968)
-             + mlc("swa", "chunk3", weightSize: 325_282_880)
-             + mlc("swa", "chunk4", weightSize: 526_874_880)
-        let prefillFiles = prefillMeta("prefill_chunk1", "chunk1")
-             + prefillMeta("prefill_chunk2", "chunk2")
-             + prefillMeta("prefill_chunk3", "chunk3")
-             + prefillMeta("prefill_chunk4", "chunk4")
+        let chunkFiles = mlc("swa", "chunk1", "chunk1", weightSize: 155_436_864)
+             + mlc("swa", "chunk2", "chunk2", weightSize: 133_963_968)
+             + mlc("swa", "chunk3", "chunk3", weightSize: 325_282_880)
+             + mlc("swa", "chunk4", "chunk4", weightSize: 526_874_880)
+        let prefillFiles = prefillMeta("chunk1", "prefill_chunk1")
+             + prefillMeta("chunk2", "prefill_chunk2")
+             + prefillMeta("chunk3", "prefill_chunk3")
+             + prefillMeta("chunk4", "prefill_chunk4")
         let extraFiles: [DownloadFile] = [
             .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 500),
             .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
