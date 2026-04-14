@@ -65,6 +65,16 @@ public final class CoreMLLLM: @unchecked Sendable {
     public var mtpAcceptanceRate: Double { mtpEngine?.acceptanceRate ?? 0 }
     public var mtpTokensPerRound: Double { mtpEngine?.tokensPerRound ?? 0 }
 
+    // Token-ID recording for offline accept-rate benches. These are populated
+    // from the last `generate` / `stream` call and live until the next one.
+    // See `docs/MAC_FIRST_EXECUTION_PLAN.md` §A1 for usage.
+    public private(set) var lastPromptTokenIDs: [Int32] = []
+    public private(set) var lastEmittedTokenIDs: [Int32] = []
+
+    /// Expose the tokenizer so a harness can re-encode / decode arbitrary
+    /// text without duplicating the swift-transformers wiring.
+    public var tokenizerRef: any Tokenizer { tokenizer }
+
     // MARK: - Public Types
 
     /// A message in a multi-turn conversation.
@@ -330,6 +340,10 @@ public final class CoreMLLLM: @unchecked Sendable {
 
         reset()
 
+        // Clear recording buffers and record the prompt IDs for this turn.
+        self.lastPromptTokenIDs = tokenIDs.map { Int32($0) }
+        self.lastEmittedTokenIDs = []
+
         let mutableSelf = self
         let imgFeats = imageFeatures
         let audFeats = audioFeatures
@@ -432,11 +446,13 @@ public final class CoreMLLLM: @unchecked Sendable {
                                         nid = tok
                                         break
                                     }
+                                    mutableSelf.lastEmittedTokenIDs.append(tok)
                                     let text = mutableSelf.tokenizer.decode(tokens: [Int(tok)])
                                     continuation.yield(text)
                                     tokenCount += 1
                                 }
                             } else {
+                                mutableSelf.lastEmittedTokenIDs.append(nid)
                                 let text = mutableSelf.tokenizer.decode(tokens: [Int(nid)])
                                 continuation.yield(text)
                                 tokenCount += 1
@@ -472,6 +488,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                         for _ in 0..<maxTokens {
                             if eosIDs.contains(nextID) { break }
                             if pos >= ctxLimit { break }
+                            mutableSelf.lastEmittedTokenIDs.append(Int32(nextID))
                             let text = mutableSelf.tokenizer.decode(tokens: [nextID])
                             continuation.yield(text)
                             tokenCount += 1
