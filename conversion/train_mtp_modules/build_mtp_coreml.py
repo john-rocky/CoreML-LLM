@@ -239,10 +239,94 @@ class MtpModuleANE(nn.Module):
 # Main: build and convert
 # ---------------------------------------------------------------------------
 
+def load_trained_module_weights(ane_model: MtpModuleANE, ckpt_path: str,
+                                module_idx: int):
+    """Extract module[module_idx] weights from a trained MtpStack checkpoint
+    and load into an MtpModuleANE (ANE Conv2d layout).
+
+    Training MtpModule uses nn.Linear; inference MtpModuleANE uses nn.Conv2d(1,1).
+    Weight shape conversion: Linear (out, in) → Conv2d (out, in, 1, 1).
+
+    The training module's `input_proj` takes concat(hidden_prev, token_embed)
+    of shape (..., 2H). Split into two separate Conv1x1s: in_h and in_e.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+
+    prefix = f"modules_list.{module_idx}."
+    module_sd = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+    if not module_sd:
+        raise RuntimeError(f"No keys with prefix {prefix!r} found in checkpoint")
+    print(f"  Found {len(module_sd)} tensors for module_{module_idx}")
+
+    H = ane_model.cfg.hidden_size
+
+    def to_conv(w):
+        return w.unsqueeze(-1).unsqueeze(-1).to(MODEL_DTYPE)
+
+    ane_sd = {}
+
+    # Input fusion: split input_proj (H, 2H) → in_h (H, H, 1, 1) + in_e (H, H, 1, 1)
+    # input_proj was called with cat([hidden_prev, token_embed], dim=-1):
+    # - weight[:, :H] multiplies hidden_prev → in_h
+    # - weight[:, H:] multiplies token_embed → in_e
+    W_in = module_sd["input_proj.weight"]  # (H, 2H)
+    ane_sd["in_h.weight"] = to_conv(W_in[:, :H])
+    ane_sd["in_e.weight"] = to_conv(W_in[:, H:])
+
+    # Sandwich norms + final norm (same names, direct copy)
+    for norm_key in ["input_layernorm", "post_attention_layernorm",
+                     "pre_feedforward_layernorm", "post_feedforward_layernorm",
+                     "final_norm"]:
+        ane_sd[f"{norm_key}.weight"] = module_sd[f"{norm_key}.weight"].to(MODEL_DTYPE)
+
+    # Attention projections: Linear → Conv2d
+    for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+        ane_sd[f"{name}.weight"] = to_conv(module_sd[f"attn.{name}.weight"])
+    # Attention head norms
+    ane_sd["q_norm.weight"] = module_sd["attn.q_norm.weight"].to(MODEL_DTYPE)
+    ane_sd["k_norm.weight"] = module_sd["attn.k_norm.weight"].to(MODEL_DTYPE)
+
+    # MLP projections (gate/up/down)
+    for name in ["gate_proj", "up_proj", "down_proj"]:
+        ane_sd[f"{name}.weight"] = to_conv(module_sd[f"mlp.{name}.weight"])
+
+    # Load into ANE model (strict=False because lm_head_weight is a buffer
+    # loaded separately from the HF trunk)
+    missing, unexpected = ane_model.load_state_dict(ane_sd, strict=False)
+    # lm_head_weight (buffer) is expected-missing; warn on others
+    real_missing = [k for k in missing if "lm_head_weight" not in k]
+    if real_missing:
+        print(f"  WARNING: missing keys after load: {real_missing}")
+    if unexpected:
+        print(f"  WARNING: unexpected keys: {unexpected}")
+
+    print(f"  Loaded {len(ane_sd)} weights from module_{module_idx}")
+
+
+def load_lm_head_from_hf(ane_model: MtpModuleANE, hf_dir: str):
+    """Load the tied LM head weight from the HF trunk (= embed_tokens.weight)."""
+    from transformers import Gemma4ForConditionalGeneration
+    print(f"  Loading HF trunk for tied lm_head from {hf_dir}")
+    hf = Gemma4ForConditionalGeneration.from_pretrained(
+        hf_dir, torch_dtype=torch.float32, device_map="cpu",
+    )
+    lm = hf.model.language_model
+    embed = lm.embed_tokens.weight.detach().clone()
+    with torch.no_grad():
+        ane_model.lm_head_weight.copy_(embed.to(MODEL_DTYPE))
+    print(f"  lm_head_weight loaded: {tuple(embed.shape)} norm={embed.norm().item():.2f}")
+    del hf, lm
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", type=str, default=None,
-                    help="Trained module checkpoint (.pt). If None, random weights.")
+                    help="Trained MtpStack checkpoint (.pt). If None, random weights.")
+    ap.add_argument("--module-idx", type=int, default=0,
+                    help="Which module from the trained stack to convert (0 or 1 for K=2).")
+    ap.add_argument("--hf-dir", type=str, default=None,
+                    help="HF Gemma 4 dir for loading tied lm_head. Required with --ckpt.")
     ap.add_argument("--output", type=str, default="/tmp/mtp_module.mlpackage")
     ap.add_argument("--palettize-int4", action="store_true")
     ap.add_argument("--include-lm-head", action="store_true", default=True,
@@ -260,10 +344,13 @@ def main():
     print(f"Module params: {trainable:,}")
 
     if args.ckpt:
-        print(f"Loading weights from {args.ckpt}")
-        state = torch.load(args.ckpt, map_location="cpu")
-        # TODO: wire up weight loading once training produces checkpoints
-        model.load_state_dict(state, strict=False)
+        print(f"Loading module_{args.module_idx} from {args.ckpt}")
+        load_trained_module_weights(model, args.ckpt, args.module_idx)
+        if args.include_lm_head:
+            if not args.hf_dir:
+                raise ValueError("--hf-dir is required when --ckpt is provided "
+                                 "with --include-lm-head")
+            load_lm_head_from_hf(model, args.hf_dir)
     else:
         print("Using RANDOM weights (for latency test only)")
         if args.include_lm_head:
