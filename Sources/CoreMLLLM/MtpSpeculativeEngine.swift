@@ -81,12 +81,16 @@ public final class MtpSpeculativeEngine {
         }
 
         guard let kv13K = engine.lastKV13K,
-              let kv13V = engine.lastKV13V,
+              let kv13VRaw = engine.lastKV13V,
               let kv14K = engine.lastKV14K,
-              let kv14V = engine.lastKV14V
+              let kv14VRaw = engine.lastKV14V
         else {
             throw SpeculativeError.verifyFailed("kv13/kv14 not available for MTP drafter")
         }
+        // Target stores V as (1,1,seq,hd); drafter expects Google TFLite
+        // convention (1,1,hd,seq). Transpose last two dims.
+        let kv13V = try transposeLastTwoDims(kv13VRaw)
+        let kv14V = try transposeLastTwoDims(kv14VRaw)
 
         // Build mask ONCE per cycle at the last committed position.
         // The drafter reads target KV (positions 0..pos-1), so mask allows 0..pos-1.
@@ -192,6 +196,26 @@ public final class MtpSpeculativeEngine {
         nextID = Int32(newNext)
         isBootstrapped = true
         return [emitted]
+    }
+
+    /// Transpose last two dims of a (1, 1, N, M) fp16 MLMultiArray → (1, 1, M, N).
+    private func transposeLastTwoDims(_ src: MLMultiArray) throws -> MLMultiArray {
+        let shape = src.shape.map { $0.intValue }
+        precondition(shape.count == 4 && shape[0] == 1 && shape[1] == 1,
+                     "transposeLastTwoDims expects (1, 1, N, M) shape")
+        let N = shape[2]
+        let M = shape[3]
+        let result = try MLMultiArray(
+            shape: [1, 1, NSNumber(value: M), NSNumber(value: N)],
+            dataType: .float16)
+        let srcPtr = src.dataPointer.bindMemory(to: UInt16.self, capacity: N * M)
+        let dstPtr = result.dataPointer.bindMemory(to: UInt16.self, capacity: N * M)
+        for i in 0..<N {
+            for j in 0..<M {
+                dstPtr[j * N + i] = srcPtr[i * M + j]
+            }
+        }
+        return result
     }
 
     /// Slice first `halfDim` values from a (1,1,1,halfDim*2) RoPE tensor
