@@ -21,5 +21,10 @@ let package = Package(
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        .executableTarget(
+            name: "MtpMacCheck",
+            dependencies: ["CoreMLLLM"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )

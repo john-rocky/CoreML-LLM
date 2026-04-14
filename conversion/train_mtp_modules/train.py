@@ -59,7 +59,9 @@ def compute_losses_and_acc(stack, batch, device, k_depth):
     losses = []
     accuracies = []
     for k in range(k_depth):
-        target = tokens[:, k + 1:k + 1 + T_eff]  # (B, T_eff) — token at t+k+1
+        # DeepSeek V3 target: module_k predicts tokens[t + k + 2].
+        # (embed input is tokens[t+k+1], target is 1 step further.)
+        target = tokens[:, k + 2:k + 2 + T_eff]  # (B, T_eff) — token at t+k+2
         logits = logits_list[k]  # (B, T_eff, V)
         loss = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]),

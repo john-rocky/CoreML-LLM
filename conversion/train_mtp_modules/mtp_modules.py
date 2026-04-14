@@ -245,28 +245,45 @@ class MtpStack(nn.Module):
     def forward(
         self,
         l34_hidden: torch.Tensor,      # (B, T, H) from frozen trunk
-        token_ids: torch.Tensor,       # (B, T+K) — current + K draft targets
+        token_ids: torch.Tensor,       # (B, T+K+1) — DeepSeek V3 MTP indexing
     ) -> list[torch.Tensor]:
-        """Training-time forward. Returns list of logits, one per module.
+        """Training-time forward. DeepSeek V3 MTP indexing.
 
-        module_k predicts token at position t+k+1, given:
-          - hidden_prev = L34[t] (k=1) or h_{k-1} (k>=2)
-          - embed(tok_t+k-1)
+        For each position t:
+          module_k input:
+            - hidden_prev = L34[t] (k=0) or h_{k-1}[t] (k>=1)
+            - embed(tokens[t + k + 1])   ← shifted +1 from position t
+          module_k target:
+            - tokens[t + k + 2]          ← predicts 2+k steps ahead
+
+        For K=2:
+          module_0: (L34[t], embed(tokens[t+1])) → tokens[t+2]
+          module_1: (h_0[t], embed(tokens[t+2])) → tokens[t+3]
+
+        In deployment:
+          currentPos = P, nextID = tokens[P] (from main's lm_head).
+          module_0(L34[P-1], embed(nextID = tokens[P])) → d_0 ≈ tokens[P+1].
+          module_1(h_0, embed(d_0 ≈ tokens[P+1]))      → d_1 ≈ tokens[P+2].
+
+        NOTE: earlier versions used `tok_k = tokens[k:k+T]` (no +1 shift),
+        which trained module_0 redundantly with main's lm_head. The fix
+        aligns with DeepSeek V3 paper Figure 3 formulation.
         """
         B, T, _ = l34_hidden.shape
         K = self.cfg.num_modules
 
-        assert token_ids.shape[1] >= T + K, \
-            f"Need T+K={T+K} tokens for K-depth MTP, got {token_ids.shape[1]}"
+        assert token_ids.shape[1] >= T + K + 1, (
+            f"Need T+K+1={T+K+1} tokens for DeepSeek V3 K-depth MTP "
+            f"(target of module_{K-1} is tokens[t+{K+1}:t+{K+1}+T]), "
+            f"got {token_ids.shape[1]}"
+        )
 
-        # Cast l34 to match module parameter dtype (modules may be bf16/fp16
-        # while precomputed hiddens on disk were fp32-loaded).
+        # Cast l34 to match module parameter dtype
         module_dtype = next(self.modules_list.parameters()).dtype
         l34_hidden = l34_hidden.to(module_dtype)
 
         positions = torch.arange(T, device=l34_hidden.device)
         causal_mask = torch.zeros(B, 1, T, T, device=l34_hidden.device, dtype=torch.float32)
-        # Standard causal: mask future positions
         causal_mask = causal_mask + torch.triu(
             torch.full((T, T), float("-inf"), device=l34_hidden.device), diagonal=1
         )
@@ -274,8 +291,8 @@ class MtpStack(nn.Module):
         logits_per_module = []
         h_prev = l34_hidden
         for k in range(K):
-            # Input token for module_k: tok_t+k (shifted by k from position t)
-            tok_k = token_ids[:, k:k + T]            # (B, T)
+            # +1 shift: embed is NEXT token, not current position's token
+            tok_k = token_ids[:, k + 1:k + 1 + T]    # (B, T)
             emb_k = self._scaled_embed(tok_k)        # (B, T, H)
 
             h_out = self.modules_list[k](

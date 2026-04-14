@@ -99,23 +99,24 @@ def collate_mtp(batch, k_depth: int = 2):
     """
     B = len(batch)
     T_full = batch[0]["tokens"].shape[0]
-    T_eff = T_full - k_depth  # number of valid training positions per sequence
+    # DeepSeek V3: module_k needs embed(tokens[t+k+1]) and target tokens[t+k+2].
+    # For k = K-1 (last module): needs tokens[t+K+1]. So need tokens up to
+    # T_eff + K + 1 total. T_eff = T_full - K - 1.
+    T_eff = T_full - k_depth - 1
 
     tokens = torch.stack([b["tokens"] for b in batch], dim=0)       # (B, T_full)
     hiddens = torch.stack([b["hiddens"] for b in batch], dim=0)     # (B, T_full, H)
 
-    # Trainer-side slicing:
-    # l34_hidden[t] (t in [0, T_eff)) predicts future tokens
-    # module_k (k in [1, K]) uses:
-    #   - hidden_prev: l34_hidden[t] for k=1, h_{k-1} for k>1
-    #   - embed input: tokens[t + k - 1]  (the (k-1)-th prior token in the draft chain)
-    #   - target: tokens[t + k]  (for loss CE)
-    # So for K=2:
-    #   module_1 input emb = embed(tokens[t]),   target = tokens[t+1]
-    #   module_2 input emb = embed(tokens[t+1]), target = tokens[t+2]
+    # DeepSeek V3 MTP indexing (K=2 example):
+    #   l34_hidden[t]  (t in [0, T_eff))  — trunk hidden AT position t
+    #   module_0 input: hidden_prev = L34[t], embed(tokens[t+1])  → tokens[t+2]
+    #   module_1 input: hidden_prev = h_0[t], embed(tokens[t+2])  → tokens[t+3]
+    #
+    # Deployment analog: currentPos = P, carry = L34[P-1] (approx), nextID = tokens[P].
+    #   module_0(L34[P-1], embed(tokens[P] = nextID)) → tokens[P+1] = d_0
+    #   module_1(h_0,      embed(d_0))                → tokens[P+2] = d_1
 
     return {
-        "l34_hidden": hiddens[:, :T_eff, :],      # (B, T_eff, H)
-        "input_tokens": tokens[:, :T_eff + k_depth],  # (B, T_eff + K) — for embedding lookup
-        # target_tokens[k-1] = tokens[:, k:k+T_eff] = target for module_k
+        "l34_hidden": hiddens[:, :T_eff, :],              # (B, T_eff, H)
+        "input_tokens": tokens[:, :T_eff + k_depth + 1],  # (B, T_eff + K + 1)
     }
