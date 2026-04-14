@@ -32,27 +32,6 @@ import torch
 import torch.nn.functional as F
 
 
-def make_collator(tokenizer, seq_len: int):
-    def collate(batch):
-        texts = [b.get("text") or b.get("content", "") for b in batch]
-        # Tokenize without padding, we'll pack
-        all_ids = []
-        for t in texts:
-            ids = tokenizer(t, add_special_tokens=False).input_ids
-            all_ids.extend(ids)
-        # Prepend BOS
-        bos = tokenizer.bos_token_id
-        if bos is not None and (len(all_ids) == 0 or all_ids[0] != bos):
-            all_ids = [bos] + all_ids
-        # Chunk into seq_len windows
-        chunks = []
-        for i in range(0, len(all_ids) - seq_len + 1, seq_len):
-            chunk = all_ids[i:i + seq_len]
-            chunks.append(chunk)
-        return chunks
-    return collate
-
-
 def iter_hf_dataset(name_or_path: str, streaming: bool = True, max_samples: int = None):
     """Yield text samples from an HF dataset. Supports streaming for large sets."""
     from datasets import load_dataset
@@ -160,9 +139,6 @@ def main():
     lm = hf.model.language_model
     H = lm.config.hidden_size
 
-    # Tokenize + shard
-    collator = make_collator(tok, args.seq_len)
-
     total_tokens = 0
     shard_idx = 0
     buf_tokens = []
@@ -190,17 +166,33 @@ def main():
         buf_hiddens = []
 
     print(f"\nDatasets: {args.dataset}")
-    all_chunks = []
+    # Accumulate tokens across ALL examples, THEN chunk into seq_len windows.
+    # Per-example chunking fails for short entries like wikitext (lines, not docs).
+    bos = tok.bos_token_id
+    all_tokens = [bos] if bos is not None else []
+    total_samples = 0
     for ds_name in args.dataset:
         print(f"  Streaming {ds_name} (max {args.samples_per_dataset} samples)...")
-        ds_chunks = 0
+        ds_tokens_before = len(all_tokens)
+        ds_samples = 0
         for ex in iter_hf_dataset(ds_name, streaming=True, max_samples=args.samples_per_dataset):
-            chunks = collator([ex])
-            all_chunks.extend(chunks)
-            ds_chunks += len(chunks)
-        print(f"    {ds_name}: {ds_chunks} chunks ({ds_chunks * args.seq_len:,} tokens)")
+            text = ex.get("text") or ex.get("content", "")
+            if not text:
+                continue
+            ids = tok(text, add_special_tokens=False).input_ids
+            all_tokens.extend(ids)
+            ds_samples += 1
+        ds_tokens = len(all_tokens) - ds_tokens_before
+        total_samples += ds_samples
+        print(f"    {ds_name}: {ds_samples} samples, {ds_tokens:,} tokens")
 
-    print(f"\nTotal chunks to process: {len(all_chunks)} ({len(all_chunks) * args.seq_len:,} tokens)")
+    # Chunk into seq_len windows
+    all_chunks = []
+    for i in range(0, len(all_tokens) - args.seq_len + 1, args.seq_len):
+        all_chunks.append(all_tokens[i:i + args.seq_len])
+
+    print(f"\nTotal: {total_samples} samples → {len(all_tokens):,} tokens → "
+          f"{len(all_chunks)} chunks of {args.seq_len}")
 
     with torch.inference_mode():
         for i, chunk in enumerate(all_chunks):
