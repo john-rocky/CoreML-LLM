@@ -89,6 +89,7 @@ public final class ModelDownloader: NSObject {
 
     override init() {
         super.init()
+        cleanGraveyard()
         restorePendingDownload()
         let config = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
         config.isDiscretionary = false
@@ -265,23 +266,7 @@ public final class ModelDownloader: NSObject {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
         defer { refreshTrigger += 1 }
         guard fileManager.fileExists(atPath: dir.path) else { return }
-        // Primary path: remove the whole directory tree.
-        do {
-            try fileManager.removeItem(at: dir)
-            return
-        } catch {
-            // Fallback: some items (e.g., bundles left in an unusual state by
-            // a previous app version) can resist a single removeItem call on
-            // the parent. Remove children individually, then retry the dir.
-            if let children = try? fileManager.contentsOfDirectory(
-                at: dir, includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]) {
-                for child in children {
-                    try? fileManager.removeItem(at: child)
-                }
-            }
-            try fileManager.removeItem(at: dir)
-        }
+        try evictToGraveyard(dir)
     }
 
     /// Remove every model folder under `modelsDirectory`. Used as an escape
@@ -294,18 +279,43 @@ public final class ModelDownloader: NSObject {
         let children = (try? fileManager.contentsOfDirectory(
             at: modelsDirectory, includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles])) ?? []
+        var firstError: Error?
         for child in children {
-            do {
-                try fileManager.removeItem(at: child)
-            } catch {
-                if let grandchildren = try? fileManager.contentsOfDirectory(
-                    at: child, includingPropertiesForKeys: nil,
-                    options: [.skipsHiddenFiles]) {
-                    for g in grandchildren { try? fileManager.removeItem(at: g) }
-                }
-                try? fileManager.removeItem(at: child)
-            }
+            // Skip the graveyard itself — it gets cleaned asynchronously.
+            if child.lastPathComponent.hasPrefix(".graveyard-") { continue }
+            do { try evictToGraveyard(child) }
+            catch { if firstError == nil { firstError = error } }
         }
+        if let e = firstError { throw e }
+    }
+
+    /// Move a file / directory out of sight by renaming it into a hidden
+    /// graveyard folder, then best-effort delete. Rename succeeds on APFS
+    /// even when URLSession background tasks still hold open handles to
+    /// files inside — whereas `removeItem` on the same path fails with
+    /// "no permission to access" because of those handles.
+    ///
+    /// The visible model folder disappears immediately. Remaining graveyard
+    /// bytes are swept up by `cleanGraveyard` at the next init.
+    private func evictToGraveyard(_ url: URL) throws {
+        let graveRoot = modelsDirectory.appendingPathComponent(".graveyard", isDirectory: true)
+        try? fileManager.createDirectory(at: graveRoot, withIntermediateDirectories: true)
+        let grave = graveRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fileManager.moveItem(at: url, to: grave)
+        try? fileManager.removeItem(at: grave)  // best-effort; leftovers cleaned next launch
+    }
+
+    /// Best-effort removal of any graveyard residue from prior sessions.
+    /// Called on init — by then the URLSession daemon from the prior app
+    /// run has released its file handles, so removeItem usually succeeds.
+    private func cleanGraveyard() {
+        let graveRoot = modelsDirectory.appendingPathComponent(".graveyard", isDirectory: true)
+        guard fileManager.fileExists(atPath: graveRoot.path) else { return }
+        if let children = try? fileManager.contentsOfDirectory(
+            at: graveRoot, includingPropertiesForKeys: nil, options: []) {
+            for c in children { try? fileManager.removeItem(at: c) }
+        }
+        try? fileManager.removeItem(at: graveRoot)
     }
 
     // MARK: - Parallel Download Scheduling
