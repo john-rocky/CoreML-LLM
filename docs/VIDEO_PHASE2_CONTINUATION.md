@@ -274,9 +274,37 @@ macro content (object names, motion direction) even if phrasing differs.
 
 - **`torch.jit.trace` on the vision tower**: the `gemma4_vision.py`
   docstring says tracing was hard last time because of dynamic masking.
-  Phase 2 depends on either that being resolved upstream or switching to
-  `torch.export` / `ct.convert(source="pytorch")`. Budget a day for this
-  risk.
+  **Partially resolved** on this branch — see
+  `conversion/phase2/trace_video_vision.py`. Summary of what we learned
+  in a ~1.5 hr Phase 2 spike on 2026-04-15:
+  - Env that works: **Python 3.11 + `transformers@main` (5.6.0.dev0) +
+    `torch 2.7.0` + `coremltools 9.0` + `accelerate 1.13`** via `uv`.
+    Python 3.9 is too old for transformers main.
+  - `hf.model.get_image_features(pixel_values=(1,630,768),
+    image_position_ids=(1,630,2) int64)` returns `(64, 1536)` directly
+    for a 24×24 patch grid — the vision tower **adaptively pools** to
+    the video-grade token count without any config change. That's the
+    output we want.
+  - `torch.export` path: conversion fails at coremltools-9.0 on
+    unsupported fx nodes (`new_ones`, then `__and__`, then …). A
+    whack-a-mole. Unusable until coremltools 10+.
+  - `torch.jit.trace` path: the vision encoder's `forward` calls
+    `create_bidirectional_mask(...)` which internally does
+    `q_length.shape[0]` on what's effectively a scalar during trace and
+    raises `IndexError`. Fix is to monkey-patch
+    `hf.model.vision_tower.encoder.forward` with a replacement that
+    builds a static additive mask from the `attention_mask` input —
+    implementation is in `phase2/trace_video_vision.py`
+    (`patched_vision_forward`).
+  - With that patch, `torch.jit.trace` succeeds. **`ct.convert` then
+    fails** in MIL on a cast op (`only 0-dimensional arrays can be
+    converted to Python scalars`) — probably inside `rotary_emb` or
+    similar. Next engineer picks up here.
+  - Suggested next step: run with
+    `ct.convert(..., debug=True)` to localize the offending node, then
+    either (a) patch that node's handler in
+    `coremltools/converters/mil/frontend/torch/ops.py`, or (b)
+    rewrite the vision tower's `rotary_emb` path to avoid the cast.
 - **ANE placement**: the still-image encoder runs `.cpuAndGPU` by design
   (see BENCHMARKING.md). The video encoder inherits the same constraint
   unless ANE-friendly ops can be substituted. Do not chase ANE placement
@@ -292,7 +320,9 @@ macro content (object names, motion direction) even if phrasing differs.
 
 | Path                                                 | Change               |
 |------------------------------------------------------|----------------------|
-| `conversion/models/gemma4_vision.py`                 | add video converter  |
+| `conversion/phase2/trace_video_vision.py`            | **starting point** — partial trace+convert, blocked in MIL cast |
+| `conversion/phase2/probe_vision.py`                  | reference: confirms `(64,1536)` output for 24×24 patches |
+| `conversion/models/gemma4_vision.py`                  | add video converter (productionize phase2/)  |
 | `conversion/convert_gemma4_multimodal.py`            | `--video-vision` flag|
 | `Sources/CoreMLLLM/CoreMLLLM.swift`                  | load/use new encoder |
 | `Sources/CoreMLLLM/VideoProcessor.swift`             | doc tweaks only      |
