@@ -115,6 +115,11 @@ public final class ModelDownloader: NSObject {
         if fileManager.fileExists(atPath: chunk1.appendingPathComponent("weights/weight.bin").path) {
             return chunk1
         }
+        // Multi-function chunks are distributed as .mlpackage (MTP speculative variant).
+        let chunk1Pkg = dir.appendingPathComponent("chunk1.mlpackage")
+        if fileManager.fileExists(atPath: chunk1Pkg.appendingPathComponent("Manifest.json").path) {
+            return chunk1Pkg
+        }
         let modelc = dir.appendingPathComponent("model.mlmodelc")
         if fileManager.fileExists(atPath: modelc.appendingPathComponent("weights/weight.bin").path) {
             return modelc
