@@ -102,10 +102,13 @@ public final class MtpSpeculativeEngine {
 
         for k in 0..<K {
             let draftPos = pos + k
-            let cosSwa = try engine.lookupCosSWA(position: draftPos)
-            let sinSwa = try engine.lookupSinSWA(position: draftPos)
-            let cosFull = try engine.lookupCosFull(position: draftPos)
-            let sinFull = try engine.lookupSinFull(position: draftPos)
+            // Target RoPE tables store (1,1,1,dim) with duplicated halves:
+            //   emb = cat((freqs, freqs), dim=-1) — see base_model.py RotaryEmbedding.
+            // Drafter expects (1, dim/2) with only the unique half.
+            let cosSwa = try sliceAndReshape(engine.lookupCosSWA(position: draftPos), halfDim: 128)
+            let sinSwa = try sliceAndReshape(engine.lookupSinSWA(position: draftPos), halfDim: 128)
+            let cosFull = try sliceAndReshape(engine.lookupCosFull(position: draftPos), halfDim: 256)
+            let sinFull = try sliceAndReshape(engine.lookupSinFull(position: draftPos), halfDim: 256)
 
             let (tokenId, projActOut) = try drafter.draftOne(
                 embedToken: embedToken,
@@ -189,6 +192,17 @@ public final class MtpSpeculativeEngine {
         nextID = Int32(newNext)
         isBootstrapped = true
         return [emitted]
+    }
+
+    /// Slice first `halfDim` values from a (1,1,1,halfDim*2) RoPE tensor
+    /// and reshape to (1, halfDim) for the drafter.
+    private func sliceAndReshape(_ src: MLMultiArray, halfDim: Int) throws -> MLMultiArray {
+        let result = try MLMultiArray(
+            shape: [1, NSNumber(value: halfDim)], dataType: .float16)
+        let srcPtr = src.dataPointer.bindMemory(to: UInt16.self, capacity: src.count)
+        let dstPtr = result.dataPointer.bindMemory(to: UInt16.self, capacity: halfDim)
+        memcpy(dstPtr, srcPtr, halfDim * MemoryLayout<UInt16>.stride)
+        return result
     }
 
     /// Slice hidden state at index `k` from lastVerifyHiddenStates (1, K, hidden).
