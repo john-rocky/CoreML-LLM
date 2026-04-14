@@ -18,6 +18,15 @@ diff < 1e-5). Phase 2 now has **two parallel paths**: MTP (faster-to-ship,
 no retraining) and EAGLE-3 (retrain required, Blocker 1 root cause now
 understood — training-corpus KV-sharing mismatch, not a forward bug).
 
+**2026-04-14 late:** MTP Path A end-to-end integration complete and deployed
+to iPhone 17 Pro. **acc0 = 0 %** across all prompts — drafts never match
+target. Runtime plumbing (verify chunks, write-through KV, per-step RoPE,
+bootstrap, carry state) all verified working. Root cause is the 0.82 cosine
+TFLite→PyTorch parity gap — the drafter's extraction quality is
+insufficient to hit target's argmax. Details: `docs/MTP_INTEGRATION_RESULTS.md`.
+**Recommendation: fallback to EAGLE-3 retrain (Track B) or self-trained MTP
+heads (Path C in MTP_PATH_A_FINDINGS §7).**
+
 ---
 
 ## Phase 0 — Diagnostics & zero-risk micro-opts (< 1 day each)
