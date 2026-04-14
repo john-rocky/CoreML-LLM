@@ -15,9 +15,21 @@
 import CoreML
 import Foundation
 
+/// Common interface for speculative drafter engines. Both MTP Path A
+/// (autoregressive drafter) and Path C (K=2 sequential modules) conform.
+/// CoreMLLLM holds an optional of this protocol; the decode loop calls
+/// speculateStep per iteration.
+public protocol SpeculativeDrafterEngine: AnyObject {
+    func speculateStep(nextID: inout Int32) throws -> [Int32]
+    var shouldSpeculate: Bool { get }
+    func reset()
+    var acceptanceRate: Double { get }
+    var tokensPerRound: Double { get }
+}
+
 /// MTP speculative decoding engine — drafts K tokens with the MTP drafter,
 /// verifies them against the target (ChunkedEngine), and commits accepted tokens.
-public final class MtpSpeculativeEngine {
+public final class MtpSpeculativeEngine: SpeculativeDrafterEngine {
 
     let engine: ChunkedEngine
     let drafter: MtpDraftSource

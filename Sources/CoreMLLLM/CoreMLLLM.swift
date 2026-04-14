@@ -55,8 +55,8 @@ public final class CoreMLLLM: @unchecked Sendable {
     // Multi-turn: cache image features across turns
     private var cachedImageFeatures: MLMultiArray?
 
-    // MTP speculative decoding
-    private var mtpEngine: MtpSpeculativeEngine?
+    // MTP speculative decoding (Path A drafter or Path C 2-module stack)
+    private var mtpEngine: SpeculativeDrafterEngine?
     /// Toggle MTP speculation on/off for benchmarking.
     public var mtpEnabled: Bool = true
 
@@ -143,21 +143,40 @@ public final class CoreMLLLM: @unchecked Sendable {
             llm.monolithicState = llm.monolithicModel?.makeState()
         }
 
-        // MTP drafter (optional — enables speculative decoding)
-        let mtpCompiled = directory.appendingPathComponent("mtp_drafter.mlmodelc")
-        let mtpPkg = directory.appendingPathComponent("mtp_drafter.mlpackage")
-        let mtpURL: URL? = FileManager.default.fileExists(atPath: mtpCompiled.path) ? mtpCompiled
-            : FileManager.default.fileExists(atPath: mtpPkg.path) ? mtpPkg : nil
-        if let mtpURL, let engine = llm.chunkedEngine, engine.hasVerify {
-            onProgress?("Loading MTP drafter...")
-            do {
-                let drafterSource = try MtpDraftSource(
-                    modelURL: mtpURL, K: engine.verifyK)
-                llm.mtpEngine = MtpSpeculativeEngine(
-                    engine: engine, drafter: drafterSource)
-                print("[MTP] Drafter loaded (K=\(engine.verifyK))")
-            } catch {
-                print("[MTP] Failed to load drafter: \(error)")
+        // MTP speculative decoding — prefer Path C (K=2 sequential modules)
+        // if both mtp_module_0 and mtp_module_1 exist. Fall back to Path A
+        // (single MTP drafter, deprecated) if only mtp_drafter present.
+        if let engine = llm.chunkedEngine, engine.hasVerify {
+            func findModel(_ name: String) -> URL? {
+                let mlc = directory.appendingPathComponent("\(name).mlmodelc")
+                if FileManager.default.fileExists(atPath: mlc.path) { return mlc }
+                let pkg = directory.appendingPathComponent("\(name).mlpackage")
+                if FileManager.default.fileExists(atPath: pkg.path) { return pkg }
+                return nil
+            }
+
+            let m0URL = findModel("mtp_module_0")
+            let m1URL = findModel("mtp_module_1")
+            if let m0URL, let m1URL {
+                onProgress?("Loading MTP modules (Path C)...")
+                do {
+                    llm.mtpEngine = try MtpModuleStackEngine(
+                        engine: engine, module0URL: m0URL, module1URL: m1URL)
+                    print("[MTP] Path C loaded (2 sequential modules, K=2 drafts)")
+                } catch {
+                    print("[MTP] Failed to load Path C modules: \(error)")
+                }
+            } else if let drafterURL = findModel("mtp_drafter") {
+                onProgress?("Loading MTP drafter (Path A)...")
+                do {
+                    let drafterSource = try MtpDraftSource(
+                        modelURL: drafterURL, K: engine.verifyK)
+                    llm.mtpEngine = MtpSpeculativeEngine(
+                        engine: engine, drafter: drafterSource)
+                    print("[MTP] Path A drafter loaded (K=\(engine.verifyK))")
+                } catch {
+                    print("[MTP] Failed to load Path A drafter: \(error)")
+                }
             }
         }
 
