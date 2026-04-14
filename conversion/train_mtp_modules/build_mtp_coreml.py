@@ -219,14 +219,25 @@ class MtpModuleANE(nn.Module):
         hidden_out = self.final_norm(x)  # (1, 1, H)
 
         if self.include_lm_head:
-            # LM head + softcap + top-k(8)
+            # LM head + softcap + argmax (top-1).
+            #
+            # NOTE: we used to emit torch.topk(k=8) to carry candidates for
+            # speculative sampling. An equivalence test on coremltools 9.0
+            # showed topk output being truncated to the lower 16 bits of the
+            # vocab index for the large V=262144 case (indices off by k*65536),
+            # but ONLY when topk followed the full MtpModule graph (squeeze +
+            # softcap); isolated topk was fine. Switching to argmax side-steps
+            # the bug and returns exactly what the Swift consumer reads (first
+            # element of top_k_indices). Kept output name for Swift compatibility.
             logits = F.linear(hidden_out.float(), self.lm_head_weight.float())
-            logits = torch.tanh(logits / self.softcap) * self.softcap
-            logits = logits.squeeze(0).squeeze(0)  # (V,)
-            top_k_vals, top_k_ids = torch.topk(logits, k=8)
+            logits = torch.tanh(logits / self.softcap) * self.softcap  # (1, 1, V)
+            argmax_id = logits.argmax(dim=-1)  # (1, 1)
+            top_k_indices = argmax_id.reshape(1).to(torch.int32)  # (1,)
+            # Return value at the argmax for introspection (not used by Swift).
+            top_k_values = logits.gather(-1, argmax_id.unsqueeze(-1)).reshape(1).to(MODEL_DTYPE)
             return (
-                top_k_ids.to(torch.int32),
-                top_k_vals.to(MODEL_DTYPE),
+                top_k_indices,
+                top_k_values,
                 hidden_out,
                 kv_k_out,
                 kv_v_out,
@@ -308,8 +319,9 @@ def load_lm_head_from_hf(ane_model: MtpModuleANE, hf_dir: str):
     """Load the tied LM head weight from the HF trunk (= embed_tokens.weight)."""
     from transformers import Gemma4ForConditionalGeneration
     print(f"  Loading HF trunk for tied lm_head from {hf_dir}")
+    # device_map requires `accelerate`; omit to work on vanilla envs (e.g. local Mac).
     hf = Gemma4ForConditionalGeneration.from_pretrained(
-        hf_dir, torch_dtype=torch.float32, device_map="cpu",
+        hf_dir, torch_dtype=torch.float32,
     )
     lm = hf.model.language_model
     embed = lm.embed_tokens.weight.detach().clone()
