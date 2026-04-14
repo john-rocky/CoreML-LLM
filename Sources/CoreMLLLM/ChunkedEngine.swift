@@ -1081,10 +1081,12 @@ final class ChunkedEngine {
 
     // MARK: - MTP drafter support
 
-    /// Raw (unscaled) token embedding for MTP drafter.
+    /// Scaled token embedding for MTP drafter (with embedScale = sqrt(hidden)).
+    /// Matches target main model's L0 input. Empirically gives higher MTP
+    /// acceptance than unscaled; try .lookupUnscaled if this produces 0% accept.
     func lookupRawEmbed(_ tokenID: Int32) throws -> MLMultiArray {
         let hidden = config.hiddenSize
-        return try embedTokens.lookupUnscaled(Int(tokenID),
+        return try embedTokens.lookup(Int(tokenID),
             shape: [1, 1, NSNumber(value: hidden)])
     }
 
