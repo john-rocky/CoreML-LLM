@@ -52,44 +52,71 @@ final class PromptLookupDrafter: Drafter {
 /// most-recent earlier match. Tracks the full session (prompt + emitted)
 /// across bursts, so multi-turn self-quotation is captured.
 final class SuffixTreeDrafter: Drafter {
-    let name: String
-    private var history: [Int32] = []
+    let name = "suffix-scan"
 
-    init() {
-        self.name = "suffix-scan"
-    }
+    func reset() {}
+    func ingest(_ token: Int32) {}
 
-    func reset() {
-        history.removeAll(keepingCapacity: true)
-    }
-
-    func ingest(_ token: Int32) {
-        history.append(token)
-    }
-
-    func propose(history _: [Int32], K: Int) -> [Int32] {
-        guard self.history.count >= 4 else { return [] }
+    /// Stateless over the caller-supplied `history`. That's safe here
+    /// because the replay harness passes the full committed prefix up to
+    /// position P each iteration, so there's no delta to track.
+    func propose(history: [Int32], K: Int) -> [Int32] {
+        guard history.count >= 4 else { return [] }
         for ngram in stride(from: 4, through: 2, by: -1) {
-            let tail = Array(self.history.suffix(ngram))
-            let end = self.history.count - ngram
+            let tail = Array(history.suffix(ngram))
+            let end = history.count - ngram
             guard end > 0 else { continue }
             var i = end - 1
             while i >= 0 {
                 var match = true
-                for j in 0..<ngram where self.history[i + j] != tail[j] {
+                for j in 0..<ngram where history[i + j] != tail[j] {
                     match = false
                     break
                 }
                 if match {
                     let start = i + ngram
-                    let sliceEnd = min(start + K, self.history.count)
+                    let sliceEnd = min(start + K, history.count)
                     guard start < sliceEnd else { return [] }
-                    return Array(self.history[start..<sliceEnd])
+                    return Array(history[start..<sliceEnd])
                 }
                 i -= 1
             }
         }
         return []
+    }
+}
+
+/// Phase A4 candidate. Wraps the shipping `CrossVocabDraft` (Qwen 2.5 0.5B
+/// monolithic model + Qwen↔Gemma vocab map) in the oracle-replay protocol.
+///
+/// The drafter is stateful (owns Qwen MLState). We advance its
+/// `committedPosition` exactly one step per oracle-replay iteration by
+/// rewinding after each `draftBurst` and letting the harness's `ingest`
+/// feed the actual-next token via `consume`.
+final class CrossVocabOracleDrafter: Drafter {
+    let name = "cross-vocab-qwen"
+    private let drafter: CrossVocabDraft
+    private let K: Int
+
+    init(drafter: CrossVocabDraft, K: Int) {
+        self.drafter = drafter
+        self.K = K
+    }
+
+    func reset() {
+        drafter.reset()
+    }
+
+    func ingest(_ token: Int32) {
+        _ = try? drafter.consume(gemmaToken: token)
+    }
+
+    func propose(history: [Int32], K: Int) -> [Int32] {
+        guard let seed = history.last else { return [] }
+        let saved = drafter.committedPosition
+        defer { drafter.committedPosition = saved }  // rewind — see class doc
+        guard let burst = try? drafter.draftBurst(seed: seed) else { return [] }
+        return Array(burst.drafts.prefix(K))
     }
 }
 
@@ -141,14 +168,17 @@ func replayDrafter(
     K: Int
 ) -> AcceptStats {
     drafter.reset()
-    for tok in prompt { drafter.ingest(tok) }
+    // Ingest all prompt tokens except the LAST one. That matches the state
+    // convention `CrossVocabDraft` expects at burst time: cp == P where P
+    // is the position of the just-emitted / just-committed token whose
+    // continuation we want to draft. Propose sees `history[0...P]` via the
+    // explicit parameter, and the stateful drafter's cp stays at P until
+    // ingest advances it.
+    for tok in prompt.dropLast() { drafter.ingest(tok) }
 
-    // The "all" sequence is prompt + emitted, but we only score bursts whose
-    // target tokens lie entirely in the emitted segment. A burst at position
-    // P proposes tokens that would become emitted[P - prompt.count + 1 ...].
     let all = prompt + emitted
     var stats = AcceptStats(K: K)
-    let startPos = prompt.count - 1  // first emitted is at index prompt.count
+    let startPos = prompt.count - 1
     let lastStart = all.count - K - 1
     guard startPos <= lastStart else { return stats }
 
@@ -164,7 +194,8 @@ func replayDrafter(
         }
         stats.histogram[match] += 1
         stats.totalBursts += 1
-        drafter.ingest(all[P + 1])
+        // Advance drafter state past all[P] before next iteration.
+        drafter.ingest(all[P])
     }
     return stats
 }

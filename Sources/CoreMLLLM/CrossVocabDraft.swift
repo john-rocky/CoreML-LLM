@@ -125,7 +125,11 @@ public final class CrossVocabDraft {
     /// positions >= committedPosition may hold stale speculative writes.
     /// Setter is module-internal so the orchestrating speculative engine
     /// can re-anchor or fast-forward during bootstrap / miss cycles.
-    public internal(set) var committedPosition: Int = 0
+    /// Exposed settable so offline accept-rate benches (oracle replay) can
+    /// rewind state between per-position measurements. Runtime callers
+    /// should prefer `applyCommit(matchCount:burst:)` which does this
+    /// correctly relative to the last burst.
+    public var committedPosition: Int = 0
 
     private let step: StepFn
 

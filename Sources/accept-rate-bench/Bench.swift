@@ -125,14 +125,46 @@ struct Main {
             print("[bench] loaded in \(String(format: "%.1f", Date().timeIntervalSince(loadStart)))s")
             print("")
 
-            let drafters: [Drafter] = [
+            var drafters: [Drafter] = [
                 PromptLookupDrafter(ngramSize: 2),
                 PromptLookupDrafter(ngramSize: 3),
                 SuffixTreeDrafter(),
             ]
 
-            // Disable MTP so we record the pure target-decode sequence.
+            // Disable both in-engine spec paths so generate() records the
+            // pure target-decode sequence. Cross-vocab is measured below via
+            // the direct CrossVocabDraft API wrapped in an oracle-replay
+            // adapter.
             llm.mtpEnabled = false
+            llm.crossVocabEnabled = false
+
+            let cvDir = args.modelDir.appendingPathComponent("cross_vocab")
+            let cvCompiled = cvDir.appendingPathComponent("qwen_drafter.mlmodelc")
+            let cvPkg = cvDir.appendingPathComponent("qwen_drafter.mlpackage")
+            let cvMapURL = cvDir.appendingPathComponent("qwen_gemma_vocab.bin")
+            let cvModelURL: URL? = FileManager.default.fileExists(atPath: cvCompiled.path) ? cvCompiled
+                : FileManager.default.fileExists(atPath: cvPkg.path) ? cvPkg : nil
+            if let cvModelURL, FileManager.default.fileExists(atPath: cvMapURL.path) {
+                do {
+                    let map = try CrossVocabMap(url: cvMapURL)
+                    // Qwen 2.5 0.5B mlpackage in sibling repo was compiled
+                    // with ctx=512. Using 2048 triggers a MultiArray shape
+                    // mismatch on causal_mask inputs.
+                    let cvDraft = try CrossVocabDraft(
+                        modelURL: cvModelURL,
+                        vocabMap: map,
+                        K: args.K,
+                        contextLength: 512,
+                        computeUnits: .cpuAndGPU)
+                    drafters.append(CrossVocabOracleDrafter(drafter: cvDraft, K: args.K))
+                    let cov = Double(map.qwenToGemma.filter { $0 >= 0 }.count) / Double(map.qwenVocabSize) * 100
+                    print("[bench] cross-vocab drafter loaded (qwen→gemma coverage=\(String(format: "%.1f%%", cov)))")
+                } catch {
+                    print("[bench] cross-vocab drafter unavailable: \(error)")
+                }
+            } else {
+                print("[bench] cross-vocab artifacts not found under \(cvDir.path) — skipping")
+            }
 
             var results: [PromptResult] = []
 
