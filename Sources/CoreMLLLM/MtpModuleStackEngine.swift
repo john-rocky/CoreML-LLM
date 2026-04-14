@@ -93,20 +93,25 @@ public final class MtpModuleStackEngine: SpeculativeDrafterEngine {
         precondition(engine.verifyK == 3,
                      "Target verify was built for K=3; K=2 drafts + verify[2] as bonus")
 
-        // Allocate zero-initialized KV caches for both modules
-        func zeroKV() throws -> MLMultiArray {
-            let arr = try MLMultiArray(
-                shape: [1, NSNumber(value: numKvHeads),
-                        NSNumber(value: W), NSNumber(value: headDim)],
-                dataType: .float16)
-            memset(arr.dataPointer, 0,
-                   numKvHeads * W * headDim * MemoryLayout<UInt16>.stride)
-            return arr
-        }
-        self.m0KvK = try zeroKV()
-        self.m0KvV = try zeroKV()
-        self.m1KvK = try zeroKV()
-        self.m1KvV = try zeroKV()
+        // Allocate zero-initialized KV caches for both modules.
+        // Inlined (not a nested func) because the nested func would capture
+        // self.numKvHeads etc., which Swift considers a use-before-init.
+        let kvNKV = 1    // matches self.numKvHeads
+        let kvW = 128    // matches self.W
+        let kvHD = 256   // matches self.headDim
+        let kvShape: [NSNumber] = [
+            1, NSNumber(value: kvNKV),
+            NSNumber(value: kvW), NSNumber(value: kvHD),
+        ]
+        let kvBytes = kvNKV * kvW * kvHD * MemoryLayout<UInt16>.stride
+        self.m0KvK = try MLMultiArray(shape: kvShape, dataType: .float16)
+        memset(self.m0KvK.dataPointer, 0, kvBytes)
+        self.m0KvV = try MLMultiArray(shape: kvShape, dataType: .float16)
+        memset(self.m0KvV.dataPointer, 0, kvBytes)
+        self.m1KvK = try MLMultiArray(shape: kvShape, dataType: .float16)
+        memset(self.m1KvK.dataPointer, 0, kvBytes)
+        self.m1KvV = try MLMultiArray(shape: kvShape, dataType: .float16)
+        memset(self.m1KvV.dataPointer, 0, kvBytes)
     }
 
     // MARK: - Public entry
