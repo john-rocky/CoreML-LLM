@@ -71,6 +71,11 @@ struct ChatView: View {
                                 .font(.caption.monospacedDigit())
                                 .foregroundStyle(.secondary)
                         }
+                        if runner.crossVocabAcceptanceRate > 0 {
+                            Text(String(format: "xv=%.0f%%", runner.crossVocabAcceptanceRate * 100))
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
                         if !runner.isGenerating {
                             Text("(last)")
                                 .font(.caption2)

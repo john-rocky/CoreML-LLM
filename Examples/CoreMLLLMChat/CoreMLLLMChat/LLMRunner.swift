@@ -25,6 +25,10 @@ final class LLMRunner {
     var mtpTokensPerRound: Double = 0
     var hasMTP: Bool { llm?.mtpAcceptanceRate != nil }
 
+    // Cross-vocabulary (Qwen) speculation metrics — Route B
+    var crossVocabAcceptanceRate: Double = 0
+    var crossVocabTokensPerCycle: Double = 0
+
     private var llm: CoreMLLLM?
     private var modelFolderURL: URL?
 
@@ -83,6 +87,8 @@ final class LLMRunner {
                     runner.tokensPerSecond = engine.tokensPerSecond
                     runner.mtpAcceptanceRate = engine.mtpAcceptanceRate
                     runner.mtpTokensPerRound = engine.mtpTokensPerRound
+                    runner.crossVocabAcceptanceRate = engine.crossVocabAcceptanceRate
+                    runner.crossVocabTokensPerCycle = engine.crossVocabTokensPerCycle
                 }
                 runner.loadingStatus = "Ready"
                 continuation.finish()
