@@ -104,13 +104,18 @@ public final class MtpSpeculativeEngine {
         var embedToken = try engine.lookupRawEmbed(nextID)
         var projAct = carryState!
 
-        // Diagnostic: print magnitudes on first round
-        if totalRounds == 0 {
+        // Diagnostic: print magnitudes + first embed values on each round
+        if totalRounds < 3 {
             let eNorm = l2Norm(embedToken)
             let pNorm = l2Norm(projAct)
             let vhsState = engine.lastVerifyHiddenStates == nil ? "nil" : "populated"
-            print("[MTP-DIAG] round=0 embedNorm=\(String(format: "%.3f", eNorm)) " +
-                  "carryNorm=\(String(format: "%.3f", pNorm)) verifyHS=\(vhsState)")
+            let eSample = firstValues(embedToken, count: 5)
+            let pSample = firstValues(projAct, count: 5)
+            print("[MTP-DIAG] round=\(totalRounds) nextID=\(nextID) " +
+                  "embedNorm=\(String(format: "%.3f", eNorm)) carryNorm=\(String(format: "%.3f", pNorm)) " +
+                  "verifyHS=\(vhsState)")
+            print("[MTP-DIAG]   embed[0..4]=\(eSample)")
+            print("[MTP-DIAG]   carry[0..4]=\(pSample)")
         }
 
         for k in 0..<K {
@@ -219,6 +224,13 @@ public final class MtpSpeculativeEngine {
         nextID = Int32(newNext)
         isBootstrapped = true
         return [emitted]
+    }
+
+    /// Return first N values as fp32 for diagnostic printing.
+    private func firstValues(_ arr: MLMultiArray, count: Int) -> [Float] {
+        let n = min(count, arr.count)
+        let ptr = arr.dataPointer.bindMemory(to: UInt16.self, capacity: n)
+        return (0..<n).map { fp16ToF32(ptr[$0]) }
     }
 
     /// Compute L2 norm of an fp16 MLMultiArray.
