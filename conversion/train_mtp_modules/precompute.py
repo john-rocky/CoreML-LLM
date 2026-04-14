@@ -133,6 +133,14 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Auto-append to existing shards if present — continue numbering.
+    import glob as _glob
+    existing = sorted(_glob.glob(str(out_dir / "shard_*.tokens.npy")))
+    starting_shard_idx = len(existing)
+    if starting_shard_idx > 0:
+        print(f"Append mode: found {starting_shard_idx} existing shards; "
+              f"new shards will start at shard_{starting_shard_idx:04d}")
+
     print(f"Device: {args.device}  Dtype: {args.dtype}")
     print(f"Loading HF Gemma 4 from {args.hf_dir}...")
     from transformers import AutoTokenizer, Gemma4ForConditionalGeneration
@@ -146,7 +154,7 @@ def main():
     H = lm.config.hidden_size
 
     total_tokens = 0
-    shard_idx = 0
+    shard_idx = starting_shard_idx
     buf_tokens = []
     buf_hiddens = []
 
