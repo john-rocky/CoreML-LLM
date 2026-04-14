@@ -90,7 +90,8 @@ def main():
         logits_list = stack(l34, tokens)
         losses = []
         for k in range(cfg.num_modules):
-            target = tokens[:, k + 1:k + 1 + T_eff]
+            # DeepSeek V3: module_k target is tokens[t+k+2]
+            target = tokens[:, k + 2:k + 2 + T_eff]
             loss = F.cross_entropy(
                 logits_list[k].reshape(-1, cfg.vocab_size),
                 target.reshape(-1),

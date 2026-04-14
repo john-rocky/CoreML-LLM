@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Path C training Phase 1: precompute L34 hidden states for a corpus.
+"""Path C training Phase 1: precompute last-layer hidden states for a corpus.
 
 For each sequence in the dataset:
   1. Run frozen HF Gemma 4 trunk forward.
-  2. Extract L34 raw hidden state (shape (T, H)) at every position.
-  3. Save (token_ids, L34_hidden) to disk in a memory-mapped format.
+  2. Extract the OUTPUT OF THE LAST DECODER LAYER, PRE-FINAL-NORM (shape (T, H)).
+  3. Save (token_ids, hidden) to disk in a memory-mapped format.
+
+CRITICAL: extraction must match what the Swift deployment feeds to the drafter.
+Chunk 4 (SWAVerifyChunk4) returns `hidden_states` BEFORE `self.norm`, so
+training data must be the same: output of layer[-1] pre-norm. Earlier versions
+of this script used `hidden_states[-2]` which in HF Gemma 4 is the OUTPUT OF
+LAYER 33 (penultimate) — a different tensor entirely. Using a forward hook on
+the last decoder layer is the simplest way to get the exact chunk-4 state.
 
 The training loop later consumes these cached pairs without touching the
 trunk. This makes training ~100× faster than trunk-in-the-loop training,
@@ -153,6 +160,15 @@ def main():
     lm = hf.model.language_model
     H = lm.config.hidden_size
 
+    # Register a hook on the last decoder layer to capture its PRE-FINAL-NORM
+    # output — this is what SWAVerifyChunk4 returns as `hidden_states_out` at
+    # inference. hf.output_hidden_states[-2] is L33 (different layer); do NOT use it.
+    _last_hidden_capture = {}
+    def _capture_last_hidden(_mod, _inp, outp):
+        h = outp[0] if isinstance(outp, tuple) else outp
+        _last_hidden_capture["h"] = h
+    lm.layers[-1].register_forward_hook(_capture_last_hidden)
+
     total_tokens = 0
     shard_idx = starting_shard_idx
     buf_tokens = []
@@ -220,10 +236,11 @@ def main():
         with torch.inference_mode():
             for i, chunk in enumerate(ds_chunks):
                 ids = torch.tensor([chunk], dtype=torch.long, device=args.device)
-                out = lm(input_ids=ids, output_hidden_states=True, use_cache=False)
-                l34 = out.hidden_states[-2][0].to(torch.float16).cpu().numpy()
+                # Hook captures last-layer pre-norm hidden; no need for output_hidden_states.
+                lm(input_ids=ids, use_cache=False)
+                last_hidden = _last_hidden_capture["h"][0].to(torch.float16).cpu().numpy()
                 buf_tokens.append(np.array(chunk, dtype=np.int32))
-                buf_hiddens.append(l34)
+                buf_hiddens.append(last_hidden)
                 total_tokens += len(chunk)
 
                 if len(buf_tokens) >= args.shard_size:
