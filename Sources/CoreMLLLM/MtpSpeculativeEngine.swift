@@ -160,20 +160,27 @@ public final class MtpSpeculativeEngine: SpeculativeDrafterEngine {
         let targetArgmax = try engine.verifyCandidates(
             tokens: verifyTokens, startPosition: pos)
 
-        // Accept/reject: greedy comparison
+        // Accept/reject: greedy comparison.
+        // Emission rule (no double-emit): emit nextID + accepted drafts.
+        // correction/bonus becomes nextID for next cycle (emitted there).
         var emitted = [Int32]()
         emitted.reserveCapacity(K + 1)
-        emitted.append(nextID) // always emit tTokNext
+        emitted.append(nextID) // emit current nextID (not yet emitted by caller)
         var matchCount = 0
+        var newNextID: Int32 = nextID
         for k in 0..<K {
             if proposals[k] == targetArgmax[k] {
                 emitted.append(proposals[k])
                 matchCount += 1
+                newNextID = proposals[k]  // last accepted becomes next if all match
             } else {
-                emitted.append(targetArgmax[k]) // correction/bonus
+                newNextID = targetArgmax[k]  // correction — NOT emitted
                 break
             }
         }
+        // If all K matched, newNextID is last accepted draft. Its KV wasn't
+        // written (verify only had K inputs, last draft d_{K-1} wasn't there).
+        // Next cycle will verify it and write its KV.
 
         // Commit: advance by positions whose KV was actually written by verify.
         // Verify wrote KV at K positions (P..P+K-1) for inputs [nextID, d0..d_{K-2}].
@@ -205,8 +212,10 @@ public final class MtpSpeculativeEngine: SpeculativeDrafterEngine {
                   "matched=\(matchCount)/\(K) committed=\(committed)")
         }
 
-        // nextID = last emitted token (correction or bonus, not yet committed)
-        nextID = emitted.last!
+        // newNextID was set during accept loop — correction, or last matched
+        // draft (all-match case). NOT included in emitted — will be emitted
+        // at start of next cycle's speculateStep.
+        nextID = newNextID
 
         return emitted
     }

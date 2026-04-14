@@ -176,27 +176,30 @@ public final class MtpModuleStackEngine: SpeculativeDrafterEngine {
         // -----------------------------
         // Accept/reject
         // -----------------------------
+        // Emission rule (no double-emit): emit nextID + accepted drafts.
+        // The correction/bonus is NOT emitted this cycle — it becomes
+        // nextID for the next cycle, where it will be emitted at start
+        // of that cycle's speculateStep. This matches the non-spec decode
+        // pattern (emit current token; compute next; loop).
         var emitted: [Int32] = [nextID]
-        emitted.reserveCapacity(K + 2)  // nextID + K drafts + 1 bonus
+        emitted.reserveCapacity(K + 1)
         var matchCount = 0
+        var newNextID: Int32
 
-        // Compare draft k against targetArgmax[k]
         if d0Token == targetArgmax[0] {
             emitted.append(d0Token)
             matchCount += 1
             if d1Token == targetArgmax[1] {
                 emitted.append(d1Token)
                 matchCount += 1
-                // Both drafts matched — trunk's argmax[2] is a free bonus token.
-                // It's trunk's genuine prediction after seeing [nextID, d_0, d_1],
-                // which equals trunk's natural next continuation (not a draft guess).
-                emitted.append(targetArgmax[2])
-                // Do NOT count bonus in matchCount (it's not a draft match).
+                // Both drafts matched — trunk's argmax[2] is a free bonus
+                // (genuine target prediction, not a draft). Becomes nextID.
+                newNextID = targetArgmax[2]
             } else {
-                emitted.append(targetArgmax[1])  // correction at pos P+2
+                newNextID = targetArgmax[1]  // correction at P+2
             }
         } else {
-            emitted.append(targetArgmax[0])  // correction at pos P+1
+            newNextID = targetArgmax[0]  // correction at P+1
         }
 
         // -----------------------------
@@ -227,7 +230,7 @@ public final class MtpModuleStackEngine: SpeculativeDrafterEngine {
         totalAccepted += matchCount
         totalEmitted += emitted.count
 
-        nextID = emitted.last!
+        nextID = newNextID
         return emitted
     }
 
