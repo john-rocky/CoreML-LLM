@@ -55,9 +55,11 @@ def iter_hf_dataset(name_or_path: str, streaming: bool = True, max_samples: int 
         "wikitext":    ("Salesforce/wikitext", "train", ["text"]),  # tiny, always works
         "fineweb-edu": ("HuggingFaceFW/fineweb-edu", "train", ["text"]),  # high quality EN
         "oasst1":      ("OpenAssistant/oasst1", "train", ["text"]),  # EN chat
-        "stack-small": ("bigcode/the-stack-smol", "train", ["content"]),  # code
         "codealpaca":  ("sahil2801/CodeAlpaca-20k", "train", ["instruction", "input", "output"]),
-        # Gated/limited — fall back if these fail
+        "github-code": ("codeparrot/github-code-clean", "train", ["code"]),  # open code (Apache 2.0 subset)
+        "codesearch":  ("code_search_net", "train", ["whole_func_string"]),  # open, all langs
+        # Gated — require HF auth + term acceptance. Skip if user hasn't agreed.
+        "stack-small": ("bigcode/the-stack-smol", "train", ["content"]),
         "lmsys-chat":  ("lmsys/lmsys-chat-1m", "train", ["conversation"]),
         "c4-en":       ("allenai/c4", "train", ["text"]),  # needs subset 'en'
         "c4-ja":       ("allenai/c4", "train", ["text"]),  # needs subset 'ja'
@@ -72,8 +74,12 @@ def iter_hf_dataset(name_or_path: str, streaming: bool = True, max_samples: int 
             kwargs["name"] = "ja"
         if name_or_path == "wikitext":
             kwargs["name"] = "wikitext-103-raw-v1"
+        if name_or_path == "github-code":
+            # codeparrot/github-code-clean has config by language; use python
+            kwargs["name"] = "python-all"
+        if name_or_path == "codesearch":
+            kwargs["name"] = "python"
         if name_or_path == "oasst1":
-            # oasst1 field is "text" but only if role=='assistant'; just take all text
             pass
         ds = load_dataset(repo, split=split, **kwargs)
         count = 0
