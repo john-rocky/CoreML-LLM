@@ -7,13 +7,20 @@ clear, measurable margin on iPhone 17 Pro (A19 Pro).
 
 | Platform | Engine | tok/s @ 2K (Gemma 4 E2B) | Source |
 |---|---|---|---|
-| Pixel 9 Pro (Tensor G4) | LiteRT-LM | 25–30 | Google-public micro-benches; our `docs/LITERT_RUNTIME_ANALYSIS.md` |
+| **iPhone (LiteRT-LM iOS build)** | Google LiteRT-LM | **56** | Google's own iOS benchmark (user-reported 2026-04-14) |
+| Pixel 9 Pro (Tensor G4) | LiteRT-LM Android | 25–30 | public micro-benches; `docs/LITERT_RUNTIME_ANALYSIS.md` |
 | iPhone 15 Pro (A17 Pro) | CoreML (AFM-2B) | ~30 | Apple AFM arxiv 2507.13575 |
-| iPhone 17 Pro (A19 Pro) | our stack today | **31.4** | decode profile 2026-04-14 (c1=5.9, c2=6.8, c3=8.1, c4=10.4 ms) |
+| iPhone 17 Pro (A19 Pro) | **our stack today** | **31.4** | decode profile 2026-04-14 (c1=5.9, c2=6.8, c3=8.1, c4=10.4 ms) |
 
-So we're already neck-and-neck with Google at parity. This doc lays
-out the path to a **70–110 tok/s** range at 2K, i.e. 2.5–4× Google's
-reported throughput.
+So **on the same hardware class (iOS)** we're at 31 tok/s versus
+Google's LiteRT-LM doing 56. They're roughly 1.8× ahead of us on
+iPhone specifically. Target for this plan: **70–110 tok/s** at 2K —
+i.e. 1.25–2× Google's iOS build, and 2–4× their Android number.
+
+Google's 56-tok/s iOS number implies they've already extracted a
+significant amount of the Apple-silicon hybrid-compute win. Our
+Tier 2 / Tier 4 async dispatch infrastructure is how we match and
+exceed that; today's stack doesn't schedule GPU alongside ANE at all.
 
 ---
 
