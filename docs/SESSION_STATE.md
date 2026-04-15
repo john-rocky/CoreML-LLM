@@ -171,6 +171,17 @@ device trips opportunistically.
    See `docs/PHASE_B_V4_CHAIN_FINDINGS.md`. Don't count "all K
    positions independently" either — that over-counts. Use chain-mode
    or `--mode chain` in the bench to get live-equivalent numbers.
+   - **2026-04-15 (PR #72 / B.3) — mechanism is semantic, not
+     numerical.** Replacing batched `verify_qK` with K serial
+     `decode_q1` calls still reproduces the chain gap (cross-vocab
+     code 1.01, chat 2.31→2.09). So the v4 fp16-ordering speculation
+     is refuted; the chain gap comes from verify writing drafter
+     proposals into KV at positions P+1..P+K-1 *before* acceptance
+     is decided. Subsequent target argmaxes then condition on a
+     contaminated cache. Oracle replay avoids this (no verify call);
+     serial decode reproduces it (same writes, sequenced). Not
+     fixable by tightening verify numerics. See
+     `docs/PHASE_C_TIGHTENING_FINDINGS.md`.
 4. **Per-model caches.** Staging directories under
    `~/Downloads/coreml-llm-artifacts/` contain live model files. Don't
    `rm -rf` them casually. `staging-2k-fast-prefill` currently has the
