@@ -741,6 +741,18 @@ public final class CoreMLLLM: @unchecked Sendable {
         chunkedEngine?.currentPosition += count
     }
 
+    /// Serial-decode equivalent of `benchVerify` — runs K `decode_q1`
+    /// steps instead of one batched `verify_qK`. Same input/output
+    /// contract. Bench-only; used by the chain-mode `--verify-serial`
+    /// flag to isolate batched-compute numerical drift (Phase C C0).
+    public func benchVerifySerial(_ tokens: [Int32]) throws -> [Int32] {
+        guard let engine = chunkedEngine, engine.hasVerify else {
+            throw CoreMLLLMError.predictionFailed
+        }
+        return try engine.verifyCandidatesSerial(tokens: tokens,
+                                                 startPosition: engine.currentPosition)
+    }
+
     // MARK: - Private: monolithic prediction
 
     private func predictMonolithic(tokenID: Int, position: Int,
