@@ -140,6 +140,39 @@ attributable.
 
 ---
 
+## Merge discipline (corrected 2026-04-15)
+
+Previous sessions auto-merged several code PRs based on "user approved"
+as sufficient. That was wrong. **Code PRs require an iPhone baseline
+check before merge**, regardless of user approval, because speed
+regressions only show up on device and the product's headline number
+is iPhone tok/s. Docs-only PRs keep the auto-merge permission.
+
+Rules going forward:
+
+- **Docs-only PR** (content under `docs/` only): auto-merge OK after
+  user approval.
+- **Code PR touching Sources/ or conversion/**:
+  1. Mac build + tests must pass.
+  2. Land it on a feature branch and push.
+  3. At least the next bundled iPhone trip must measure baseline
+     regression on a clean prompt; log the tok/s before / after.
+  4. Merge *only* after iPhone baseline check clears.
+  5. If the change is genuinely runtime-free (e.g. only populates
+     an observable array) Mac CoreML on Apple Silicon is acceptable
+     as a proxy, but document the Mac numbers in the PR body.
+
+Retroactive audit of 2026-04-14 / 2026-04-15 merges:
+
+- **PR #45** (accept-rate-bench + CrossVocab merge + runtime hooks):
+  merged without an iPhone check. Mac Studio same-model decode
+  profile pre-merge ≈ 33 tok/s (c1=5.9 c2=6.7 c3=7.5 c4=10.3), post-
+  merge bench on same model ≈ 29-31 tok/s per prompt — essentially
+  baseline. Evidence (not proof) of no regression. iPhone
+  confirmation is Phase B task #6 (see above). If the Phase B trip
+  finds a regression, revert.
+- All other 2026-04-14/15 merges are docs-only.
+
 ## Housekeeping
 
 `model_config_8k_backup.json` at repo root is an untracked leftover;
