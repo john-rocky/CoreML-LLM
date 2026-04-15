@@ -60,6 +60,45 @@ enum ComputePlanAudit {
         print("[ComputePlan] ── summary: \(totalFallbacks) non-ANE op(s) out of \(totalOps) total across all chunks")
     }
 
+    /// Audit the cross-vocab Qwen drafter at `cross_vocab/qwen_drafter.mlmodelc`
+    /// (or `.mlpackage`). Uses the same `.cpuAndGPU` units the runtime
+    /// passes to `CrossVocabDraft.init` so the placement table reflects
+    /// what actually runs on device. Phase B Task 2 — needed to localise
+    /// the iPhone 1.8 tok/s regression: GPU placement = "drafter is GPU
+    /// but slow" (model surgery), CPU fallback = "force compute units".
+    static func runDrafter(modelDirectory: URL) async {
+        guard isEnabled else { return }
+        let cvDir = modelDirectory.appendingPathComponent("cross_vocab")
+        let compiled = cvDir.appendingPathComponent("qwen_drafter.mlmodelc")
+        let pkg = cvDir.appendingPathComponent("qwen_drafter.mlpackage")
+        let url: URL
+        if FileManager.default.fileExists(atPath: compiled.path) {
+            url = compiled
+        } else if FileManager.default.fileExists(atPath: pkg.path) {
+            url = pkg
+        } else {
+            print("[ComputePlan] cross_vocab/qwen_drafter: not found, skipping")
+            return
+        }
+
+        // Match `CrossVocabDraft.init` defaults: drafter loads with
+        // .cpuAndGPU. If the runtime ever switches units, mirror that
+        // change here so the audit reflects production placement.
+        let config = MLModelConfiguration()
+        config.computeUnits = .cpuAndGPU
+
+        do {
+            let plan = try await MLComputePlan.load(contentsOf: url,
+                                                    configuration: config)
+            let (ops, fallbacks) = auditDrafterPlan(plan,
+                                                    name: "qwen_drafter",
+                                                    expectedDevice: "GPU")
+            print("[ComputePlan] qwen_drafter: \(fallbacks) off-GPU op(s) out of \(ops) total")
+        } catch {
+            print("[ComputePlan] qwen_drafter: failed to load plan — \(error)")
+        }
+    }
+
     // MARK: - Private
 
     /// Walk a single compute plan, log non-ANE ops, return (totalOps, fallbackCount).
@@ -142,6 +181,69 @@ enum ComputePlanAudit {
         case .gpu: return "GPU"
         case .neuralEngine: return "ANE"
         @unknown default: return "other"
+        }
+    }
+
+    /// Walk a plan and report any op whose preferred device is not
+    /// `expectedDevice` ("GPU" for the cross-vocab drafter). Mirrors
+    /// `auditPlan` but with a different device baseline so the same
+    /// audit infrastructure can cover both decode chunks (expect ANE)
+    /// and the cross-vocab drafter (expect GPU).
+    private static func auditDrafterPlan(_ plan: MLComputePlan,
+                                         name: String,
+                                         expectedDevice: String) -> (Int, Int) {
+        guard case .program(let program) = plan.modelStructure else {
+            print("[ComputePlan] \(name): model structure is not a program")
+            return (0, 0)
+        }
+        let constOps: Set<String> = [
+            "const", "constexpr_lut_to_dense", "constexpr_affine_dequantize",
+            "constexpr_blockwise_shift_scale", "constexpr_sparse_to_dense",
+            "constexpr_cast",
+        ]
+        var totalOps = 0
+        var fallbackOps = 0
+        for (fnName, function) in program.functions {
+            walkDrafterBlock(function.block, path: "\(name)/\(fnName)",
+                             plan: plan, expectedDevice: expectedDevice,
+                             constOps: constOps,
+                             totalOps: &totalOps, fallbackOps: &fallbackOps)
+        }
+        return (totalOps, fallbackOps)
+    }
+
+    private static func walkDrafterBlock(_ block: MLModelStructure.Program.Block,
+                                         path: String,
+                                         plan: MLComputePlan,
+                                         expectedDevice: String,
+                                         constOps: Set<String>,
+                                         totalOps: inout Int,
+                                         fallbackOps: inout Int) {
+        for op in block.operations {
+            let isConstOp = constOps.contains(op.operatorName)
+            if !isConstOp { totalOps += 1 }
+            let usage = plan.deviceUsage(for: op)
+            let cost = plan.estimatedCost(of: op)
+            let actualDevice = deviceLabel(usage?.preferred)
+            let onExpected: Bool = isConstOp ? true : (actualDevice == expectedDevice)
+            if !onExpected && !isConstOp {
+                fallbackOps += 1
+                let costStr: String
+                if let w = cost?.weight {
+                    costStr = String(format: "cost=%.4f", w)
+                } else {
+                    costStr = "cost=n/a"
+                }
+                let outputs = op.outputs.map(\.name).joined(separator: ",")
+                print("[ComputePlan] \(path) | \(op.operatorName) → \(actualDevice) "
+                    + "(expected \(expectedDevice)) | \(costStr) | outputs=\(outputs)")
+            }
+            for nested in op.blocks {
+                walkDrafterBlock(nested, path: "\(path)/\(op.operatorName)",
+                                 plan: plan, expectedDevice: expectedDevice,
+                                 constOps: constOps,
+                                 totalOps: &totalOps, fallbackOps: &fallbackOps)
+            }
         }
     }
 }

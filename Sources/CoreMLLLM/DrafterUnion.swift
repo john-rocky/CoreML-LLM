@@ -109,18 +109,23 @@ public final class DrafterUnion {
         var lookupHist = history
         lookupHist.append(nextID)
 
-        let plProps3: [Int32] = (rollingPL3 >= pldThreshold)
-            ? PromptLookupDraft.propose(history: lookupHist, ngramSize: 3, maxDraftLen: K - 1)
-            : []
-        let plProps2: [Int32] = (rollingPL2 >= pldThreshold)
-            ? PromptLookupDraft.propose(history: lookupHist, ngramSize: 2, maxDraftLen: K - 1)
-            : []
+        let (plProps3, pl3Ms): ([Int32], Double) = SpecProfile.time {
+            (rollingPL3 >= pldThreshold)
+                ? PromptLookupDraft.propose(history: lookupHist, ngramSize: 3, maxDraftLen: K - 1)
+                : []
+        }
+        let (plProps2, pl2Ms): ([Int32], Double) = SpecProfile.time {
+            (rollingPL2 >= pldThreshold)
+                ? PromptLookupDraft.propose(history: lookupHist, ngramSize: 2, maxDraftLen: K - 1)
+                : []
+        }
 
         var cvBurst: DraftBurst? = nil
+        var cvMs: Double = 0
         if let cv = crossVocab, !crossVocabDisabled, rollingCV >= crossVocabThreshold {
             // Side-effect: writes K Qwen KV slots speculatively. If CV is
             // not picked, we rewind below.
-            cvBurst = try cv.draftBurst(seed: nextID)
+            (cvBurst, cvMs) = try SpecProfile.time { try cv.draftBurst(seed: nextID) }
         }
         let cvProps: [Int32] = cvBurst?.drafts ?? []
 
@@ -156,8 +161,10 @@ public final class DrafterUnion {
         verifyTokens[0] = nextID
         for (i, t) in useProps.enumerated() { verifyTokens[i + 1] = t }
 
-        let targetArgmax = try engine.verifyCandidates(
-            tokens: verifyTokens, startPosition: pos)
+        let (targetArgmax, verifyMs) = try SpecProfile.time {
+            try engine.verifyCandidates(
+                tokens: verifyTokens, startPosition: pos)
+        }
 
         // 4. Walk acceptance.
         var matchCount = 0
@@ -201,18 +208,20 @@ public final class DrafterUnion {
         //    rewinds/extends correctly. If CV ran but wasn't picked, its
         //    speculative writes don't match the committed prefix — rewind
         //    and replay the actual committed tokens through Qwen.
-        if let cv = cvActive, let burst = cvBurst {
-            if source == .crossVocab {
-                try cv.applyCommit(matchCount: matchCount, burst: burst)
-            } else {
-                cv.committedPosition = pos
-                for k in 0..<committed {
-                    let gid = emitted[k]
-                    let qid = cv.vocabMap.gemma(gid)
-                    if qid >= 0 {
-                        _ = try cv.consume(gemmaToken: gid)
-                    } else {
-                        cv.committedPosition += 1
+        let (_, commitMs) = try SpecProfile.time {
+            if let cv = cvActive, let burst = cvBurst {
+                if source == .crossVocab {
+                    try cv.applyCommit(matchCount: matchCount, burst: burst)
+                } else {
+                    cv.committedPosition = pos
+                    for k in 0..<committed {
+                        let gid = emitted[k]
+                        let qid = cv.vocabMap.gemma(gid)
+                        if qid >= 0 {
+                            _ = try cv.consume(gemmaToken: gid)
+                        } else {
+                            cv.committedPosition += 1
+                        }
                     }
                 }
             }
@@ -234,6 +243,13 @@ public final class DrafterUnion {
         totalEmitted += emitted.count
         totalAcceptedDraftSlots += matchCount
 
+        SpecProfile.logUnionBurst(
+            cycle: totalCycles, source: source.rawValue,
+            perSourceMs: ["cv": cvMs, "pl3": pl3Ms, "pl2": pl2Ms],
+            verifyMs: verifyMs, commitMs: commitMs,
+            accepted: matchCount, compareLen: compareLen,
+            emitted: emitted.count)
+
         nextID = carry
         return emitted
     }
@@ -245,33 +261,41 @@ public final class DrafterUnion {
     }
 
     private func bootstrap(nextID: inout Int32) throws -> [Int32] {
-        if let cv = cvActive {
-            let targetPos = engine.currentPosition
-            let replayCount = min(prefillHistory.count, targetPos)
-            for i in 0..<replayCount {
-                let gid = prefillHistory[i]
-                let qid = cv.vocabMap.gemma(gid)
-                if qid >= 0 {
-                    _ = try cv.consume(gemmaToken: gid)
-                } else {
-                    cv.committedPosition += 1
+        var replayCount = 0
+        let (_, replayMs) = try SpecProfile.time {
+            if let cv = cvActive {
+                let targetPos = engine.currentPosition
+                replayCount = min(prefillHistory.count, targetPos)
+                for i in 0..<replayCount {
+                    let gid = prefillHistory[i]
+                    let qid = cv.vocabMap.gemma(gid)
+                    if qid >= 0 {
+                        _ = try cv.consume(gemmaToken: gid)
+                    } else {
+                        cv.committedPosition += 1
+                    }
                 }
-            }
-            if targetPos > cv.committedPosition {
-                cv.committedPosition = targetPos
+                if targetPos > cv.committedPosition {
+                    cv.committedPosition = targetPos
+                }
             }
         }
         isBootstrapped = true
 
         let emittedTok = nextID
-        let newNext = try engine.predictStep(
-            tokenID: Int(nextID), position: engine.currentPosition)
+        let (newNext, targetStepMs) = try SpecProfile.time {
+            try engine.predictStep(
+                tokenID: Int(nextID), position: engine.currentPosition)
+        }
         engine.currentPosition += 1
         history.append(emittedTok)
         if let cv = cvActive {
             _ = try cv.consume(gemmaToken: nextID)
         }
         nextID = Int32(newNext)
+        SpecProfile.logBootstrap(
+            engine: "union", replayCount: replayCount,
+            replayMs: replayMs, targetStepMs: targetStepMs)
         return [emittedTok]
     }
 
@@ -282,8 +306,10 @@ public final class DrafterUnion {
             cv.committedPosition = pos
         }
         let emittedTok = nextID
-        let newNext = try engine.predictStep(
-            tokenID: Int(nextID), position: engine.currentPosition)
+        let (newNext, targetStepMs) = try SpecProfile.time {
+            try engine.predictStep(
+                tokenID: Int(nextID), position: engine.currentPosition)
+        }
         engine.currentPosition += 1
         history.append(emittedTok)
         if let cv = cvActive {
@@ -295,6 +321,8 @@ public final class DrafterUnion {
             }
         }
         nextID = Int32(newNext)
+        SpecProfile.logFallback(
+            engine: "union", cycle: totalCycles, targetStepMs: targetStepMs)
         return [emittedTok]
     }
 }
