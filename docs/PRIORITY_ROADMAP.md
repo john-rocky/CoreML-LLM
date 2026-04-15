@@ -139,7 +139,7 @@ active. Retrain with `use_cache=True` traces should fix acceptance.
 | **10** | **Sequoia (Y-tree) optimal topology** | +15–33% (e.g. 36→41.6 tok/s) | 1–2 days offline DP | V3 §A4, ANE_SURVEY |
 | **11** | **Traversal Verification** | +10–20% | 0.5 day Swift | V3 §A5 |
 | **11b** | **Verify chunks T=4** — Google uses T=3+1; extend our T=3 | K=4 capability | 0.5 day + reconvert | LITERT_CONTAINER |
-| **11c** | **Verify-chunk numerical alignment (K=3 ↔ K=1)** — fp16 argmaxes from `verify_qK` and `predict` diverge under speculation by design (different SIMD tiling). Investigate whether reconverting verify chunks to match the decode chunk's accumulation order, or normalising via an explicit fp32 logit cast, closes the gap. Surfaced when PR #54 (DrafterUnion) couldn't satisfy the original "bit-exact at temp=0 vs serial" criterion. | could lift accept rates by aligning argmaxes; also enables a stricter Phase B exit gate next time | 1–2 days investigation + possible reconvert | PR #54 thread |
+| **11c** | **Verify-chunk numerical alignment (K=3 ↔ K=1)** — fp16 argmaxes from `verify_qK` and `predict` diverge under speculation by design (different SIMD tiling). Investigate whether reconverting verify chunks to match the decode chunk's accumulation order, or normalising via an explicit fp32 logit cast, closes the gap. Surfaced when PR #54 (DrafterUnion) couldn't satisfy the original "bit-exact at temp=0 vs serial" criterion. **Upgraded 2026-04-15** — Path C (self-trained K=2 MTP) independently hit the same wall on iPhone (acc0 9–17 %, Japanese prompt produces a degenerate single-token loop). Confirms the drift is target-chunk-side, not drafter-specific. This item is now load-bearing for any speculative drafter on this target: closing it also lowers break-even acceptance from ~77 % to ~40 % (see `docs/MTP_PATH_C_FINDINGS.md` §4.1). | load-bearing for MTP / Path C / any future drafter; closing it lifts every speculation path at once | 1–2 days investigation + possible reconvert | PR #54 thread, `docs/MTP_PATH_C_FINDINGS.md` |
 
 ### Track C — Zero-training auxiliaries (ship alongside A or B)
 
@@ -290,6 +290,14 @@ for repetitive / long-prompt workloads.**
   2026-04-14 (TFLite drafter's target-distribution mismatch). Kept
   for the I/O contract and parity-gate methodology, referenced by
   the self-trained Path C effort in the sibling session.
+- **MTP_PATH_C_FINDINGS.md**: 2026-04-15 — Path C (self-trained K=2
+  DeepSeek V3-style drafter against our own HF trunk) **shelved**
+  after iPhone measurement (~16 tok/s vs 31 baseline, output drift
+  on Japanese). Not a drafter bug — confirms item 11c (verify-chunk
+  drift) is load-bearing for any speculation path. Keep for the
+  Mac-first verification harness + three documented structural
+  bugs (indexing, layer mismatch, topk 16-bit overflow) that the
+  harness caught before the iPhone trip.
 - **EAGLE3_INTEGRATION_STATE.md**: Phase 2 Track B state. Blocker 1 reframed,
   Blocker 2 remains.
 
