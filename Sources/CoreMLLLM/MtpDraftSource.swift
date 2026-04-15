@@ -42,6 +42,10 @@ public final class MtpDraftSource {
         let cfg = configuration ?? {
             let c = MLModelConfiguration()
             c.computeUnits = .cpuAndNeuralEngine
+            // V6-1: drafter shapes are fixed across speculative bursts.
+            if #available(iOS 18.2, macOS 15.2, *) {
+                c.optimizationHints.reshapeFrequency = .infrequent
+            }
             return c
         }()
         guard FileManager.default.fileExists(atPath: modelURL.path) else {

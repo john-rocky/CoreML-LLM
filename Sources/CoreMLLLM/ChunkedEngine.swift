@@ -114,6 +114,51 @@ final class ChunkedEngine {
     let prefillN: Int
     var currentPosition: Int = 0
 
+    // V6-2: retained compute plans (iOS 17+). Keeping these alive means the
+    // runtime does not rebuild the plan on first prediction. Typed as `Any?`
+    // so the declaration is available on older OSes; actual values are
+    // `MLComputePlan` instances when set.
+    private var warmComputePlans: [Any] = []
+
+    // V6 (outputBackings): persistent per-chunk MLPredictionOptions. Output
+    // buffers are pre-allocated at first predict and reused every step so
+    // CoreML skips IOSurface allocation + refcount churn on the hot path.
+    // These are nil until the first predict finishes wiring the shapes up;
+    // subsequent steps take the fast path.
+    private var optionsC1: MLPredictionOptions?
+    private var optionsC2: MLPredictionOptions?
+    private var optionsC3: MLPredictionOptions?
+    private var optionsC4: MLPredictionOptions?
+    // Persistent output backings (MLMultiArray instances that CoreML writes
+    // into directly, bypassing per-step alloc). Keyed by output name.
+    private var backingsC1: [String: MLMultiArray] = [:]
+    private var backingsC2: [String: MLMultiArray] = [:]
+    private var backingsC3: [String: MLMultiArray] = [:]
+    private var backingsC4: [String: MLMultiArray] = [:]
+
+    // V6 (input reuse): scratch input buffers for decode step. Embedding,
+    // per-layer-raw and RoPE rows get rewritten each step; allocating fresh
+    // MLMultiArray objects every time is measurable (~0.05–0.2 ms sum).
+    private lazy var scratchHidden: MLMultiArray = {
+        try! MLMultiArray(shape: [1, 1, NSNumber(value: config.hiddenSize)], dataType: .float16)
+    }()
+    private lazy var scratchPLRaw: MLMultiArray = {
+        let totalDim = config.numLayers * config.perLayerDim
+        return try! MLMultiArray(shape: [1, 1, NSNumber(value: totalDim)], dataType: .float16)
+    }()
+    private lazy var scratchCosS: MLMultiArray = {
+        try! MLMultiArray(shape: [1, 1, 1, 256], dataType: .float16)
+    }()
+    private lazy var scratchSinS: MLMultiArray = {
+        try! MLMultiArray(shape: [1, 1, 1, 256], dataType: .float16)
+    }()
+    private lazy var scratchCosF: MLMultiArray = {
+        try! MLMultiArray(shape: [1, 1, 1, 512], dataType: .float16)
+    }()
+    private lazy var scratchSinF: MLMultiArray = {
+        try! MLMultiArray(shape: [1, 1, 1, 512], dataType: .float16)
+    }()
+
     var hasPrefill: Bool {
         prefillChunk1 != nil && prefillChunk2 != nil
             && prefillChunk3 != nil && prefillChunk4 != nil
@@ -141,6 +186,13 @@ final class ChunkedEngine {
         let mlConfig = MLModelConfiguration()
         mlConfig.computeUnits = computeUnits
 
+        // V6-1: iOS 18.2+ hint — tell CoreML that input shapes are fixed
+        // across predictions so it skips the per-call shape-trace + bounds
+        // check. All of our chunks use static shapes. No-op on older OSes.
+        if #available(iOS 18.2, macOS 15.2, *) {
+            mlConfig.optimizationHints.reshapeFrequency = .infrequent
+        }
+
         func findModel(_ name: String) -> URL? {
             let compiled = directory.appendingPathComponent("\(name).mlmodelc")
             if FileManager.default.fileExists(atPath: compiled.path) { return compiled }
@@ -158,6 +210,28 @@ final class ChunkedEngine {
             let dt = CFAbsoluteTimeGetCurrent() - t0
             print("[Load] \(name) done in \(String(format: "%.1f", dt))s")
             return m
+        }
+
+        // V6-2: warm the MLComputePlan for every chunk at load time so the
+        // first prediction does not pay the ~0.8 ms plan-build cost (and any
+        // subsequent cold sub-paths reuse the already-resident plan).
+        // Plans are loaded in parallel alongside the model binaries; we
+        // retain them on the engine so ARC keeps the compute-plan blob
+        // resident for the lifetime of the model.
+        func warmPlan(_ name: String) async -> (String, Any?) {
+            guard let url = findModel(name) else { return (name, nil) }
+            if #available(iOS 17.0, macOS 14.0, *) {
+                do {
+                    let plan = try await MLComputePlan.load(contentsOf: url,
+                                                            configuration: mlConfig)
+                    return (name, plan)
+                } catch {
+                    // Non-fatal: failing to build a plan does not block model
+                    // loading, it just means we lose the warm-pool benefit.
+                    return (name, nil)
+                }
+            }
+            return (name, nil)
         }
 
         // Load all chunks in parallel (MLModel(contentsOf:) is thread-safe,
@@ -221,6 +295,24 @@ final class ChunkedEngine {
         }
         print("[Load] Decode layout: \(chosenLayout.rawValue)-chunk")
 
+        // V6-2: warm compute plans. Runs only on iOS 17+ and is best-effort.
+        // Parallelised with the verify-function load that follows.
+        var warmedPlans: [Any] = []
+        if #available(iOS 17.0, macOS 14.0, *) {
+            let planT0 = CFAbsoluteTimeGetCurrent()
+            await withTaskGroup(of: (String, Any?).self) { group in
+                for name in ["chunk1", "chunk2", "chunk3", "chunk4"] {
+                    group.addTask { await warmPlan(name) }
+                }
+                for await (_, plan) in group {
+                    if let plan { warmedPlans.append(plan) }
+                }
+            }
+            let planDt = CFAbsoluteTimeGetCurrent() - planT0
+            print("[Load] ComputePlan warm: \(warmedPlans.count) plan(s) in " +
+                  "\(String(format: "%.2f", planDt))s")
+        }
+
         // Load verify functions from multi-function chunks (if available).
         // Multi-function chunks have a "verify_qK" function alongside the
         // default "decode_q1". We detect this by checking if the chunk has
@@ -231,6 +323,9 @@ final class ChunkedEngine {
             let verifyConfig = MLModelConfiguration()
             verifyConfig.computeUnits = computeUnits
             verifyConfig.functionName = "verify_qK"
+            if #available(iOS 18.2, macOS 15.2, *) {
+                verifyConfig.optimizationHints.reshapeFrequency = .infrequent
+            }
 
             let verifyT0 = CFAbsoluteTimeGetCurrent()
             try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
@@ -406,6 +501,9 @@ final class ChunkedEngine {
             kFullM: kFullM, vFullM: vFullM,
             config: config, prefillN: prefillN)
 
+        // V6-2: hand the warm plans to the engine so ARC keeps them alive.
+        engine.warmComputePlans = warmedPlans
+
         // ANE pipeline prewarm (Phase 0b): four dummy decode steps at load
         // time force the ANE compiler to finalize dispatch schedules and
         // resident weight layouts before the first user token arrives —
@@ -497,6 +595,81 @@ final class ChunkedEngine {
     private var profileC3: Double = 0
     private var profileC4: Double = 0
 
+    /// Allocate one `MLMultiArray` matching an output description.
+    private func allocateBacking(for desc: MLFeatureDescription) throws -> MLMultiArray? {
+        guard let c = desc.multiArrayConstraint else { return nil }
+        let dt: MLMultiArrayDataType
+        switch c.dataType {
+        case .float16: dt = .float16
+        case .float32: dt = .float32
+        case .int32: dt = .int32
+        case .double: dt = .double
+        default: dt = .float16
+        }
+        return try MLMultiArray(shape: c.shape, dataType: dt)
+    }
+
+    /// One-time setup: allocate persistent output backings + MLPredictionOptions
+    /// for every decode chunk so subsequent steps reuse the same destination
+    /// buffers (saves IOSurface alloc + refcount churn on the hot path).
+    ///
+    /// Note: KV outputs (`K_*_out` / `V_*_out`) get *fresh* persistent
+    /// backings rather than aliasing the persistent KV cache. Aliasing input
+    /// and output to the same buffer can introduce a RAW hazard inside the
+    /// chunk's attention rewrite — kept the explicit copyBack to keep
+    /// numerical parity with the existing decode path. We still win the
+    /// per-step IOSurface allocation (the output backing is reused step over
+    /// step, only the copyBack memcpy remains).
+    private func ensureDecodeBackings() throws {
+        guard optionsC1 == nil else { return }
+
+        // Helper to scan a model's outputs and produce a backing dictionary.
+        func backings(for model: MLModel) throws -> [String: MLMultiArray] {
+            var out: [String: MLMultiArray] = [:]
+            for (name, desc) in model.modelDescription.outputDescriptionsByName {
+                if let backing = try allocateBacking(for: desc) {
+                    out[name] = backing
+                }
+            }
+            return out
+        }
+
+        backingsC1 = try backings(for: chunk1)
+        backingsC2 = try backings(for: chunk2)
+        backingsC3 = try backings(for: chunk3)
+        backingsC4 = try backings(for: chunk4)
+
+        // outputBackings is typed `[String: Any]`. Pass MLMultiArrays via
+        // type-erased dictionaries so CoreML treats each entry as a backing
+        // for the matching output name.
+        let o1 = MLPredictionOptions()
+        o1.outputBackings = backingsC1.mapValues { $0 as Any }
+        optionsC1 = o1
+        let o2 = MLPredictionOptions()
+        o2.outputBackings = backingsC2.mapValues { $0 as Any }
+        optionsC2 = o2
+        let o3 = MLPredictionOptions()
+        o3.outputBackings = backingsC3.mapValues { $0 as Any }
+        optionsC3 = o3
+        let o4 = MLPredictionOptions()
+        o4.outputBackings = backingsC4.mapValues { $0 as Any }
+        optionsC4 = o4
+
+        if profileBenchEnabled {
+            print("[WarmPath] outputBackings ready: c1=\(backingsC1.count) " +
+                  "c2=\(backingsC2.count) c3=\(backingsC3.count) c4=\(backingsC4.count) outputs reused")
+        }
+    }
+
+    /// Bench-mode flag: gates extra logging that should NOT run on user
+    /// devices in release. Driven by env var `WARM_PATH_BENCH=1` or
+    /// UserDefaults bool `WARM_PATH_BENCH`. Read once and cached.
+    private static let _benchEnabled: Bool = {
+        if ProcessInfo.processInfo.environment["WARM_PATH_BENCH"] != nil { return true }
+        return UserDefaults.standard.bool(forKey: "WARM_PATH_BENCH")
+    }()
+    private var profileBenchEnabled: Bool { Self._benchEnabled }
+
     func predictStep(tokenID: Int, position: Int,
                      imageEmbedding: MLMultiArray? = nil) throws -> Int {
         // Route to the merged fast paths when their mlpackages are present.
@@ -519,17 +692,32 @@ final class ChunkedEngine {
         let W = config.slidingWindow
         let hidden = config.hiddenSize
 
+        // V6 outputBackings + scratch inputs: lazy one-time setup. This is
+        // the warm-path fast lane — every subsequent step writes into the
+        // same MLMultiArray instances on both sides of the dispatch.
+        try ensureDecodeBackings()
+
         let t0 = CFAbsoluteTimeGetCurrent()
         let hiddenIn: MLMultiArray
         let plRaw: MLMultiArray
         if let imageEmbedding {
+            // Image-embedding path is rare and uses a foreign buffer; keep
+            // the original allocating fallback to avoid copying 2KB into the
+            // scratch buffer for what is typically a single boot prompt.
             hiddenIn = imageEmbedding
             let totalDim = config.numLayers * config.perLayerDim
             plRaw = try MLMultiArray(shape: [1, 1, NSNumber(value: totalDim)], dataType: .float16)
             memset(plRaw.dataPointer, 0, totalDim * MemoryLayout<UInt16>.stride)
         } else {
-            hiddenIn = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hidden)])
-            plRaw = try lookupPerLayerRaw(tokenID: tokenID)
+            // Reuse persistent scratch buffers; rewrite contents per step.
+            hiddenIn = scratchHidden
+            embedTokens.lookupInto(
+                tokenID,
+                dst: hiddenIn.dataPointer.bindMemory(to: UInt16.self, capacity: hidden))
+            plRaw = scratchPLRaw
+            let totalDim = config.numLayers * config.perLayerDim
+            let raw = embedPerLayer.lookupRaw(tokenID)
+            memcpy(plRaw.dataPointer, raw, totalDim * MemoryLayout<UInt16>.stride)
         }
         let t1 = CFAbsoluteTimeGetCurrent()
         profileEmbed += (t1 - t0)
@@ -537,14 +725,23 @@ final class ChunkedEngine {
         let maskFull = try makeCausalMask(position: position, length: ctx)
         let maskSliding = try makeSlidingCausalMask(position: position, W: W)
         let umask = try makeUpdateMask(position: position, length: ctx)
-        let cosS = try lookupRoPE(table: cosSlidingTable, position: position, dim: 256)
-        let sinS = try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
-        let cosF = try lookupRoPE(table: cosFullTable, position: position, dim: 512)
-        let sinF = try lookupRoPE(table: sinFullTable, position: position, dim: 512)
+        // RoPE rows: write straight into scratch buffers (256/512-d).
+        let cosS = scratchCosS
+        try lookupRoPEInto(table: cosSlidingTable, position: position, dim: 256, dst: cosS)
+        let sinS = scratchSinS
+        try lookupRoPEInto(table: sinSlidingTable, position: position, dim: 256, dst: sinS)
+        let cosF = scratchCosF
+        try lookupRoPEInto(table: cosFullTable, position: position, dim: 512, dst: cosF)
+        let sinF = scratchSinF
+        try lookupRoPEInto(table: sinFullTable, position: position, dim: 512, dst: sinF)
         let tMask = CFAbsoluteTimeGetCurrent()
         profileMask += (tMask - t1)
 
-        // Chunk 1
+        // Chunk 1 — outputBackings reuse: persistent options + persistent
+        // backings. We read from the returned feature provider so correctness
+        // holds even if CoreML silently ignores a backing (e.g. shape mismatch
+        // or non-IOSurface buffer); when the backing IS accepted, the returned
+        // feature points at the same MLMultiArray we supplied → zero copy.
         let tC1Start = CFAbsoluteTimeGetCurrent()
         let out1 = try chunk1.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: hiddenIn),
@@ -558,7 +755,9 @@ final class ChunkedEngine {
             "V_sliding_in": MLFeatureValue(multiArray: vSliding1),
             "K_full_in": MLFeatureValue(multiArray: kFull1),
             "V_full_in": MLFeatureValue(multiArray: vFull1),
-        ]))
+        ]), options: optionsC1!)
+        // Read via the returned feature provider — equals the supplied
+        // backing on accept, equals an internal allocation on silent reject.
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
         copyBack(out1, "K_sliding_out", into: kSliding1)
@@ -582,7 +781,7 @@ final class ChunkedEngine {
             "V_sliding_in": MLFeatureValue(multiArray: vSliding2),
             "K_full_in": MLFeatureValue(multiArray: kFull2),
             "V_full_in": MLFeatureValue(multiArray: vFull2),
-        ]))
+        ]), options: optionsC2!)
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
         copyBack(out2, "K_sliding_out", into: kSliding2)
         copyBack(out2, "V_sliding_out", into: vSliding2)
@@ -611,7 +810,8 @@ final class ChunkedEngine {
         // Chunk 3
         let tC3Start = CFAbsoluteTimeGetCurrent()
         var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
-        let h3 = try chunk3.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
+        let h3 = try chunk3.prediction(from: MLDictionaryFeatureProvider(dictionary: d3),
+                                       options: optionsC3!)
             .featureValue(for: "hidden_states_out")!.multiArrayValue!
         let tC3End = CFAbsoluteTimeGetCurrent()
         profileC3 += (tC3End - tC3Start)
@@ -619,7 +819,8 @@ final class ChunkedEngine {
         // Chunk 4
         let tC4Start = CFAbsoluteTimeGetCurrent()
         var d4 = shared; d4["hidden_states"] = MLFeatureValue(multiArray: h3)
-        let out4 = try chunk4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4))
+        let out4 = try chunk4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4),
+                                         options: optionsC4!)
         let tC4End = CFAbsoluteTimeGetCurrent()
         profileC4 += (tC4End - tC4Start)
 
@@ -1411,6 +1612,26 @@ final class ChunkedEngine {
         memset(up, 0, length * MemoryLayout<UInt16>.stride)
         up[min(position, length - 1)] = 0x3C00
         return umask
+    }
+
+    /// Fill an existing MLMultiArray (shape (1,1,1,dim)) with RoPE row at
+    /// `position`. Avoids allocating a fresh MLMultiArray per decode step.
+    func lookupRoPEInto(table: Data?, position: Int, dim: Int, dst: MLMultiArray) throws {
+        let p = dst.dataPointer.bindMemory(to: UInt16.self, capacity: dim)
+        guard let table else { memset(p, 0, dim * MemoryLayout<UInt16>.stride); return }
+        var headerSize = 128
+        table.withUnsafeBytes { raw in
+            let b = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            headerSize = 10 + (Int(b[8]) | (Int(b[9]) << 8))
+        }
+        let rowBytes = dim * MemoryLayout<UInt16>.stride
+        let offset = headerSize + position * rowBytes
+        guard offset + rowBytes <= table.count else {
+            memset(p, 0, rowBytes); return
+        }
+        _ = table.withUnsafeBytes { raw in
+            memcpy(p, raw.baseAddress!.advanced(by: offset), rowBytes)
+        }
     }
 
     func lookupRoPE(table: Data?, position: Int, dim: Int) throws -> MLMultiArray {

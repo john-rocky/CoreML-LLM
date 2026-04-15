@@ -156,6 +156,10 @@ public final class CrossVocabDraft {
         }
         let cfg = MLModelConfiguration()
         cfg.computeUnits = computeUnits
+        // V6-1: cross-vocab drafter has fixed input shapes per K.
+        if #available(iOS 18.2, macOS 15.2, *) {
+            cfg.optimizationHints.reshapeFrequency = .infrequent
+        }
         let m = try MLModel(contentsOf: modelURL, configuration: cfg)
         let st = m.makeState()
 
