@@ -1,19 +1,32 @@
 # Route B execution plan — drafter-free path to 70+ tok/s @ 2K
 
+> ⚠️ **Projected tok/s numbers in this doc (70–85 tok/s, per-task
+> speedups) are invalidated by PR #62 (2026-04-15).** The projections
+> were derived from the oracle-replay bench (`accept-rate-bench-v2.json`)
+> which over-claims live accept rates by 3–9×. Union on Mac measured
+> 15–21 tok/s vs baseline 32 — a regression, not a +50 %.
+>
+> Task scaffolding (I1/I2/I3/T2–T4) remains broadly useful, but the
+> ROI ordering and tok/s targets tied to A5 numbers are wrong. Re-read
+> after task #2 (target-argmax bench) produces live-equivalent data.
+> See `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md` for the full finding.
+
 **Purpose:** detailed, self-contained execution plan for the
 drafter-free parallel track described in
 `docs/MOBILE_2K_COMPETITIVE_PLAN.md`. Any engineer (or agent) can
 pick this up without prior session context and ship item-by-item.
 
 **Current baseline:** 31.4 tok/s @ 2K on iPhone 17 Pro (A19 Pro).
-**Target:** 70–85 tok/s @ 2K, which is +25–50% over Google's
-LiteRT-LM iOS (56 tok/s).
+**Target:** ~~70–85 tok/s~~ TBD — under reassessment after PR #62.
+Previous target of 70–85 tok/s assumed A5 drafter accept rates that
+did not hold in live decoding.
 
 **Why Route B exists:** Route A (MTP / HASS / EAGLE-3 retrain)
 needs A100-class GPU time and is a parallel session. Route B uses
 only pre-trained drafters or prompt-based heuristics, so it can
-progress independently and — if training stalls — still delivers
-~85 tok/s on its own.
+progress independently. ~~If training stalls — still delivers
+~85 tok/s on its own.~~ The "Route B alone" ceiling is being
+recomputed with live-equivalent accept rates.
 
 ---
 

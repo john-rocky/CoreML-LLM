@@ -98,27 +98,24 @@ items continue to share the next bundled iPhone trip.
    - Exit: log artifact + placement table from one device run; we
      can choose between the two failure modes (CPU fallback vs slow
      GPU) without burning a second trip.
-   - **Accept-rate ceiling check (bundle in same trip).** Path C
-     shelving (`docs/MTP_PATH_C_FINDINGS.md`) gives an independent
-     corroboration that iPhone acc0 may be capped by item 11c rather
-     than drafter quality. While the trip is running with
-     `SPECULATIVE_PROFILE=1`, also run Union in PLD-only mode (CV
-     disabled) and compare the on-device per-burst accept rate against
-     the Mac oracle-replay accept rate in `eval/accept-rate-bench-v2.json`
-     for the same prompts. Decision branch:
-     – iPhone acc ≪ Mac acc → item 11c is the bottleneck; defer
-       bootstrap work and shift to verify-chunk numerical alignment
-       (coordinate with MTP session on `feature/mtp-speculative-v1`;
-       their `conversion/train_mtp_modules/verify_coreml_equiv.py`
-       and `verify_accept_logic.py` are the methodological baseline,
-       though neither is yet a `verify_qK` vs `decode_q1` target-side
-       diff — that tool is what the 11c investigation has to build).
-     – iPhone acc ≈ Mac acc → Task 3 (bootstrap) and Phase C Mirror
-       SD / async dispatch remain the critical path.
-     First pass can work with the aggregate `accepted=N/M` field
-     already in the `[SpecProfile …]` stream; if aggregate is
-     suggestive but inconclusive, a small follow-up PR can add
-     per-position accept-or-not to SpecProfile.
+   - ~~**Accept-rate ceiling check (bundle in same trip).**~~
+     **Retracted 2026-04-15 late by PR #62.** The branching logic
+     below assumed comparing iPhone live vs Mac oracle-replay would
+     reveal 11c as the bottleneck. PR #62's Mac reproduction
+     (`coreml-llm-smoke UNION_TRIP=1`) shows the same live-vs-oracle
+     gap on Mac (cpuAndGPU, no ANE). The gap is bench methodology,
+     not ANE fp16 drift. Item 11c is deprioritised as the Phase B
+     driver. See `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md`.
+
+     Kept for history:
+     > Path C shelving (`docs/MTP_PATH_C_FINDINGS.md`) gives an
+     > independent corroboration that iPhone acc0 may be capped by
+     > item 11c rather than drafter quality. While the trip is
+     > running with `SPECULATIVE_PROFILE=1`, also run Union in
+     > PLD-only mode (CV disabled) and compare on-device per-burst
+     > accept rate against Mac oracle-replay. Decision branch:
+     > – iPhone acc ≪ Mac acc → item 11c. – iPhone acc ≈ Mac acc →
+     > Task 3 + Phase C remain critical path.
 3. **Bootstrap optimisation** — gated on Task 2's data. Two
    candidates depending on what the timing log says:
    (i) batched Qwen prefill shape so the N sequential `consume()`
@@ -138,12 +135,11 @@ items continue to share the next bundled iPhone trip.
    + V6-2 (`MLComputePlan` warm-pool). See V6.md for details.
    - Exit: no correctness change; hint loadable at init.
 6. **iPhone-measured verify chunk cost**. The A5 decision doc
-   projected ~52 ms per verify dispatch; the actual number is an
-   unknown that gates whether the 44–63 tok/s ceiling holds. Log a
-   `[Profile]` on a verify call directly. Bundles into Task 2's
-   timing-log PR for free.
-   - Exit: real verify ms/dispatch recorded; Phase A5 ceiling numbers
-     updated with measured verify cost instead of the 1.7× estimate.
+   projected ~52 ms per verify dispatch; actual Mac number from PR
+   #62 logs is ~31 ms (close to decode cost, not 1.7×). iPhone
+   number still unmeasured but less load-bearing now that A5 tok/s
+   ceilings are superseded. Log opportunistically when next trip
+   runs.
 
 Critical path: Task 2 → Task 3 → re-enable defaults → re-measure
 against B1's (b)(c)(d) criteria. Tasks 4, 5, 6 piggyback on the same
@@ -191,15 +187,17 @@ device trips opportunistically.
 
 - iPhone 17 Pro 2K baseline (main, drafters OFF — current default):
   **31.4 tok/s**. Per-chunk c1=5.9 c2=6.8 c3=8.1 c4=10.4 ms.
-- iPhone 17 Pro 2K with Union ON (post-#54, opt-in): **~1.8 tok/s
-  decode + 25+ s TTFT**. Output also degraded. Gates Phase B Task 2
-  perf investigation.
 - Google LiteRT-LM iOS @ 2K Gemma 4 E2B: **56 tok/s** (user-supplied).
-- Phase A accept-rate winners: chat=cross-vocab 2.31, code=pl-n3 2.94,
-  qa=cross-vocab 3.17, summary=pl-n2/suffix 3.26.
-- Phase B theoretical target: 44–63 tok/s with Mirror SD on, 30–63
-  serial. **Not yet measured on device** — would require defaults
-  back on, which is gated.
+- **Mac Union live (PR #62 repro, `coreml-llm-smoke UNION_TRIP=1`):**
+  code 19.3, chat 17.8, qa 15.2, summary 21.2 tok/s vs Mac baseline
+  ≈ 32. Net regression on all four categories.
+- ~~Phase A accept-rate winners: chat=cross-vocab 2.31, code=pl-n3 2.94,
+  qa=cross-vocab 3.17, summary=pl-n2/suffix 3.26.~~ **Superseded by
+  PR #62.** These were oracle-replay numbers; live draft-rate on Mac
+  is 0.059–0.212 — 3–9× lower. Task #2 rebuilds the bench with a
+  target-argmax mode.
+- ~~Phase B theoretical target: 44–63 tok/s with Mirror SD on, 30–63
+  serial.~~ Deferred; ceilings re-compute once v3 bench lands.
 
 ---
 

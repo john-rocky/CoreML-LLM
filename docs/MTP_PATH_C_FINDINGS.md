@@ -1,8 +1,23 @@
 # MTP Path C — Self-trained drafter findings
 
-**Status:** 2026-04-15. Full pipeline (train → convert → deploy) completed. **iPhone 17 Pro result: Path C is net negative vs baseline — ~16 tok/s vs 31 tok/s baseline, with subtle output drift.** Shelved in favor of the DrafterUnion path (Phase B) and item 11c (verify-chunk numerical alignment).
+**Status:** 2026-04-15. Full pipeline (train → convert → deploy) completed. **iPhone 17 Pro result: Path C is net negative vs baseline — ~16 tok/s vs 31 tok/s baseline, with subtle output drift.** Shelved.
 
-**TL;DR.** We self-trained DeepSeek V3-style K=2 sequential MTP modules against our own frozen Gemma 4 E2B trunk (no LiteRT dependency), fixed three structural bugs via Mac-first verification, confirmed end-to-end numerical equivalence between PyTorch and CoreML, and deployed. On iPhone 17 Pro with coherent English prompts we measured ~16.3 tok/s at acc0=17 % — **about half of the 31 tok/s baseline**. The drafter is correct; the gap is driven by the same target-side fp16 divergence between `verify_qK` and `decode_q1` chunks that was surfaced in PR #54 and filed as PRIORITY_ROADMAP item 11c. With item 11c unresolved, **no self-trained drafter can break even on this target**: per-cycle verify cost is ~2.3× decode on ANE, which requires ~77 % acceptance just to match baseline. Training another drafter doesn't buy that — closing item 11c does. **Recommendation: park Path C, resume Phase B, treat item 11c as the unlock for any future MTP effort (Path A, Path C, or EAGLE-3).**
+> **Correction 2026-04-15 late (post-PR #62).** The original TL;DR
+> below blamed item 11c (K=3 vs K=1 fp16 drift) as the root cause.
+> PR #62 invalidated that diagnosis: Mac reproduction via
+> `coreml-llm-smoke UNION_TRIP=1` shows the same live-vs-bench
+> accept-rate gap on Mac (cpuAndGPU, no ANE), so the regression is
+> primarily bench methodology over-claim, not ANE fp16 drift. The
+> "77 % acceptance break-even" arithmetic holds but requires live-
+> equivalent accept-rate measurement (task #2) to decide whether
+> *any* drafter on this target can clear it.
+>
+> Path C remains shelved, but for a different reason: the measured
+> acc0=17 % live is below the break-even, and closing 11c alone will
+> not change the live-vs-corpus gap. See
+> `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md` for the corrected framing.
+
+**TL;DR.** We self-trained DeepSeek V3-style K=2 sequential MTP modules against our own frozen Gemma 4 E2B trunk (no LiteRT dependency), fixed three structural bugs via Mac-first verification, confirmed end-to-end numerical equivalence between PyTorch and CoreML, and deployed. On iPhone 17 Pro with coherent English prompts we measured ~16.3 tok/s at acc0=17 % — **about half of the 31 tok/s baseline**. The drafter is numerically correct; ~~the gap is driven by the same target-side fp16 divergence between `verify_qK` and `decode_q1` chunks that was surfaced in PR #54 and filed as PRIORITY_ROADMAP item 11c. With item 11c unresolved, **no self-trained drafter can break even on this target**~~ Updated post-PR #62: the gap is dominated by the live-vs-oracle accept-rate delta, not verify-chunk fp16 drift. **Recommendation: park Path C, resume Phase B starting at task #2 (target-argmax bench rebuild).**
 
 Branch of record: `feature/mtp-speculative-v1`. Final commits: `f5bbac0`, `881500c`, `ad0dc91`. All Mac-side tooling that caught the bugs is in `conversion/train_mtp_modules/`.
 
