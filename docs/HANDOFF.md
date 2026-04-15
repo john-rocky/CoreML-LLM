@@ -1,18 +1,21 @@
 # Next-session handoff
 
-**Last updated:** end of 2026-04-15 session.
+**Last updated:** end of 2026-04-15 session, post-PR #62.
 
 ## Read this first
 
 To resume cleanly, the next session should:
 
 1. Open this file (`docs/HANDOFF.md`) — takes 5 minutes.
-2. Skim `docs/SESSION_STATE.md` for the exact PR / branch / task state.
-3. Read `docs/MAC_FIRST_EXECUTION_PLAN.md` for the phased itinerary
+2. Read `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md` — **this invalidates
+   the Phase A5 drafter-union decision**. Don't plan work on top of
+   A5 numbers without reading this first.
+3. Skim `docs/SESSION_STATE.md` for the exact PR / branch / task state.
+4. Read `docs/MAC_FIRST_EXECUTION_PLAN.md` for the phased itinerary
    and the Mac-vs-iPhone authority split.
-4. Read `docs/PHASE_A5_DECISION.md` for the drafter-union decision
-   and per-category projections.
-5. Start on Phase B Task 1 (Union orchestrator).
+5. `docs/PHASE_A5_DECISION.md` — read for historical context, but its
+   concrete projections are superseded by PHASE_B_LIVE_ACCEPT_RATE_GAP.
+6. Start on task #2 (target-argmax replay mode for accept-rate-bench).
 
 No need to touch MTP Path A, PR #17, or PR #33 — all deprioritised
 with reasons in the roadmap's Rejected table.
@@ -22,15 +25,30 @@ with reasons in the roadmap's Rejected table.
 Copy-paste this at the start of the next `/claude` session so the
 model walks in with correct framing:
 
-> Continue the Phase B work on this repo. Read `docs/HANDOFF.md`,
-> `docs/SESSION_STATE.md`, `docs/MAC_FIRST_EXECUTION_PLAN.md`, and
-> `docs/PHASE_A5_DECISION.md` in that order — those cover where we
-> stand and what Phase B means. Phase A (accept-rate measurement
-> and drafter selection) is done; the PR #45 regression check on
-> iPhone already passed at 31–32 tok/s baseline. Start with Phase B
-> Task 1 — the Union-of-drafters orchestrator — and hold any code
-> PR until it clears an iPhone baseline check per our merge
-> discipline. Docs-only PRs can still auto-merge.
+> PR #62 landed a major finding: the oracle-replay bench
+> (eval/accept-rate-bench-v2.json) over-claims live accept rates by
+> 3–9× across all four categories. Union is a net regression on Mac
+> (15–21 tok/s vs baseline 32). iPhone cv=0 bursts were the rolling
+> gate closing, not a bug. Read (in order):
+> 1. docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md — the full finding and
+>    three candidate next steps (PL-only union / raise gates / defer
+>    to Mirror SD).
+> 2. docs/HANDOFF.md — this file; the 11c branching chart is
+>    retracted. Gap is present on Mac (no ANE) so 11c isn't the
+>    driver.
+> 3. docs/SESSION_STATE.md — current PR / branch / task state.
+>
+> Start on task #2: add a target-argmax replay mode to
+> accept-rate-bench so we can measure live-equivalent numbers without
+> running the chat app. Mac-only, no iPhone trip. Output:
+> eval/accept-rate-bench-v3-target-argmax.json. Implementation
+> pointer: Sources/accept-rate-bench/Bench.swift (existing harness
+> already loads Gemma + CoreML chunks; add `--mode argmax` flag that
+> open-generates from Gemma and checks drafter proposals against
+> verify_qK's returned argmax instead of corpus tokens).
+>
+> Code PRs hold for iPhone baseline check; docs-only PRs can
+> auto-merge per CLAUDE.md discipline.
 
 ## Full roadmap — Phase A → final
 
@@ -102,7 +120,18 @@ so speculation needs ~77 % acceptance to match baseline. Training hits
 ~38 %; closing 11c would push the multiplier toward ~1.3× and the
 break-even to ~40 %, which existing drafters already clear.
 
-#### Revised Phase B priority ordering (post-#57, pending iPhone trip)
+#### ~~Revised Phase B priority ordering (post-#57, pending iPhone trip)~~ RETRACTED by PR #62
+
+> **Retracted 2026-04-15 late (PR #62).** The branching chart below
+> assumed "iPhone live accept << Mac oracle replay" implied item 11c's
+> fp16 drift was load-bearing. Mac reproduction via `coreml-llm-smoke
+> UNION_TRIP=1` shows the same 3–9× gap on Mac (cpuAndGPU, no ANE).
+> The gap is bench methodology (oracle-replay vs target-argmax), not
+> device divergence. See `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md` for
+> the full analysis. Kept inline for history; do not act on it.
+
+<details>
+<summary>Retracted chart (expand for historical context)</summary>
 
 ```
 iPhone trip with PR #57 env vars on (SPECULATIVE_PROFILE=1, COMPUTE_PLAN_AUDIT=1)
@@ -112,21 +141,30 @@ iPhone trip with PR #57 env vars on (SPECULATIVE_PROFILE=1, COMPUTE_PLAN_AUDIT=1
     eval/accept-rate-bench-v2.json.
   ┌──────────────────────────────────────────┐
   │ iPhone accept rate << Mac oracle replay  │  → item 11c confirmed load-bearing.
-  │                                          │    Next work: verify-chunk numerical
-  │                                          │    alignment (reconvert with fp32
-  │                                          │    softmax tail, or K=3 tiling
-  │                                          │    matched to K=1). Unblocks
-  │                                          │    cross-vocab AND Path C AND any
-  │                                          │    future drafter simultaneously.
   ├──────────────────────────────────────────┤
-  │ iPhone accept rate ≈ Mac oracle replay   │  → 11c is NOT the bottleneck for
-  │                                          │    this trip's prompt set. Original
-  │                                          │    drafter-perf plan holds — next
-  │                                          │    work: bootstrap optimisation
-  │                                          │    (Phase B Task 3) and Mirror SD /
-  │                                          │    async dispatch (Phase C).
+  │ iPhone accept rate ≈ Mac oracle replay   │  → 11c is NOT the bottleneck.
   └──────────────────────────────────────────┘
 ```
+
+</details>
+
+#### Actual Phase B priority ordering (post-PR #62)
+
+1. **Rebuild accept-rate-bench with target-argmax mode** (task #2,
+   Mac only). Existing v2.json is oracle-replay — produces numbers
+   that are 3–9× optimistic vs live. Output: v3 json with both modes
+   side-by-side so future drafter decisions have live-equivalent
+   data.
+2. **Re-decide Union shape.** Three candidates in
+   `PHASE_B_LIVE_ACCEPT_RATE_GAP.md` §"Implications": PL-only union,
+   raise rolling gates to collapse-to-baseline fast, or defer Union
+   until Mirror SD. v3 numbers drive the pick.
+3. **Then** iPhone trip to confirm Mac finding replicates on ANE
+   hardware. Expected: same ~30 % regression pattern with current
+   Union defaults off. Bundle with B4 MLComputePlan audit.
+4. Item 11c investigation is deprioritised (not the Phase B driver).
+   Revisit only if Mac live vs iPhone live shows a gap — which would
+   genuinely implicate ANE fp16 drift.
 
 The MTP session is working 11c directly on `feature/mtp-speculative-v1`;
 coordinate with them before duplicating any verify-vs-decode argmax
