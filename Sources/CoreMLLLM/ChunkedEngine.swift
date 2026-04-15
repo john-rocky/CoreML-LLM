@@ -5,22 +5,59 @@ import Foundation
 
 /// Internal engine for SWA-chunked Gemma 4 E2B inference.
 ///
-/// The model is split into 4 decode chunks + 4 optional prefill chunks:
+/// The model is split into decode chunks + optional prefill chunks. The
+/// default shipping layout is 4 decode chunks (`chunk1..chunk4`):
 ///   - chunk1: layers 0-7 (7 sliding + 1 full) + PLE projection
 ///   - chunk2: layers 8-14 (5 sliding + 2 full), outputs shared kv13/kv14
 ///   - chunk3: layers 15-24 (all KV-shared via kv13/kv14)
 ///   - chunk4: layers 25-34 (all KV-shared) + RMSNorm + LM head + argmax
 ///
+/// An optional consolidated layout halves the per-step ANE dispatch count:
+///   - `merged_chunk1` + `merged_chunk2` (2-chunk): L0-14 then L15-34+LMhead
+///   - `merged_full`                    (1-chunk): L0-34+LMhead in one graph
+///
+/// Detection is automatic: the engine prefers the most consolidated variant
+/// present on disk and falls back to 4-chunk if none / only some files are
+/// found. Prefill and verify paths always use the 4-chunk layout (their
+/// shapes diverge from decode and their dispatch count is small relative
+/// to decode's cumulative cost).
+///
 /// External resources (loaded from disk, not baked into the model):
 ///   - INT8 quantized embedding tables (embed_tokens + embed_per_layer)
 ///   - Per-layer projection weight + norm weight (for PLE on CPU/Accelerate)
 ///   - Pre-computed RoPE cos/sin tables (sliding 256-d, full 512-d)
+
+/// Decode-path chunk layout. Selected automatically by file presence.
+public enum ChunkLayout: String, Sendable {
+    case four        // chunk1..chunk4 (default shipping)
+    case two         // merged_chunk1 + merged_chunk2
+    case one         // merged_full
+}
+
 final class ChunkedEngine {
-    // Decode chunks
+    // Decode chunks (4-chunk layout, always loaded — also used as fallback
+    // and by the prefill/verify paths which keep the 4-chunk shape).
     private let chunk1: MLModel
     private let chunk2: MLModel
     private let chunk3: MLModel
     private let chunk4: MLModel
+
+    // Optional consolidated decode chunks. When present, `predictStep`
+    // routes through them instead of chunk1..chunk4 to halve (or quarter)
+    // the ANE dispatch count per decode step.
+    private let mergedChunk1: MLModel?  // 2-chunk layout: L0-14
+    private let mergedChunk2: MLModel?  // 2-chunk layout: L15-34 + head
+    private let mergedFull: MLModel?    // 1-chunk layout: L0-34 + head
+
+    /// Active decode layout, selected at load time.
+    let layout: ChunkLayout
+
+    // Merged-layout KV caches (12 sliding + 3 full, vs the 4-chunk split
+    // of 7+5 sliding and 1+2 full). Allocated only for .two/.one layouts.
+    private var kSlidingM: MLMultiArray?
+    private var vSlidingM: MLMultiArray?
+    private var kFullM: MLMultiArray?
+    private var vFullM: MLMultiArray?
 
     // Prefill chunks (optional; falls back to per-token decode if nil)
     private let prefillChunk1: MLModel?
@@ -126,8 +163,13 @@ final class ChunkedEngine {
         // Load all chunks in parallel (MLModel(contentsOf:) is thread-safe,
         // ANE compiler can pipeline compilation across chunks)
         let hasPrefillFiles = findModel("prefill_chunk1") != nil
+        // Merged decode layouts — picked up when present on disk. The
+        // most consolidated variant wins (.one > .two > .four).
+        let hasMergedFull = findModel("merged_full") != nil
+        let hasMergedTwo = findModel("merged_chunk1") != nil && findModel("merged_chunk2") != nil
         var c1: MLModel!, c2: MLModel!, c3: MLModel!, c4: MLModel!
         var p1: MLModel?, p2: MLModel?, p3: MLModel?, p4: MLModel?
+        var mF: MLModel?, mA: MLModel?, mB: MLModel?
 
         let loadT0 = CFAbsoluteTimeGetCurrent()
         try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
@@ -136,6 +178,13 @@ final class ChunkedEngine {
             }
             if hasPrefillFiles {
                 for name in ["prefill_chunk1", "prefill_chunk2", "prefill_chunk3", "prefill_chunk4"] {
+                    group.addTask { (name, try loadOne(name)) }
+                }
+            }
+            if hasMergedFull {
+                group.addTask { ("merged_full", try loadOne("merged_full")) }
+            } else if hasMergedTwo {
+                for name in ["merged_chunk1", "merged_chunk2"] {
                     group.addTask { (name, try loadOne(name)) }
                 }
             }
@@ -149,12 +198,28 @@ final class ChunkedEngine {
                 case "prefill_chunk2": p2 = model
                 case "prefill_chunk3": p3 = model
                 case "prefill_chunk4": p4 = model
+                case "merged_full": mF = model
+                case "merged_chunk1": mA = model
+                case "merged_chunk2": mB = model
                 default: break
                 }
             }
         }
         let loadDt = CFAbsoluteTimeGetCurrent() - loadT0
-        print("[Load] All \(hasPrefillFiles ? 8 : 4) chunks loaded in \(String(format: "%.1f", loadDt))s (parallel)")
+        let loaded = 4 + (hasPrefillFiles ? 4 : 0) +
+                     (hasMergedFull ? 1 : (hasMergedTwo ? 2 : 0))
+        print("[Load] All \(loaded) chunks loaded in \(String(format: "%.1f", loadDt))s (parallel)")
+
+        // Select the active decode layout (most consolidated wins).
+        let chosenLayout: ChunkLayout
+        if hasMergedFull && mF != nil {
+            chosenLayout = .one
+        } else if hasMergedTwo && mA != nil && mB != nil {
+            chosenLayout = .two
+        } else {
+            chosenLayout = .four
+        }
+        print("[Load] Decode layout: \(chosenLayout.rawValue)-chunk")
 
         // Load verify functions from multi-function chunks (if available).
         // Multi-function chunks have a "verify_qK" function alongside the
@@ -257,7 +322,13 @@ final class ChunkedEngine {
         // Mixed 2K / 8K chunk files from different builds are rejected with a clear
         // error so the user knows to re-download a consistent set.
         let configuredCtx = config.contextLength
-        for (label, model) in [("chunk1", c1!), ("chunk2", c2!), ("chunk3", c3!), ("chunk4", c4!)] {
+        var allChunks: [(String, MLModel)] = [
+            ("chunk1", c1!), ("chunk2", c2!), ("chunk3", c3!), ("chunk4", c4!),
+        ]
+        if let mA { allChunks.append(("merged_chunk1", mA)) }
+        if let mB { allChunks.append(("merged_chunk2", mB)) }
+        if let mF { allChunks.append(("merged_full", mF)) }
+        for (label, model) in allChunks {
             if let desc = model.modelDescription.inputDescriptionsByName["causal_mask_full"],
                let c = desc.multiArrayConstraint,
                let last = c.shape.last?.intValue, last != configuredCtx {
@@ -302,8 +373,24 @@ final class ChunkedEngine {
         }
         print("[KV] Allocating IOSurface-backed KV cache buffers (ctx=\(ctx))")
 
+        // Merged-layout KV buffers: 12 sliding + 3 full (concatenation of
+        // the 4-chunk split). Allocated only when a merged layout is active
+        // — we pay nothing extra for the default 4-chunk deployment.
+        var kSlidingM: MLMultiArray? = nil
+        var vSlidingM: MLMultiArray? = nil
+        var kFullM: MLMultiArray? = nil
+        var vFullM: MLMultiArray? = nil
+        if chosenLayout != .four {
+            kSlidingM = try ioSurfaceArray(slots: 12, seqLen: W)
+            vSlidingM = try ioSurfaceArray(slots: 12, seqLen: W)
+            kFullM    = try ioSurfaceArray(slots: 3,  seqLen: ctx)
+            vFullM    = try ioSurfaceArray(slots: 3,  seqLen: ctx)
+        }
+
         let engine = try ChunkedEngine(
             chunk1: c1, chunk2: c2, chunk3: c3, chunk4: c4,
+            mergedChunk1: mA, mergedChunk2: mB, mergedFull: mF,
+            layout: chosenLayout,
             prefillChunk1: p1, prefillChunk2: p2, prefillChunk3: p3, prefillChunk4: p4,
             verifyChunk1: v1, verifyChunk2: v2, verifyChunk3: v3, verifyChunk4: v4,
             verifyK: detectedK,
@@ -315,6 +402,8 @@ final class ChunkedEngine {
             kFull1: ioSurfaceArray(slots: 1, seqLen: ctx), vFull1: ioSurfaceArray(slots: 1, seqLen: ctx),
             kSliding2: ioSurfaceArray(slots: 5, seqLen: W), vSliding2: ioSurfaceArray(slots: 5, seqLen: W),
             kFull2: ioSurfaceArray(slots: 2, seqLen: ctx), vFull2: ioSurfaceArray(slots: 2, seqLen: ctx),
+            kSlidingM: kSlidingM, vSlidingM: vSlidingM,
+            kFullM: kFullM, vFullM: vFullM,
             config: config, prefillN: prefillN)
 
         // ANE pipeline prewarm (Phase 0b): four dummy decode steps at load
@@ -333,6 +422,8 @@ final class ChunkedEngine {
     }
 
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
+                 mergedChunk1: MLModel?, mergedChunk2: MLModel?, mergedFull: MLModel?,
+                 layout: ChunkLayout,
                  prefillChunk1: MLModel?, prefillChunk2: MLModel?,
                  prefillChunk3: MLModel?, prefillChunk4: MLModel?,
                  verifyChunk1: MLModel?, verifyChunk2: MLModel?,
@@ -346,9 +437,14 @@ final class ChunkedEngine {
                  kFull1: MLMultiArray, vFull1: MLMultiArray,
                  kSliding2: MLMultiArray, vSliding2: MLMultiArray,
                  kFull2: MLMultiArray, vFull2: MLMultiArray,
+                 kSlidingM: MLMultiArray?, vSlidingM: MLMultiArray?,
+                 kFullM: MLMultiArray?, vFullM: MLMultiArray?,
                  config: ModelConfig, prefillN: Int) {
         self.chunk1 = chunk1; self.chunk2 = chunk2
         self.chunk3 = chunk3; self.chunk4 = chunk4
+        self.mergedChunk1 = mergedChunk1; self.mergedChunk2 = mergedChunk2
+        self.mergedFull = mergedFull
+        self.layout = layout
         self.prefillChunk1 = prefillChunk1; self.prefillChunk2 = prefillChunk2
         self.prefillChunk3 = prefillChunk3; self.prefillChunk4 = prefillChunk4
         self.verifyChunk1 = verifyChunk1; self.verifyChunk2 = verifyChunk2
@@ -362,6 +458,8 @@ final class ChunkedEngine {
         self.kFull1 = kFull1; self.vFull1 = vFull1
         self.kSliding2 = kSliding2; self.vSliding2 = vSliding2
         self.kFull2 = kFull2; self.vFull2 = vFull2
+        self.kSlidingM = kSlidingM; self.vSlidingM = vSlidingM
+        self.kFullM = kFullM; self.vFullM = vFullM
         self.config = config; self.prefillN = prefillN
     }
 
@@ -371,6 +469,12 @@ final class ChunkedEngine {
         for buf in [kSliding1, vSliding1, kFull1, vFull1,
                     kSliding2, vSliding2, kFull2, vFull2] {
             memset(buf.dataPointer, 0, buf.count * MemoryLayout<UInt16>.stride)
+        }
+        // Merged-layout caches — only allocated when layout != .four.
+        for maybe in [kSlidingM, vSlidingM, kFullM, vFullM] {
+            if let buf = maybe {
+                memset(buf.dataPointer, 0, buf.count * MemoryLayout<UInt16>.stride)
+            }
         }
         currentPosition = 0
         profileEmbed = 0
@@ -395,6 +499,22 @@ final class ChunkedEngine {
 
     func predictStep(tokenID: Int, position: Int,
                      imageEmbedding: MLMultiArray? = nil) throws -> Int {
+        // Route to the merged fast paths when their mlpackages are present.
+        // Prefill / speculative-verify paths always go through the 4-chunk
+        // layout (not overridden here). On ANE-fallback or shape mismatch
+        // we must regenerate the mlpackage; we do NOT silently fall back
+        // to the 4-chunk path because that would mask compile regressions.
+        switch layout {
+        case .one:
+            return try predictStepOneChunk(tokenID: tokenID, position: position,
+                                           imageEmbedding: imageEmbedding)
+        case .two:
+            return try predictStepTwoChunk(tokenID: tokenID, position: position,
+                                           imageEmbedding: imageEmbedding)
+        case .four:
+            break  // fall through to the original 4-chunk decode below
+        }
+
         let ctx = config.contextLength
         let W = config.slidingWindow
         let hidden = config.hiddenSize
@@ -522,6 +642,185 @@ final class ChunkedEngine {
         }
 
         return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+    }
+
+    // MARK: - Merged decode paths (2-chunk / 1-chunk)
+
+    /// 2-chunk decode: merged_chunk1 (L0-14) -> merged_chunk2 (L15-34 + head).
+    /// Cuts per-step ANE dispatches from 4 to 2 (~-4.6 ms on iPhone 17 Pro).
+    private func predictStepTwoChunk(tokenID: Int, position: Int,
+                                     imageEmbedding: MLMultiArray?) throws -> Int {
+        guard let m1 = mergedChunk1, let m2 = mergedChunk2,
+              let ks = kSlidingM, let vs = vSlidingM,
+              let kf = kFullM,    let vf = vFullM else {
+            // This should be impossible given how `layout` is selected at load,
+            // but we surface a clear error instead of crashing on force-unwrap.
+            throw CoreMLLLMError.modelNotFound("merged_chunk1/merged_chunk2 unavailable but layout=two")
+        }
+        let ctx = config.contextLength
+        let W = config.slidingWindow
+        let hidden = config.hiddenSize
+
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let hiddenIn: MLMultiArray
+        let plRaw: MLMultiArray
+        if let imageEmbedding {
+            hiddenIn = imageEmbedding
+            let totalDim = config.numLayers * config.perLayerDim
+            plRaw = try MLMultiArray(shape: [1, 1, NSNumber(value: totalDim)], dataType: .float16)
+            memset(plRaw.dataPointer, 0, totalDim * MemoryLayout<UInt16>.stride)
+        } else {
+            hiddenIn = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hidden)])
+            plRaw = try lookupPerLayerRaw(tokenID: tokenID)
+        }
+        let t1 = CFAbsoluteTimeGetCurrent()
+        profileEmbed += (t1 - t0)
+
+        let maskFull = try makeCausalMask(position: position, length: ctx)
+        let maskSliding = try makeSlidingCausalMask(position: position, W: W)
+        let umask = try makeUpdateMask(position: position, length: ctx)
+        let cosS = try lookupRoPE(table: cosSlidingTable, position: position, dim: 256)
+        let sinS = try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
+        let cosF = try lookupRoPE(table: cosFullTable, position: position, dim: 512)
+        let sinF = try lookupRoPE(table: sinFullTable, position: position, dim: 512)
+        let tMask = CFAbsoluteTimeGetCurrent()
+        profileMask += (tMask - t1)
+
+        // Merged chunk 1 (L0-14)
+        let tC1Start = CFAbsoluteTimeGetCurrent()
+        let out1 = try m1.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: hiddenIn),
+            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+            "update_mask": MLFeatureValue(multiArray: umask),
+            "per_layer_raw": MLFeatureValue(multiArray: plRaw),
+            "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
+            "K_sliding_in": MLFeatureValue(multiArray: ks),
+            "V_sliding_in": MLFeatureValue(multiArray: vs),
+            "K_full_in": MLFeatureValue(multiArray: kf),
+            "V_full_in": MLFeatureValue(multiArray: vf),
+        ]))
+        let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
+        copyBack(out1, "K_sliding_out", into: ks)
+        copyBack(out1, "V_sliding_out", into: vs)
+        copyBack(out1, "K_full_out", into: kf)
+        copyBack(out1, "V_full_out", into: vf)
+        let kv13k = out1.featureValue(for: "kv13_k")!.multiArrayValue!
+        let kv13v = out1.featureValue(for: "kv13_v")!.multiArrayValue!
+        let kv14k = out1.featureValue(for: "kv14_k")!.multiArrayValue!
+        let kv14v = out1.featureValue(for: "kv14_v")!.multiArrayValue!
+        lastKV13K = kv13k; lastKV13V = kv13v
+        lastKV14K = kv14k; lastKV14V = kv14v
+        let tC1End = CFAbsoluteTimeGetCurrent()
+        profileC1 += (tC1End - tC1Start)
+
+        // Merged chunk 2 (L15-34 + head)
+        let tC2Start = CFAbsoluteTimeGetCurrent()
+        let out2 = try m2.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: h1),
+            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+            "update_mask": MLFeatureValue(multiArray: umask),
+            "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
+            "kv13_k": MLFeatureValue(multiArray: kv13k), "kv13_v": MLFeatureValue(multiArray: kv13v),
+            "kv14_k": MLFeatureValue(multiArray: kv14k), "kv14_v": MLFeatureValue(multiArray: kv14v),
+        ]))
+        let tC2End = CFAbsoluteTimeGetCurrent()
+        profileC2 += (tC2End - tC2Start)
+
+        profilePredict += (CFAbsoluteTimeGetCurrent() - t1)
+        profileCount += 1
+        if profileCount == 1 || profileCount % 10 == 0 {
+            let n = Double(profileCount)
+            print(String(format:
+                "[Profile-2chunk] emb=%.1fms mask=%.1fms | m1=%.1f m2=%.1f (sum=%.1fms) | predict=%.1fms (%.1f tok/s)",
+                profileEmbed / n * 1000, profileMask / n * 1000,
+                profileC1 / n * 1000, profileC2 / n * 1000,
+                (profileC1 + profileC2) / n * 1000,
+                profilePredict / n * 1000,
+                1000.0 / ((profileEmbed + profilePredict) / n * 1000)))
+        }
+
+        return out2.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+    }
+
+    /// 1-chunk decode: merged_full (L0-34 + head). Most aggressive dispatch
+    /// reduction. Risk: 35-layer function may exceed the ANE stability ceiling.
+    /// ComputePlanAudit should be run to verify full ANE placement.
+    private func predictStepOneChunk(tokenID: Int, position: Int,
+                                     imageEmbedding: MLMultiArray?) throws -> Int {
+        guard let mfull = mergedFull,
+              let ks = kSlidingM, let vs = vSlidingM,
+              let kf = kFullM,    let vf = vFullM else {
+            throw CoreMLLLMError.modelNotFound("merged_full unavailable but layout=one")
+        }
+        let ctx = config.contextLength
+        let W = config.slidingWindow
+        let hidden = config.hiddenSize
+
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let hiddenIn: MLMultiArray
+        let plRaw: MLMultiArray
+        if let imageEmbedding {
+            hiddenIn = imageEmbedding
+            let totalDim = config.numLayers * config.perLayerDim
+            plRaw = try MLMultiArray(shape: [1, 1, NSNumber(value: totalDim)], dataType: .float16)
+            memset(plRaw.dataPointer, 0, totalDim * MemoryLayout<UInt16>.stride)
+        } else {
+            hiddenIn = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hidden)])
+            plRaw = try lookupPerLayerRaw(tokenID: tokenID)
+        }
+        let t1 = CFAbsoluteTimeGetCurrent()
+        profileEmbed += (t1 - t0)
+
+        let maskFull = try makeCausalMask(position: position, length: ctx)
+        let maskSliding = try makeSlidingCausalMask(position: position, W: W)
+        let umask = try makeUpdateMask(position: position, length: ctx)
+        let cosS = try lookupRoPE(table: cosSlidingTable, position: position, dim: 256)
+        let sinS = try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
+        let cosF = try lookupRoPE(table: cosFullTable, position: position, dim: 512)
+        let sinF = try lookupRoPE(table: sinFullTable, position: position, dim: 512)
+        let tMask = CFAbsoluteTimeGetCurrent()
+        profileMask += (tMask - t1)
+
+        let tCStart = CFAbsoluteTimeGetCurrent()
+        let out = try mfull.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: hiddenIn),
+            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+            "update_mask": MLFeatureValue(multiArray: umask),
+            "per_layer_raw": MLFeatureValue(multiArray: plRaw),
+            "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
+            "K_sliding_in": MLFeatureValue(multiArray: ks),
+            "V_sliding_in": MLFeatureValue(multiArray: vs),
+            "K_full_in": MLFeatureValue(multiArray: kf),
+            "V_full_in": MLFeatureValue(multiArray: vf),
+        ]))
+        copyBack(out, "K_sliding_out", into: ks)
+        copyBack(out, "V_sliding_out", into: vs)
+        copyBack(out, "K_full_out", into: kf)
+        copyBack(out, "V_full_out", into: vf)
+        let tCEnd = CFAbsoluteTimeGetCurrent()
+        profileC1 += (tCEnd - tCStart)
+
+        profilePredict += (CFAbsoluteTimeGetCurrent() - t1)
+        profileCount += 1
+        if profileCount == 1 || profileCount % 10 == 0 {
+            let n = Double(profileCount)
+            print(String(format:
+                "[Profile-1chunk] emb=%.1fms mask=%.1fms | full=%.1f | predict=%.1fms (%.1f tok/s)",
+                profileEmbed / n * 1000, profileMask / n * 1000,
+                profileC1 / n * 1000,
+                profilePredict / n * 1000,
+                1000.0 / ((profileEmbed + profilePredict) / n * 1000)))
+        }
+
+        return out.featureValue(for: "token_id")!.multiArrayValue![0].intValue
     }
 
     // MARK: - Batched prefill (seq=N)
