@@ -62,9 +62,24 @@ public final class CoreMLLLM: @unchecked Sendable {
 
     // Cross-vocabulary (Qwen -> Gemma) speculative decoding — Route B
     private var crossVocabEngine: CrossVocabSpeculativeEngine?
-    /// Toggle cross-vocab speculation on/off. When both MTP and
-    /// cross-vocab are loaded, MTP wins (better accept rate when trained).
-    public var crossVocabEnabled: Bool = true
+    /// Underlying Qwen drafter, also re-used by `drafterUnion`. Held
+    /// separately so the union can drive it without going through the
+    /// cross-vocab-only engine wrapper.
+    private var crossVocabDrafter: CrossVocabDraft?
+    /// Toggle cross-vocab speculation on/off. Defaults to OFF on 2026-04-15
+    /// after on-device testing showed the Qwen drafter runs ~10× slower
+    /// than Mac projection, producing 1.8 tok/s with degraded output on
+    /// iPhone 17 Pro. Opt-in until drafter cost + bootstrap-TTFT + K=3↔K=1
+    /// numerical alignment (roadmap 11c) are investigated. MTP preserves
+    /// priority when loaded.
+    public var crossVocabEnabled: Bool = false
+
+    // Phase B Task 1 — union of cross-vocab + prompt-lookup{n=2, n=3}
+    private var drafterUnion: DrafterUnion?
+    /// Opt-in for Phase B union. Default off until iPhone baseline check
+    /// confirms no regression (per merge discipline in docs/HANDOFF.md).
+    /// Takes precedence over crossVocabEnabled when both are true.
+    public var drafterUnionEnabled: Bool = false
 
     // Generation metrics
     public private(set) var tokensPerSecond: Double = 0
@@ -72,6 +87,28 @@ public final class CoreMLLLM: @unchecked Sendable {
     public var mtpTokensPerRound: Double { mtpEngine?.tokensPerRound ?? 0 }
     public var crossVocabAcceptanceRate: Double { crossVocabEngine?.acceptanceRate ?? 0 }
     public var crossVocabTokensPerCycle: Double { crossVocabEngine?.tokensPerCycle ?? 0 }
+    public var drafterUnionAcceptanceRate: Double { drafterUnion?.acceptanceRate ?? 0 }
+    public var drafterUnionTokensPerCycle: Double { drafterUnion?.tokensPerCycle ?? 0 }
+    public var drafterUnionPicks: [String: Int] {
+        guard let u = drafterUnion else { return [:] }
+        var out: [String: Int] = [:]
+        for (k, v) in u.picks { out[k.rawValue] = v }
+        return out
+    }
+    /// Hard-disable the cross-vocab source inside the union. Used by the
+    /// Mac-side bit-exact verifier to keep CV out of the picture when the
+    /// staging Qwen has the wrong context length (gotcha #2 in
+    /// docs/SESSION_STATE.md). On iPhone leave this `false`.
+    public func setDrafterUnionCrossVocabDisabled(_ disabled: Bool) {
+        drafterUnion?.crossVocabDisabled = disabled
+    }
+    /// Override the union's PLD rolling-accept gate. Setting it above 1.0
+    /// hard-disables PLD for the whole generation — useful for narrowing
+    /// down whether divergence vs serial decode comes from PLD-induced
+    /// verify-chunk drift or from union bookkeeping.
+    public func setDrafterUnionPLDThreshold(_ value: Double) {
+        drafterUnion?.pldThreshold = value
+    }
 
     // Token-ID recording for offline accept-rate benches. These are populated
     // from the last `generate` / `stream` call and live until the next one.
@@ -206,11 +243,25 @@ public final class CoreMLLLM: @unchecked Sendable {
                     computeUnits: .cpuAndGPU)
                 llm.crossVocabEngine = CrossVocabSpeculativeEngine(
                     engine: engine, drafter: drafter)
+                llm.crossVocabDrafter = drafter
+                llm.drafterUnion = DrafterUnion(
+                    engine: engine, crossVocab: drafter, K: engine.verifyK)
                 print("[CrossVocab] Drafter loaded (K=\(engine.verifyK), "
                       + "coverage q->g=\(String(format: "%.1f", Double(map.qwenToGemma.filter { $0 >= 0 }.count) / Double(map.qwenVocabSize) * 100))%)")
             } catch {
                 print("[CrossVocab] Failed to load drafter: \(error)")
             }
+        }
+
+        // PLD-only union: still useful when cross-vocab drafter assets are
+        // absent (typical for stripped iPhone bundles). Phase B's union
+        // collapses to prompt-lookup{n=2,n=3} which has near-zero cost.
+        if llm.drafterUnion == nil,
+           let engine = llm.chunkedEngine,
+           engine.hasVerify {
+            llm.drafterUnion = DrafterUnion(
+                engine: engine, crossVocab: nil, K: engine.verifyK)
+            print("[DrafterUnion] PLD-only mode (cross-vocab drafter not loaded)")
         }
 
         // Vision model (optional, lazy loaded on first image)
@@ -471,12 +522,22 @@ public final class CoreMLLLM: @unchecked Sendable {
                         let startTime = CFAbsoluteTimeGetCurrent()
                         var tokenCount = 0
                         let maxDecode = min(ctxLimit - engine.currentPosition, maxTokens)
-                        // Drafter selection: MTP wins when both are loaded and
-                        // enabled (trained-drafter accept rate > cross-vocab).
+                        // Drafter selection priority (highest first):
+                        //   1. MTP (trained drafter, best when present)
+                        //   2. DrafterUnion (Phase B; cv + pld-n2 + pld-n3)
+                        //   3. CrossVocab alone (legacy, kept as opt-out fallback)
+                        // Only the selected engine resets — the union and the
+                        // CV-alone engine share an underlying CrossVocabDraft,
+                        // so simultaneous use would corrupt Qwen state.
                         let mtpSpec = mutableSelf.mtpEnabled ? mutableSelf.mtpEngine : nil
-                        let cvSpec = (mtpSpec == nil && mutableSelf.crossVocabEnabled)
+                        let unionSpec = (mtpSpec == nil && mutableSelf.drafterUnionEnabled)
+                            ? mutableSelf.drafterUnion : nil
+                        let cvSpec = (mtpSpec == nil && unionSpec == nil
+                                      && mutableSelf.crossVocabEnabled)
                             ? mutableSelf.crossVocabEngine : nil
                         mtpSpec?.reset()
+                        unionSpec?.reset()
+                        unionSpec?.setPrefillHistory(tokens.map { Int32($0) })
                         cvSpec?.reset()
                         cvSpec?.setPrefillHistory(tokens.map { Int32($0) })
 
@@ -494,6 +555,20 @@ public final class CoreMLLLM: @unchecked Sendable {
                                         nid = tok
                                         break
                                     }
+                                    let text = mutableSelf.tokenizer.decode(tokens: [Int(tok)])
+                                    continuation.yield(text)
+                                    tokenCount += 1
+                                }
+                            } else if let se = unionSpec, se.shouldSpeculate {
+                                let emitted = try autoreleasepool {
+                                    try se.speculateStep(nextID: &nid)
+                                }
+                                for tok in emitted {
+                                    if eosIDs.contains(Int(tok)) {
+                                        nid = tok
+                                        break
+                                    }
+                                    mutableSelf.lastEmittedTokenIDs.append(tok)
                                     let text = mutableSelf.tokenizer.decode(tokens: [Int(tok)])
                                     continuation.yield(text)
                                     tokenCount += 1
@@ -579,6 +654,7 @@ public final class CoreMLLLM: @unchecked Sendable {
         }
         mtpEngine?.reset()
         crossVocabEngine?.reset()
+        drafterUnion?.reset()
         tokensPerSecond = 0
     }
 

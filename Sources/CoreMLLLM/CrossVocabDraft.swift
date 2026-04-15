@@ -139,6 +139,13 @@ public final class CrossVocabDraft {
     private let state: MLState?
 
     /// Production initializer — loads a Qwen monolithic model.
+    ///
+    /// The caller-supplied `contextLength` is only a hint; the actual
+    /// context length is derived from the model's `causal_mask` input
+    /// shape (the shipping Qwen 2.5 0.5B mlpackage compiles at
+    /// ctx=512, not the target Gemma's 2048, so passing the Gemma
+    /// config value blindly used to crash with a MultiArray shape
+    /// mismatch at the first prediction).
     public convenience init(modelURL: URL,
                             vocabMap: CrossVocabMap,
                             K: Int,
@@ -152,14 +159,29 @@ public final class CrossVocabDraft {
         let m = try MLModel(contentsOf: modelURL, configuration: cfg)
         let st = m.makeState()
 
+        // Auto-detect the drafter's own context length from its
+        // causal_mask input, falling back to the hint only if the model
+        // lacks that feature (shouldn't happen for Qwen but don't crash).
+        var detectedCtx = contextLength
+        if let desc = m.modelDescription.inputDescriptionsByName["causal_mask"],
+           let c = desc.multiArrayConstraint,
+           let last = c.shape.last?.intValue,
+           last > 0 {
+            detectedCtx = last
+            if detectedCtx != contextLength {
+                print("[CrossVocab] auto-detected drafter ctx=\(detectedCtx) (caller passed \(contextLength))")
+            }
+        }
+        let ctxLength = detectedCtx
+
         let idsBuf = try MLMultiArray(shape: [1, 1], dataType: .int32)
         let posBuf = try MLMultiArray(shape: [1], dataType: .int32)
         let cmBuf = try MLMultiArray(
-            shape: [1, 1, 1, NSNumber(value: contextLength)], dataType: .float16)
+            shape: [1, 1, 1, NSNumber(value: ctxLength)], dataType: .float16)
         let umBuf = try MLMultiArray(
-            shape: [1, 1, NSNumber(value: contextLength), 1], dataType: .float16)
+            shape: [1, 1, NSNumber(value: ctxLength), 1], dataType: .float16)
 
-        let ctx = contextLength
+        let ctx = ctxLength
         let mlStep: StepFn = { [m, st, idsBuf, posBuf, cmBuf, umBuf] qwenToken, position in
             if position >= ctx { return -1 }
 
@@ -187,7 +209,7 @@ public final class CrossVocabDraft {
         self.init(stepFn: mlStep,
                   vocabMap: vocabMap,
                   K: K,
-                  contextLength: contextLength,
+                  contextLength: ctxLength,
                   model: m,
                   state: st)
     }

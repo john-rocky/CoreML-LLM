@@ -118,41 +118,65 @@ public final class CrossVocabSpeculativeEngine {
         }
 
         // 2. Verify on target.
-        var verifyTokens = [nextID]
-        verifyTokens.append(contentsOf: burst.drafts.dropLast())
+        //    Cap proposals to K-1 across all sources so every accepted token's
+        //    KV is actually written by verify — verify writes K KV slots for
+        //    K inputs, and committing the K-th draft would mean the token at
+        //    slot K+1 (the correction / bonus) had no KV written, leaving a
+        //    hole the next burst silently reads as garbage. Back-port of the
+        //    DrafterUnion fix; previously ran with drafts.count == K and hit
+        //    this bug on every all-accept cycle.
+        let useProps = Array(burst.drafts.prefix(K - 1))
+        let compareLen = useProps.count
+        var verifyTokens = [Int32](repeating: 0, count: K)
+        verifyTokens[0] = nextID
+        for (i, t) in useProps.enumerated() { verifyTokens[i + 1] = t }
         let targetArgmax = try engine.verifyCandidates(
             tokens: verifyTokens, startPosition: pos)
 
-        // 3. Accept prefix.
-        var emitted: [Int32] = [nextID]
-        emitted.reserveCapacity(K + 1)
+        // 3. Accept prefix (only draft positions).
         var matchCount = 0
-        for k in 0..<K {
-            if burst.drafts[k] == targetArgmax[k] {
-                emitted.append(burst.drafts[k])
+        for k in 0..<compareLen {
+            if useProps[k] == targetArgmax[k] {
                 matchCount += 1
             } else {
-                emitted.append(targetArgmax[k])
                 break
             }
         }
 
-        // 4. Advance target position and re-anchor drafter.
+        // 4. Emitted = [nextID, matched...]. Do NOT include the carry
+        //    (correction / bonus argmax) — that becomes next burst's seed.
+        //    Emitting it here AND using it as the next nextID re-commits
+        //    the same token at two consecutive positions, which shows up
+        //    in output as "some some context context about about" — the
+        //    carry-token double-emit bug this back-port fixes.
+        var emitted: [Int32] = [nextID]
+        emitted.reserveCapacity(matchCount + 1)
+        for k in 0..<matchCount { emitted.append(useProps[k]) }
+
+        let carry: Int32
+        if matchCount < compareLen {
+            carry = targetArgmax[matchCount]  // correction
+        } else if matchCount < K {
+            carry = targetArgmax[matchCount]  // bonus
+        } else {
+            carry = targetArgmax[K - 1]  // defensive; unreachable given K-1 cap
+        }
+
+        // 5. Advance target position and re-anchor drafter.
         let committed = matchCount + 1
         engine.currentPosition = pos + committed
         try drafter.applyCommit(matchCount: matchCount, burst: burst)
 
-        // 5. Update metrics + rolling accept.
+        // 6. Update metrics + rolling accept.
         totalCycles += 1
         totalAccepted += matchCount
         totalEmitted += emitted.count
-        let rate = Double(matchCount) / Double(K)
+        let rate = Double(matchCount) / Double(max(compareLen, 1))
         rollingAcceptance = rollingAlpha * rate
             + (1 - rollingAlpha) * rollingAcceptance
 
-        // 6. nextID = last emitted; it will be consumed by the next cycle's
-        //    verify (target side) OR next single-step (fallback).
-        nextID = emitted.last!
+        // 7. Carry becomes next burst's seed (NOT emitted from this cycle).
+        nextID = carry
         return emitted
     }
 
