@@ -351,7 +351,10 @@ struct ChatView: View {
         } else {
             content = text
         }
-        messages.append(ChatMessage(role: .user, content: content, imageData: attachedImageData))
+        let userMessage = ChatMessage(role: .user, content: content,
+                                       imageData: attachedImageData)
+        let userMessageId = userMessage.id
+        messages.append(userMessage)
         inputText = ""
         streamingText = ""
 
@@ -368,6 +371,20 @@ struct ChatView: View {
                     let opts = VideoProcessor.Options(
                         fps: 1.0, maxFrames: frames,
                         includeAudio: includeAudio)
+                    // Surface the same frames the model is about to see in the
+                    // chat bubble. Extraction is fast (~50 ms × N at 1 fps) so
+                    // we do it inline before kicking off inference, keeping the
+                    // thumbnail row in sync with the prompt the encoder gets.
+                    let extracted = try? await VideoProcessor.extractFrames(
+                        from: videoURL, options: opts)
+                    if let extracted, !extracted.isEmpty {
+                        let thumbs = await Self.buildThumbnails(extracted)
+                        await MainActor.run {
+                            if let idx = messages.firstIndex(where: { $0.id == userMessageId }) {
+                                messages[idx].videoFrames = thumbs
+                            }
+                        }
+                    }
                     stream = try await runner.generate(
                         messages: messages, videoURL: videoURL, videoOptions: opts)
                 } else {
@@ -422,6 +439,36 @@ struct ChatView: View {
         selectedVideoURL = nil
         selectedVideoLabel = nil
         selectedVideoItem = nil
+    }
+
+    /// Downscale each frame to ~96 px on the long edge and JPEG-encode.
+    /// Runs off the main actor; output is small enough (~3–6 KB / thumb)
+    /// that storing it in `ChatMessage` keeps the bubble lightweight.
+    private static func buildThumbnails(
+        _ frames: [VideoProcessor.Frame]
+    ) async -> [(Data, Double)] {
+        await Task.detached(priority: .userInitiated) {
+            let target: CGFloat = 96
+            return frames.compactMap { frame -> (Data, Double)? in
+                let w = CGFloat(frame.image.width)
+                let h = CGFloat(frame.image.height)
+                let scale = max(w, h) > target ? target / max(w, h) : 1
+                let tw = max(1, Int(w * scale))
+                let th = max(1, Int(h * scale))
+                guard let ctx = CGContext(
+                    data: nil, width: tw, height: th, bitsPerComponent: 8,
+                    bytesPerRow: tw * 4,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue).rawValue
+                ) else { return nil }
+                ctx.interpolationQuality = .medium
+                ctx.draw(frame.image, in: CGRect(x: 0, y: 0, width: tw, height: th))
+                guard let cg = ctx.makeImage(),
+                      let data = UIImage(cgImage: cg).jpegData(compressionQuality: 0.7)
+                else { return nil }
+                return (data, frame.timestampSeconds)
+            }
+        }.value
     }
 
     private func toggleRecording() {
@@ -597,6 +644,29 @@ struct MessageBubble: View {
                         .frame(maxWidth: 200, maxHeight: 200)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                 }
+                if let frames = message.videoFrames, !frames.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        LazyHStack(alignment: .top, spacing: 6) {
+                            ForEach(Array(frames.enumerated()), id: \.offset) { _, item in
+                                let (data, ts) = item
+                                if let uiImage = UIImage(data: data) {
+                                    VStack(spacing: 2) {
+                                        Image(uiImage: uiImage)
+                                            .resizable()
+                                            .scaledToFill()
+                                            .frame(width: 64, height: 64)
+                                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                                        Text(Self.timestampLabel(ts))
+                                            .font(.caption2.monospacedDigit())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .frame(maxWidth: 280)
+                }
                 Text(message.content)
                     .padding(.horizontal, 14).padding(.vertical, 10)
                     .background(backgroundColor)
@@ -613,6 +683,11 @@ struct MessageBubble: View {
         case .assistant: Color(.systemGray5)
         case .system: Color.orange.opacity(0.2)
         }
+    }
+
+    private static func timestampLabel(_ seconds: Double) -> String {
+        let total = max(0, Int(seconds.rounded()))
+        return String(format: "%02d:%02d", total / 60, total % 60)
     }
 }
 
