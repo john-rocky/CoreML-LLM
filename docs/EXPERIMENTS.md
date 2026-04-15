@@ -38,7 +38,18 @@ See `docs/SPEED_8K.md` for the overall speed roadmap and tier assignments.
 
 - Files: `conversion/models/gemma4_lite_chunks.py`, `conversion/models/gemma4_lite_wrapper.py`
 - Idea: Two chunks (embedding + L0–14) and (L15–34 + LM head). Fewer chunks = less per-step overhead, but risks the ANE compiler stability ceiling.
-- Status: kept as a fallback in case the 4-chunk split has problems on a new OS release. Not the default.
+- Status: kept as a fallback in case the 4-chunk split has problems on a new OS release. Not the default. Note: predates SWA, uses ctx-sized KV cache for every layer — not suitable for shipping.
+
+### SWA 2-chunk / 1-chunk consolidation  —  Prototype (2026-04-15)
+
+- Files: `conversion/models/gemma4_swa_merged2.py` (2-chunk), `conversion/models/gemma4_swa_merged1.py` (1-chunk), `conversion/build_merged_chunks.py`, `conversion/test_merged_parity.py`, `Sources/CoreMLLLM/ChunkedEngine.swift` (auto-detect + dispatch), `docs/CHUNK_CONSOLIDATION_BENCH.md`
+- Motivation: `docs/BASELINE_SPEED_AUDIT.md` shows 4×2.3 ms dispatch overhead per step. Halving dispatches ≈ +14 tok/s on the 2K decode path.
+- Idea:
+  - **2-chunk**: `MergedChunk12` (L0-14 + PLE, owns KV) -> `MergedChunk34` (L15-34 + norm + LM head). Reuses `_run_layer_swa` from the shipping builder, so layer math is byte-identical — composition only.
+  - **1-chunk**: `MergedChunk1` (all 35 layers, PLE, norm, LM head) in a single graph. kv13/kv14 stay internal so the Swift runtime never materialises them.
+- Runtime: `ChunkedEngine` auto-detects layout by file presence; falls back to the 4-chunk path if merged files are missing. Merged layouts allocate their own 12×W + 3×ctx KV buffers. Prefill / speculative-verify paths keep the 4-chunk split (dispatch savings there are negligible and their shapes differ).
+- Risk (not yet exercised on device): the ANE compiler stability ceiling. 15-layer merged chunk1 is near the line we hit in the WFA experiment; 35-layer merged_full is almost certainly past it. `ComputePlanAudit` gates shipping. See the bench doc for pass/ship criteria.
+- Status as of 2026-04-15: builder, parity test and runtime wiring landed. Numerical parity on CPU-torch unverified (requires HF weights) but the merged forward paths re-use the reference `_run_layer_swa`, so failure would indicate a composition bug, not a math bug. Device bench pending.
 
 ### Stateless 4-chunk (no MLState)  —  Shipping
 
@@ -117,6 +128,14 @@ See `docs/SPEED_8K.md` for the overall speed roadmap and tier assignments.
 - **Result**: `error code: -14` ("Failed to build the model execution plan") on both Mac ANE and iPhone 17 Pro ANE. The `coreml_update_state` op does not generate a valid ANE execution plan.
 - **Root cause**: MLState is GPU-only on current hardware/OS. HuggingFace's WWDC24 Mistral CoreML reference explicitly states stateful KV is "excellent for GPUs on Mac computers" and ANE requires "additional adaptations." Apple's own on-device Llama 3.1 and smpanaro/coreml-llm-cli both use stateless explicit-I/O KV, not MLState. The `coreml_update_state` MIL op is not supported by the ANE compiler as of iOS 26 / coremltools 9.0.
 - **Conclusion**: dispatch-overhead hypothesis (FUNDAMENTAL_UNTRIED.md §0) remains valid as a bottleneck description, but MLState cannot address it on ANE. Alternative paths to reduce dispatch overhead: (1) chunk consolidation (4→2 chunks), (2) speculative decoding (amortize dispatch across multiple tokens per burst).
+
+### MLState + KV heads padded to 32  —  Rejected (2026-04-15)
+
+- Files: `conversion/models/gemma4_stateful_padded.py`, `conversion/build_stateful_padded.py` (on branch `worktree-agent-ad21e314`, not in main). Findings in `docs/SPLIT_ROTATE_FINDINGS.md` and `docs/SPLIT_ROTATE_BENCH.md`.
+- Idea: hypothesis that error -14 was caused by the non-mod-32 `num_kv_heads=1` dim being rejected by ANE's 32-wide tile scheduler. Probe: pad KV heads 1→32 in both stateless (`PaddedKVChunk2`) and stateful (`StatefulPaddedChunk2`) variants.
+- Part 1 result: PyTorch parity between `StatelessChunk2` and `PaddedKVChunk2` is bit-exact on all finite outputs; padded heads stay zero as expected.
+- Part 2 result: `build_stateful_padded.py --ctx 512 --nbits 0 --smoke-test` → conversion emits the **same** `error code: -14` warning at save time; Mac CPU_ONLY predict returns finite outputs in 49 ms (graph is runtime-valid on CPU). Device retry would reproduce -14 on ANE.
+- **Conclusion**: 32-alignment is **not** the cause of error -14. The ANE compiler does not schedule `coreml_update_state` regardless of the padded tensor widths. ANEMLL's `--split-rotate` is a separate multi-function-loading workaround, not an alignment fix. No further MLState-on-ANE work is warranted; any stateful path must target GPU (`CPU_AND_GPU`) as the WWDC24 Mistral demo does.
 
 ### SuffixDecoding (CPU-only draft)  —  Measured, demoted to auxiliary (2026-04-13)
 
