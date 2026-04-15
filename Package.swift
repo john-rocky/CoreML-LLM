@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "CoreMLLLM", targets: ["CoreMLLLM"]),
         .executable(name: "accept-rate-bench", targets: ["AcceptRateBench"]),
         .executable(name: "coreml-llm-smoke", targets: ["CoreMLLLMSmoke"]),
+        .executable(name: "union-bitexact", targets: ["UnionBitExact"]),
     ],
     dependencies: [
         .package(url: "https://github.com/huggingface/swift-transformers", from: "0.1.12"),
@@ -40,6 +41,15 @@ let package = Package(
             name: "AcceptRateBench",
             dependencies: ["CoreMLLLM"],
             path: "Sources/accept-rate-bench",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // Mac-only bit-exact verifier for DrafterUnion (Phase B Task 1).
+        // Runs each prompt twice (serial vs union) and asserts the
+        // emitted token streams match — this gates the iPhone trip.
+        .executableTarget(
+            name: "UnionBitExact",
+            dependencies: ["CoreMLLLM"],
+            path: "Sources/union-bitexact",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
