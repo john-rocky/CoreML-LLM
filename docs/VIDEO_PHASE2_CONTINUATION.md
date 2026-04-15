@@ -259,14 +259,26 @@ macro content (object names, motion direction) even if phrasing differs.
 
 ## Step 4 — Ship
 
-- Update `docs/MULTIMODAL.md` — remove the "Phase 2 pending" paragraph
-  and the pool-hack note; add `vision_video.mlpackage` to the file list.
-- Bump the HF release (`mlboydaisuke/gemma-4-E2B-coreml`) to include
-  `vision_video.mlpackage`.
-- Update `ModelDownloader.ModelInfo.gemma4e2b.size` to reflect the new
-  artifact (adds ~150 MB).
-- Post-merge: audit `tokensPerFrame` default — once every shipped model
-  has the video encoder, the pool-fallback branch can be deleted.
+Done in this branch:
+- `docs/MULTIMODAL.md` — "Phase 2 pending" text replaced with the
+  `vision_video.mlpackage` description.
+- `convert_gemma4_multimodal.py --video-vision` — one-shot CLI.
+- Swift: video encoder loader + `concatVideoFrameFeatures`, with the
+  Phase 1 pool kept as a fallback when the artifact is absent.
+
+Sequencing for the actual ship:
+1. **HF release first**: upload the compiled `vision_video.mlmodelc`
+   (and/or `.mlpackage`) to `mlboydaisuke/gemma-4-E2B-coreml`.
+   Ordering matters — bumping `ModelDownloader` before the blob is
+   live will 404 existing users.
+2. **Then** bump `ModelDownloader.ModelInfo.gemma4e2b`: append the
+   `vision_video.mlmodelc/*` entries (mirror the shape of the
+   existing `vision.mlmodelc/*` block, ~150 MB post-palettize;
+   weights size is the only non-trivial estimate — read the
+   `weights/weight.bin` size on HF once uploaded).
+3. Post-release: audit `tokensPerFrame` default — once every shipped
+   model bundle has the video encoder, the pool-fallback branch in
+   `concatFrameFeatures` can be deleted.
 
 ---
 
