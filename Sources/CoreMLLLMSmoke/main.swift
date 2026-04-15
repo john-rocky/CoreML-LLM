@@ -35,6 +35,15 @@ struct Smoke {
             let dt = CFAbsoluteTimeGetCurrent() - t0
             print("[smoke] loaded in \(String(format: "%.1f", dt))s — model=\(llm.modelName)")
 
+            // TEMP Phase B trip: mirror LLMRunner iPhone-trip overrides so
+            // the Mac CLI exercises the same DrafterUnion + CV path.
+            if ProcessInfo.processInfo.environment["UNION_TRIP"] != nil {
+                llm.mtpEnabled = false
+                llm.drafterUnionEnabled = true
+                llm.crossVocabEnabled = true
+                print("[smoke] UNION_TRIP=1 — mtp=off union=on cv=on")
+            }
+
             print("[smoke] prompt: \(prompt)")
             print("[smoke] max_tokens=\(maxTokens)")
 
