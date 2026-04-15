@@ -1,23 +1,23 @@
 # Next-session handoff
 
-**Last updated:** end of 2026-04-15 session, post v3 argmax-mode bench.
+**Last updated:** end of 2026-04-15 session, post v4 chain-mode bench.
 
 ## Read this first
 
 To resume cleanly, the next session should:
 
 1. Open this file (`docs/HANDOFF.md`) — takes 5 minutes.
-2. Read `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md` — the finding that
-   invalidates Phase A5 projections.
-3. Read `docs/PHASE_B_V3_ARGMAX_FINDINGS.md` — v3 bench ran; the
-   obvious "decode_q1 vs verify_qK drift" hypothesis does NOT
-   explain the 3–9× live gap. Next step proposed in §"What's still
-   open".
-4. Skim `docs/SESSION_STATE.md` for the exact PR / branch / task state.
-5. Read `docs/MAC_FIRST_EXECUTION_PLAN.md` for the phased itinerary
-   and the Mac-vs-iPhone authority split.
-6. `docs/PHASE_A5_DECISION.md` — read for historical context, but its
-   concrete projections are superseded.
+2. Read `docs/PHASE_B_V4_CHAIN_FINDINGS.md` — **live gap is
+   reproduced by the bench in chain mode. Mechanism identified: fp16
+   sensitivity of batched `verify_qK` to slot 1..K-1 content.** Drives
+   the Union-shape decision.
+3. Read `docs/PHASE_B_V3_ARGMAX_FINDINGS.md` — v3 ruled out `decode_q1`
+   vs `verify_qK` drift; v4 identifies the actual mechanism.
+4. Read `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md` — original live-gap
+   finding.
+5. Skim `docs/SESSION_STATE.md` for the exact PR / branch / task state.
+6. Read `docs/MAC_FIRST_EXECUTION_PLAN.md` for the phased itinerary.
+7. `docs/PHASE_A5_DECISION.md` — historical context only, superseded.
 
 No need to touch MTP Path A, PR #17, or PR #33 — all deprioritised
 with reasons in the roadmap's Rejected table.
@@ -27,28 +27,31 @@ with reasons in the roadmap's Rejected table.
 Copy-paste this at the start of the next `/claude` session so the
 model walks in with correct framing:
 
-> v3 argmax-mode bench ran (eval/accept-rate-bench-v3-target-argmax.json).
-> Surprise: argmax mode is ~equal to oracle on Mac — 3–9× live gap from
-> PHASE_B is NOT explained by decode_q1 vs verify_qK fp16 drift alone.
+> v4 chain-mode bench ran (eval/accept-rate-bench-v4-chain.json).
+> CHAIN MODE REPRODUCES THE LIVE GAP. Mechanism: drafter proposals in
+> verify slots 1..K-1 cause fp16 drift in verify_qK's argmax chain;
+> this breaks byte-exact n-gram matching for prompt-lookup and hurts
+> cross-vocab acceptance. Gotcha #3's chain-accept equivalence
+> argument holds in exact arithmetic but not at fp16.
 > Read (in order):
-> 1. docs/PHASE_B_V3_ARGMAX_FINDINGS.md — v3 results and the proposed
->    chain-following argmax follow-up (drafter proposals in verify
->    slots, not zeros). ~1–2 h to implement + measure.
-> 2. docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md — original live-gap finding
->    and the three Union-shape candidates (PL-only / raise gates /
->    defer to Mirror SD).
-> 3. docs/HANDOFF.md — this file; priority ordering is updated.
-> 4. docs/SESSION_STATE.md — current PR / branch / task state.
+> 1. docs/PHASE_B_V4_CHAIN_FINDINGS.md — v4 results per category;
+>    verdicts on the three Union-shape candidates (PL-only rejected;
+>    raise gates viable short-term; defer to Mirror SD likely right
+>    answer — but same verify chunk in Mirror SD, so speculative
+>    decoding is capped unless verify chunks are re-quantised).
+> 2. docs/PHASE_B_V3_ARGMAX_FINDINGS.md — v3 ruled out decode_q1 vs
+>    verify_qK drift as the dominant factor.
+> 3. docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md — original live-gap finding.
+> 4. docs/HANDOFF.md — priority ordering updated.
+> 5. docs/SESSION_STATE.md — current PR / branch / task state.
 >
-> Start on v3 follow-up: extend accept-rate-bench `--mode argmax` to a
-> chain-following variant that feeds drafter proposals into verify
-> slots 1..K-1 (not zeros). If stats still ≈ oracle, the live gap is
-> implementation-level (bootstrap replay / CV state / rolling gate)
-> and the Union-shape decision can proceed on that basis.
+> Start on Union-shape decision per v4 verdicts, OR investigate the
+> remaining chat CV gap (v4 chain 2.31 vs live 1.34) by
+> instrumenting `DrafterUnion.speculateStep` directly.
 >
-> Bench code and the `bench*` helpers on CoreMLLLM are already public
-> (this branch's PR). Docs auto-merge; bench/harness-only code
-> changes also auto-merge per user note 2026-04-15.
+> Bench code and `bench*` helpers on CoreMLLLM are public (merged).
+> Docs auto-merge; bench/harness-only code changes also auto-merge
+> per user note 2026-04-15.
 
 ## Full roadmap — Phase A → final
 
@@ -151,23 +154,27 @@ iPhone trip with PR #57 env vars on (SPECULATIVE_PROFILE=1, COMPUTE_PLAN_AUDIT=1
 #### Actual Phase B priority ordering (post-PR #62)
 
 1. ~~**Rebuild accept-rate-bench with target-argmax mode**~~ —
-   **DONE 2026-04-15** (v3 artifact + findings doc). Surprise finding:
-   argmax mode ≈ oracle mode on Mac; the `decode_q1`/`verify_qK` fp16
-   drift alone does not explain the 3–9× live gap. See
-   `docs/PHASE_B_V3_ARGMAX_FINDINGS.md` and
-   `eval/accept-rate-bench-v3-target-argmax.json`.
-2. **Close the bench-vs-live gap before re-deciding Union shape.**
-   v3 ruled out the obvious methodological culprit, so the remaining
-   delta is in the live `DrafterUnion` path (bootstrap replay,
-   cross-vocab state, rolling-accept gate, or verify slot 1..K-1
-   semantics). Next concrete step suggested in
-   `PHASE_B_V3_ARGMAX_FINDINGS.md` §"What's still open": add a
-   chain-following argmax mode (drafter proposals in verify slots,
-   not zeros) and re-measure. ~1–2 h.
-3. **Then** re-decide Union shape. Three candidates in
-   `PHASE_B_LIVE_ACCEPT_RATE_GAP.md` §"Implications": PL-only union,
-   raise rolling gates to collapse-to-baseline fast, or defer Union
-   until Mirror SD.
+   **DONE 2026-04-15** (v3). `decode_q1`/`verify_qK` fp16 drift is
+   real on Mac but does not explain the 3–9× live gap. See
+   `docs/PHASE_B_V3_ARGMAX_FINDINGS.md`.
+2. ~~**Chain-following argmax mode**~~ — **DONE 2026-04-15** (v4).
+   Drafter proposals in verify slots 1..K-1 reproduce the live gap
+   directionally on code/qa/summary. Mechanism identified: fp16
+   sensitivity of batched verify_qK to slot 1..K-1 content, breaking
+   PL's byte-exact n-gram matching. See
+   `docs/PHASE_B_V4_CHAIN_FINDINGS.md` and
+   `eval/accept-rate-bench-v4-chain.json`.
+3. **Union-shape decision.** Per v4 §"Implications":
+    - **PL-only Union:** rejected (net-regression on 3/4 categories
+      in chain-mode numbers).
+    - **Raise rolling gates:** viable short-term — preserves baseline,
+      no speculative gain but no regression.
+    - **Defer until Mirror SD + verify re-quantisation:** most likely
+      right answer. Mirror SD alone doesn't fix the fp16 batched-verify
+      sensitivity; the verify chunks need tighter numerics.
+4. **Remaining chat CV gap** (v4 chain 2.31 vs live 1.34): investigate
+   by instrumenting `DrafterUnion.speculateStep` directly
+   (rolling-gate, bootstrap, CV state drift). Not bench-harness work.
 4. **Then** iPhone trip to confirm Mac finding replicates on ANE
    hardware. Expected: same ~30 % regression pattern with current
    Union defaults off. Bundle with B4 MLComputePlan audit.

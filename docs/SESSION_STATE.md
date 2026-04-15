@@ -1,6 +1,6 @@
 # Session state — rolling handoff
 
-**Last updated:** 2026-04-15 late (post v3 argmax-mode bench).
+**Last updated:** 2026-04-15 late (post v4 chain-mode bench).
 
 Keep this doc short and always-current. Any engineer / agent picking up
 should be able to cold-start from it in under 10 minutes.
@@ -160,13 +160,17 @@ device trips opportunistically.
    `causal_mask` input shape and ignores the caller-supplied
    `contextLength` if it conflicts. The accept-rate bench's
    hard-coded 512 still works but is no longer load-bearing.
-3. **Oracle replay ≠ real verify semantics only past the first miss.**
-   At temp=0, verify's target argmax at position P+k+1 conditions on
-   history ending with the drafter's d_k (NOT the true emitted[P+k]).
-   Oracle replay conditions on the true history. For "chain-accept"
-   semantics where we only count matches while every prior position
-   also matched, the two are identical. Don't change the replay to
-   "count all K positions independently" — it breaks this equivalence.
+3. **Oracle replay ≈ real verify semantics — but only in exact
+   arithmetic.** At temp=0, verify's argmax at P+k+1 depends only on
+   history ending with the drafter's d_k; if d_k matches the true
+   emitted[P+k] (by chain-accept definition), the two agree. **v4
+   empirically contradicts this at fp16.** Drafter proposals in
+   verify slots 1..K-1 cause batched-computation fp16 drift that
+   changes `argmax[0]` even when slot 0 is the same. This is how the
+   bench-vs-live 3–9× gap arises.
+   See `docs/PHASE_B_V4_CHAIN_FINDINGS.md`. Don't count "all K
+   positions independently" either — that over-counts. Use chain-mode
+   or `--mode chain` in the bench to get live-equivalent numbers.
 4. **Per-model caches.** Staging directories under
    `~/Downloads/coreml-llm-artifacts/` contain live model files. Don't
    `rm -rf` them casually. `staging-2k-fast-prefill` currently has the
