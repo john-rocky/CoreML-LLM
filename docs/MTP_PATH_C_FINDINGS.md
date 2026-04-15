@@ -195,10 +195,54 @@ Any of the following unlocks re-opening Path C:
 - The Mac-first verification methodology (§2.4). Three harnesses caught three structural bugs in one day. This pattern generalizes — every future drafter trip should open with its own equivalence test before any iPhone build.
 - `precompute.py`'s forward-hook approach to extracting a specific layer's pre-norm output. Applicable to any distillation/speculation training that has to match what a chunked target serves at inference.
 - The DeepSeek V3 MTP indexing in the training code. If someone else wants to train a K>2 drafter later, this is the correct baseline to fork.
+- `scripts/measure_verify_drift.sh` — a reproducible, iPhone-free handoff artefact for whoever investigates item 11c next (§7).
 
 ---
 
-## 6. Cross-links
+## 6. (reserved)
+
+---
+
+## 7. Handoff for item 11c: Mac-side drift measurement harness
+
+`scripts/measure_verify_drift.sh` runs `MtpMacCheck` twice against the same deploy directory — once with the two `mtp_module_*.mlmodelc` moved aside (so the speculative path is disabled and generation stays on `decode_q1`), and once with them in place (so generation goes through `verify_qK`). The only variable between the two runs is which chunk function produces each position's hidden state. Any token-stream divergence between the two runs is item 11c's drift surfacing on the target's chunks, in isolation from drafter quality.
+
+### Use
+
+```bash
+scripts/measure_verify_drift.sh <deploy-dir-with-mtp_modules> "<prompt>"
+```
+
+Required inputs in `<deploy-dir>`: verify-capable `chunk1-4.mlmodelc` (i.e. multi-function with both `decode_q1` and `verify_qK`) plus both `mtp_module_0.mlmodelc` and `mtp_module_1.mlmodelc`. `staging-2k-fast-prefill/gemma4-e2b` + Path C's compiled modules meets this exactly.
+
+Outputs under `/tmp/verify_drift/`:
+
+- `base_tokens.txt` — tokens produced by `decode_q1`-only generation.
+- `spec_tokens.txt` — tokens produced with speculation on.
+- `diff.txt` — unified diff.
+- Console summary: first-flip position, flip rate over the common prefix, baseline vs speculation tok/s, mtp acceptance.
+
+### Recorded baselines (2026-04-15, Path C modules trained on 16.2 M tokens)
+
+| Prompt | Base tok/s | Spec tok/s | Acc rate | First flip | Flip rate over common prefix |
+|---|---|---|---|---|---|
+| `"Hello"` | 30.3 | 13.8 | 16.7 % | — | 0 / 9 = 0 % |
+| `"こんにちは"` | 30.4 | 22.8 | 64.3 % | position 3 | 8 / 10 = 80 % |
+
+Interpretation:
+
+- **English:** no drift. `decode_q1` and `verify_qK` produce the *same* argmax at every position the two paths both emit. The ~55 % tok/s loss is entirely the verify-cycle overhead (~2× decode) relative to the number of accepted drafts; no correctness issue. If item 11c only addressed the overhead multiplier (e.g. reducing per-cycle cost), English workloads would become net-positive at current training acceptance rates.
+- **Japanese:** drift at position 3. By the time the model has emitted "こんにちは", "！", and one more token, the two paths agree; from position 3 onward the speculation path emits "😊" while decode emits "何か" and subsequent positions cascade. Acceptance inflates to 64.3 % because once the main model enters the degenerate "ゅ" loop, every drafter prediction agrees. This is the case that argues item 11c is a **correctness** concern, not purely perf.
+
+### Success metric for an item 11c patch
+
+A candidate 11c fix (reconverted chunks with fp32 accumulator, altered SIMD tiling, fp32 logit cast before argmax, etc.) is validated by rerunning this script on the patched chunks and checking that the Japanese flip rate drops from ~80 % toward 0 %. English flip rate is already 0 %; the English branch is the no-regression check.
+
+The script is intentionally zero-dependency: just builds `MtpMacCheck`, runs it twice, diffs. No Colab, no iPhone, no Python env. Iteration cost ≈ 2 × runtime of one MtpMacCheck pass (~5 minutes incl. cold-start ANE compile on Mac).
+
+---
+
+## 8. Cross-links
 
 - `docs/PRIORITY_ROADMAP.md` item 11c — the verify-chunk alignment blocker, upgraded from "could lift accept rates" to "load-bearing gate for any MTP drafter on this target" by this session's evidence.
 - `docs/MTP_INTEGRATION_RESULTS.md` — Path A (TFLite drafter) findings. Complementary failure mode (target-distribution mismatch vs target-runtime-drift).
