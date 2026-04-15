@@ -32,7 +32,8 @@ iPhone-measured, Mac is only for accept-rate / correctness.
 
 | PR | Status | What | Why blocked / what next |
 |---|---|---|---|
-| [#45](https://github.com/john-rocky/CoreML-LLM/pull/45) | **open, awaiting code approval** | Mac accept-rate bench + A1–A4 wiring (incorporates `origin/feature/route-b-cross-vocab-drafter` via merge) | User approval. It's the foundation for Phase B; merging is cheap and lets the bench keep running |
+| [#45](https://github.com/john-rocky/CoreML-LLM/pull/45) | **merged 2026-04-15** | Mac accept-rate bench + A1–A4 wiring (incorporates `origin/feature/route-b-cross-vocab-drafter` via merge) | iPhone baseline cleared at 31.4 tok/s; merged. |
+| [#54](https://github.com/john-rocky/CoreML-LLM/pull/54) | **open, held for iPhone baseline** | Phase B Task 1 — DrafterUnion (cv + pld-n2 + pld-n3) + Mac bit-exact verifier | Bookkeeping bit-exact (fallback-only mode); iPhone trip should record baseline + per-source picks before merge. |
 | [#33](https://github.com/john-rocky/CoreML-LLM/pull/33) | **draft** | 0d prefill bypass | 6× decode regression on device (2026-04-14); root cause not isolated. Don't merge as-is. Fresh-eyes investigation later |
 | #27 | open | MTP TFLite path fix | Owned by another session |
 | #16 | open | SuffixDecoding implementation | Superseded in effect by `feat/accept-rate-bench-phase-a1` which measured suffix = prompt-lookup in single-turn. Re-evaluate if someone wants a multi-turn session bench |
@@ -62,8 +63,13 @@ with each.
    (cross-vocab, prompt-lookup n=2, prompt-lookup n=3), pick the
    proposal with the longest matching prefix against the single target
    verify call.
-   - Exit: bit-exact output at temp=0 vs serial decode, ≥ 50 tok/s
-     chat, ≥ 60 tok/s other categories.
+   - Exit (revised 2026-04-15 — see HANDOFF.md §B1):
+     (a) matched-prefix bookkeeping bit-exact vs serial on Mac,
+     (b) on-device accept rate within ±5 % of A5 projection,
+     (c) manual quality spot-check on 5 prompts/category,
+     (d) chat ≥ 50 tok/s, other categories ≥ 60.
+   - **In-flight**: PR #54 (`feat/drafter-union`) implements (a) +
+     orchestration; (b)–(d) need iPhone trip.
 2. **Rolling-accept gate** per drafter. Cross-vocab threshold ~0.3,
    prompt-lookup ~0.1 (missing is cheap). Fall back to single-token
    decode below threshold.
