@@ -60,10 +60,28 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// Toggle MTP speculation on/off for benchmarking.
     public var mtpEnabled: Bool = true
 
+    // Cross-vocabulary (Qwen -> Gemma) speculative decoding — Route B
+    private var crossVocabEngine: CrossVocabSpeculativeEngine?
+    /// Toggle cross-vocab speculation on/off. When both MTP and
+    /// cross-vocab are loaded, MTP wins (better accept rate when trained).
+    public var crossVocabEnabled: Bool = true
+
     // Generation metrics
     public private(set) var tokensPerSecond: Double = 0
     public var mtpAcceptanceRate: Double { mtpEngine?.acceptanceRate ?? 0 }
     public var mtpTokensPerRound: Double { mtpEngine?.tokensPerRound ?? 0 }
+    public var crossVocabAcceptanceRate: Double { crossVocabEngine?.acceptanceRate ?? 0 }
+    public var crossVocabTokensPerCycle: Double { crossVocabEngine?.tokensPerCycle ?? 0 }
+
+    // Token-ID recording for offline accept-rate benches. These are populated
+    // from the last `generate` / `stream` call and live until the next one.
+    // See `docs/MAC_FIRST_EXECUTION_PLAN.md` §A1 for usage.
+    public private(set) var lastPromptTokenIDs: [Int32] = []
+    public private(set) var lastEmittedTokenIDs: [Int32] = []
+
+    /// Expose the tokenizer so a harness can re-encode / decode arbitrary
+    /// text without duplicating the swift-transformers wiring.
+    public var tokenizerRef: any Tokenizer { tokenizer }
 
     // MARK: - Public Types
 
@@ -158,6 +176,40 @@ public final class CoreMLLLM: @unchecked Sendable {
                 print("[MTP] Drafter loaded (K=\(engine.verifyK))")
             } catch {
                 print("[MTP] Failed to load drafter: \(error)")
+            }
+        }
+
+        // Cross-vocabulary drafter (Route B): Qwen 2.5 0.5B monolithic +
+        // vocab map. Looks for `cross_vocab/qwen_drafter.mlmodelc` (or
+        // `.mlpackage`) plus `cross_vocab/qwen_gemma_vocab.bin` under the
+        // model directory. Silently skipped if absent.
+        let cvDir = directory.appendingPathComponent("cross_vocab")
+        let cvCompiled = cvDir.appendingPathComponent("qwen_drafter.mlmodelc")
+        let cvPkg = cvDir.appendingPathComponent("qwen_drafter.mlpackage")
+        let cvMapURL = cvDir.appendingPathComponent("qwen_gemma_vocab.bin")
+        let cvModelURL: URL? = FileManager.default.fileExists(atPath: cvCompiled.path) ? cvCompiled
+            : FileManager.default.fileExists(atPath: cvPkg.path) ? cvPkg : nil
+        if let cvModelURL,
+           FileManager.default.fileExists(atPath: cvMapURL.path),
+           let engine = llm.chunkedEngine,
+           engine.hasVerify {
+            onProgress?("Loading cross-vocab drafter (Qwen 2.5 0.5B)...")
+            do {
+                let map = try CrossVocabMap(url: cvMapURL)
+                // Qwen 2.5 0.5B supports 32K natively; cap at target's
+                // context length so the two stay in lockstep.
+                let drafter = try CrossVocabDraft(
+                    modelURL: cvModelURL,
+                    vocabMap: map,
+                    K: engine.verifyK,
+                    contextLength: config.contextLength,
+                    computeUnits: .cpuAndGPU)
+                llm.crossVocabEngine = CrossVocabSpeculativeEngine(
+                    engine: engine, drafter: drafter)
+                print("[CrossVocab] Drafter loaded (K=\(engine.verifyK), "
+                      + "coverage q->g=\(String(format: "%.1f", Double(map.qwenToGemma.filter { $0 >= 0 }.count) / Double(map.qwenVocabSize) * 100))%)")
+            } catch {
+                print("[CrossVocab] Failed to load drafter: \(error)")
             }
         }
 
@@ -330,6 +382,10 @@ public final class CoreMLLLM: @unchecked Sendable {
 
         reset()
 
+        // Clear recording buffers and record the prompt IDs for this turn.
+        self.lastPromptTokenIDs = tokenIDs.map { Int32($0) }
+        self.lastEmittedTokenIDs = []
+
         let mutableSelf = self
         let imgFeats = imageFeatures
         let audFeats = audioFeatures
@@ -415,15 +471,21 @@ public final class CoreMLLLM: @unchecked Sendable {
                         let startTime = CFAbsoluteTimeGetCurrent()
                         var tokenCount = 0
                         let maxDecode = min(ctxLimit - engine.currentPosition, maxTokens)
-                        let specEngine = mutableSelf.mtpEnabled ? mutableSelf.mtpEngine : nil
-                        specEngine?.reset()
+                        // Drafter selection: MTP wins when both are loaded and
+                        // enabled (trained-drafter accept rate > cross-vocab).
+                        let mtpSpec = mutableSelf.mtpEnabled ? mutableSelf.mtpEngine : nil
+                        let cvSpec = (mtpSpec == nil && mutableSelf.crossVocabEnabled)
+                            ? mutableSelf.crossVocabEngine : nil
+                        mtpSpec?.reset()
+                        cvSpec?.reset()
+                        cvSpec?.setPrefillHistory(tokens.map { Int32($0) })
 
                         var nid = Int32(nextID)
                         while tokenCount < maxDecode {
                             if eosIDs.contains(Int(nid)) { break }
                             if engine.currentPosition >= ctxLimit { break }
 
-                            if let se = specEngine, se.shouldSpeculate {
+                            if let se = mtpSpec, se.shouldSpeculate {
                                 let emitted = try autoreleasepool {
                                     try se.speculateStep(nextID: &nid)
                                 }
@@ -436,7 +498,22 @@ public final class CoreMLLLM: @unchecked Sendable {
                                     continuation.yield(text)
                                     tokenCount += 1
                                 }
+                            } else if let se = cvSpec, se.shouldSpeculate {
+                                let emitted = try autoreleasepool {
+                                    try se.speculateStep(nextID: &nid)
+                                }
+                                for tok in emitted {
+                                    if eosIDs.contains(Int(tok)) {
+                                        nid = tok
+                                        break
+                                    }
+                                    mutableSelf.lastEmittedTokenIDs.append(tok)
+                                    let text = mutableSelf.tokenizer.decode(tokens: [Int(tok)])
+                                    continuation.yield(text)
+                                    tokenCount += 1
+                                }
                             } else {
+                                mutableSelf.lastEmittedTokenIDs.append(nid)
                                 let text = mutableSelf.tokenizer.decode(tokens: [Int(nid)])
                                 continuation.yield(text)
                                 tokenCount += 1
@@ -472,6 +549,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                         for _ in 0..<maxTokens {
                             if eosIDs.contains(nextID) { break }
                             if pos >= ctxLimit { break }
+                            mutableSelf.lastEmittedTokenIDs.append(Int32(nextID))
                             let text = mutableSelf.tokenizer.decode(tokens: [nextID])
                             continuation.yield(text)
                             tokenCount += 1
@@ -500,6 +578,7 @@ public final class CoreMLLLM: @unchecked Sendable {
             monolithicState = monolithicModel?.makeState()
         }
         mtpEngine?.reset()
+        crossVocabEngine?.reset()
         tokensPerSecond = 0
     }
 
