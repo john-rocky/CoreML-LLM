@@ -1,5 +1,13 @@
 # Phase A5 — drafter decision + theoretical on-device ceiling
 
+> ⚠️ **SUPERSEDED 2026-04-15 — target changed from 56 tok/s parity to
+> ANE-native value prop.** This doc's tok/s ceiling projections were
+> grounded in a "beat LiteRT-LM at 56 tok/s" framing that has been
+> retired. The current goal is power + TTFT + ANE tok/s ceiling, not
+> decode-rate parity with Metal-GPU runtimes. See
+> `docs/MOBILE_2K_COMPETITIVE_PLAN.md` for the current value prop.
+> Content below retained for historical context.
+
 > ⚠️ **SUPERSEDED by PR #62 (2026-04-15 late).** The decision in this
 > doc ("ship a union-of-drafters: cross-vocab Qwen + PL-n3 + PL-n2")
 > was based on oracle-replay bench numbers that turned out to

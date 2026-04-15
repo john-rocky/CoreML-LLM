@@ -1,85 +1,76 @@
 # Next-session handoff
 
-**Last updated:** 2026-04-15 post B.3 refutation (PR #72) — batched
-fp16 hypothesis is dead; mechanism is semantic KV write-through.
+**Last updated:** 2026-04-15 post value-prop reframe. The "beat
+LiteRT-LM at 56 tok/s" target is **retired**; go-forward value prop
+is ANE-native (power + TTFT + ~43 tok/s ceiling). See
+`docs/MOBILE_2K_COMPETITIVE_PLAN.md`.
 
 ## Read this first
 
 To resume cleanly, the next session should:
 
-1. **If starting C0 work:** open `docs/PHASE_C_TIGHTENING_FINDINGS.md`
-   first — PR #72's B.3 result that rules out the batched-fp16
-   hypothesis and pins the mechanism to semantic KV write-through.
-   Then `docs/NEXT_SESSION_C0.md` for the two-track (loosen / rebuild)
-   branching, **but read the updated candidate list in
-   `docs/PHASE_B_DECISION.md` §"Phase C gating item" §"2026-04-15
-   update — B.3 refutation" before acting on NEXT_SESSION_C0 —
-   approaches 1 and 2 there are now dead.**
+1. Open `docs/MOBILE_2K_COMPETITIVE_PLAN.md` — **authoritative
+   value prop**. ANE-native triad: power, TTFT, tok/s ceiling. 56
+   tok/s parity is no longer a goal; we compete on a different axis.
 2. Open this file (`docs/HANDOFF.md`) — takes 5 minutes.
-3. Read `docs/PHASE_B_DECISION.md` — **Phase B closes here; Union
-   defaults stay OFF; Phase C is gated on item "C0".** Candidate
-   list is now (a) output-space tolerance / (b) verify-protocol
-   redesign; fp32 upcast and accumulation-order variants are dead
-   per B.3.
-4. Read `docs/PHASE_B_V4_CHAIN_FINDINGS.md` — empirical basis for
-   the decision **layered with the 2026-04-15 UPDATE callout that
-   retracts the batched-fp16 speculation**.
-5. Read `docs/PHASE_B_V3_ARGMAX_FINDINGS.md` — v3 ruled out the
-   narrower "`decode_q1` vs `verify_qK` drift" hypothesis.
-6. Read `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md` — original live-gap
-   finding.
-7. Skim `docs/SESSION_STATE.md` for exact PR / branch / task state
-   (gotcha #3 has the short-form B.3 summary).
-8. `docs/MAC_FIRST_EXECUTION_PLAN.md` for the phased itinerary.
-9. `docs/PHASE_A5_DECISION.md` — historical, superseded.
+3. Read `docs/PHASE_B_DECISION.md` §"What this means for the
+   go-forward target" — why speculative decoding is off the critical
+   path and the two tractable items that replaced it (D1b + item 27).
+4. Read `docs/BASELINE_SPEED_AUDIT.md` — per-chunk costs that ground
+   the ~43 tok/s pipelining ceiling.
+5. Skim `docs/SESSION_STATE.md` for exact PR / branch / task state.
+6. Historical context (read only if needed):
+   - `docs/PHASE_C_TIGHTENING_FINDINGS.md` — why verify-chunk redesign
+     is multi-week.
+   - `docs/PHASE_B_V4_CHAIN_FINDINGS.md`, `PHASE_B_V3_ARGMAX_FINDINGS.md`,
+     `PHASE_B_LIVE_ACCEPT_RATE_GAP.md` — speculative-decode refutation
+     chain.
+   - `docs/PHASE_A5_DECISION.md` — superseded.
 
-No need to touch MTP Path A, PR #17, or PR #33 — all deprioritised
-with reasons in the roadmap's Rejected table.
+No need to touch MTP Path A, PR #17, PR #33, or further Union /
+speculative wiring — all off the critical path with reasons in
+`docs/PHASE_B_DECISION.md` and the roadmap's Rejected / Demoted tables.
 
 ## Suggested opening prompt for the next session
 
 Copy-paste this at the start of the next `/claude` session so the
 model walks in with correct framing:
 
-> Phase B closed 2026-04-15. Union defaults stay OFF on main.
-> Phase C is gated on roadmap item 11c ("C0"). Refutation chain:
-> v3 ruled out decode_q1 ↔ verify_qK drift; v4 hypothesised batched-
-> fp16 ordering inside verify_qK; **B.3 / PR #72 refuted that** by
-> swapping batched verify_qK for K serial decode_q1 calls and seeing
-> no chain-gap closure. The mechanism is **semantic** — verify writes
-> drafter proposals into KV before acceptance is decided, so target
-> argmaxes at subsequent positions condition on the contaminated
-> cache. This is not fixable by tightening verify numerics.
-> Remaining C0 options: (a) output-space tolerance (Track A / PR #73
-> patch-ready, cheap; blocked on verify chunks emitting top-K
-> logits), (b) verify-protocol redesign with delayed KV write-through
-> (multi-week).
+> Value-prop reframed 2026-04-15. **56 tok/s parity with LiteRT-LM
+> is no longer a goal.** LiteRT-LM is Metal GPU at 3–5 W; this repo
+> is ANE-native at ~1 W. Different competitive axis. Current target
+> triad: (1) sustained power ~1 W, (2) TTFT ~1 s (conditional on
+> item 27), (3) decode tok/s ~43 (conditional on D1b). All three
+> projections are documented in docs/MOBILE_2K_COMPETITIVE_PLAN.md.
+>
+> Next-session focus: **ship D1b full impl + scope item 27 (GPU
+> prefill via MLX-Swift)**. Both are Swift-side, both preserve
+> ANE-resident decode. Neither depends on speculative decoding.
+>
+> Speculative decoding is off the critical path. Phase B closed;
+> verify-protocol redesign (C0 option b) is multi-week and is not
+> required for the ANE-native value prop. Do not re-litigate.
 >
 > Read (in order):
-> 1. docs/PHASE_C_TIGHTENING_FINDINGS.md — B.3 result and mechanism.
-> 2. docs/PHASE_B_DECISION.md — go-forward plan with B.3-updated
->    candidate list.
-> 3. docs/PHASE_B_V4_CHAIN_FINDINGS.md — empirical basis with the
->    2026-04-15 UPDATE callout.
-> 4. docs/PHASE_B_V3_ARGMAX_FINDINGS.md — ruled out the narrower
->    drift hypothesis.
-> 5. docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md — original live-gap finding.
-> 6. docs/HANDOFF.md (this file) + docs/SESSION_STATE.md.
+> 1. docs/MOBILE_2K_COMPETITIVE_PLAN.md — the value prop.
+> 2. docs/PHASE_B_DECISION.md §"What this means for the go-forward
+>    target" — why speculation is parked.
+> 3. docs/BASELINE_SPEED_AUDIT.md — per-chunk costs; grounds the
+>    43 tok/s ceiling.
+> 4. docs/HANDOFF.md (this file) + docs/SESSION_STATE.md.
 >
 > Start options:
-> - **Track A measurement (cheap):** unblock by landing the verify
->   chunk re-export that emits `logits_fp16` alongside `token_ids`
->   (conversion/ change, ~1 output-node addition); then Track A
->   bench (PR #73 wiring) measures how many chain flips are
->   within-margin and should be tolerated.
-> - **Non-speculative D1 spike (also cheap, unblocked now):** staged
->   chunk pipelining per HANDOFF §"Phase D". Doesn't depend on
->   verify numerics and is independent of the C0 question.
-> - Verify-protocol redesign (option (b)) is multi-week and should
->   wait until Track A has quantified whether tolerance alone
->   recovers a useful fraction of the chain gap.
+> - **Ship D1b pipelining full impl.** PR #77 validated the ANE+GPU
+>   compute-unit split (overlap 0.87–0.99). Branch
+>   `feat/chunk-pipelining-d1b` is in flight. Deliver the 4-stage
+>   pipeline + iPhone measurement; exit criterion is ≥ 40 tok/s at
+>   2K on iPhone 17 Pro.
+> - **Scope item 27 (GPU prefill).** MLX-Swift prefill path, 7–10
+>   days. Decode stays on ANE; GPU is used only during the 512-token
+>   prefill. Exit criterion for the scoping pass: a one-page design
+>   that identifies the Metal↔CoreML handoff cost and the ~1 s TTFT
+>   feasibility gate.
 >
-> Bench + `bench*` helpers on CoreMLLLM are public (merged).
 > Docs auto-merge; bench/harness code auto-merges too.
 
 ## Full roadmap — Phase A → final

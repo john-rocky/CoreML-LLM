@@ -143,12 +143,21 @@ active. Retrain with `use_cache=True` traces should fix acceptance.
 
 ### Track C — Zero-training auxiliaries (ship alongside A or B)
 
+> **2026-04-15 demotion.** Items 14 and 14b (SuffixDecoding and
+> Union-of-drafters) are no longer on the critical path. All
+> speculative-decoding items are blocked downstream at item 11c
+> (verify-protocol semantic redesign, multi-week) regardless of
+> drafter choice — see `docs/PHASE_B_DECISION.md`. The ANE-native
+> value-prop reframe (`docs/MOBILE_2K_COMPETITIVE_PLAN.md`) does
+> not depend on speculation. Items 12/13/14/14b are retained as
+> future options but are **not forecast inputs** for the 2K plan.
+
 | Priority | What | Gain | Effort | Source |
 |---|---|---|---|---|
-| **12** | **Prompt Lookup Decoding** — algorithm merged in PR #36; wiring pending | ×2.4 (summaries/QA), 0× on chat | 0.5 day wiring | SOURCES, V6 §V6-4 |
-| **13** | **Cross-vocabulary SD (Qwen 2.5 0.5B drafter)** — already bundled | ×1.5–2.5 | 3–4 days | V5 |
-| **14** | **SuffixDecoding** (measured T1=18%, hit=48% after 4 turns) | +10–30% repetitive workloads | 1 day wiring | FUND §1 |
-| **14b** | **Union-of-drafters**: Prompt Lookup ∪ SuffixDecoding ∪ {HASS \| EAGLE-3} gated by max-accept-length; single verify pass when all miss | +30–40% over best single source | 6 days (after 12 + one drafter) | V6 §V6-11 |
+| **12** | **Prompt Lookup Decoding** — algorithm merged in PR #36; wiring pending. Blocked on 11c. | ×2.4 (summaries/QA), 0× on chat | 0.5 day wiring | SOURCES, V6 §V6-4 |
+| **13** | **Cross-vocabulary SD (Qwen 2.5 0.5B drafter)** — already bundled. Blocked on 11c. | ×1.5–2.5 | 3–4 days | V5 |
+| ~~**14**~~ | ~~**SuffixDecoding**~~ — **DEMOTED 2026-04-15**. Blocked on 11c; net-regression live per PR #62 live-gap findings. Off critical path. | — | — | FUND §1 |
+| ~~**14b**~~ | ~~**Union-of-drafters**~~ — **DEMOTED 2026-04-15**. Phase B Union shipped with defaults OFF (PR #54); v4 chain-mode refuted the original accept-rate projections; all Union variants need 11c first. Off critical path. | — | — | V6 §V6-11 |
 
 **EAGLE-3 training targets (if Track B chosen)**: acc0 ≥ 50% → Q=K →
 KV direct-write → **40–60 tok/s @ 2K, 25–35 tok/s @ 8K**.
@@ -184,9 +193,17 @@ KV direct-write → **40–60 tok/s @ 2K, 25–35 tok/s @ 8K**.
 
 ## Phase 5 — UX & deployment
 
+> **2026-04-15 update:** item 27 (GPU prefill) promoted from "stretch"
+> to **Phase C critical path** under the ANE-native value-prop reframe.
+> TTFT is one of the three value-prop axes in
+> `docs/MOBILE_2K_COMPETITIVE_PLAN.md`; ~1 s TTFT is the projected
+> win once item 27 ships. Effort revised up to 7–10 days (MLX-Swift
+> is recent and underdocumented; original 1–2-day estimate was
+> optimistic).
+
 | Priority | What | Gain | Effort | Source |
 |---|---|---|---|---|
-| **27** | **GPU prefill** — A19 Pro tensor cores, TTFT only | TTFT 13s → 5s | 1–2 days | UNEXP §A |
+| **27** ⭐ | **GPU prefill via MLX-Swift** — A19 Pro tensor cores; decode stays on ANE. **Phase C critical path** (TTFT axis of the ANE-native value prop). | TTFT 13s → ~1s (projection) | 7–10 days | UNEXP §A, MOBILE_2K_COMPETITIVE_PLAN §"Projection basis" |
 | **28** | **Prefix KV caching** — persistent on disk | TTFT 4–35× on hit | 1 day Swift | UNEXP §E |
 | **29** | **System Prompt KV cache (Ollama pattern)** — resume turns 2+ | TTFT ×2–5 on turn 2+ | 0.5 day | SOURCES |
 | **30** | **Vocab pruning** — 262k → ~50k | −1.7 GB download | 1 day | UNEXP §D |
