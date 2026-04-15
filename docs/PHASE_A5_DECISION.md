@@ -89,10 +89,24 @@ numbers collapse to the 52 ms verify floor:
 | qa | 3.17 | 52 | **61** |
 | summary | 3.26 | 52 | **63** |
 
-Mixed-workload average (roughly equal weight): **~56 tok/s without
-Mirror SD, ~56 with**. The qualitative conclusion: **without Mirror
-SD, Route B's cross-vocab anchor loses on chat workloads**. Chat is
-the largest share of typical usage. Mirror SD is load-bearing.
+Mixed-workload average (equal weight across categories):
+
+- **Serial (no Mirror SD): ~48 tok/s** — (30 + 57 + 42 + 63) / 4.
+  Below Google's 56 on average; chat is the bottleneck.
+- **With Mirror SD: ~56 tok/s** — (44 + 57 + 61 + 63) / 4. Ties
+  Google's iOS number.
+
+The qualitative conclusion: **Route B's union-of-drafters alone
+matches Google only once Mirror SD hides drafter cost**. Without
+Mirror SD, the chat regression drags the average below Google.
+
+What the *current main* branch delivers today is less than either of
+these averages, because only cross-vocab is wired (prompt-lookup
+wiring is still on `feat/route-b-task1-prompt-lookup-wiring`, union
+orchestrator not built). Running main on iPhone right now would
+exercise cross-vocab alone: projected 30/34/42/41 tok/s on
+chat/code/qa/summary, average **~37 tok/s**. The 48 and 56 numbers
+above require Phase B (union) and Phase C (Mirror SD) landings.
 
 ## Known limits of this estimate
 
