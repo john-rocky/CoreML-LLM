@@ -185,6 +185,10 @@ public final class CoreMLLLM: @unchecked Sendable {
         } else {
             let mlConfig = MLModelConfiguration()
             mlConfig.computeUnits = computeUnits
+            // V6-1: fixed-shape hint (iOS 18.2+). Skips per-call shape trace.
+            if #available(iOS 18.2, macOS 15.2, *) {
+                mlConfig.optimizationHints.reshapeFrequency = .infrequent
+            }
             let modelURL = directory.appendingPathComponent("model.mlmodelc")
             if FileManager.default.fileExists(atPath: modelURL.path) {
                 onProgress?("Loading model...")
