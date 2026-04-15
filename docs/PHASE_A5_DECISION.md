@@ -1,8 +1,22 @@
 # Phase A5 — drafter decision + theoretical on-device ceiling
 
-**Status:** 2026-04-15 late. Closes Phase A of
+> ⚠️ **SUPERSEDED by PR #62 (2026-04-15 late).** The decision in this
+> doc ("ship a union-of-drafters: cross-vocab Qwen + PL-n3 + PL-n2")
+> was based on oracle-replay bench numbers that turned out to
+> over-claim live accept rates by 3–9×. Mac reproduction via
+> `coreml-llm-smoke UNION_TRIP=1` shows Union is a net regression on
+> all four categories (15–21 tok/s vs baseline 32). The theoretical
+> tok/s projections below (30/42/57/63 serial; 44/57/61/63 Mirror
+> SD) assume drafter accept rates that do not reflect live decoding.
+>
+> Read `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md` for the updated
+> picture. Union shape is being re-decided via task #2 (target-argmax
+> replay mode for accept-rate-bench). Content below retained for
+> historical context — **do not plan work on top of these numbers**.
+
+**Status:** 2026-04-15 late. ~~Closes Phase A of
 `docs/MAC_FIRST_EXECUTION_PLAN.md`. Three device trips saved (0 done).
-Ready for Phase B.
+Ready for Phase B.~~ Superseded by PR #62; see banner above.
 
 ---
 
