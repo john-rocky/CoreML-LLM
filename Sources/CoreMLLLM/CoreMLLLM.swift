@@ -81,6 +81,18 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// Takes precedence over crossVocabEnabled when both are true.
     public var drafterUnionEnabled: Bool = false
 
+    /// Phase D (item 11d) — enable the pipelined decode path: chunk3 runs on
+    /// .cpuAndGPU (its own driver queue) with async dispatch, intended to
+    /// overlap with ANE-resident chunks. Built on top of the PR #77 spike's
+    /// compute-unit split. The load-time flip requires setting the env var
+    /// CHUNK_PIPELINE_ENABLED=1 before `load(from:)` is called; this
+    /// in-memory property is informational (reports whether the engine
+    /// actually loaded chunk3 on GPU). Defaults OFF on main until iPhone
+    /// validation, per the same merge discipline as drafterUnionEnabled.
+    public var chunkPipeliningEnabled: Bool {
+        chunkedEngine?.isPipeliningEnabled ?? false
+    }
+
     // Generation metrics
     public private(set) var tokensPerSecond: Double = 0
     public var mtpAcceptanceRate: Double { mtpEngine?.acceptanceRate ?? 0 }

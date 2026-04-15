@@ -104,6 +104,24 @@ final class ChunkedEngine {
         let mlConfig = MLModelConfiguration()
         mlConfig.computeUnits = computeUnits
 
+        // Phase D pipelining (item 11d): when CHUNK_PIPELINE_ENABLED=1, load
+        // chunk3 on .cpuAndGPU so it goes through a distinct driver queue from
+        // the ANE-resident chunks. This is a prerequisite for predictStep's
+        // pipelined variant (see predictStepPipelined). Default off; zero
+        // behaviour change when the env var is unset. See also PR #77 spike
+        // (CHUNK_PIPELINE_SPIKE=1 / COMPUTE_UNIT_SPLIT=1), which stays as a
+        // diagnostic in main.
+        let pipelineEnv = ProcessInfo.processInfo.environment["CHUNK_PIPELINE_ENABLED"] == "1"
+        let pipelineGPUConfig: MLModelConfiguration = {
+            let c = MLModelConfiguration()
+            c.computeUnits = .cpuAndGPU
+            return c
+        }()
+        if pipelineEnv {
+            print("[Pipeline] CHUNK_PIPELINE_ENABLED=1 — chunk3 on .cpuAndGPU, " +
+                  "predictStep uses async c3 dispatch")
+        }
+
         func findModel(_ name: String) -> URL? {
             let compiled = directory.appendingPathComponent("\(name).mlmodelc")
             if FileManager.default.fileExists(atPath: compiled.path) { return compiled }
@@ -117,9 +135,11 @@ final class ChunkedEngine {
                 throw CoreMLLLMError.modelNotFound(name)
             }
             let t0 = CFAbsoluteTimeGetCurrent()
-            let m = try MLModel(contentsOf: url, configuration: mlConfig)
+            let cfg = (pipelineEnv && name == "chunk3") ? pipelineGPUConfig : mlConfig
+            let m = try MLModel(contentsOf: url, configuration: cfg)
             let dt = CFAbsoluteTimeGetCurrent() - t0
-            print("[Load] \(name) done in \(String(format: "%.1f", dt))s")
+            print("[Load] \(name) done in \(String(format: "%.1f", dt))s" +
+                  (pipelineEnv && name == "chunk3" ? " (.cpuAndGPU)" : ""))
             return m
         }
 
@@ -315,7 +335,8 @@ final class ChunkedEngine {
             kFull1: ioSurfaceArray(slots: 1, seqLen: ctx), vFull1: ioSurfaceArray(slots: 1, seqLen: ctx),
             kSliding2: ioSurfaceArray(slots: 5, seqLen: W), vSliding2: ioSurfaceArray(slots: 5, seqLen: W),
             kFull2: ioSurfaceArray(slots: 2, seqLen: ctx), vFull2: ioSurfaceArray(slots: 2, seqLen: ctx),
-            config: config, prefillN: prefillN)
+            config: config, prefillN: prefillN,
+            pipeliningEnabled: pipelineEnv)
 
         // ANE pipeline prewarm (Phase 0b): four dummy decode steps at load
         // time force the ANE compiler to finalize dispatch schedules and
@@ -332,6 +353,14 @@ final class ChunkedEngine {
         return engine
     }
 
+    /// True when chunk3 is loaded on .cpuAndGPU and predictStep should route
+     /// through the pipelined variant (overlap c3 GPU with CPU-side work).
+    private let pipeliningEnabled: Bool
+    /// Serial queue for c3 async dispatch. Defined even when pipelining is
+    /// off so property initialisation stays simple; unused in that case.
+    private let c3Queue = DispatchQueue(label: "coreml-llm.chunk3.gpu",
+                                        qos: .userInitiated)
+
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
                  prefillChunk1: MLModel?, prefillChunk2: MLModel?,
                  prefillChunk3: MLModel?, prefillChunk4: MLModel?,
@@ -346,7 +375,8 @@ final class ChunkedEngine {
                  kFull1: MLMultiArray, vFull1: MLMultiArray,
                  kSliding2: MLMultiArray, vSliding2: MLMultiArray,
                  kFull2: MLMultiArray, vFull2: MLMultiArray,
-                 config: ModelConfig, prefillN: Int) {
+                 config: ModelConfig, prefillN: Int,
+                 pipeliningEnabled: Bool = false) {
         self.chunk1 = chunk1; self.chunk2 = chunk2
         self.chunk3 = chunk3; self.chunk4 = chunk4
         self.prefillChunk1 = prefillChunk1; self.prefillChunk2 = prefillChunk2
@@ -363,7 +393,11 @@ final class ChunkedEngine {
         self.kSliding2 = kSliding2; self.vSliding2 = vSliding2
         self.kFull2 = kFull2; self.vFull2 = vFull2
         self.config = config; self.prefillN = prefillN
+        self.pipeliningEnabled = pipeliningEnabled
     }
+
+    /// Runtime-readable pipelining state (ChunkedEngine -> CoreMLLLM).
+    var isPipeliningEnabled: Bool { pipeliningEnabled }
 
     // MARK: - Reset
 
@@ -488,10 +522,56 @@ final class ChunkedEngine {
             "kv14_k": MLFeatureValue(multiArray: kv14_k), "kv14_v": MLFeatureValue(multiArray: kv14_v),
         ]
 
-        // Chunk 3
+        // Chunk 3 (+ chunk 4)
+        //
+        // Pipelined path: when chunk3 is on .cpuAndGPU (distinct driver from
+        // the ANE-resident chunk4), dispatch c3 asynchronously on c3Queue so
+        // the GPU submission and the CPU-side d4 dict construction / Swift
+        // runtime work on this thread proceed concurrently. Empirically the
+        // overlap opportunity inside a single step is small (d4 build is
+        // microseconds) — the real gain from this flag comes from PR #77's
+        // spike probe, which showed kernel-level overlap between ANE and GPU
+        // drivers. See docs/PHASE_D_PIPELINING_IMPL.md.
+        //
+        // Serial path: the original c3 → c4 back-to-back call on the caller
+        // thread. Keeps behaviour bit-identical when pipelining is off.
         let tC3Start = CFAbsoluteTimeGetCurrent()
         var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
-        let h3 = try chunk3.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
+        let h3: MLMultiArray
+        if pipeliningEnabled {
+            let d3Provider = try MLDictionaryFeatureProvider(dictionary: d3)
+            var h3Result: MLMultiArray?
+            var h3Error: Error?
+            let sem = DispatchSemaphore(value: 0)
+            c3Queue.async { [chunk3] in
+                do {
+                    let o3 = try chunk3.prediction(from: d3Provider)
+                    h3Result = o3.featureValue(for: "hidden_states_out")!.multiArrayValue!
+                } catch {
+                    h3Error = error
+                }
+                sem.signal()
+            }
+            // CPU-side overlap window: build c4's feature dict base while GPU
+            // is busy with c3. The dict build is ~microseconds; this mostly
+            // exists so the async architecture is in place for future
+            // restructuring (e.g., decoupled c4 that no longer depends on h3).
+            var d4Base = shared
+            sem.wait()
+            if let err = h3Error { throw err }
+            h3 = h3Result!
+            let tC3End = CFAbsoluteTimeGetCurrent()
+            profileC3 += (tC3End - tC3Start)
+
+            let tC4Start = CFAbsoluteTimeGetCurrent()
+            d4Base["hidden_states"] = MLFeatureValue(multiArray: h3)
+            let out4 = try chunk4.prediction(from:
+                MLDictionaryFeatureProvider(dictionary: d4Base))
+            let tC4End = CFAbsoluteTimeGetCurrent()
+            profileC4 += (tC4End - tC4Start)
+            return try finishStep(out4: out4, t1: t1)
+        }
+        h3 = try chunk3.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
             .featureValue(for: "hidden_states_out")!.multiArrayValue!
         let tC3End = CFAbsoluteTimeGetCurrent()
         profileC3 += (tC3End - tC3Start)
@@ -503,6 +583,13 @@ final class ChunkedEngine {
         let tC4End = CFAbsoluteTimeGetCurrent()
         profileC4 += (tC4End - tC4Start)
 
+        return try finishStep(out4: out4, t1: t1)
+    }
+
+    /// Shared post-chunk4 bookkeeping: update profile counters, emit periodic
+    /// log line, return argmax token_id. Called from both the serial and the
+    /// pipelined predictStep paths.
+    private func finishStep(out4: MLFeatureProvider, t1: CFAbsoluteTime) throws -> Int {
         profilePredict += (CFAbsoluteTimeGetCurrent() - t1)
         profileCount += 1
         if profileCount == 1 || profileCount % 10 == 0 {
@@ -520,7 +607,6 @@ final class ChunkedEngine {
                 eMs, mMs, c1, c2, c3, c4, c1 + c2 + c3 + c4,
                 pMs, eMs + pMs, 1000.0 / (eMs + pMs)))
         }
-
         return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
     }
 
