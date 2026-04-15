@@ -39,7 +39,13 @@ The iOS sample app downloads models automatically. You can also convert your own
 
 ## Quick Start
 
-### iOS App
+### Try it without building — App Store
+
+If you just want to try Gemma 4 on your iPhone, grab **Models Zoo** — a pre-built app that ships CoreML-LLM:
+
+[<img src="https://toolbox.marketingtools.apple.com/api/v2/badges/download-on-the-app-store/black/en-us?releaseDate=1735689600" alt="Download on the App Store" height="48">](https://apps.apple.com/jp/app/models-zoo/id6762083207)
+
+### iOS App (build from source)
 
 ```bash
 open Examples/CoreMLLLMChat/CoreMLLLMChat.xcodeproj
