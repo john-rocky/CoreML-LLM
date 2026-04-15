@@ -257,28 +257,28 @@ macro content (object names, motion direction) even if phrasing differs.
 
 ---
 
-## Step 4 — Ship
+## Step 4 — Ship (done 2026-04-15)
 
-Done in this branch:
-- `docs/MULTIMODAL.md` — "Phase 2 pending" text replaced with the
-  `vision_video.mlpackage` description.
-- `convert_gemma4_multimodal.py --video-vision` — one-shot CLI.
+All of the following shipped on `feat/gemma4-video-input` → merged
+into `main` as PR #81:
+
+- `docs/MULTIMODAL.md` updated.
+- `convert_gemma4_multimodal.py --video-vision` one-shot CLI.
 - Swift: video encoder loader + `concatVideoFrameFeatures`, with the
   Phase 1 pool kept as a fallback when the artifact is absent.
+- HF release `mlboydaisuke/gemma-4-E2B-coreml` carries
+  `vision_video.mlmodelc/*` (commit `86b4e0d`).
+- `ModelDownloader.ModelInfo.gemma4e2b` manifest lists the five
+  files; bundle size bumped 2.8 GB → 3.1 GB.
+- End-to-end verified on iPhone 17 Pro (iOS 26.4): clean install →
+  `Get Model` → video picker → output matches HF forward.
 
-Sequencing for the actual ship:
-1. **HF release first**: upload the compiled `vision_video.mlmodelc`
-   (and/or `.mlpackage`) to `mlboydaisuke/gemma-4-E2B-coreml`.
-   Ordering matters — bumping `ModelDownloader` before the blob is
-   live will 404 existing users.
-2. **Then** bump `ModelDownloader.ModelInfo.gemma4e2b`: append the
-   `vision_video.mlmodelc/*` entries (mirror the shape of the
-   existing `vision.mlmodelc/*` block, ~150 MB post-palettize;
-   weights size is the only non-trivial estimate — read the
-   `weights/weight.bin` size on HF once uploaded).
-3. Post-release: audit `tokensPerFrame` default — once every shipped
-   model bundle has the video encoder, the pool-fallback branch in
-   `concatFrameFeatures` can be deleted.
+Follow-up (deferred, not blocking):
+- Audit `tokensPerFrame` default once every shipped model bundle has
+  the video encoder, then delete the pool-fallback branch in
+  `concatFrameFeatures`.
+- Re-build the decoder on 8K chunks and bump `maxFrames` to 24 so
+  Gemma 4's 60 s / 1 fps budget fits in a single prefill.
 
 ---
 
