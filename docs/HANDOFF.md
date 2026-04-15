@@ -78,6 +78,62 @@ One bundled iPhone trip for the whole phase.
 > `docs/PRIORITY_ROADMAP.md` (item 11c) — could lift accept rates by
 > aligning verify and decode argmaxes.
 
+#### Two-drafter confluence on item 11c (2026-04-15 evening)
+
+Two independently-validated drafter approaches hit the same device-side
+regression wall. The drafters themselves are correct — Mac equivalence
+tests pass for both — yet each produces net-negative speed on iPhone
+17 Pro. The common dependency is the target's `verify_qK` / `decode_q1`
+multi-function pair (item 11c).
+
+| Drafter | Mac validation | iPhone tok/s | iPhone symptom | Source doc |
+|---|---|---|---|---|
+| Cross-vocab Qwen 2.5 0.5B (PR #54 Union) | bookkeeping bit-exact in `union-bitexact --mode fallback-only` | ~1.8 (baseline 31) | 25 s TTFT, coherent fragments echoing earlier context | `docs/SESSION_STATE.md` Phase B Task 2 |
+| MTP Path C self-trained K=2 modules | PT↔CoreML argmax parity via `verify_coreml_equiv.py` | 16.3 (baseline 31) | Japanese prompt degenerates into single-token loop after ~5 tokens | `docs/MTP_PATH_C_FINDINGS.md` |
+
+Path A (TFLite MTP extraction, `docs/MTP_INTEGRATION_RESULTS.md`) is a
+related but *distinct* failure: parked earlier for target-distribution
+mismatch (W4A8 training vs HF fp target), not verify-chunk drift.
+Mentioned for context, not counted as 11c evidence.
+
+The break-even arithmetic from `MTP_PATH_C_FINDINGS.md` §4.1 shows why
+this is load-bearing: per-cycle verify cost ≈ 1.8–2.3× decode on ANE,
+so speculation needs ~77 % acceptance to match baseline. Training hits
+~38 %; closing 11c would push the multiplier toward ~1.3× and the
+break-even to ~40 %, which existing drafters already clear.
+
+#### Revised Phase B priority ordering (post-#57, pending iPhone trip)
+
+```
+iPhone trip with PR #57 env vars on (SPECULATIVE_PROFILE=1, COMPUTE_PLAN_AUDIT=1)
+  → Measure drafter-vs-verify ms distribution (grounds the break-even math).
+  → Simultaneously measure accept-rate ceiling: run Union with PLD only,
+    compare iPhone per-burst accept rate against Mac oracle-replay in
+    eval/accept-rate-bench-v2.json.
+  ┌──────────────────────────────────────────┐
+  │ iPhone accept rate << Mac oracle replay  │  → item 11c confirmed load-bearing.
+  │                                          │    Next work: verify-chunk numerical
+  │                                          │    alignment (reconvert with fp32
+  │                                          │    softmax tail, or K=3 tiling
+  │                                          │    matched to K=1). Unblocks
+  │                                          │    cross-vocab AND Path C AND any
+  │                                          │    future drafter simultaneously.
+  ├──────────────────────────────────────────┤
+  │ iPhone accept rate ≈ Mac oracle replay   │  → 11c is NOT the bottleneck for
+  │                                          │    this trip's prompt set. Original
+  │                                          │    drafter-perf plan holds — next
+  │                                          │    work: bootstrap optimisation
+  │                                          │    (Phase B Task 3) and Mirror SD /
+  │                                          │    async dispatch (Phase C).
+  └──────────────────────────────────────────┘
+```
+
+The MTP session is working 11c directly on `feature/mtp-speculative-v1`;
+coordinate with them before duplicating any verify-vs-decode argmax
+diff work. Their Mac-first verification pattern (`verify_coreml_equiv.py`,
+`verify_accept_logic.py`, `precompute.py` forward hooks; all under
+`conversion/train_mtp_modules/`) is the methodological baseline.
+
 ### Phase C — Mirror Speculation + async dispatch infrastructure
 
 Goal: break past 48 tok/s mixed average.
