@@ -66,9 +66,13 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// separately so the union can drive it without going through the
     /// cross-vocab-only engine wrapper.
     private var crossVocabDrafter: CrossVocabDraft?
-    /// Toggle cross-vocab speculation on/off. When both MTP and
-    /// cross-vocab are loaded, MTP wins (better accept rate when trained).
-    public var crossVocabEnabled: Bool = true
+    /// Toggle cross-vocab speculation on/off. Defaults to OFF on 2026-04-15
+    /// after on-device testing showed the Qwen drafter runs ~10× slower
+    /// than Mac projection, producing 1.8 tok/s with degraded output on
+    /// iPhone 17 Pro. Opt-in until drafter cost + bootstrap-TTFT + K=3↔K=1
+    /// numerical alignment (roadmap 11c) are investigated. MTP preserves
+    /// priority when loaded.
+    public var crossVocabEnabled: Bool = false
 
     // Phase B Task 1 — union of cross-vocab + prompt-lookup{n=2, n=3}
     private var drafterUnion: DrafterUnion?
