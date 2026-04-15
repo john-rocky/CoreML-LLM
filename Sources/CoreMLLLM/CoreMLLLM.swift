@@ -42,6 +42,12 @@ public final class CoreMLLLM: @unchecked Sendable {
     private var visionModelURL: URL?
     private var visionConfig: MLModelConfiguration?
 
+    // Optional video-grade vision encoder (max_soft_tokens=70 → 64
+    // tokens/frame). When present, replaces the Phase 1 Swift 2×2 pool.
+    private var videoVisionModel: MLModel?
+    private var videoVisionModelURL: URL?
+    private var videoVisionConfig: MLModelConfiguration?
+
     // Audio (lazy loaded to save memory)
     private var audioModel: MLModel?
     private var audioModelURL: URL?
@@ -173,6 +179,22 @@ public final class CoreMLLLM: @unchecked Sendable {
             let cfg = MLModelConfiguration()
             cfg.computeUnits = .cpuAndGPU
             llm.visionConfig = cfg
+        }
+
+        // Optional video-grade vision encoder. Ships alongside
+        // vision.mlpackage when the HF release was built with
+        // `convert_gemma4_multimodal.py --video-vision`.
+        let videoVisionCompiled = directory.appendingPathComponent("vision_video.mlmodelc")
+        let videoVisionPkg = directory.appendingPathComponent("vision_video.mlpackage")
+        if FileManager.default.fileExists(atPath: videoVisionCompiled.path) {
+            llm.videoVisionModelURL = videoVisionCompiled
+        } else if FileManager.default.fileExists(atPath: videoVisionPkg.path) {
+            llm.videoVisionModelURL = videoVisionPkg
+        }
+        if llm.videoVisionModelURL != nil {
+            let cfg = MLModelConfiguration()
+            cfg.computeUnits = .cpuAndGPU
+            llm.videoVisionConfig = cfg
         }
 
         // Audio model (optional, lazy loaded on first audio)
@@ -672,6 +694,14 @@ public final class CoreMLLLM: @unchecked Sendable {
         return try ImageProcessor.process(image, with: vm)
     }
 
+    private func processVideoFrame(_ image: CGImage) throws -> MLMultiArray {
+        if videoVisionModel == nil, let url = videoVisionModelURL, let cfg = videoVisionConfig {
+            videoVisionModel = try MLModel(contentsOf: url, configuration: cfg)
+        }
+        guard let vm = videoVisionModel else { throw CoreMLLLMError.visionNotAvailable }
+        return try ImageProcessor.processVideoFrame(image, with: vm)
+    }
+
     // MARK: - Private: audio
 
     /// Returns (features, actualTokenCount).
@@ -780,13 +810,20 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// padding for a square input, laid out as a 16×16 grid). For video we
     /// want a lower token budget per frame (Gemma 4's `video_processor`
     /// uses `max_soft_tokens=70` ≈ 64 real). We cover three cases here:
+    ///   - `tokensPerFrame = 64`, `vision_video.mlpackage` present:
+    ///       use the purpose-built video encoder which already emits 64
+    ///       tokens/frame — no Swift-side pooling needed.
     ///   - `tokensPerFrame = 256`: raw passthrough (first 256 of 280).
-    ///   - `tokensPerFrame = 64`:  2×2 average-pool the 16×16 grid to 8×8.
+    ///   - `tokensPerFrame = 64`, no video encoder: 2×2 average-pool the
+    ///       16×16 grid to 8×8 (Phase 1 fallback).
     ///   - other:                   first `tokensPerFrame` tokens of the 280
     ///                              (not semantically meaningful — debug only).
     private func concatFrameFeatures(_ frames: [CGImage],
                                       tokensPerFrame: Int) throws -> MLMultiArray {
         precondition(!frames.isEmpty)
+        if tokensPerFrame == 64, videoVisionModelURL != nil {
+            return try concatVideoFrameFeatures(frames)
+        }
         let hidden = config.hiddenSize
         let total = frames.count * tokensPerFrame
         let out = try MLMultiArray(
@@ -804,6 +841,31 @@ public final class CoreMLLLM: @unchecked Sendable {
                 memcpy(dstFrame, src,
                        tokensPerFrame * hidden * MemoryLayout<UInt16>.stride)
             }
+        }
+        return out
+    }
+
+    /// Video-encoder path for `concatFrameFeatures`. The encoder emits
+    /// (1, 64, hidden) per frame; we memcpy each block into the combined
+    /// (1, N·64, hidden) buffer. Kept separate from the still-image path
+    /// so the pool fallback is easy to delete once every shipped model
+    /// bundle includes `vision_video.mlpackage`.
+    private func concatVideoFrameFeatures(_ frames: [CGImage]) throws -> MLMultiArray {
+        precondition(!frames.isEmpty)
+        let hidden = config.hiddenSize
+        let perFrame = 64
+        let total = frames.count * perFrame
+        let out = try MLMultiArray(
+            shape: [1, NSNumber(value: total), NSNumber(value: hidden)],
+            dataType: .float16)
+        let dst = out.dataPointer.bindMemory(to: UInt16.self, capacity: total * hidden)
+        memset(dst, 0, total * hidden * MemoryLayout<UInt16>.stride)
+        for (i, frame) in frames.enumerated() {
+            let feat = try processVideoFrame(frame)
+            let src = feat.dataPointer.bindMemory(to: UInt16.self, capacity: feat.count)
+            let dstFrame = dst.advanced(by: i * perFrame * hidden)
+            memcpy(dstFrame, src,
+                   perFrame * hidden * MemoryLayout<UInt16>.stride)
         }
         return out
     }

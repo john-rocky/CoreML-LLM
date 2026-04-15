@@ -169,13 +169,17 @@ frame into the LLM as if they were video produced garbage output — the
 model was trained expecting ~64 tokens per frame for video and got
 confused by ×4 the expected density, emitting EOS after ~100 characters.
 
-The current workaround (`tokensPerFrame = 64`, default) 2×2-average-pools
-each frame's 16×16 token grid down to 8×8 in fp32 on-the-fly in Swift.
-Output length jumps from ~100 chars to ~900, and the model starts
-explicitly referencing frames by their `MM:SS` timestamps and reasoning
-about temporal progression. Phase 2 will replace this pool with a
-purpose-built `vision_video.mlpackage` (`max_soft_tokens=70`) so the
-downsampling happens inside the encoder rather than after it.
+When `vision_video.mlpackage` is present (produced by
+`convert_gemma4_multimodal.py --video-vision`), CoreMLLLM uses it
+directly and the encoder itself emits 64 tokens per frame — this is the
+correct video-grade path and matches the HF forward at cosine=1.0000.
+
+For model bundles that predate Phase 2, `tokensPerFrame = 64` falls back
+to 2×2-average-pooling each frame's 16×16 still-image token grid down
+to 8×8 in fp32 on-the-fly in Swift. Output length jumps from ~100 chars
+to ~900 and the model starts explicitly referencing frames by their
+`MM:SS` timestamps; the pool is a drop-in approximation of the
+video-grade encoder but is expected to drift more under motion.
 
 ### Mobile context-length budget
 
@@ -190,10 +194,10 @@ Each frame costs ~261 tokens (256 placeholders + BOI + EOI + `MM:SS` + space).
 `VideoProcessor.Options(fps:maxFrames:includeAudio:)` defaults to
 `fps=1.0, maxFrames=8, includeAudio=false` — safe on a 2K chunk.
 
-For longer clips on mobile, Phase 2 will add a low-token-budget vision
-encoder variant (`max_soft_tokens=64`, Gemma's `token_budget=70`) so that
-30–60 s at 1 fps fits in 8K. That requires re-running `gemma4_vision.py`
-with a different pooler config and is tracked separately.
+For longer clips on mobile, `vision_video.mlpackage` provides the
+low-token-budget encoder variant (`max_soft_tokens=70`, ≈64 real
+tokens/frame) so 30–60 s at 1 fps fits in 8K. Build it by re-running
+`convert_gemma4_multimodal.py --video-vision`.
 
 ### Usage
 

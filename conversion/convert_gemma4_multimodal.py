@@ -28,7 +28,10 @@ from transformers import Gemma4ForConditionalGeneration
 
 from models.gemma4 import Gemma4Model
 from models.gemma4_decoder import Gemma4DecoderWrapper
-from models.gemma4_vision import save_vision_weights
+from models.gemma4_vision import (
+    convert_video_vision_to_coreml,
+    save_vision_weights,
+)
 
 
 def main():
@@ -38,6 +41,12 @@ def main():
     parser.add_argument("--context-length", type=int, default=512)
     parser.add_argument("--quantize", type=str, default="int4", choices=["int4", "int8", "none"])
     parser.add_argument("--output", type=str, default="./output/gemma4-multimodal")
+    parser.add_argument(
+        "--video-vision",
+        action="store_true",
+        help="Also convert the video-grade vision tower "
+             "(max_soft_tokens=70 → 64 tokens/frame) to vision_video.mlpackage.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -70,6 +79,12 @@ def main():
 
     # Save vision weights (vision encoder runs in PyTorch due to dynamic masking)
     save_vision_weights(hf_model, args.output)
+
+    video_vision_produced = False
+    if args.video_vision:
+        print("\nConverting video-grade vision tower (max_soft_tokens=70)...")
+        convert_video_vision_to_coreml(hf_model, args.output)
+        video_vision_produced = True
 
     # Free the full model to save memory before decoder conversion
     del hf_model
@@ -215,6 +230,8 @@ def main():
             "vision": "vision.mlpackage",
             "decoder": "decoder.mlpackage",
             "embeddings": "embeddings/",
+            **({"vision_video": "vision_video.mlpackage"}
+               if video_vision_produced else {}),
         },
         "tokenizer_repo": "google/gemma-4-E2B-it",
         "embed_scale": float(hidden_size ** 0.5),
@@ -231,6 +248,8 @@ def main():
     print("\n" + "=" * 60)
     print("Conversion complete!")
     print(f"  Vision:  {args.output}/vision.mlpackage")
+    if video_vision_produced:
+        print(f"  Video:   {args.output}/vision_video.mlpackage")
     print(f"  Decoder: {args.output}/decoder.mlpackage")
     print(f"  Embeds:  {args.output}/embeddings/")
     print(f"  Config:  {args.output}/model_config.json")

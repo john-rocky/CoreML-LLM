@@ -37,11 +37,11 @@ public enum VideoProcessor {
         public var centerCropSquare: Bool
         /// Soft tokens per frame to inject into the prompt. Gemma 4's
         /// `video_processor` uses `max_soft_tokens=70` (≈ 64 real per square
-        /// frame) while `image_processor` uses 280/256. The still-image
-        /// encoder shipped here produces 256 tokens per square input; set
-        /// `poolTokensPerFrame=64` to 2×2-average-pool each frame's 16×16
-        /// token grid down to 8×8 so the LLM sees a video-grade token count
-        /// rather than 256 "still-image-res" tokens per frame.
+        /// frame) while `image_processor` uses 280/256. Set to 64 for the
+        /// video-grade budget: CoreMLLLM will use `vision_video.mlpackage`
+        /// if it's bundled with the model (Phase 2), otherwise it falls
+        /// back to 2×2-pooling each frame's 16×16 still-image token grid
+        /// down to 8×8 (Phase 1).
         public var tokensPerFrame: Int
 
         public init(fps: Double = 1.0, maxFrames: Int = 8,
