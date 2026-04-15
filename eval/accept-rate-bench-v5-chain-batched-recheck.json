@@ -1,0 +1,519 @@
+{
+  "K" : 3,
+  "generatedAt" : "2026-04-15T07:06:52Z",
+  "maxTokens" : 128,
+  "mode" : "chain",
+  "modelDir" : "\/Users\/majimadaisuke\/Downloads\/coreml-llm-artifacts\/staging-2k-fast-prefill\/gemma4-e2b",
+  "prompts" : [
+    {
+      "category" : "code",
+      "drafters" : {
+
+      },
+      "draftersArgmax" : {
+
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            17,
+            1,
+            0,
+            0
+          ],
+          "totalBursts" : 18
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            17,
+            0,
+            1,
+            0
+          ],
+          "totalBursts" : 18
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            17,
+            1,
+            0,
+            0
+          ],
+          "totalBursts" : 18
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            17,
+            1,
+            0,
+            0
+          ],
+          "totalBursts" : 18
+        }
+      },
+      "emittedArgmaxLen" : 18,
+      "emittedLen" : 0,
+      "id" : "code-complete-sum",
+      "promptLen" : 49
+    },
+    {
+      "category" : "code",
+      "drafters" : {
+
+      },
+      "draftersArgmax" : {
+
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            88,
+            1,
+            0,
+            0
+          ],
+          "totalBursts" : 89
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            89,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 89
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            89,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 89
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            89,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 89
+        }
+      },
+      "emittedArgmaxLen" : 89,
+      "emittedLen" : 0,
+      "id" : "code-explain-fib",
+      "promptLen" : 58
+    },
+    {
+      "category" : "code",
+      "drafters" : {
+
+      },
+      "draftersArgmax" : {
+
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            33,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 33
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            33,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 33
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            33,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 33
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            33,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 33
+        }
+      },
+      "emittedArgmaxLen" : 33,
+      "emittedLen" : 0,
+      "id" : "code-refactor-loop",
+      "promptLen" : 57
+    },
+    {
+      "category" : "summary",
+      "drafters" : {
+
+      },
+      "draftersArgmax" : {
+
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            21,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 21
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            21,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 21
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            21,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 21
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            21,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 21
+        }
+      },
+      "emittedArgmaxLen" : 21,
+      "emittedLen" : 0,
+      "id" : "sum-para-ane",
+      "promptLen" : 71
+    },
+    {
+      "category" : "summary",
+      "drafters" : {
+
+      },
+      "draftersArgmax" : {
+
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            40,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 40
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            40,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 40
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            40,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 40
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            40,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 40
+        }
+      },
+      "emittedArgmaxLen" : 40,
+      "emittedLen" : 0,
+      "id" : "sum-para-compiler",
+      "promptLen" : 82
+    },
+    {
+      "category" : "qa",
+      "drafters" : {
+
+      },
+      "draftersArgmax" : {
+
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            10,
+            0,
+            1,
+            0
+          ],
+          "totalBursts" : 11
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            11,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 11
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            11,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 11
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            11,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 11
+        }
+      },
+      "emittedArgmaxLen" : 11,
+      "emittedLen" : 0,
+      "id" : "qa-where-is-swift",
+      "promptLen" : 59
+    },
+    {
+      "category" : "qa",
+      "drafters" : {
+
+      },
+      "draftersArgmax" : {
+
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            12,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 12
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            12,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 12
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            12,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 12
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            12,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 12
+        }
+      },
+      "emittedArgmaxLen" : 12,
+      "emittedLen" : 0,
+      "id" : "qa-what-is-ane",
+      "promptLen" : 66
+    },
+    {
+      "category" : "chat",
+      "drafters" : {
+
+      },
+      "draftersArgmax" : {
+
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            30,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 30
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            30,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 30
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            30,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 30
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            30,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 30
+        }
+      },
+      "emittedArgmaxLen" : 30,
+      "emittedLen" : 0,
+      "id" : "chat-define-transformer",
+      "promptLen" : 23
+    },
+    {
+      "category" : "chat",
+      "drafters" : {
+
+      },
+      "draftersArgmax" : {
+
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            65,
+            4,
+            59,
+            0
+          ],
+          "totalBursts" : 128
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            50,
+            77,
+            1,
+            0
+          ],
+          "totalBursts" : 128
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            51,
+            75,
+            2,
+            0
+          ],
+          "totalBursts" : 128
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            49,
+            78,
+            1,
+            0
+          ],
+          "totalBursts" : 128
+        }
+      },
+      "emittedArgmaxLen" : 128,
+      "emittedLen" : 0,
+      "id" : "chat-explain-rope",
+      "promptLen" : 21
+    },
+    {
+      "category" : "chat",
+      "drafters" : {
+
+      },
+      "draftersArgmax" : {
+
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            9,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            9,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            9,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            9,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 9
+        }
+      },
+      "emittedArgmaxLen" : 9,
+      "emittedLen" : 0,
+      "id" : "chat-greeting",
+      "promptLen" : 31
+    }
+  ]
+}

@@ -756,6 +756,26 @@ final class ChunkedEngine {
         return result
     }
 
+    // MARK: - Serial verify (sanity-check path — Phase C C0 Track B approach 3)
+
+    /// Replay K draft tokens through the non-batched `decode_q1` path, one
+    /// token at a time. Returns the argmax at each of the K positions —
+    /// same return shape as `verifyCandidates`, so chain-mode bench can
+    /// swap between the two to isolate batched-compute numerical drift.
+    /// Writes KV at `startPosition..startPosition+K-1` just like the
+    /// batched path. Does not advance `currentPosition`.
+    func verifyCandidatesSerial(tokens: [Int32], startPosition: Int) throws -> [Int32] {
+        let K = tokens.count
+        var result = [Int32]()
+        result.reserveCapacity(K)
+        for k in 0..<K {
+            let argmax = try predictStep(tokenID: Int(tokens[k]),
+                                         position: startPosition + k)
+            result.append(Int32(argmax))
+        }
+        return result
+    }
+
     // MARK: - Verify helpers
 
     private func buildVerifyHidden(tokenIDs: [Int]) throws -> MLMultiArray {

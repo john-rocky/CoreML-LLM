@@ -49,6 +49,11 @@ struct BenchArgs {
     var outJSON: URL?
     var promptFilter: String?  // run only prompts whose category or id contains this
     var mode: BenchMode = .oracle
+    /// Chain-mode only: replace the batched `verify_qK` call with K serial
+    /// `decode_q1` calls. Phase C C0 Track B approach-3 sanity check — if the
+    /// gap closes under serial verify, batched-compute numerical drift is the
+    /// root cause.
+    var verifySerial: Bool = false
 }
 
 func parseArgs() -> BenchArgs {
@@ -87,6 +92,8 @@ func parseArgs() -> BenchArgs {
                 exit(2)
             }
             args.mode = m
+        case "--verify-serial":
+            args.verifySerial = true
         case "-h", "--help":
             print("""
                 Usage: accept-rate-bench [options]
@@ -96,6 +103,7 @@ func parseArgs() -> BenchArgs {
                   --out <path>         Write JSON results here in addition to stdout
                   --filter <substr>    Only run prompts whose category or id contains <substr>
                   --mode <m>           oracle (default) | argmax | chain | both | all. See PHASE_B_V3_ARGMAX_FINDINGS.md
+                  --verify-serial      chain-mode only: run K serial decode_q1 instead of one verify_qK (sanity check)
                 """)
             exit(0)
         default:
@@ -282,11 +290,12 @@ struct Main {
                 }
 
                 if runChain {
-                    print("[\(p.category)/\(p.id)] chain-following via verify_qK…")
+                    let label = args.verifySerial ? "serial decode_q1×K" : "verify_qK"
+                    print("[\(p.category)/\(p.id)] chain-following via \(label)…")
                     let genStart = Date()
                     let (pTok, chainEmitted, stats) = try await runChainMode(
                         llm: llm, prompt: p.text, maxTokens: args.maxTokens,
-                        K: args.K, drafters: drafters)
+                        K: args.K, drafters: drafters, verifySerial: args.verifySerial)
                     let genSec = Date().timeIntervalSince(genStart)
                     if prompt.isEmpty { prompt = pTok }
                     if emittedVerify.isEmpty { emittedVerify = chainEmitted }
@@ -429,11 +438,14 @@ enum BenchError: Error {
 // drafter sees drafter's own proposals in verify slots 1..K-1, so its
 // argmax[1..K-1] is computed under the same conditions as live Union.
 func runChainMode(
-    llm: CoreMLLLM, prompt: String, maxTokens: Int, K: Int, drafters: [Drafter]
+    llm: CoreMLLLM, prompt: String, maxTokens: Int, K: Int, drafters: [Drafter],
+    verifySerial: Bool = false
 ) async throws -> (prompt: [Int32], emitted: [Int32], stats: [String: AcceptStats]) {
     guard let verifyK = llm.benchVerifyK else { throw BenchError.verifyUnavailable }
     precondition(verifyK == K,
                  "--K \(K) but engine verify_qK expects K=\(verifyK)")
+    let verifyFn: ([Int32]) throws -> [Int32] =
+        verifySerial ? llm.benchVerifySerial : llm.benchVerify
     let (promptTokens, seed) = try await llm.benchPrefill(prompt)
 
     for d in drafters { d.reset() }
@@ -464,7 +476,7 @@ func runChainMode(
             for i in 1..<K {
                 verifyTokens[i] = (i - 1 < useCount) ? props[i - 1] : 0
             }
-            let argmax = try llm.benchVerify(verifyTokens)
+            let argmax = try verifyFn(verifyTokens)
 
             var match = 0
             for k in 0..<useCount {
