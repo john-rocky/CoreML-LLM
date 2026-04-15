@@ -788,7 +788,9 @@ class SWAVerifyChunk3(nn.Module):
 class SWAVerifyChunk4(nn.Module):
     """Verify version of chunk4 (L25-34): Q=K, shared KV + norm + lm_head.
 
-    Outputs per-position token IDs (1, K) and hidden_states for MTP carry state.
+    Outputs per-position token IDs (1, K), hidden_states for MTP carry state,
+    and the pre-argmax logits tensor (1, K, vocab) in fp16 for tolerance-aware
+    acceptance (top-N / logit-margin) in the Swift bench harness.
     """
     START, END = 25, 35
 
@@ -830,5 +832,9 @@ class SWAVerifyChunk4(nn.Module):
             logits = torch.tanh(logits / self.softcap) * self.softcap
         # Per-position argmax
         token_ids = torch.argmax(logits, dim=-1).to(torch.int32)  # (1, K)
+        # Expose pre-argmax logits in fp16 so Swift-side tolerance-aware
+        # chain-mode acceptance (top-N / logit-margin) can score each
+        # candidate. Shape: (1, K, vocab).
+        logits_fp16 = logits.to(torch.float16)
         # Return hidden_states for MTP drafter carry state
-        return token_ids, hidden_states
+        return token_ids, hidden_states, logits_fp16

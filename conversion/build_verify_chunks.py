@@ -467,8 +467,12 @@ def main():
     vc4 = SWAVerifyChunk4(base, seq_len=K).eval()
     s4_verify = shared_kv_samples(K)
     in4_verify = shared_kv_inputs(K)
+    # Track A (Phase C tolerance) requires pre-argmax logits to score
+    # drafter proposals against the target's top-N. `logits_fp16` is
+    # (1, K, vocab) fp16. Existing `token_ids` / `hidden_states_out`
+    # outputs are preserved so the default acceptance path is unchanged.
     verify4 = trace_and_convert(vc4, s4_verify, in4_verify,
-                                ["token_ids", "hidden_states_out"],
+                                ["token_ids", "hidden_states_out", "logits_fp16"],
                                 quantize=quantize)
     save_temp(verify4, f"{tmp}/chunk4_verify.mlpackage")
     del verify4
