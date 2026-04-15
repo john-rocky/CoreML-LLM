@@ -7,17 +7,20 @@
 To resume cleanly, the next session should:
 
 1. Open this file (`docs/HANDOFF.md`) — takes 5 minutes.
-2. Read `docs/PHASE_B_V4_CHAIN_FINDINGS.md` — **live gap is
-   reproduced by the bench in chain mode. Mechanism identified: fp16
-   sensitivity of batched `verify_qK` to slot 1..K-1 content.** Drives
-   the Union-shape decision.
-3. Read `docs/PHASE_B_V3_ARGMAX_FINDINGS.md` — v3 ruled out `decode_q1`
-   vs `verify_qK` drift; v4 identifies the actual mechanism.
-4. Read `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md` — original live-gap
+2. Read `docs/PHASE_B_DECISION.md` — **Phase B closes here; Union
+   defaults stay OFF; Phase C is gated on verify-chunk numerical
+   tightening (item "C0").** Consolidates the v3/v4 findings into a
+   concrete go-forward plan.
+3. Read `docs/PHASE_B_V4_CHAIN_FINDINGS.md` — empirical basis for the
+   decision (chain-mode bench reproduces the live gap, mechanism
+   identified).
+4. Read `docs/PHASE_B_V3_ARGMAX_FINDINGS.md` — v3 ruled out the
+   narrower "`decode_q1` vs `verify_qK` drift" hypothesis.
+5. Read `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md` — original live-gap
    finding.
-5. Skim `docs/SESSION_STATE.md` for the exact PR / branch / task state.
-6. Read `docs/MAC_FIRST_EXECUTION_PLAN.md` for the phased itinerary.
-7. `docs/PHASE_A5_DECISION.md` — historical context only, superseded.
+6. Skim `docs/SESSION_STATE.md` for exact PR / branch / task state.
+7. `docs/MAC_FIRST_EXECUTION_PLAN.md` for the phased itinerary.
+8. `docs/PHASE_A5_DECISION.md` — historical, superseded.
 
 No need to touch MTP Path A, PR #17, or PR #33 — all deprioritised
 with reasons in the roadmap's Rejected table.
@@ -27,31 +30,29 @@ with reasons in the roadmap's Rejected table.
 Copy-paste this at the start of the next `/claude` session so the
 model walks in with correct framing:
 
-> v4 chain-mode bench ran (eval/accept-rate-bench-v4-chain.json).
-> CHAIN MODE REPRODUCES THE LIVE GAP. Mechanism: drafter proposals in
-> verify slots 1..K-1 cause fp16 drift in verify_qK's argmax chain;
-> this breaks byte-exact n-gram matching for prompt-lookup and hurts
-> cross-vocab acceptance. Gotcha #3's chain-accept equivalence
-> argument holds in exact arithmetic but not at fp16.
+> Phase B closed 2026-04-15. Union defaults stay OFF on main.
+> Phase C is gated on roadmap item 11c ("C0"): batched `verify_qK`'s
+> argmax at slot 0 is fp16-sensitive to slots 1..K-1 content, which is
+> the dominant driver of the bench-vs-live 3–9× accept-rate gap.
+> Speculative decoding is capped until verify chunks are re-quantised
+> or the acceptance test uses output-space tolerance.
 > Read (in order):
-> 1. docs/PHASE_B_V4_CHAIN_FINDINGS.md — v4 results per category;
->    verdicts on the three Union-shape candidates (PL-only rejected;
->    raise gates viable short-term; defer to Mirror SD likely right
->    answer — but same verify chunk in Mirror SD, so speculative
->    decoding is capped unless verify chunks are re-quantised).
-> 2. docs/PHASE_B_V3_ARGMAX_FINDINGS.md — v3 ruled out decode_q1 vs
->    verify_qK drift as the dominant factor.
-> 3. docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md — original live-gap finding.
-> 4. docs/HANDOFF.md — priority ordering updated.
-> 5. docs/SESSION_STATE.md — current PR / branch / task state.
+> 1. docs/PHASE_B_DECISION.md — go-forward plan, rejected / viable /
+>    gating options.
+> 2. docs/PHASE_B_V4_CHAIN_FINDINGS.md — empirical basis.
+> 3. docs/PHASE_B_V3_ARGMAX_FINDINGS.md — ruled out the narrower
+>    drift hypothesis.
+> 4. docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md — original live-gap finding.
+> 5. docs/HANDOFF.md (this file) + docs/SESSION_STATE.md.
 >
-> Start on Union-shape decision per v4 verdicts, OR investigate the
-> remaining chat CV gap (v4 chain 2.31 vs live 1.34) by
-> instrumenting `DrafterUnion.speculateStep` directly.
+> Start on C0 investigation: pick a verify-chunk tightening approach
+> from `docs/PHASE_B_DECISION.md` §"Phase C gating item" (fp32 upcast
+> / re-quantise / output-space tolerance), prototype on Mac, measure
+> v4 chain numbers before/after. Output-space tolerance is the
+> cheapest first try (bench-only change, no model re-export).
 >
-> Bench code and `bench*` helpers on CoreMLLLM are public (merged).
-> Docs auto-merge; bench/harness-only code changes also auto-merge
-> per user note 2026-04-15.
+> Bench + `bench*` helpers on CoreMLLLM are public (merged).
+> Docs auto-merge; bench/harness code auto-merges too.
 
 ## Full roadmap — Phase A → final
 
