@@ -736,6 +736,27 @@ public final class CoreMLLLM: @unchecked Sendable {
                                            startPosition: engine.currentPosition)
     }
 
+    /// Variant of `benchVerify` that also returns per-position top-`topK`
+    /// `(token_id, logit_fp32)` pairs. Used by the tolerance-based accept
+    /// variant of `accept-rate-bench`.
+    ///
+    /// Throws `CoreMLLLMError.verifyLogitsNotExposed` until the Track B
+    /// (`feat/c0-verify-requant`) re-export of verify chunk 4 adds a
+    /// `logits_fp16` output. Until that PR merges, callers must fall back to
+    /// argmax-only acceptance via `benchVerify`.
+    public func benchVerifyTopK(_ tokens: [Int32], topK: Int = 3) throws
+        -> [[(Int32, Float)]]
+    {
+        guard let engine = chunkedEngine, engine.hasVerify else {
+            throw CoreMLLLMError.predictionFailed
+        }
+        let (_, top) = try engine.verifyCandidatesWithLogits(
+            tokens: tokens,
+            startPosition: engine.currentPosition,
+            topK: topK)
+        return top
+    }
+
     /// Advance `benchCurrentPosition` by `count`.
     public func benchAdvance(by count: Int) {
         chunkedEngine?.currentPosition += count
@@ -892,6 +913,10 @@ public enum CoreMLLLMError: LocalizedError {
     case prefillNotAvailable
     case visionNotAvailable
     case audioNotAvailable
+    /// The verify-chunk pipeline does not expose a `logits_fp16` output yet.
+    /// Returned by `benchVerifyTopK` / `verifyCandidatesWithLogits` until the
+    /// Track B re-export (`feat/c0-verify-requant`) lands on `main`.
+    case verifyLogitsNotExposed
 
     public var errorDescription: String? {
         switch self {
@@ -901,6 +926,8 @@ public enum CoreMLLLMError: LocalizedError {
         case .prefillNotAvailable: return "Prefill chunks not loaded"
         case .visionNotAvailable: return "Vision model not available"
         case .audioNotAvailable: return "Audio model not available"
+        case .verifyLogitsNotExposed:
+            return "verify chunk 4 does not expose `logits_fp16` (Track B re-export pending)"
         }
     }
 }

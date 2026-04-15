@@ -49,6 +49,14 @@ struct BenchArgs {
     var outJSON: URL?
     var promptFilter: String?  // run only prompts whose category or id contains this
     var mode: BenchMode = .oracle
+    /// Top-N tolerance: accept a drafter proposal if it's among verify's top-N
+    /// tokens at that position. `0` = exact match only (default, v4 semantics).
+    /// Only consulted when `mode == .chain || .all`.
+    var tolerance: Int = 0
+    /// Logit margin: additionally accept a drafter proposal if its logit at
+    /// that position is within this many fp32 units of verify's argmax logit.
+    /// `0` = disabled. Applied in addition to (OR'd with) the top-N check.
+    var logitMargin: Float = 0.0
 }
 
 func parseArgs() -> BenchArgs {
@@ -87,6 +95,12 @@ func parseArgs() -> BenchArgs {
                 exit(2)
             }
             args.mode = m
+        case "--tolerance":
+            i += 1
+            args.tolerance = max(0, Int(argv[i]) ?? 0)
+        case "--logit-margin":
+            i += 1
+            args.logitMargin = Float(argv[i]) ?? 0.0
         case "-h", "--help":
             print("""
                 Usage: accept-rate-bench [options]
@@ -96,6 +110,10 @@ func parseArgs() -> BenchArgs {
                   --out <path>         Write JSON results here in addition to stdout
                   --filter <substr>    Only run prompts whose category or id contains <substr>
                   --mode <m>           oracle (default) | argmax | chain | both | all. See PHASE_B_V3_ARGMAX_FINDINGS.md
+                  --tolerance <N>      top-N acceptance under chain mode (default 0 = exact argmax).
+                                       Requires verify_qK to expose `logits_fp16` (Track B work).
+                  --logit-margin <M>   Additionally accept if drafter's logit is within M of
+                                       argmax's logit (fp32 units, default 0 = off).
                 """)
             exit(0)
         default:
@@ -282,11 +300,30 @@ struct Main {
                 }
 
                 if runChain {
-                    print("[\(p.category)/\(p.id)] chain-following via verify_qK…")
+                    let useTolerance = args.tolerance > 0 || args.logitMargin > 0
+                    if useTolerance {
+                        print("[\(p.category)/\(p.id)] chain-following via verify_qK (tolerance=\(args.tolerance), margin=\(args.logitMargin))…")
+                    } else {
+                        print("[\(p.category)/\(p.id)] chain-following via verify_qK…")
+                    }
                     let genStart = Date()
-                    let (pTok, chainEmitted, stats) = try await runChainMode(
-                        llm: llm, prompt: p.text, maxTokens: args.maxTokens,
-                        K: args.K, drafters: drafters)
+                    let (pTok, chainEmitted, stats): ([Int32], [Int32], [String: AcceptStats])
+                    if useTolerance {
+                        do {
+                            (pTok, chainEmitted, stats) = try await runChainModeTolerance(
+                                llm: llm, prompt: p.text, maxTokens: args.maxTokens,
+                                K: args.K, drafters: drafters,
+                                tolerance: args.tolerance, logitMargin: args.logitMargin)
+                        } catch CoreMLLLMError.verifyLogitsNotExposed {
+                            FileHandle.standardError.write(Data(
+                                "error: --tolerance requires Track B's logit-output re-export (not yet merged). Run without --tolerance OR wait for that PR.\n".utf8))
+                            exit(4)
+                        }
+                    } else {
+                        (pTok, chainEmitted, stats) = try await runChainMode(
+                            llm: llm, prompt: p.text, maxTokens: args.maxTokens,
+                            K: args.K, drafters: drafters)
+                    }
                     let genSec = Date().timeIntervalSince(genStart)
                     if prompt.isEmpty { prompt = pTok }
                     if emittedVerify.isEmpty { emittedVerify = chainEmitted }
@@ -477,6 +514,102 @@ func runChainMode(
             // argmax[0] values should match modulo fp16 jitter (depends only
             // on slot 0, same across all calls).
             if chainNext == nil { chainNext = argmax[0] }
+        }
+
+        emitted.append(nextID)
+        history.append(nextID)
+        for d in drafters { d.ingest(nextID) }
+        llm.benchAdvance(by: 1)
+        nextID = chainNext ?? nextID
+    }
+    return (promptTokens, emitted, stats)
+}
+
+// MARK: - Chain mode with output-space tolerance (Track A)
+//
+// Identical to `runChainMode` except acceptance is relaxed:
+//   - tolerance > 0: accept if drafter's proposal is among verify's top-N
+//     tokens at that position (not just argmax).
+//   - logitMargin > 0: additionally accept if drafter's proposal has a logit
+//     within `logitMargin` of the argmax logit.
+// Both rules are OR'd. Either >0 activates this path.
+//
+// Calls `benchVerifyTopK`, which throws `CoreMLLLMError.verifyLogitsNotExposed`
+// until Track B's `logits_fp16` re-export merges. The caller surfaces that as
+// an exit-4 error message.
+//
+// The committed chain token is still `argmax[0]` (a.k.a. topK[0][0]) — we
+// only loosen the *measurement* of accept rate, not the emitted sequence.
+func runChainModeTolerance(
+    llm: CoreMLLLM, prompt: String, maxTokens: Int, K: Int, drafters: [Drafter],
+    tolerance: Int, logitMargin: Float
+) async throws -> (prompt: [Int32], emitted: [Int32], stats: [String: AcceptStats]) {
+    guard let verifyK = llm.benchVerifyK else { throw BenchError.verifyUnavailable }
+    precondition(verifyK == K,
+                 "--K \(K) but engine verify_qK expects K=\(verifyK)")
+    let (promptTokens, seed) = try await llm.benchPrefill(prompt)
+
+    for d in drafters { d.reset() }
+    for tok in promptTokens.dropLast() { for d in drafters { d.ingest(tok) } }
+
+    let eosIDs: Set<Int32> = [1, 106, 151645]
+    var emitted: [Int32] = []
+    emitted.reserveCapacity(maxTokens)
+    var stats: [String: AcceptStats] = [:]
+    for d in drafters { stats[d.name] = AcceptStats(K: K) }
+
+    var history = promptTokens
+    var nextID = seed
+    var verifyTokens = [Int32](repeating: 0, count: K)
+    // Pull `max(tolerance, 1)` top slots so we always get argmax + alternatives.
+    let topKRequest = max(tolerance, 1)
+
+    for _ in 0..<maxTokens {
+        if eosIDs.contains(nextID) { break }
+        verifyTokens[0] = nextID
+
+        var chainNext: Int32? = nil
+
+        for d in drafters {
+            let props = d.propose(history: history, K: K - 1)
+            let useCount = min(props.count, K - 1)
+            for i in 1..<K {
+                verifyTokens[i] = (i - 1 < useCount) ? props[i - 1] : 0
+            }
+            let topK = try llm.benchVerifyTopK(verifyTokens, topK: topKRequest)
+
+            var match = 0
+            for k in 0..<useCount {
+                let prop = props[k]
+                let row = topK[k]
+                let argmaxLogit = row.first?.1 ?? 0
+                // Top-N check.
+                var accepted = false
+                if tolerance > 0 {
+                    let limit = min(tolerance, row.count)
+                    for i in 0..<limit where row[i].0 == prop {
+                        accepted = true
+                        break
+                    }
+                }
+                // Logit-margin check (OR with top-N).
+                if !accepted && logitMargin > 0 {
+                    for (tid, logit) in row where tid == prop {
+                        if argmaxLogit - logit <= logitMargin { accepted = true }
+                        break
+                    }
+                }
+                // Fallback to exact argmax match (tolerance==0, margin==0
+                // shouldn't reach here — gated at caller — but be defensive).
+                if !accepted && tolerance == 0 && logitMargin == 0 {
+                    accepted = (prop == row.first?.0)
+                }
+                if accepted { match += 1 } else { break }
+            }
+            stats[d.name]!.histogram[match] += 1
+            stats[d.name]!.totalBursts += 1
+
+            if chainNext == nil { chainNext = topK[0].first?.0 }
         }
 
         emitted.append(nextID)
