@@ -39,6 +39,43 @@ enum SpecProfile {
         return UserDefaults.standard.bool(forKey: "SPECULATIVE_PROFILE")
     }()
 
+    /// Chat-CV residual investigation (docs/PHASE_B_CHAT_CV_RESIDUAL.md).
+    /// Additive to `SPECULATIVE_PROFILE`; prints pre-propose / post-propose /
+    /// post-commit CV state per burst so we can disentangle rolling-gate
+    /// closure, bootstrap replay effects, and mid-burst state drift.
+    /// Strictly env-gated — zero overhead when unset.
+    static let isUnionDebugCV: Bool = {
+        ProcessInfo.processInfo.environment["UNION_DEBUG_CV"] != nil
+    }()
+
+    /// Structured per-burst CV-state log for UNION_DEBUG_CV. All fields on a
+    /// single tab-friendly line so awk / python can parse directly.
+    static func logUnionDebugCV(cycle: Int,
+                                source: String,
+                                rollingCV: Double,
+                                rollingPL3: Double,
+                                rollingPL2: Double,
+                                cvProposed: Bool,
+                                cvPosBefore: Int,
+                                cvPosAfterPropose: Int,
+                                cvPosAfterRewind: Int,
+                                cvPosAfterCommit: Int,
+                                enginePosBefore: Int,
+                                enginePosAfterCommit: Int,
+                                matchCount: Int,
+                                compareLen: Int) {
+        guard isUnionDebugCV else { return }
+        print(String(format:
+            "[UnionDebugCV #%04d src=%@] rCV=%.3f rPL3=%.3f rPL2=%.3f "
+          + "cvProposed=%d cvPos[before=%d afterPropose=%d afterRewind=%d afterCommit=%d] "
+          + "enginePos[before=%d afterCommit=%d] match=%d/%d",
+            cycle, source, rollingCV, rollingPL3, rollingPL2,
+            cvProposed ? 1 : 0,
+            cvPosBefore, cvPosAfterPropose, cvPosAfterRewind, cvPosAfterCommit,
+            enginePosBefore, enginePosAfterCommit,
+            matchCount, compareLen))
+    }
+
     /// Time a throwing block. Returns (result, elapsed milliseconds).
     /// Always runs the block — caller decides whether to log based on
     /// `isEnabled`. Kept un-gated because the timing itself is cheap

@@ -1,0 +1,6 @@
+[SpecProfile union bootstrap] replay=31 (544.32ms) target_step=32.05ms
+[UnionDebugCV #0001 src=cv] rCV=1.000 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=32 afterPropose=34 afterRewind=34 afterCommit=33] enginePos[before=32 afterCommit=33] match=0/1
+[UnionDebugCV #0002 src=cv] rCV=0.900 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=33 afterPropose=36 afterRewind=36 afterCommit=34] enginePos[before=33 afterCommit=34] match=0/2
+[UnionDebugCV #0003 src=cv] rCV=0.810 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=34 afterPropose=37 afterRewind=37 afterCommit=36] enginePos[before=34 afterCommit=36] match=1/2
+[UnionDebugCV #0004 src=cv] rCV=0.779 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=36 afterPropose=39 afterRewind=39 afterCommit=38] enginePos[before=36 afterCommit=38] match=1/2
+[UnionDebugCV #0005 src=cv] rCV=0.751 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=38 afterPropose=41 afterRewind=41 afterCommit=39] enginePos[before=38 afterCommit=39] match=0/2
