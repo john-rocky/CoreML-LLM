@@ -4,7 +4,7 @@
 
 CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a good fit for always-on, battery-friendly inference. [MLX Swift](https://github.com/ml-explore/mlx-swift) is the best choice when you want maximum throughput from the GPU; CoreML-LLM is the answer when you want the LLM to live on the ANE so the GPU stays free.
 
-> **v0.6.0** — Audio multimodal (Gemma 4 E2B speech understanding), library-side `ModelDownloader`, 404-tolerant downloads. See [What's new](#whats-new-in-v060).
+> **v0.6.2** — Audio multimodal (Gemma 4 E2B speech understanding), library-side `ModelDownloader`, fixed 2K chunk download path. See [What's new](#whats-new).
 
 | Text | Image | Audio (v0.6) |
 |------|-------|--------------|
@@ -12,7 +12,7 @@ CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a 
 
 ## Performance (Gemma 4 E2B, iPhone 17 Pro)
 
-| | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | v0.5.0 | **v0.6.0** |
+| | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | v0.5.0 | **v0.6.2** |
 |---|---:|---:|---:|---:|---:|---:|
 | Context length | 512 | 2048 | 2048 | 2048 | 2048 | **2048** |
 | Decode speed | ~11 tok/s | ~11 tok/s | ~28 tok/s | ~28 tok/s | ~31 tok/s | **~31 tok/s** |
@@ -135,105 +135,15 @@ python convert.py --model gemma4-e2b --output ./output/gemma4-e2b
 python convert.py --list
 ```
 
-## What's new in v0.6.0
+## What's new
 
-### Audio multimodal
-Gemma 4 E2B can hear. Record on the phone, send, get an answer.
+Current release: **v0.6.2** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases/tag/v0.6.2)).
 
-```
-PCM (16 kHz mono) → Swift mel spectrogram → audio.mlmodelc (12-layer
-Conformer, ANE) → 250-token, 1536-dim audio features → injected at
-<|audio|> placeholder positions in the LLM prefill → streaming text.
-```
+- **Audio multimodal** — Gemma 4 E2B can hear. Record on the phone, get an answer. 12-layer Conformer encoder, INT4-palettized, ANE-resident; features injected at `<|audio|>` placeholders via the same path as the vision encoder. See [docs/AUDIO.md](docs/AUDIO.md).
+- **`ModelDownloader` in the library** — `import CoreMLLLM` → `ModelDownloader.shared`. 404-tolerant on optional `mlmodelc` metadata.
+- **v0.6.2 download fix** — v0.6.0 / v0.6.1 pulled 8K chunks for a 2K model and hard-failed on load. v0.6.2 downloads the real 2K chunks (`swa/`, `prefill/`) and auto-invalidates stale caches on upgrade — no manual delete.
 
-- **Encoder**: 12-layer Conformer, INT4-palettized, ANE-resident. Input
-  (1, 1000, 128) mel fp16; output (1, 250, 1536) features fp16 with the
-  `output_proj + RMSNorm + embed_proj` projection fused into the graph.
-- **Feature injection**: same mechanism as the vision path — per-layer-raw
-  zeroed at audio placeholder positions to avoid PLE corruption.
-- **Recorder**: `AudioRecorder.swift` (AVAudioEngine, mono 16 kHz, max
-  duration synced from the model's `mel_frames`).
-- **UI**: mic button in `CoreMLLLMChat` gated on `supportsAudio`. Audio-only
-  sends (no text) pass an empty prompt so the model treats the audio
-  contents as the user's utterance instead of a sound to describe.
-
-### `ModelDownloader` promoted to the library
-Previously a file in the example app; now in `Sources/CoreMLLLM/`. Other
-apps linking the Swift package get it via `ModelDownloader.shared`.
-
-### 404-tolerant downloads
-A 404 on `*.mlmodelc/metadata.json` or `*.mlmodelc/analytics/coremldata.bin`
-no longer aborts the whole session — these are descriptive, not required
-by CoreML. Required files (`coremldata.bin`, `model.mil`,
-`weights/weight.bin`) still hard-fail.
-
-### Experimental scaffolds (dormant, not wired to the UI)
-Library-side files to support future work on other branches. Nothing is
-on by default.
-
-- `MirrorSpeculativeLoop.swift` — parallel NPU+GPU speculative decoding.
-- `SpeculativeLoop.swift` — EAGLE-3 draft / fusion / verify wiring.
-- `PrefixKVCache.swift` — persistent prefix KV cache for fast TTFT.
-- `ComputePreferenceLoader.swift` — sidecar dual ANE/GPU mlpackage loader.
-
-### Docs
-- `docs/AUDIO.md` — audio pipeline architecture and conversion notes
-- `docs/SPEED_8K.md` — 8K-context roadmap (W8A8, DuoAttention, TriForce)
-- `docs/UNEXPLORED_APPROACHES.md` — six unexplored directions with
-  effort/payoff estimates
-- `docs/POST_BENCH_PRIORITIES.md` — performance-first priority ordering
-  after the on-device EAGLE-3 bench
-
-## What's new in v0.5.0
-
-### Decode +11%, Prefill +60%
-Two optimizations that required no model changes — pure Swift-side improvements:
-
-1. **Vectorized embedding lookup** — Replaced scalar INT8→FP16 dequantization loop (10,496 iterations per token) with Accelerate SIMD pipeline: `vDSP.convertElements` → `vDSP.multiply` → `vImageConvert_PlanarFtoPlanar16F`. Embedding time dropped from 2.0ms to 0.4ms per token. Prefill benefits even more since it processes hundreds of embeddings per call.
-
-2. **IOSurface-backed KV cache** — SWA KV cache buffers use IOSurface-backed `CVPixelBuffer` + `MLMultiArray(pixelBuffer:shape:)` for zero-copy CPU↔ANE data transfer.
-
-### Parallel chunk loading
-All 8 model chunks (4 decode + 4 prefill) load concurrently via `withThrowingTaskGroup`. First-run ANE compilation is pipelined across chunks.
-
-### Research documentation
-New [docs/RESEARCH.md](docs/RESEARCH.md) with comprehensive mobile LLM competitive analysis, ANE hardware internals, and optimization findings.
-
-## What's new in v0.4.0
-
-### Multimodal image understanding
-Gemma 4 E2B can now describe images on iPhone. The vision encoder runs on GPU (`.cpuAndGPU`), produces 256 soft tokens projected to the LLM's hidden space, and the features are injected at `<|image|>` placeholder positions during prefill/decode.
-
-Two bugs were preventing this from working:
-
-1. **PLE corruption at image positions** — Per-Layer Embedding was being looked up from the PAD/IMAGE token IDs (norm ~94 each) instead of being zeroed for image positions. All 256 image positions received garbage PLE that corrupted the model's internal state. Fix: set `per_layer_raw = zeros` for any position where the hidden state comes from the vision encoder.
-
-2. **Multi-turn prompt duplication** — `buildPrompt()` inserted 256 image placeholders into every user message when `hasImage` was true. On the second turn, the first message's 256 placeholders would consume all vision features, leaving the second message's placeholders with no features. Fix: image tokens are now inserted only for the last user message.
-
-Image features are cached across conversation turns so follow-up questions about a previously sent image work without re-attaching it. Cache clears on "Clear".
-
-See [docs/MULTIMODAL.md](docs/MULTIMODAL.md) for the full architecture and debugging notes.
-
-### Memory diagnostics
-New "Mem" button in the sample app reports `task_vm_info` (`phys_footprint`, `resident_size`, `compressed`) and `os_proc_available_memory()` instantly, without the heavy `MLComputePlan` load that the "ANE?" button requires.
-
-### Memory correction
-Previous versions quoted ~250 MB memory usage from Xcode's gauge. Actual `phys_footprint` (iOS jetsam basis) is **~1 GB** — INT4 palettized model weights are counted in `phys_footprint` but may not appear in Xcode's gauge. Corrected in this release. Thanks to community feedback for flagging this.
-
-## What's new in v0.3.0
-
-- **Prefill fp16 overflow fix** — `q_norm` pre-scaling overflowed `Q @ K^T` in fp16. Reverted to manual attention with scale=1.0.
-- **Decode ~2.5× faster** — 11 → 28 tok/s (side effect of the rebuild).
-- **Prefill window 64 → 512** — multimodal prompts fit in a single prefill pass.
-- **ANE placement verified** — 99.78% via `MLComputePlan` on iPhone.
-- **Swift Package works** — `CoreMLLLM.load(from:)` auto-detects chunked vs monolithic models.
-- **Battery benchmark** — "Bench" menu for sustained generation + SoC drain tracking.
-
-## Carried over from v0.2.0
-
-- **Sliding Window Attention** — 28 sliding (W=512) + 7 full-attention layers.
-- **Per-Layer Embedding on ANE** — 8960×1536 projection inside the CoreML graph.
-- **Context length 2048** — stateless KV cache with explicit I/O.
+Full release history: [GitHub Releases](https://github.com/john-rocky/CoreML-LLM/releases).
 
 ## Architecture
 
