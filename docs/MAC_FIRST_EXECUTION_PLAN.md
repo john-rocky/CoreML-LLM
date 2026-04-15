@@ -12,13 +12,32 @@ resource and we weren't maximizing the information per trip.
 
 This plan enforces:
 
-1. **Mac-side validation first.** Every candidate is run through an
-   offline measurement to estimate gain before burning a device trip.
-2. **Bundled device trips.** When the iPhone does come out, multiple
+1. **Mac-side pre-validation.** Every candidate is run through an
+   offline measurement to estimate gain / confirm correctness before
+   burning a device trip. Mac is a development tool — not the product
+   target.
+2. **iPhone is the authoritative speed benchmark.** The product claim
+   is "ANE-optimized LLM on iPhone"; headline tok/s numbers in
+   README / release notes / this doc must be measured on iPhone. Mac
+   numbers are proxies used to rank candidates and catch correctness
+   regressions, never as the shipping number.
+3. **Bundled device trips.** When the iPhone does come out, multiple
    unrelated data points are collected in one session.
-3. **ROI-ranked execution.** Start with items that deliver the most per
+4. **ROI-ranked execution.** Start with items that deliver the most per
    day, stop when the competitive target (> 56 tok/s @ 2K, Google's
-   LiteRT-LM iOS) is comfortably exceeded.
+   LiteRT-LM iOS) is comfortably exceeded on device.
+
+### What each environment is authoritative for
+
+| Quantity | Mac can answer? | iPhone required? |
+|---|---|---|
+| Correctness / numerical bit-exactness | ✅ (fp16 deterministic) | no |
+| Accept rate for speculative drafters | ✅ (drafter proposals and target argmax are device-independent) | no |
+| Model load sequence, file layout, IO | ✅ | no |
+| Wall-clock chunk latencies (ms/step) | proxy only | **yes** |
+| Final tok/s for README / release | no | **yes** |
+| MLComputePlan ANE placement ratio | proxy only (Mac ANE ≠ iPhone ANE ops) | **yes** |
+| TTFT with real prefill chunks | proxy only | **yes** |
 
 ---
 
