@@ -22,10 +22,16 @@ public enum VideoProcessor {
     }
 
     public struct Options: Sendable {
-        /// Target frames per second for frame sampling.
+        /// Upper bound on sampling rate. `extractFrames` distributes
+        /// `maxFrames` evenly across the full clip duration, then caps
+        /// the total so we don't sample faster than this (e.g. on a 2 s
+        /// clip with `fps=1.0, maxFrames=8`, you still get at most 3
+        /// frames). 1.0 matches Gemma 4's `video_processor` default.
         public var fps: Double
-        /// Upper bound on extracted frames (protects against long videos
-        /// exploding the prompt — see MULTIMODAL.md).
+        /// Target number of frames — also an upper bound for short
+        /// clips where `fps` binds first. Frames are distributed evenly
+        /// across the clip so the whole video is represented, not just
+        /// the first `maxFrames / fps` seconds.
         public var maxFrames: Int
         /// Also extract the audio track as mono 16 kHz float PCM.
         public var includeAudio: Bool
@@ -58,8 +64,16 @@ public enum VideoProcessor {
 
     // MARK: - Frames
 
-    /// Sample up to `options.maxFrames` frames from `url` at `options.fps`.
-    /// Returned frames carry the wall-clock offset from the start of the clip.
+    /// Sample up to `options.maxFrames` frames from `url`, distributed
+    /// evenly across the full clip so the encoder sees the whole video
+    /// rather than just the first `maxFrames / fps` seconds. `options.fps`
+    /// is now an upper bound on the sampling rate (we don't sample faster
+    /// than the model was trained to consume) — it stops mattering for
+    /// any clip longer than `maxFrames / fps` seconds, where the uniform
+    /// stride is wider than `1/fps` anyway.
+    ///
+    /// Returned frames carry the wall-clock offset from the start of the
+    /// clip, in presentation order.
     public static func extractFrames(
         from url: URL,
         options: Options
@@ -68,23 +82,37 @@ public enum VideoProcessor {
         let durationSec = try await asset.load(.duration).seconds
         guard durationSec.isFinite, durationSec > 0 else { return [] }
 
-        let step = max(1.0 / max(options.fps, 0.01), 1.0 / 120.0)
-        let maxByDuration = Int(floor(durationSec / step)) + 1
-        let count = max(1, min(options.maxFrames, maxByDuration))
+        // Count: target `maxFrames`, capped by `fps` so very short clips
+        // don't duplicate the same frame several times.
+        let maxByFps = max(1, Int(floor(durationSec * max(options.fps, 0.01))) + 1)
+        let count = max(1, min(options.maxFrames, maxByFps))
+
+        // Stride between samples when spread uniformly across the clip.
+        // For count == 1 fall back to the clip midpoint (more
+        // representative than t=0 for a single-frame summary).
+        let stride = count > 1 ? durationSec / Double(count) : durationSec
 
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        // We're sampling sparsely; allow the generator to snap to the nearest
-        // keyframe within half the sampling interval to avoid expensive seeks.
-        let tol = CMTime(seconds: step / 2, preferredTimescale: 600)
+        // Allow the generator to snap to the nearest keyframe within half
+        // the sampling interval. Uniform sampling can make this interval
+        // large on long clips — good for seek cost, still well below the
+        // inter-frame gap so frames don't collapse onto the same keyframe.
+        let tol = CMTime(seconds: max(stride / 2, 0.1), preferredTimescale: 600)
         generator.requestedTimeToleranceBefore = tol
         generator.requestedTimeToleranceAfter = tol
 
         var frames: [Frame] = []
         frames.reserveCapacity(count)
         for i in 0..<count {
-            let t = min(Double(i) * step, max(0, durationSec - 0.01))
-            let cmTime = CMTime(seconds: t, preferredTimescale: 600)
+            // t_i = D * i / count    → first frame at 0 (natural thumb),
+            // last frame at D*(count-1)/count (avoids EOF seek failures).
+            // For count == 1 this is 0, so nudge to the midpoint above.
+            let t = count > 1
+                ? Double(i) * stride
+                : durationSec * 0.5
+            let cmTime = CMTime(seconds: min(t, max(0, durationSec - 0.01)),
+                                preferredTimescale: 600)
             let result = try await generator.image(at: cmTime)
             let img = options.centerCropSquare ? centerSquareCrop(result.image) : result.image
             frames.append(Frame(image: img, timestampSeconds: t))

@@ -126,7 +126,9 @@ video.mp4 / .mov
     │
     ▼
 VideoProcessor.extractFrames(options.fps, options.maxFrames)
-    │  AVAssetImageGenerator, aspect-ratio preserving, 1 fps default
+    │  AVAssetImageGenerator, aspect-ratio preserving.
+    │  `maxFrames` distributed evenly across the full clip duration;
+    │  `fps` caps the sampling rate so short clips don't duplicate frames.
     │
     ▼
 ImageProcessor.process() × N frames       (optional audio branch)
@@ -185,14 +187,17 @@ video-grade encoder but is expected to drift more under motion.
 
 Each frame costs ~261 tokens (256 placeholders + BOI + EOI + `MM:SS` + space).
 
-| Chunk size | Usable frames @ 1 fps | Recommended `maxFrames` |
-|------------|------------------------|--------------------------|
-| 512        | ~1                     | 1 (use the still-image path instead) |
-| 2048       | ~7                     | 6                        |
-| 8192       | ~30                    | 24                       |
+| Chunk size | Max frames fittable | Recommended `maxFrames` |
+|------------|---------------------|--------------------------|
+| 512        | ~1                  | 1 (use the still-image path instead) |
+| 2048       | ~7                  | 6                        |
+| 8192       | ~30                 | 24                       |
 
 `VideoProcessor.Options(fps:maxFrames:includeAudio:)` defaults to
 `fps=1.0, maxFrames=8, includeAudio=false` — safe on a 2K chunk.
+`maxFrames` is the actual count target (frames are spaced evenly across
+the clip); `fps` caps the rate so clips shorter than `maxFrames / fps`
+seconds don't produce near-duplicate samples.
 
 For longer clips on mobile, `vision_video.mlpackage` provides the
 low-token-budget encoder variant (`max_soft_tokens=70`, ≈64 real
