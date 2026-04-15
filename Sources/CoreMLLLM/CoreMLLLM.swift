@@ -668,6 +668,79 @@ public final class CoreMLLLM: @unchecked Sendable {
         cachedImageFeatures = nil
     }
 
+    // MARK: - Bench helpers (offline harness use only; not for production)
+
+    /// Chunked-engine verify K (typically 3). Nil if the monolithic path is
+    /// in use or verify chunks aren't loaded.
+    public var benchVerifyK: Int? {
+        guard let e = chunkedEngine, e.hasVerify else { return nil }
+        return e.verifyK
+    }
+
+    /// Current decode position on the chunked engine, or nil on monolithic.
+    public var benchCurrentPosition: Int? { chunkedEngine?.currentPosition }
+
+    /// Run prefill + sequential `predictStep` for any tokens that didn't fit
+    /// in a prefill chunk. After return, `benchCurrentPosition ==
+    /// promptTokens.count` and `seed` is target's argmax (via `decode_q1`) for
+    /// that position — the token to emit first. Resets engine + spec engines.
+    ///
+    /// Text prompts only; image/audio paths are not handled.
+    public func benchPrefill(_ prompt: String) async throws -> (prompt: [Int32], seed: Int32) {
+        guard let engine = chunkedEngine else {
+            throw CoreMLLLMError.predictionFailed
+        }
+        let messages = [Message(role: .user, content: prompt)]
+        let chatPrompt = buildPrompt(messages, hasImage: false, hasAudio: false,
+                                     audioTokenCount: 0)
+        let tokens = tokenizer.encode(text: chatPrompt)
+        reset()
+        self.lastPromptTokenIDs = tokens.map { Int32($0) }
+        self.lastEmittedTokenIDs = []
+
+        var nextID = 0
+        let prefillLen = min(tokens.count, engine.prefillN)
+        let useHybrid = engine.hasPrefill && prefillLen > 0
+        if useHybrid {
+            try autoreleasepool {
+                let batch = Array(tokens[0..<prefillLen])
+                nextID = try engine.runPrefill(tokenIDs: batch)
+            }
+            engine.currentPosition = prefillLen
+            for step in prefillLen..<tokens.count {
+                try autoreleasepool {
+                    nextID = try engine.predictStep(tokenID: tokens[step], position: step)
+                }
+                engine.currentPosition = step + 1
+            }
+        } else {
+            for (step, tid) in tokens.enumerated() {
+                try autoreleasepool {
+                    nextID = try engine.predictStep(tokenID: tid, position: step)
+                }
+                engine.currentPosition = step + 1
+            }
+        }
+        return (tokens.map { Int32($0) }, Int32(nextID))
+    }
+
+    /// Run `verify_qK` at the current decode position. `tokens.count` must
+    /// equal `benchVerifyK`. Returns target's argmax at each of K positions.
+    /// Writes K KV slots starting at `benchCurrentPosition` but does NOT
+    /// advance the position — use `benchAdvance(by:)` to commit.
+    public func benchVerify(_ tokens: [Int32]) throws -> [Int32] {
+        guard let engine = chunkedEngine, engine.hasVerify else {
+            throw CoreMLLLMError.predictionFailed
+        }
+        return try engine.verifyCandidates(tokens: tokens,
+                                           startPosition: engine.currentPosition)
+    }
+
+    /// Advance `benchCurrentPosition` by `count`.
+    public func benchAdvance(by count: Int) {
+        chunkedEngine?.currentPosition += count
+    }
+
     // MARK: - Private: monolithic prediction
 
     private func predictMonolithic(tokenID: Int, position: Int,

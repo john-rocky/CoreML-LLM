@@ -1,6 +1,6 @@
 # Session state — rolling handoff
 
-**Last updated:** 2026-04-15 evening (post-PR #54 merge).
+**Last updated:** 2026-04-15 late (post v3 argmax-mode bench).
 
 Keep this doc short and always-current. Any engineer / agent picking up
 should be able to cold-start from it in under 10 minutes.

@@ -21,12 +21,26 @@ import CoreMLLLM
 
 // MARK: - CLI parsing
 
+enum BenchMode: String {
+    /// Compare drafter proposals against `llm.generate(...)`'s emitted token
+    /// stream (target's `decode_q1` argmax). Pre-PR #62 default; oracle replay.
+    case oracle
+    /// Compare drafter proposals against the target's argmax from `verify_qK`.
+    /// Motivation: `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md` — oracle-replay
+    /// over-claims by 3–9× because `decode_q1` ≠ `verify_qK` argmax at fp16.
+    /// This mode produces live-equivalent accept-rate numbers.
+    case argmax
+    /// Run both and emit side-by-side stats in one report.
+    case both
+}
+
 struct BenchArgs {
     var modelDir: URL
     var maxTokens: Int = 128
     var K: Int = 3
     var outJSON: URL?
     var promptFilter: String?  // run only prompts whose category or id contains this
+    var mode: BenchMode = .oracle
 }
 
 func parseArgs() -> BenchArgs {
@@ -58,6 +72,13 @@ func parseArgs() -> BenchArgs {
         case "--filter":
             i += 1
             args.promptFilter = argv[i]
+        case "--mode":
+            i += 1
+            guard let m = BenchMode(rawValue: argv[i]) else {
+                FileHandle.standardError.write(Data("error: --mode must be oracle | argmax | both\n".utf8))
+                exit(2)
+            }
+            args.mode = m
         case "-h", "--help":
             print("""
                 Usage: accept-rate-bench [options]
@@ -66,6 +87,7 @@ func parseArgs() -> BenchArgs {
                   --K <K>              Draft burst size (default: 3)
                   --out <path>         Write JSON results here in addition to stdout
                   --filter <substr>    Only run prompts whose category or id contains <substr>
+                  --mode <m>           oracle (default) | argmax | both. See PHASE_B_LIVE_ACCEPT_RATE_GAP.md
                 """)
             exit(0)
         default:
@@ -82,22 +104,36 @@ struct PromptResult: Codable {
     let id: String
     let category: String
     let promptLen: Int
+    /// Tokens emitted via `decode_q1` (oracle mode). Zero if mode = argmax-only.
     let emittedLen: Int
+    /// Tokens emitted via the `verify_qK` argmax chain (argmax mode). Zero if
+    /// mode = oracle-only.
+    let emittedArgmaxLen: Int
+    /// How many leading tokens in the `decode_q1` and `verify_qK` chains
+    /// agreed. Surfaces the numerical drift between chunks (item 11c). Nil if
+    /// mode didn't run both.
+    let decodeVerifyAgreePrefix: Int?
+    /// Oracle-mode drafter stats (drafter proposals vs `decode_q1` emitted).
     let drafters: [String: AcceptStats]
+    /// Argmax-mode drafter stats (drafter proposals vs `verify_qK` emitted).
+    let draftersArgmax: [String: AcceptStats]
 }
 
 struct BenchReport: Codable {
     let modelDir: String
+    let mode: String
     let K: Int
     let maxTokens: Int
     let generatedAt: Date
     let prompts: [PromptResult]
 
     /// Aggregate chain-accept per drafter across all prompts in a category.
-    func aggregate(by category: String, drafterName: String) -> AcceptStats {
+    /// `useArgmax = true` pulls from `draftersArgmax`; otherwise from `drafters`.
+    func aggregate(by category: String, drafterName: String, useArgmax: Bool) -> AcceptStats {
         var agg = AcceptStats(K: K)
         for p in prompts where p.category == category {
-            if let st = p.drafters[drafterName] {
+            let src = useArgmax ? p.draftersArgmax : p.drafters
+            if let st = src[drafterName] {
                 for (k, v) in st.histogram.enumerated() { agg.histogram[k] += v }
                 agg.totalBursts += st.totalBursts
             }
@@ -166,37 +202,84 @@ struct Main {
                 print("[bench] cross-vocab artifacts not found under \(cvDir.path) — skipping")
             }
 
+            let runOracle = (args.mode == .oracle || args.mode == .both)
+            let runArgmax = (args.mode == .argmax || args.mode == .both)
+            if runArgmax, llm.benchVerifyK == nil {
+                FileHandle.standardError.write(Data(
+                    "error: --mode argmax requires a chunked engine with verify_qK chunks loaded\n".utf8))
+                exit(3)
+            }
+            print("[bench] mode:       \(args.mode.rawValue)")
+
             var results: [PromptResult] = []
 
             for p in benchPrompts {
                 if let f = args.promptFilter,
                    !(p.id.contains(f) || p.category.contains(f)) { continue }
 
-                print("[\(p.category)/\(p.id)] generating…")
-                let genStart = Date()
-                // Discard the text; we only care about the token IDs.
-                _ = try await llm.generate(p.text, maxTokens: args.maxTokens)
-                let genSec = Date().timeIntervalSince(genStart)
-                let prompt = llm.lastPromptTokenIDs
-                let emitted = llm.lastEmittedTokenIDs
-                print("    promptLen=\(prompt.count) emittedLen=\(emitted.count) in \(String(format: "%.1f", genSec))s (\(String(format: "%.1f", Double(emitted.count) / max(genSec, 0.001))) tok/s)")
+                var prompt: [Int32] = []
+                var emittedDecode: [Int32] = []
+                var emittedVerify: [Int32] = []
+                var oracleStats: [String: AcceptStats] = [:]
+                var argmaxStats: [String: AcceptStats] = [:]
 
-                var stats: [String: AcceptStats] = [:]
-                for d in drafters {
-                    let s = replayDrafter(d, prompt: prompt, emitted: emitted, K: args.K)
-                    stats[d.name] = s
-                    let chain = s.chainAccept.map { String(format: "%.2f", $0) }.joined(separator: " ")
-                    print("    \(d.name): chainAccept=[\(chain)] E[tok/burst]=\(String(format: "%.2f", s.expectedTokensPerBurst))")
+                if runOracle {
+                    print("[\(p.category)/\(p.id)] oracle generating…")
+                    let genStart = Date()
+                    _ = try await llm.generate(p.text, maxTokens: args.maxTokens)
+                    let genSec = Date().timeIntervalSince(genStart)
+                    prompt = llm.lastPromptTokenIDs
+                    emittedDecode = llm.lastEmittedTokenIDs
+                    print("    promptLen=\(prompt.count) emittedLen=\(emittedDecode.count) in \(String(format: "%.1f", genSec))s (\(String(format: "%.1f", Double(emittedDecode.count) / max(genSec, 0.001))) tok/s)")
+
+                    for d in drafters {
+                        let s = replayDrafter(d, prompt: prompt, emitted: emittedDecode, K: args.K)
+                        oracleStats[d.name] = s
+                        let chain = s.chainAccept.map { String(format: "%.2f", $0) }.joined(separator: " ")
+                        print("    [oracle] \(d.name): chainAccept=[\(chain)] E[tok/burst]=\(String(format: "%.2f", s.expectedTokensPerBurst))")
+                    }
+                }
+
+                if runArgmax {
+                    print("[\(p.category)/\(p.id)] argmax generating via verify_qK…")
+                    let genStart = Date()
+                    let (pTok, emittedV) = try await generateArgmaxChain(
+                        llm: llm, prompt: p.text, maxTokens: args.maxTokens)
+                    let genSec = Date().timeIntervalSince(genStart)
+                    emittedVerify = emittedV
+                    if prompt.isEmpty { prompt = pTok }
+                    print("    promptLen=\(pTok.count) emittedLen=\(emittedVerify.count) in \(String(format: "%.1f", genSec))s")
+
+                    for d in drafters {
+                        let s = replayDrafter(d, prompt: pTok, emitted: emittedVerify, K: args.K)
+                        argmaxStats[d.name] = s
+                        let chain = s.chainAccept.map { String(format: "%.2f", $0) }.joined(separator: " ")
+                        print("    [argmax] \(d.name): chainAccept=[\(chain)] E[tok/burst]=\(String(format: "%.2f", s.expectedTokensPerBurst))")
+                    }
+                }
+
+                var agreePrefix: Int? = nil
+                if runOracle && runArgmax {
+                    var m = 0
+                    let limit = min(emittedDecode.count, emittedVerify.count)
+                    while m < limit && emittedDecode[m] == emittedVerify[m] { m += 1 }
+                    agreePrefix = m
+                    print("    decode_q1 / verify_qK agree for first \(m)/\(limit) tokens")
                 }
 
                 results.append(PromptResult(
                     id: p.id, category: p.category,
-                    promptLen: prompt.count, emittedLen: emitted.count,
-                    drafters: stats))
+                    promptLen: prompt.count,
+                    emittedLen: emittedDecode.count,
+                    emittedArgmaxLen: emittedVerify.count,
+                    decodeVerifyAgreePrefix: agreePrefix,
+                    drafters: oracleStats,
+                    draftersArgmax: argmaxStats))
             }
 
             let report = BenchReport(
                 modelDir: args.modelDir.path,
+                mode: args.mode.rawValue,
                 K: args.K,
                 maxTokens: args.maxTokens,
                 generatedAt: Date(),
@@ -207,12 +290,21 @@ struct Main {
             print("=== summary ===")
             let cats = Set(benchPrompts.map { $0.category }).sorted()
             let dnames = drafters.map { $0.name }
+            let modes: [(String, Bool)] = {
+                switch args.mode {
+                case .oracle: return [("oracle", false)]
+                case .argmax: return [("argmax", true)]
+                case .both:   return [("oracle", false), ("argmax", true)]
+                }
+            }()
             for cat in cats {
                 print("[\(cat)]")
-                for d in dnames {
-                    let a = report.aggregate(by: cat, drafterName: d)
-                    let chain = a.chainAccept.map { String(format: "%.2f", $0) }.joined(separator: " ")
-                    print("  \(d): N=\(a.totalBursts) chain=[\(chain)] E[tok/burst]=\(String(format: "%.2f", a.expectedTokensPerBurst))")
+                for (label, useArgmax) in modes {
+                    for d in dnames {
+                        let a = report.aggregate(by: cat, drafterName: d, useArgmax: useArgmax)
+                        let chain = a.chainAccept.map { String(format: "%.2f", $0) }.joined(separator: " ")
+                        print("  [\(label)] \(d): N=\(a.totalBursts) chain=[\(chain)] E[tok/burst]=\(String(format: "%.2f", a.expectedTokensPerBurst))")
+                    }
                 }
             }
 
@@ -228,4 +320,48 @@ struct Main {
             exit(1)
         }
     }
+}
+
+// MARK: - Argmax chain generation
+
+/// Open-generate from the target using `verify_qK` to produce the argmax
+/// chain. Each step calls `benchVerify` with the current seed in slot 0 and
+/// zeros in slots 1..K-1; only `targetArgmax[0]` is consumed, so the slot 1+
+/// inputs don't matter (target's prediction at P+1 depends only on slot 0's
+/// token at position P). One verify call per committed token.
+///
+/// Slots 1..K-1 of the KV cache written by each call are overwritten by the
+/// next call (which starts at P+1), so no downstream corruption.
+func generateArgmaxChain(llm: CoreMLLLM, prompt: String, maxTokens: Int) async throws
+    -> (prompt: [Int32], emitted: [Int32])
+{
+    guard let K = llm.benchVerifyK else {
+        throw BenchError.verifyUnavailable
+    }
+    let (promptTokens, seed) = try await llm.benchPrefill(prompt)
+
+    // Gemma EOS set matches CoreMLLLM's production loop.
+    let eosIDs: Set<Int32> = [1, 106, 151645]
+
+    var emitted: [Int32] = []
+    emitted.reserveCapacity(maxTokens)
+    var nextID = seed
+
+    var verifyTokens = [Int32](repeating: 0, count: K)
+
+    for _ in 0..<maxTokens {
+        if eosIDs.contains(nextID) { break }
+        verifyTokens[0] = nextID
+        // Slots 1..K-1 left as 0 — intentional; see function doc.
+        for i in 1..<K { verifyTokens[i] = 0 }
+        let argmax = try llm.benchVerify(verifyTokens)
+        emitted.append(nextID)
+        llm.benchAdvance(by: 1)
+        nextID = argmax[0]
+    }
+    return (promptTokens, emitted)
+}
+
+enum BenchError: Error {
+    case verifyUnavailable
 }
