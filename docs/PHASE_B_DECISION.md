@@ -140,28 +140,47 @@ Blocking item for Phase C.
 
 ---
 
-## What this means for the 56 tok/s target
+## What this means for the go-forward target
 
-`MOBILE_2K_COMPETITIVE_PLAN.md` targets 56 tok/s (Google LiteRT-LM
-parity). Phase B's projected path there was via speculative decoding.
-Post-v4, that path is blocked at verify-chunk tightening. Options:
+**The repo's competitive target is no longer "56 tok/s parity with
+LiteRT-LM."** 2026-04-15 strategic pivot: since LiteRT-LM's 56 tok/s
+is Metal-GPU-resident at 3–5 W, matching it on decode rate would
+require abandoning the ANE-native placement that is this repo's
+reason for existing. The user has explicitly rejected that pivot
+("repo の意味自体がなくなる").
 
-- **Accept delay.** Finish C0 → Mirror SD → measurable speculative
-  gain. Multi-week path, well-defined.
-- **Switch priorities.** Non-speculative wins that Phase A5 deferred:
-  staged chunk pipelining (Phase D1 in HANDOFF), GPU prefill via
-  MLX-Swift (Phase 5 item 27). These don't depend on verify-chunk
-  numerics and may close part of the gap independently.
-- **Revisit the target.** 56 tok/s is a specific model/prompt
-  configuration; at 2K ctx on 17 Pro with current chunks, the
-  fallback-only path delivers ~31–32. Whether the 25-tok/s gap is
-  entirely speculative-attributable vs also chunk-dispatch overhead
-  hasn't been decomposed cleanly. A per-chunk audit (item B4, not
-  yet run) would clarify.
+The go-forward value prop is a different axis triad — **power,
+TTFT, and ANE decode ceiling**. See `docs/MOBILE_2K_COMPETITIVE_PLAN.md`
+for the full reframing and competitive table.
 
-Recommend: schedule C0 investigation as highest-priority next session
-and run the chunk-dispatch audit opportunistically on whatever iPhone
-trip follows.
+Phase B's speculative-decoding path was previously framed as *the*
+lever for closing the tok/s gap. That framing is retired for two
+independent reasons:
+
+1. The path is blocked at verify-chunk semantics (this doc's C0) —
+   a multi-week redesign, not a near-term unlock.
+2. Even if unblocked, the ANE chunk-pipelining audit (PR #75) showed
+   the ANE driver serialises submissions, so Mirror-SD's cost-hiding
+   model doesn't recover the expected concurrency win.
+
+The remaining tractable path, independent of speculation, is two
+items:
+
+- **(a) D1b chunk pipelining** — ANE+GPU compute-unit split (PR #77
+  validated overlap factor 0.87–0.99). Projected ceiling ~43 tok/s
+  on iPhone 17 Pro. In flight on `feat/chunk-pipelining-d1b`.
+- **(b) GPU prefill via MLX-Swift** — Phase 5 item 27, elevated to
+  Phase C critical path. Projected TTFT 13 s → ~1 s.
+
+Both are Swift-side work, independent of verify-chunk numerics, and
+preserve the ANE-resident decode story. The 43 tok/s and 1 s TTFT
+figures are projections; see `docs/MOBILE_2K_COMPETITIVE_PLAN.md`
+§"Projection basis" for what grounds each.
+
+Phase B itself stays closed. C0 remains filed for anyone who later
+wants to pursue the verify-protocol redesign, but it is not on the
+current critical path and is not a blocker for shipping the ANE-
+native value prop.
 
 ---
 
