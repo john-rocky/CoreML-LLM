@@ -4,8 +4,45 @@ Each prompt below is self-contained and at original full scope. Paste one per
 fresh Claude Code session with model=Opus. They timed out when run 9-parallel
 in one session; a fresh session per prompt should clear the timeout.
 
-Repo: `/Users/majimadaisuke/Downloads/CoreML-LLM/` on branch
-`feat/pre-conv-optimizations`.
+## Branch & session setup (do this FIRST in every new session)
+
+Repo: `/Users/majimadaisuke/Downloads/CoreML-LLM/`
+
+ALL 5 prompts below must commit onto the same branch:
+**`research/conversion-deep-dive`** (pushed to origin).
+
+Before pasting any prompt, run:
+```
+cd /Users/majimadaisuke/Downloads/CoreML-LLM
+git checkout research/conversion-deep-dive
+git pull --ff-only
+```
+
+After the research doc lands, commit and push:
+```
+git add docs/<new_doc>.md
+git -c commit.gpgsign=false commit -m "docs: <prompt letter> — <short title>"
+git push
+```
+
+## Integration phase (after all 5 complete)
+
+Open a separate Claude Code session after all 5 docs land. Paste:
+
+> Integrate every research doc on branch `research/conversion-deep-dive` under
+> `/Users/majimadaisuke/Downloads/CoreML-LLM/docs/` into a single action-ready
+> roadmap. Read all pre-conv + round-2 + round-3 docs (roughly 20+ files).
+> Resolve contradictions, deduplicate overlapping findings, rank all
+> optimizations by Δtok/s / LOC × risk, and produce one unified document
+> `docs/INTEGRATED_ROADMAP.md` covering: (1) immediate wins (≤ 1 day each),
+> (2) medium-term work (1-week each), (3) deferred / conditional, (4) rejected
+> with primary-source rationale. Also decompose into Issue/PR-sized work units
+> the user can execute one at a time. Use Read/Grep — do not re-research. If
+> two docs disagree, prefer the newer one (dated 2026-04-16 or later) and
+> flag the disagreement.
+
+The integration agent must NOT spawn further research — it's purely a
+synthesis pass over existing docs.
 
 Already-existing reference docs (agents should read these for context):
 - `docs/CONVERSION_AUDIT_2026_04_15.md` — 19-item conversion audit
