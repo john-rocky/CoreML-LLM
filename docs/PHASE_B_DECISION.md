@@ -163,19 +163,33 @@ independent reasons:
    the ANE driver serialises submissions, so Mirror-SD's cost-hiding
    model doesn't recover the expected concurrency win.
 
-The remaining tractable path, independent of speculation, is two
-items:
+The remaining tractable path, independent of speculation, is now a
+**single** item:
 
-- **(a) D1b chunk pipelining** — ANE+GPU compute-unit split (PR #77
-  validated overlap factor 0.87–0.99). Projected ceiling ~43 tok/s
-  on iPhone 17 Pro. In flight on `feat/chunk-pipelining-d1b`.
+- **(a) D1b chunk pipelining** — ~~Projected ceiling ~43 tok/s on
+  iPhone 17 Pro via ANE+GPU compute-unit split (PR #77).~~
+  **Implemented on `feat/chunk-pipelining-d1b` (PR #79) and
+  REGRESSED by 24 % across all 4 prompt categories** (baseline
+  32.8–33.2 → pipelined 24.9–25.5 tok/s on Mac Studio), with a
+  bit-exact failure on `summary` at token 50 (fp16 rounding between
+  ANE and GPU backends of c3). **Structural blocker:** c4 takes
+  c3's `hidden_states_out` — a strict data dep that leaves only a
+  ~1 µs Swift dict-build as the within-step overlap window against
+  a ~16 ms GPU c3. Cross-step pipelining is blocked by the symmetric
+  token-feedback edge (c3@N+1 needs c4@N). Three future options
+  documented in PR #79's `docs/PHASE_D_PIPELINING_IMPL.md`
+  (decoupled c4, speculative h3, model re-chunking) all require
+  model re-conversion — not Swift-side. D1b is off the critical
+  path; plumbing stays OFF-by-default on main.
 - **(b) GPU prefill via MLX-Swift** — Phase 5 item 27, elevated to
-  Phase C critical path. Projected TTFT 13 s → ~1 s.
+  Phase C critical path. Projected TTFT 13 s → ~1 s. **With D1b
+  invalidated, item 27 is now the sole tractable non-speculative
+  decode-adjacent gain** (it targets the TTFT axis, not decode rate).
 
-Both are Swift-side work, independent of verify-chunk numerics, and
-preserve the ANE-resident decode story. The 43 tok/s and 1 s TTFT
-figures are projections; see `docs/MOBILE_2K_COMPETITIVE_PLAN.md`
-§"Projection basis" for what grounds each.
+The decode-rate ceiling on the current chunk graph is the
+**measured 32 tok/s ANE ceiling**; the ~43 tok/s projection has been
+retracted (see `docs/MOBILE_2K_COMPETITIVE_PLAN.md` §"Projection
+basis" and §"Retraction callout").
 
 Phase B itself stays closed. C0 remains filed for anyone who later
 wants to pursue the verify-protocol redesign, but it is not on the

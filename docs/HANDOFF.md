@@ -1,23 +1,29 @@
 # Next-session handoff
 
-**Last updated:** 2026-04-15 post value-prop reframe. The "beat
-LiteRT-LM at 56 tok/s" target is **retired**; go-forward value prop
-is ANE-native (power + TTFT + ~43 tok/s ceiling). See
-`docs/MOBILE_2K_COMPETITIVE_PLAN.md`.
+**Last updated:** 2026-04-15 late (post D1b-impl retraction). The
+"beat LiteRT-LM at 56 tok/s" target is **retired**; go-forward
+value prop is ANE-native (power + TTFT + **measured 32 tok/s
+decode ceiling**). The earlier ~43 tok/s decode projection was
+retracted after PR #79 implemented the required D1b pipeline and
+measured a 24 % regression. See `docs/MOBILE_2K_COMPETITIVE_PLAN.md`
+§"Retraction callout".
 
 ## Read this first
 
 To resume cleanly, the next session should:
 
 1. Open `docs/MOBILE_2K_COMPETITIVE_PLAN.md` — **authoritative
-   value prop**. ANE-native triad: power, TTFT, tok/s ceiling. 56
+   value prop**. ANE-native triad: ~1 W power, ~1 s TTFT
+   (projected, item 27), **32 tok/s decode ceiling (measured)**. 56
    tok/s parity is no longer a goal; we compete on a different axis.
 2. Open this file (`docs/HANDOFF.md`) — takes 5 minutes.
 3. Read `docs/PHASE_B_DECISION.md` §"What this means for the
    go-forward target" — why speculative decoding is off the critical
-   path and the two tractable items that replaced it (D1b + item 27).
-4. Read `docs/BASELINE_SPEED_AUDIT.md` — per-chunk costs that ground
-   the ~43 tok/s pipelining ceiling.
+   path, why D1b pipelining was retracted (PR #79), and why item 27
+   is now the *single* tractable decode-adjacent lever.
+4. Read `docs/BASELINE_SPEED_AUDIT.md` — per-chunk costs (c1=5.9,
+   c2=6.8, c3=8.1, c4=10.4 ms on iPhone 17 Pro); read alongside the
+   retraction to understand why the `c3 → c4` dep kills overlap.
 5. Skim `docs/SESSION_STATE.md` for exact PR / branch / task state.
 6. Historical context (read only if needed):
    - `docs/PHASE_C_TIGHTENING_FINDINGS.md` — why verify-chunk redesign
@@ -26,6 +32,10 @@ To resume cleanly, the next session should:
      `PHASE_B_LIVE_ACCEPT_RATE_GAP.md` — speculative-decode refutation
      chain.
    - `docs/PHASE_A5_DECISION.md` — superseded.
+   - PR #79 / `feat/chunk-pipelining-d1b` — D1b full-impl negative
+     result (the retraction evidence); see `docs/PHASE_D_PIPELINING_IMPL.md`
+     on that branch for the three future options (decoupled c4,
+     speculative h3, model re-chunking) — all require `conversion/`.
 
 No need to touch MTP Path A, PR #17, PR #33, or further Union /
 speculative wiring — all off the critical path with reasons in
@@ -39,37 +49,49 @@ model walks in with correct framing:
 > Value-prop reframed 2026-04-15. **56 tok/s parity with LiteRT-LM
 > is no longer a goal.** LiteRT-LM is Metal GPU at 3–5 W; this repo
 > is ANE-native at ~1 W. Different competitive axis. Current target
-> triad: (1) sustained power ~1 W, (2) TTFT ~1 s (conditional on
-> item 27), (3) decode tok/s ~43 (conditional on D1b). All three
-> projections are documented in docs/MOBILE_2K_COMPETITIVE_PLAN.md.
+> triad: (1) sustained power ~1 W, (2) TTFT ~1 s (projected,
+> conditional on item 27), (3) **decode 32 tok/s (measured ANE
+> ceiling)**. The earlier ~43 tok/s decode projection has been
+> **retracted** — PR #79 implemented the D1b 2-stage pipeline that
+> projection required and measured a 24 % regression across all 4
+> categories; the `c3 → c4` data dep leaves no within-step overlap
+> window. See docs/MOBILE_2K_COMPETITIVE_PLAN.md §"Retraction
+> callout" and docs/PHASE_B_DECISION.md §"What this means for the
+> go-forward target".
 >
-> Next-session focus: **ship D1b full impl + scope item 27 (GPU
-> prefill via MLX-Swift)**. Both are Swift-side, both preserve
-> ANE-resident decode. Neither depends on speculative decoding.
+> Next-session focus: **pick one of the following.** Both are
+> independent of speculative decoding.
 >
-> Speculative decoding is off the critical path. Phase B closed;
-> verify-protocol redesign (C0 option b) is multi-week and is not
-> required for the ANE-native value prop. Do not re-litigate.
->
-> Read (in order):
-> 1. docs/MOBILE_2K_COMPETITIVE_PLAN.md — the value prop.
-> 2. docs/PHASE_B_DECISION.md §"What this means for the go-forward
->    target" — why speculation is parked.
-> 3. docs/BASELINE_SPEED_AUDIT.md — per-chunk costs; grounds the
->    43 tok/s ceiling.
-> 4. docs/HANDOFF.md (this file) + docs/SESSION_STATE.md.
->
-> Start options:
-> - **Ship D1b pipelining full impl.** PR #77 validated the ANE+GPU
->   compute-unit split (overlap 0.87–0.99). Branch
->   `feat/chunk-pipelining-d1b` is in flight. Deliver the 4-stage
->   pipeline + iPhone measurement; exit criterion is ≥ 40 tok/s at
->   2K on iPhone 17 Pro.
-> - **Scope item 27 (GPU prefill).** MLX-Swift prefill path, 7–10
->   days. Decode stays on ANE; GPU is used only during the 512-token
+> - **Item 27 (GPU prefill via MLX-Swift).** Sole remaining tractable
+>   non-speculative decode-adjacent lever after D1b was invalidated.
+>   Targets TTFT, not decode rate. MLX-Swift prefill path, 7–10 days.
+>   Decode stays on ANE; GPU is used only during the 512-token
 >   prefill. Exit criterion for the scoping pass: a one-page design
 >   that identifies the Metal↔CoreML handoff cost and the ~1 s TTFT
 >   feasibility gate.
+> - **One of PR #79's three future options** (all require `conversion/`
+>   work — not runtime-only): decoupled c4 (c4 takes h2 instead of h3,
+>   recomputing layers 25–34 independently), speculative h3
+>   (predict-and-verify on the hidden axis), or model re-chunking so
+>   c3/c4 can compute independent residual sub-streams. See
+>   `docs/PHASE_D_PIPELINING_IMPL.md` on branch `feat/chunk-pipelining-d1b`.
+>
+> Speculative decoding is off the critical path. Phase B closed;
+> verify-protocol redesign (C0 option b) is multi-week and is not
+> required for the ANE-native value prop. Do not re-litigate. D1b
+> runtime pipelining is also off the table — do not revisit without
+> first doing one of the three `conversion/` fixes above.
+>
+> Read (in order):
+> 1. docs/MOBILE_2K_COMPETITIVE_PLAN.md — the value prop (with
+>    retraction callout).
+> 2. docs/PHASE_B_DECISION.md §"What this means for the go-forward
+>    target" — why speculation is parked and why D1b was retracted.
+> 3. docs/BASELINE_SPEED_AUDIT.md — per-chunk costs; grounds the
+>    32 tok/s ceiling and shows why `c3 → c4` is load-bearing.
+> 4. docs/HANDOFF.md (this file) + docs/SESSION_STATE.md.
+> 5. PR #79 / `docs/PHASE_D_PIPELINING_IMPL.md` (on the branch) —
+>    retraction evidence + three future options.
 >
 > Docs auto-merge; bench/harness code auto-merges too.
 
