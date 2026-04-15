@@ -274,9 +274,25 @@ macro content (object names, motion direction) even if phrasing differs.
 
 - **`torch.jit.trace` on the vision tower**: the `gemma4_vision.py`
   docstring says tracing was hard last time because of dynamic masking.
-  **Partially resolved** on this branch — see
-  `conversion/phase2/trace_video_vision.py`. Summary of what we learned
-  in a ~1.5 hr Phase 2 spike on 2026-04-15:
+  **Resolved 2026-04-15** — `conversion/phase2/trace_video_vision.py`
+  now converts end-to-end and matches the HF forward with
+  `cosine=1.0000, max_abs_diff=0.0098` (fp16 rounding). Output:
+  `vision_video.mlpackage` (~323 MB). The two blockers were:
+  1. **`_cast` on 1-elt non-0-dim const**: `int(x.val)` raised
+     `TypeError: only 0-dimensional arrays can be converted to Python
+     scalars` at `ops.py:3048`. Fixed by patching `_cast` to route
+     `numpy.ndarray` values through `.item()` before casting.
+  2. **`clamp(min=0)` on int64 → fp32 promotion**: coremltools's
+     `clamp` handler uses `±inf` (float) defaults, which promote int
+     inputs to fp32 via `promote_input_dtypes`. That made the
+     downstream `one_hot` reject the indices (expects int32, got
+     fp32). Fixed by patching `clamp` (and its `clip` alias, re-
+     registered in `_TORCH_OPS_REGISTRY`) to use the `maximum`/
+     `minimum` path when the input dtype is integral. Both patches
+     are contained in `trace_video_vision.py`; upstreaming to
+     coremltools is optional.
+
+  (Historical notes from the original 1.5 hr spike, kept for context:)
   - Env that works: **Python 3.11 + `transformers@main` (5.6.0.dev0) +
     `torch 2.7.0` + `coremltools 9.0` + `accelerate 1.13`** via `uv`.
     Python 3.9 is too old for transformers main.
@@ -298,13 +314,11 @@ macro content (object names, motion direction) even if phrasing differs.
     (`patched_vision_forward`).
   - With that patch, `torch.jit.trace` succeeds. **`ct.convert` then
     fails** in MIL on a cast op (`only 0-dimensional arrays can be
-    converted to Python scalars`) — probably inside `rotary_emb` or
-    similar. Next engineer picks up here.
-  - Suggested next step: run with
-    `ct.convert(..., debug=True)` to localize the offending node, then
-    either (a) patch that node's handler in
-    `coremltools/converters/mil/frontend/torch/ops.py`, or (b)
-    rewrite the vision tower's `rotary_emb` path to avoid the cast.
+    converted to Python scalars`). See the resolution block above —
+    the offending node was actually `aten::Int` on a 1-elt numpy
+    const (not `rotary_emb`), and the second blocker after fixing
+    that was `aten::clamp` on int position_ids being silently
+    promoted to fp32.
 
 ### Reproduce the exact state Phase 2 stopped at
 
@@ -325,21 +339,23 @@ python -c "from huggingface_hub import snapshot_download; \
 python conversion/phase2/trace_video_vision.py
 ```
 
-Expected output (last lines):
+Expected output (last lines, as of 2026-04-15):
 
 ```
 reference forward...
-  ref shape: (1, 64, 1536)          ← ✓ model forward correct
-tracing (with patched vision encoder)...   ← ✓ jit.trace OK
+  ref shape: (1, 64, 1536)
+tracing (with patched vision encoder)...
 converting via coremltools (jit)...
-...
-File "coremltools/.../torch/ops.py", line 3048, in _cast
-    res = mb.const(val=dtype(x.val), name=node.name)
-                       ^^^^^^^^^^^^
-TypeError: only 0-dimensional arrays can be converted to Python scalars
+saved /tmp/vision_video.mlpackage (323.1 MB)
+
+parity check...
+  cosine similarity vs. HF forward: 1.0000
+  max abs diff: 0.0098
 ```
 
-That `_cast` failure is the single remaining blocker.
+Phase 2 convert is unblocked. Remaining work: productionize the
+converter into `conversion/models/gemma4_vision.py` + CLI flag, then
+wire the Swift side (Steps 2–4 above).
 - **ANE placement**: the still-image encoder runs `.cpuAndGPU` by design
   (see BENCHMARKING.md). The video encoder inherits the same constraint
   unless ANE-friendly ops can be substituted. Do not chase ANE placement

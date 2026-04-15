@@ -12,7 +12,72 @@ import numpy as np
 import coremltools as ct
 from transformers import Gemma4ForConditionalGeneration
 
-MODEL = "/Users/daisukemajima/Documents/Models/gemma4-e2b/hf_model"
+# ── Patch coremltools _cast to handle 1-elt (non-0-dim) numpy arrays.
+# Without this, `aten::Int` on a shape-(1,) constant raises
+# `TypeError: only 0-dimensional arrays can be converted to Python scalars`
+# at MIL import time (ops.py:3048). Fix: flatten via .item() before casting.
+from coremltools.converters.mil.frontend.torch import ops as _ct_ops
+from coremltools.converters.mil.mil import Builder as _mb
+
+def _patched_cast(context, node, dtype, dtype_name):
+    inputs = _ct_ops._get_inputs(context, node, expected=1)
+    x = inputs[0]
+    if not (len(x.shape) == 0 or np.all([d == 1 for d in x.shape])):
+        raise ValueError("input to cast must be either a scalar or a length 1 tensor")
+    if x.can_be_folded_to_const():
+        val = x.val
+        if isinstance(val, np.ndarray):
+            val = val.item() if val.size == 1 else val.reshape(()).item()
+        if not isinstance(val, dtype):
+            res = _mb.const(val=dtype(val), name=node.name)
+        else:
+            res = x
+    elif len(x.shape) > 0:
+        x2 = _mb.squeeze(x=x, name=node.name + "_item")
+        res = _mb.cast(x=x2, dtype=dtype_name, name=node.name)
+    else:
+        res = _mb.cast(x=x, dtype=dtype_name, name=node.name)
+    context.add(res, node.name)
+
+_ct_ops._cast = _patched_cast
+
+# ── Patch `clamp` so that a one-sided clamp (e.g. `.clamp(min=0)`) on an
+# int tensor does not get silently promoted to fp32 via the float-typed
+# +/- inf default bound. Preserving int dtype is required because the
+# tensor feeds directly into `one_hot` which only accepts int indices.
+from coremltools.converters.mil.mil import types as _ct_types
+
+def _patched_clamp(context, node):
+    inputs = _ct_ops._get_inputs(context, node, expected=[1, 2, 3])
+    x = inputs[0]
+    min_in = inputs[1] if len(inputs) > 1 else None
+    max_in = inputs[2] if len(inputs) > 2 else None
+    # One-sided on int → min/max path preserves dtype.
+    if (min_in is None or max_in is None) and not _ct_types.is_float(x.dtype):
+        res = x
+        if max_in is not None:
+            res = _mb.minimum(x=res, y=max_in)
+        if min_in is not None:
+            res = _mb.maximum(x=res, y=min_in, name=node.name)
+        else:
+            res = _mb.identity(x=res, name=node.name)
+        context.add(res, node.name)
+        return
+    # Fall back to the original implementation.
+    _orig_clamp(context, node)
+
+_orig_clamp = _ct_ops.clamp
+_ct_ops.clamp = _patched_clamp
+# The dispatcher looks up handlers in the registry by op name, not via
+# module attributes. Overwrite the registered entry for both `clamp` and
+# its alias `clip` so the patch actually gets called at convert time.
+from coremltools.converters.mil.frontend.torch.torch_op_registry import (
+    _TORCH_OPS_REGISTRY as _REG,
+)
+_REG.set_func_by_name(_patched_clamp, "clamp")
+_REG.set_func_by_name(_patched_clamp, "clip")
+
+MODEL = os.environ.get("GEMMA4_MODEL", "google/gemma-4-E2B-it")
 OUT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/vision_video.mlpackage"
 
 NUM_PATCHES = 630
