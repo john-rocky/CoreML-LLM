@@ -66,10 +66,65 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// Toggle MTP speculation on/off for benchmarking.
     public var mtpEnabled: Bool = true
 
+    // Cross-vocabulary (Qwen -> Gemma) speculative decoding — Route B
+    private var crossVocabEngine: CrossVocabSpeculativeEngine?
+    /// Underlying Qwen drafter, also re-used by `drafterUnion`. Held
+    /// separately so the union can drive it without going through the
+    /// cross-vocab-only engine wrapper.
+    private var crossVocabDrafter: CrossVocabDraft?
+    /// Toggle cross-vocab speculation on/off. Defaults to OFF on 2026-04-15
+    /// after on-device testing showed the Qwen drafter runs ~10× slower
+    /// than Mac projection, producing 1.8 tok/s with degraded output on
+    /// iPhone 17 Pro. Opt-in until drafter cost + bootstrap-TTFT + K=3↔K=1
+    /// numerical alignment (roadmap 11c) are investigated. MTP preserves
+    /// priority when loaded.
+    public var crossVocabEnabled: Bool = false
+
+    // Phase B Task 1 — union of cross-vocab + prompt-lookup{n=2, n=3}
+    private var drafterUnion: DrafterUnion?
+    /// Opt-in for Phase B union. Default off until iPhone baseline check
+    /// confirms no regression (per merge discipline in docs/HANDOFF.md).
+    /// Takes precedence over crossVocabEnabled when both are true.
+    public var drafterUnionEnabled: Bool = false
+
     // Generation metrics
     public private(set) var tokensPerSecond: Double = 0
     public var mtpAcceptanceRate: Double { mtpEngine?.acceptanceRate ?? 0 }
     public var mtpTokensPerRound: Double { mtpEngine?.tokensPerRound ?? 0 }
+    public var crossVocabAcceptanceRate: Double { crossVocabEngine?.acceptanceRate ?? 0 }
+    public var crossVocabTokensPerCycle: Double { crossVocabEngine?.tokensPerCycle ?? 0 }
+    public var drafterUnionAcceptanceRate: Double { drafterUnion?.acceptanceRate ?? 0 }
+    public var drafterUnionTokensPerCycle: Double { drafterUnion?.tokensPerCycle ?? 0 }
+    public var drafterUnionPicks: [String: Int] {
+        guard let u = drafterUnion else { return [:] }
+        var out: [String: Int] = [:]
+        for (k, v) in u.picks { out[k.rawValue] = v }
+        return out
+    }
+    /// Hard-disable the cross-vocab source inside the union. Used by the
+    /// Mac-side bit-exact verifier to keep CV out of the picture when the
+    /// staging Qwen has the wrong context length (gotcha #2 in
+    /// docs/SESSION_STATE.md). On iPhone leave this `false`.
+    public func setDrafterUnionCrossVocabDisabled(_ disabled: Bool) {
+        drafterUnion?.crossVocabDisabled = disabled
+    }
+    /// Override the union's PLD rolling-accept gate. Setting it above 1.0
+    /// hard-disables PLD for the whole generation — useful for narrowing
+    /// down whether divergence vs serial decode comes from PLD-induced
+    /// verify-chunk drift or from union bookkeeping.
+    public func setDrafterUnionPLDThreshold(_ value: Double) {
+        drafterUnion?.pldThreshold = value
+    }
+
+    // Token-ID recording for offline accept-rate benches. These are populated
+    // from the last `generate` / `stream` call and live until the next one.
+    // See `docs/MAC_FIRST_EXECUTION_PLAN.md` §A1 for usage.
+    public private(set) var lastPromptTokenIDs: [Int32] = []
+    public private(set) var lastEmittedTokenIDs: [Int32] = []
+
+    /// Expose the tokenizer so a harness can re-encode / decode arbitrary
+    /// text without duplicating the swift-transformers wiring.
+    public var tokenizerRef: any Tokenizer { tokenizer }
 
     // MARK: - Public Types
 
@@ -165,6 +220,59 @@ public final class CoreMLLLM: @unchecked Sendable {
             } catch {
                 print("[MTP] Failed to load drafter: \(error)")
             }
+        }
+
+        // Cross-vocabulary drafter (Route B): Qwen 2.5 0.5B monolithic +
+        // vocab map. Looks for `cross_vocab/qwen_drafter.mlmodelc` (or
+        // `.mlpackage`) plus `cross_vocab/qwen_gemma_vocab.bin` under the
+        // model directory. Silently skipped if absent.
+        let cvDir = directory.appendingPathComponent("cross_vocab")
+        let cvCompiled = cvDir.appendingPathComponent("qwen_drafter.mlmodelc")
+        let cvPkg = cvDir.appendingPathComponent("qwen_drafter.mlpackage")
+        let cvMapURL = cvDir.appendingPathComponent("qwen_gemma_vocab.bin")
+        let cvModelURL: URL? = FileManager.default.fileExists(atPath: cvCompiled.path) ? cvCompiled
+            : FileManager.default.fileExists(atPath: cvPkg.path) ? cvPkg : nil
+        if let cvModelURL,
+           FileManager.default.fileExists(atPath: cvMapURL.path),
+           let engine = llm.chunkedEngine,
+           engine.hasVerify {
+            onProgress?("Loading cross-vocab drafter (Qwen 2.5 0.5B)...")
+            do {
+                let map = try CrossVocabMap(url: cvMapURL)
+                // Qwen 2.5 0.5B supports 32K natively; cap at target's
+                // context length so the two stay in lockstep.
+                let drafter = try CrossVocabDraft(
+                    modelURL: cvModelURL,
+                    vocabMap: map,
+                    K: engine.verifyK,
+                    contextLength: config.contextLength,
+                    computeUnits: .cpuAndGPU)
+                llm.crossVocabEngine = CrossVocabSpeculativeEngine(
+                    engine: engine, drafter: drafter)
+                llm.crossVocabDrafter = drafter
+                llm.drafterUnion = DrafterUnion(
+                    engine: engine, crossVocab: drafter, K: engine.verifyK)
+                print("[CrossVocab] Drafter loaded (K=\(engine.verifyK), "
+                      + "coverage q->g=\(String(format: "%.1f", Double(map.qwenToGemma.filter { $0 >= 0 }.count) / Double(map.qwenVocabSize) * 100))%)")
+            } catch {
+                print("[CrossVocab] Failed to load drafter: \(error)")
+            }
+            // MLComputePlan audit on the drafter (Phase B Task 2). Runs
+            // only when COMPUTE_PLAN_AUDIT is set, so production load
+            // sees no extra cost. Tells us GPU placement vs CPU fallback
+            // when investigating the iPhone perf regression.
+            await ComputePlanAudit.runDrafter(modelDirectory: directory)
+        }
+
+        // PLD-only union: still useful when cross-vocab drafter assets are
+        // absent (typical for stripped iPhone bundles). Phase B's union
+        // collapses to prompt-lookup{n=2,n=3} which has near-zero cost.
+        if llm.drafterUnion == nil,
+           let engine = llm.chunkedEngine,
+           engine.hasVerify {
+            llm.drafterUnion = DrafterUnion(
+                engine: engine, crossVocab: nil, K: engine.verifyK)
+            print("[DrafterUnion] PLD-only mode (cross-vocab drafter not loaded)")
         }
 
         // Vision model (optional, lazy loaded on first image)
@@ -454,6 +562,10 @@ public final class CoreMLLLM: @unchecked Sendable {
 
         reset()
 
+        // Clear recording buffers and record the prompt IDs for this turn.
+        self.lastPromptTokenIDs = tokenIDs.map { Int32($0) }
+        self.lastEmittedTokenIDs = []
+
         let mutableSelf = self
         let imgFeats = imageFeatures
         let imgTokenLimit = imageNumTokens
@@ -541,15 +653,31 @@ public final class CoreMLLLM: @unchecked Sendable {
                         let startTime = CFAbsoluteTimeGetCurrent()
                         var tokenCount = 0
                         let maxDecode = min(ctxLimit - engine.currentPosition, maxTokens)
-                        let specEngine = mutableSelf.mtpEnabled ? mutableSelf.mtpEngine : nil
-                        specEngine?.reset()
+                        // Drafter selection priority (highest first):
+                        //   1. MTP (trained drafter, best when present)
+                        //   2. DrafterUnion (Phase B; cv + pld-n2 + pld-n3)
+                        //   3. CrossVocab alone (legacy, kept as opt-out fallback)
+                        // Only the selected engine resets — the union and the
+                        // CV-alone engine share an underlying CrossVocabDraft,
+                        // so simultaneous use would corrupt Qwen state.
+                        let mtpSpec = mutableSelf.mtpEnabled ? mutableSelf.mtpEngine : nil
+                        let unionSpec = (mtpSpec == nil && mutableSelf.drafterUnionEnabled)
+                            ? mutableSelf.drafterUnion : nil
+                        let cvSpec = (mtpSpec == nil && unionSpec == nil
+                                      && mutableSelf.crossVocabEnabled)
+                            ? mutableSelf.crossVocabEngine : nil
+                        mtpSpec?.reset()
+                        unionSpec?.reset()
+                        unionSpec?.setPrefillHistory(tokens.map { Int32($0) })
+                        cvSpec?.reset()
+                        cvSpec?.setPrefillHistory(tokens.map { Int32($0) })
 
                         var nid = Int32(nextID)
                         while tokenCount < maxDecode {
                             if eosIDs.contains(Int(nid)) { break }
                             if engine.currentPosition >= ctxLimit { break }
 
-                            if let se = specEngine, se.shouldSpeculate {
+                            if let se = mtpSpec, se.shouldSpeculate {
                                 let emitted = try autoreleasepool {
                                     try se.speculateStep(nextID: &nid)
                                 }
@@ -562,7 +690,36 @@ public final class CoreMLLLM: @unchecked Sendable {
                                     continuation.yield(text)
                                     tokenCount += 1
                                 }
+                            } else if let se = unionSpec, se.shouldSpeculate {
+                                let emitted = try autoreleasepool {
+                                    try se.speculateStep(nextID: &nid)
+                                }
+                                for tok in emitted {
+                                    if eosIDs.contains(Int(tok)) {
+                                        nid = tok
+                                        break
+                                    }
+                                    mutableSelf.lastEmittedTokenIDs.append(tok)
+                                    let text = mutableSelf.tokenizer.decode(tokens: [Int(tok)])
+                                    continuation.yield(text)
+                                    tokenCount += 1
+                                }
+                            } else if let se = cvSpec, se.shouldSpeculate {
+                                let emitted = try autoreleasepool {
+                                    try se.speculateStep(nextID: &nid)
+                                }
+                                for tok in emitted {
+                                    if eosIDs.contains(Int(tok)) {
+                                        nid = tok
+                                        break
+                                    }
+                                    mutableSelf.lastEmittedTokenIDs.append(tok)
+                                    let text = mutableSelf.tokenizer.decode(tokens: [Int(tok)])
+                                    continuation.yield(text)
+                                    tokenCount += 1
+                                }
                             } else {
+                                mutableSelf.lastEmittedTokenIDs.append(nid)
                                 let text = mutableSelf.tokenizer.decode(tokens: [Int(nid)])
                                 continuation.yield(text)
                                 tokenCount += 1
@@ -598,6 +755,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                         for _ in 0..<maxTokens {
                             if eosIDs.contains(nextID) { break }
                             if pos >= ctxLimit { break }
+                            mutableSelf.lastEmittedTokenIDs.append(Int32(nextID))
                             let text = mutableSelf.tokenizer.decode(tokens: [nextID])
                             continuation.yield(text)
                             tokenCount += 1
@@ -626,12 +784,108 @@ public final class CoreMLLLM: @unchecked Sendable {
             monolithicState = monolithicModel?.makeState()
         }
         mtpEngine?.reset()
+        crossVocabEngine?.reset()
+        drafterUnion?.reset()
         tokensPerSecond = 0
     }
 
     /// Clear cached image features (called between conversations).
     public func clearImageCache() {
         cachedImageFeatures = nil
+    }
+
+    // MARK: - Bench helpers (offline harness use only; not for production)
+
+    /// Chunked-engine verify K (typically 3). Nil if the monolithic path is
+    /// in use or verify chunks aren't loaded.
+    public var benchVerifyK: Int? {
+        guard let e = chunkedEngine, e.hasVerify else { return nil }
+        return e.verifyK
+    }
+
+    /// Current decode position on the chunked engine, or nil on monolithic.
+    public var benchCurrentPosition: Int? { chunkedEngine?.currentPosition }
+
+    /// Run prefill + sequential `predictStep` for any tokens that didn't fit
+    /// in a prefill chunk. After return, `benchCurrentPosition ==
+    /// promptTokens.count` and `seed` is target's argmax (via `decode_q1`) for
+    /// that position — the token to emit first. Resets engine + spec engines.
+    ///
+    /// Text prompts only; image/audio paths are not handled.
+    public func benchPrefill(_ prompt: String) async throws -> (prompt: [Int32], seed: Int32) {
+        guard let engine = chunkedEngine else {
+            throw CoreMLLLMError.predictionFailed
+        }
+        let messages = [Message(role: .user, content: prompt)]
+        let chatPrompt = buildPrompt(messages, hasImage: false, hasAudio: false,
+                                     audioTokenCount: 0)
+        let tokens = tokenizer.encode(text: chatPrompt)
+        reset()
+        self.lastPromptTokenIDs = tokens.map { Int32($0) }
+        self.lastEmittedTokenIDs = []
+
+        var nextID = 0
+        let prefillLen = min(tokens.count, engine.prefillN)
+        let useHybrid = engine.hasPrefill && prefillLen > 0
+        if useHybrid {
+            try autoreleasepool {
+                let batch = Array(tokens[0..<prefillLen])
+                nextID = try engine.runPrefill(tokenIDs: batch)
+            }
+            engine.currentPosition = prefillLen
+            for step in prefillLen..<tokens.count {
+                try autoreleasepool {
+                    nextID = try engine.predictStep(tokenID: tokens[step], position: step)
+                }
+                engine.currentPosition = step + 1
+            }
+        } else {
+            for (step, tid) in tokens.enumerated() {
+                try autoreleasepool {
+                    nextID = try engine.predictStep(tokenID: tid, position: step)
+                }
+                engine.currentPosition = step + 1
+            }
+        }
+        return (tokens.map { Int32($0) }, Int32(nextID))
+    }
+
+    /// Run `verify_qK` at the current decode position. `tokens.count` must
+    /// equal `benchVerifyK`. Returns target's argmax at each of K positions.
+    /// Writes K KV slots starting at `benchCurrentPosition` but does NOT
+    /// advance the position — use `benchAdvance(by:)` to commit.
+    public func benchVerify(_ tokens: [Int32]) throws -> [Int32] {
+        guard let engine = chunkedEngine, engine.hasVerify else {
+            throw CoreMLLLMError.predictionFailed
+        }
+        return try engine.verifyCandidates(tokens: tokens,
+                                           startPosition: engine.currentPosition)
+    }
+
+    /// Variant of `benchVerify` that also returns per-position top-`topK`
+    /// `(token_id, logit_fp32)` pairs. Used by the tolerance-based accept
+    /// variant of `accept-rate-bench`.
+    ///
+    /// Throws `CoreMLLLMError.verifyLogitsNotExposed` until the Track B
+    /// (`feat/c0-verify-requant`) re-export of verify chunk 4 adds a
+    /// `logits_fp16` output. Until that PR merges, callers must fall back to
+    /// argmax-only acceptance via `benchVerify`.
+    public func benchVerifyTopK(_ tokens: [Int32], topK: Int = 3) throws
+        -> [[(Int32, Float)]]
+    {
+        guard let engine = chunkedEngine, engine.hasVerify else {
+            throw CoreMLLLMError.predictionFailed
+        }
+        let (_, top) = try engine.verifyCandidatesWithLogits(
+            tokens: tokens,
+            startPosition: engine.currentPosition,
+            topK: topK)
+        return top
+    }
+
+    /// Advance `benchCurrentPosition` by `count`.
+    public func benchAdvance(by count: Int) {
+        chunkedEngine?.currentPosition += count
     }
 
     // MARK: - Private: monolithic prediction
@@ -922,6 +1176,10 @@ public enum CoreMLLLMError: LocalizedError {
     case visionNotAvailable
     case audioNotAvailable
     case videoDecodeFailed
+    /// The verify-chunk pipeline does not expose a `logits_fp16` output yet.
+    /// Returned by `benchVerifyTopK` / `verifyCandidatesWithLogits` until the
+    /// Track B re-export (`feat/c0-verify-requant`) lands on `main`.
+    case verifyLogitsNotExposed
 
     public var errorDescription: String? {
         switch self {
@@ -932,6 +1190,8 @@ public enum CoreMLLLMError: LocalizedError {
         case .visionNotAvailable: return "Vision model not available"
         case .audioNotAvailable: return "Audio model not available"
         case .videoDecodeFailed: return "Could not decode any frames from video"
+        case .verifyLogitsNotExposed:
+            return "verify chunk 4 does not expose `logits_fp16` (Track B re-export pending)"
         }
     }
 }

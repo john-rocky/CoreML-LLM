@@ -94,72 +94,107 @@ public final class MtpSpeculativeEngine {
         let maskSwa = try engine.makeDrafterSWAMask(position: max(maskPos, 0))
         let maskFull = try engine.makeDrafterFullMask(position: max(maskPos, 0))
 
-        // Draft K tokens with per-step RoPE updates
+        // Draft K tokens with per-step RoPE updates.
         var proposals = [Int32]()
         proposals.reserveCapacity(K)
         var embedToken = try engine.lookupRawEmbed(nextID)
         var projAct = carryState!
 
-        for k in 0..<K {
-            let draftPos = pos + k
-            let cosSwa = try engine.lookupCosSWA(position: draftPos)
-            let sinSwa = try engine.lookupSinSWA(position: draftPos)
-            let cosFull = try engine.lookupCosFull(position: draftPos)
-            let sinFull = try engine.lookupSinFull(position: draftPos)
+        let (_, draftMs) = try SpecProfile.time {
+            for k in 0..<K {
+                let draftPos = pos + k
+                let cosSwa = try engine.lookupCosSWA(position: draftPos)
+                let sinSwa = try engine.lookupSinSWA(position: draftPos)
+                let cosFull = try engine.lookupCosFull(position: draftPos)
+                let sinFull = try engine.lookupSinFull(position: draftPos)
 
-            let (tokenId, projActOut) = try drafter.draftOne(
-                embedToken: embedToken,
-                projAct: projAct,
-                kv13K: kv13K, kv13V: kv13V,
-                kv14K: kv14K, kv14V: kv14V,
-                cosSwa: cosSwa, sinSwa: sinSwa,
-                cosFull: cosFull, sinFull: sinFull,
-                maskSwa: maskSwa, maskFull: maskFull)
+                let (tokenId, projActOut) = try drafter.draftOne(
+                    embedToken: embedToken,
+                    projAct: projAct,
+                    kv13K: kv13K, kv13V: kv13V,
+                    kv14K: kv14K, kv14V: kv14V,
+                    cosSwa: cosSwa, sinSwa: sinSwa,
+                    cosFull: cosFull, sinFull: sinFull,
+                    maskSwa: maskSwa, maskFull: maskFull)
 
-            proposals.append(tokenId)
-            embedToken = try engine.lookupRawEmbed(tokenId)
-            projAct = projActOut
+                proposals.append(tokenId)
+                embedToken = try engine.lookupRawEmbed(tokenId)
+                projAct = projActOut
+            }
         }
 
-        // Verify [nextID, proposals[0..K-2]] at currentPosition
-        var verifyTokens = [nextID]
-        verifyTokens.append(contentsOf: proposals.dropLast())
-        let targetArgmax = try engine.verifyCandidates(
-            tokens: verifyTokens, startPosition: pos)
+        // Verify [nextID, proposals[0..K-2]] at currentPosition.
+        // Cap compared proposals to K-1 so every accepted token's KV is
+        // actually written by verify — comparing proposals[K-1] against
+        // targetArgmax[K-1] was a bug: targetArgmax[K-1] is the argmax at
+        // position pos+K (after proposals[K-2] as input), not a verification
+        // of proposals[K-1] (which was never fed to verify). On all-accept
+        // this also leaves slot pos+K without a KV write, the "all-accept
+        // KV hole" that lets the next burst read garbage. Back-port of the
+        // DrafterUnion fix.
+        let useProps = Array(proposals.prefix(K - 1))
+        let compareLen = useProps.count
+        var verifyTokens = [Int32](repeating: 0, count: K)
+        verifyTokens[0] = nextID
+        for (i, t) in useProps.enumerated() { verifyTokens[i + 1] = t }
+        let (targetArgmax, verifyMs) = try SpecProfile.time {
+            try engine.verifyCandidates(
+                tokens: verifyTokens, startPosition: pos)
+        }
 
-        // Accept/reject: greedy comparison
-        var emitted = [Int32]()
-        emitted.reserveCapacity(K + 1)
-        emitted.append(nextID) // always emit tTokNext
+        // Accept/reject: greedy comparison of the draft positions only.
         var matchCount = 0
-        for k in 0..<K {
-            if proposals[k] == targetArgmax[k] {
-                emitted.append(proposals[k])
+        for k in 0..<compareLen {
+            if useProps[k] == targetArgmax[k] {
                 matchCount += 1
             } else {
-                emitted.append(targetArgmax[k]) // correction/bonus
                 break
             }
         }
 
+        // Emitted = [nextID, matched...] — do NOT include the carry here.
+        // The carry (correction on miss, bonus on all-match) stays as the
+        // next burst's seed. Previously we emitted it AND used it as
+        // nextID, causing the same token to be re-committed at two
+        // consecutive positions — visible in output as duplicated words
+        // ("some some context context about about"). Back-port of the
+        // DrafterUnion fix.
+        var emitted: [Int32] = [nextID]
+        emitted.reserveCapacity(matchCount + 1)
+        for k in 0..<matchCount { emitted.append(useProps[k]) }
+
+        let carry: Int32
+        if matchCount < compareLen {
+            carry = targetArgmax[matchCount]  // correction
+        } else if matchCount < K {
+            carry = targetArgmax[matchCount]  // bonus (= argmax at slot K-1)
+        } else {
+            carry = targetArgmax[K - 1]  // defensive; unreachable given K-1 cap
+        }
+
         // Commit: advance position by the verified prefix only.
-        // The correction/bonus token is NOT committed — its KV will be written
-        // in the next cycle's verify pass (overwriting any stale entry).
-        let committed = matchCount + 1 // tTokNext + matched drafts
+        let committed = matchCount + 1
         engine.currentPosition = pos + committed
 
         // Extract carry state from verify hidden states.
-        // lastVerifyHiddenStates: (1, K, hidden) — use the last committed index.
-        let hiddenIdx = min(matchCount, K - 1)
-        carryState = sliceVerifyHidden(at: hiddenIdx, hidden: hidden)
+        // lastVerifyHiddenStates: (1, K, hidden) — matchCount indexes the
+        // slot whose argmax is the carry (same as hiddenIdx used before,
+        // just without clamping to K-1 since matchCount ≤ K-1 now).
+        carryState = sliceVerifyHidden(at: matchCount, hidden: hidden)
 
         // Update metrics
         totalRounds += 1
         totalAccepted += matchCount
         totalEmitted += emitted.count
 
-        // nextID = last emitted token (correction or bonus, not yet committed)
-        nextID = emitted.last!
+        SpecProfile.logBurst(
+            engine: "mtp", cycle: totalRounds,
+            draftMs: draftMs, verifyMs: verifyMs, commitMs: 0,
+            accepted: matchCount, compareLen: compareLen,
+            emitted: emitted.count, rolling: drafter.rollingAcceptance)
+
+        // Carry becomes next burst's seed — NOT yielded from this cycle.
+        nextID = carry
 
         return emitted
     }
@@ -183,11 +218,16 @@ public final class MtpSpeculativeEngine {
     /// First call: run a normal decode to populate kv13/kv14 and warm up.
     private func bootstrapStep(nextID: inout Int32) throws -> [Int32] {
         let emitted = nextID
-        let newNext = try engine.predictStep(
-            tokenID: Int(nextID), position: engine.currentPosition)
+        let (newNext, targetStepMs) = try SpecProfile.time {
+            try engine.predictStep(
+                tokenID: Int(nextID), position: engine.currentPosition)
+        }
         engine.currentPosition += 1
         nextID = Int32(newNext)
         isBootstrapped = true
+        SpecProfile.logBootstrap(
+            engine: "mtp", replayCount: 0,
+            replayMs: 0, targetStepMs: targetStepMs)
         return [emitted]
     }
 

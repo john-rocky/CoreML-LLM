@@ -758,6 +758,177 @@ final class ChunkedEngine {
         return result
     }
 
+    /// Variant of `verifyCandidates` that also returns top-K `(token_id,
+    /// logit_fp32)` pairs at each of the K verify positions.
+    ///
+    /// Requires the verify chunk 4 mlmodelc to expose a `logits_fp16` output of
+    /// shape `(1, K, vocab_size)`. The current staging model does NOT expose
+    /// this yet — the parallel Track B (`feat/c0-verify-requant`) will re-export
+    /// verify chunk 4 with the extra output. Until that lands, this method
+    /// throws `CoreMLLLMError.verifyLogitsNotExposed`.
+    ///
+    /// - Parameters:
+    ///   - tokens: K draft token IDs to verify.
+    ///   - startPosition: KV cache position of the first draft token.
+    ///   - topK: number of (token, logit) pairs to return per position.
+    /// - Returns: `(argmax, topK)` where `argmax` is the same K-length array
+    ///   that `verifyCandidates` would return, and `topK` is a K-entry array,
+    ///   each holding the top-`topK` (tokenID, logit_fp32) pairs at that
+    ///   position sorted by descending logit.
+    func verifyCandidatesWithLogits(tokens: [Int32], startPosition: Int,
+                                    topK: Int = 3) throws
+        -> (argmax: [Int32], topK: [[(Int32, Float)]])
+    {
+        guard hasVerify else {
+            throw CoreMLLLMError.predictionFailed
+        }
+        let K = tokens.count
+        precondition(K == verifyK, "verifyCandidatesWithLogits called with \(K) tokens but model expects \(verifyK)")
+
+        let ctx = config.contextLength
+        let W = config.slidingWindow
+
+        // Build batched inputs (identical to `verifyCandidates`).
+        let hiddenIn = try buildVerifyHidden(tokenIDs: tokens.map { Int($0) })
+        let plRaw = try buildVerifyPLR(tokenIDs: tokens.map { Int($0) })
+        let maskFull = try makeVerifyCausalMask(startPos: startPosition, K: K, length: ctx)
+        let maskSliding = try makeVerifySlidingMask(startPos: startPosition, K: K, W: W)
+
+        let updateIndicator = try MLMultiArray(shape: [1, 1, NSNumber(value: ctx), NSNumber(value: K)], dataType: .float16)
+        let indPtr = updateIndicator.dataPointer.bindMemory(to: UInt16.self, capacity: ctx * K)
+        memset(indPtr, 0, ctx * K * 2)
+        for k in 0..<K {
+            let pos = startPosition + k
+            if pos < ctx {
+                indPtr[pos * K + k] = 0x3C00  // 1.0 in float16
+            }
+        }
+
+        let cosS = try lookupRoPEBatch(table: cosSlidingTable, startPos: startPosition, K: K, dim: 256)
+        let sinS = try lookupRoPEBatch(table: sinSlidingTable, startPos: startPosition, K: K, dim: 256)
+        let cosF = try lookupRoPEBatch(table: cosFullTable, startPos: startPosition, K: K, dim: 512)
+        let sinF = try lookupRoPEBatch(table: sinFullTable, startPos: startPosition, K: K, dim: 512)
+
+        // Verify chunk 1
+        let out1 = try verifyChunk1!.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: hiddenIn),
+            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+            "update_indicator": MLFeatureValue(multiArray: updateIndicator),
+            "per_layer_raw": MLFeatureValue(multiArray: plRaw),
+            "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
+            "K_sliding_in": MLFeatureValue(multiArray: kSliding1),
+            "V_sliding_in": MLFeatureValue(multiArray: vSliding1),
+            "K_full_in": MLFeatureValue(multiArray: kFull1),
+            "V_full_in": MLFeatureValue(multiArray: vFull1),
+        ]))
+        let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
+        copyBack(out1, "K_sliding_out", into: kSliding1)
+        copyBack(out1, "V_sliding_out", into: vSliding1)
+        copyBack(out1, "K_full_out", into: kFull1)
+        copyBack(out1, "V_full_out", into: vFull1)
+
+        // Verify chunk 2
+        let out2 = try verifyChunk2!.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: h1),
+            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+            "update_indicator": MLFeatureValue(multiArray: updateIndicator),
+            "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
+            "K_sliding_in": MLFeatureValue(multiArray: kSliding2),
+            "V_sliding_in": MLFeatureValue(multiArray: vSliding2),
+            "K_full_in": MLFeatureValue(multiArray: kFull2),
+            "V_full_in": MLFeatureValue(multiArray: vFull2),
+        ]))
+        let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        copyBack(out2, "K_sliding_out", into: kSliding2)
+        copyBack(out2, "V_sliding_out", into: vSliding2)
+        copyBack(out2, "K_full_out", into: kFull2)
+        copyBack(out2, "V_full_out", into: vFull2)
+        let kv13k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
+        let kv13v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
+        let kv14k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
+        let kv14v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
+        lastKV13K = kv13k; lastKV13V = kv13v
+        lastKV14K = kv14k; lastKV14V = kv14v
+
+        let shared: [String: MLFeatureValue] = [
+            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+            "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
+            "kv13_k": MLFeatureValue(multiArray: kv13k), "kv13_v": MLFeatureValue(multiArray: kv13v),
+            "kv14_k": MLFeatureValue(multiArray: kv14k), "kv14_v": MLFeatureValue(multiArray: kv14v),
+        ]
+
+        // Verify chunk 3
+        var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
+        let h3 = try verifyChunk3!.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
+            .featureValue(for: "hidden_states_out")!.multiArrayValue!
+
+        // Verify chunk 4
+        var d4 = shared; d4["hidden_states"] = MLFeatureValue(multiArray: h3)
+        let out4 = try verifyChunk4!.prediction(from: MLDictionaryFeatureProvider(dictionary: d4))
+        let tokenIds = out4.featureValue(for: "token_ids")!.multiArrayValue!
+        lastVerifyHiddenStates = out4.featureValue(for: "hidden_states_out")?.multiArrayValue
+
+        // Track B gate: verify chunk 4 must expose `logits_fp16` of shape
+        // `(1, K, vocab_size)` fp16. Today's staging model only exposes the
+        // argmax reduction (`token_ids`).
+        guard let logitsFV = out4.featureValue(for: "logits_fp16"),
+              let logits = logitsFV.multiArrayValue else {
+            throw CoreMLLLMError.verifyLogitsNotExposed
+        }
+
+        // Extract argmax first so we match `verifyCandidates`'s return shape
+        // exactly (callers combining both can diff).
+        var argmax = [Int32]()
+        argmax.reserveCapacity(K)
+        let tidPtr = tokenIds.dataPointer.bindMemory(to: Int32.self, capacity: K)
+        for k in 0..<K { argmax.append(tidPtr[k]) }
+
+        // Extract top-K. Logits are fp16 laid out as (1, K, vocab_size).
+        let vocab = config.vocabSize
+        let needTopK = max(1, topK)
+        precondition(logits.count >= K * vocab,
+                     "logits_fp16 output smaller than expected (got \(logits.count), need \(K * vocab))")
+        let logitPtr = logits.dataPointer.bindMemory(to: UInt16.self, capacity: K * vocab)
+
+        var topKOut: [[(Int32, Float)]] = []
+        topKOut.reserveCapacity(K)
+        // Partial selection: linear scan keeping a small sorted buffer.
+        // needTopK is tiny (≤ ~10), so O(vocab * needTopK) is fine vs an
+        // O(vocab log vocab) full sort.
+        for k in 0..<K {
+            var best = [(Int32, Float)]()
+            best.reserveCapacity(needTopK)
+            let rowOffset = k * vocab
+            for v in 0..<vocab {
+                let logit = Float(Float16(bitPattern: logitPtr[rowOffset + v]))
+                if best.count < needTopK {
+                    best.append((Int32(v), logit))
+                    // Keep sorted descending.
+                    best.sort { $0.1 > $1.1 }
+                } else if logit > best[needTopK - 1].1 {
+                    best[needTopK - 1] = (Int32(v), logit)
+                    // Bubble up — tiny list, so insertion-sort scan suffices.
+                    var j = needTopK - 1
+                    while j > 0 && best[j].1 > best[j - 1].1 {
+                        best.swapAt(j, j - 1)
+                        j -= 1
+                    }
+                }
+            }
+            topKOut.append(best)
+        }
+        return (argmax, topKOut)
+    }
+
     // MARK: - Verify helpers
 
     private func buildVerifyHidden(tokenIDs: [Int]) throws -> MLMultiArray {

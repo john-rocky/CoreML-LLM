@@ -1,225 +1,256 @@
-# Mobile 2K competitive speedup plan
+# Mobile 2K competitive plan — ANE-native value prop
 
-**Goal:** beat Google's Gemma 4 E2B mobile deployment at ctx=2048 by a
-clear, measurable margin on iPhone 17 Pro (A19 Pro).
+**Status:** 2026-04-15 late (post D1b-impl retraction). Supersedes
+the previous "beat LiteRT-LM at 56 tok/s" framing. See §"What
+changed" for the history.
 
-**Reference points:**
+> **Retraction callout (2026-04-15 late).** An earlier revision of
+> this doc claimed a **~43 tok/s projected decode ceiling** grounded
+> in PR #77's compute-unit-split spike. **That projection is
+> withdrawn.** PR #79 implemented the full 2-stage pipeline it
+> required and measured a **24 % regression** across all 4 prompt
+> categories (baseline 32.8–33.2 → pipelined 24.9–25.5 tok/s on Mac
+> Studio), with a bit-exact failure on `summary` at token 50 due to
+> fp16 rounding between ANE and GPU backends of chunk 3. The
+> structural blocker is a strict `c3 → c4` data dependency: c4
+> consumes c3's `hidden_states_out`, so the only within-step overlap
+> window is a ~1 µs Swift dict-build against a ~16 ms GPU c3 — pure
+> regression. The numerical claim collapses to the **measured
+> 32 tok/s ANE decode ceiling**. Full analysis in PR #79 /
+> `docs/PHASE_D_PIPELINING_IMPL.md` (branch `feat/chunk-pipelining-d1b`,
+> HEAD 7c21c7b). Value prop below is updated accordingly.
 
-| Platform | Engine | tok/s @ 2K (Gemma 4 E2B) | Source |
+**Goal:** ship the strongest *ANE-native* Gemma 4 E2B runtime on
+iPhone at ctx=2048. The competitive axis is **not** raw decode tok/s —
+LiteRT-LM wins that on Metal GPU — but the triad of **sustained
+power draw, TTFT, and decode tok/s ceiling under ANE constraints.**
+
+---
+
+## Value proposition (one-liner)
+
+> ANE-native LLM runtime for Apple Silicon. Sustained **~1 W** with
+> **~1 s TTFT** (projected via item 27) on 512-token prompts and a
+> **32 tok/s decode ceiling** (measured, current) — different
+> competitive axis from LiteRT-LM's 56 tok/s at 3–5 W.
+
+The 1 s TTFT is a **projection** conditional on item 27 shipping
+(see §"Projection basis"). The 32 tok/s decode figure is the
+**measured ANE ceiling on iPhone 17 Pro / Mac Studio** after PR #79
+retired the 43 tok/s D1b pipelining projection.
+
+---
+
+## Competitive table
+
+Gemma 4 E2B on iPhone 17 Pro, ctx=2048. Power numbers are rough order-
+of-magnitude, not calibrated measurements.
+
+| Axis | LiteRT-LM iOS (Metal GPU) | This repo (ANE, shipped today) | This repo (after item 27, projected) |
+|---|---:|---:|---:|
+| Decode tok/s @ 2K | **56** | **32** (measured ceiling) | **32** (no non-speculative decode lever left) |
+| TTFT @ 512 prompt | ~1–2 s (Metal prefill) | ~13 s (ANE prefill) | **~1 s** (GPU prefill) |
+| Sustained power draw | 3–5 W (GPU active) | **~1 W** (ANE) | ~1 W + brief GPU prefill spikes |
+| Battery life @ continuous decode | baseline | **~3× baseline** | ~3× baseline |
+| GPU / CPU availability for host app | low (GPU saturated) | **high** | high (GPU used only during prefill) |
+| Background / always-on friendly | no (thermal + power) | **yes** | yes |
+| Model-placement footprint | fp16 GPU weights | INT4 ANE weights | INT4 ANE weights |
+
+On tok/s-for-tok/s we are **~42 % slower than LiteRT-LM** on decode
+(32 vs 56). We do not claim parity, and we do not claim to close
+more than a marginal fraction of that gap on the current chunk
+graph — PR #79 showed the non-speculative decode-overlap lever is
+structurally unavailable. We claim to win a different envelope.
+
+The UX argument carries on that asymmetry: **32 tok/s is ~6× human
+read speed (~5 tok/s)**, so decode is already faster than the user
+can follow. Where LiteRT-LM wins 56-vs-32 is a throughput regime the
+typical chat / assistant UX doesn't consume. The product wedge is
+sustained ~1 W, ~1 s TTFT, and the GPU-free host envelope — not
+decode parity.
+
+---
+
+## Why the ANE-native axis is a real product
+
+Decode tok/s is not the only number a user feels. For a phone app:
+
+- **Sustained power and thermals.** GPU-resident LLM inference at
+  5 W is fine for a 10-second answer and brutal for a 10-minute chat.
+  ANE at ~1 W sustains indefinitely without the phone heating up.
+- **Background and multi-task behaviour.** GPU contention with game
+  rendering, camera, video decode, or other ML (vision encoders,
+  diffusion, Whisper) is a real deployment constraint. ANE-resident
+  LLMs leave the GPU free.
+- **Battery-life / energy-per-token.** At ~1 W vs ~4 W average, the
+  same number of decoded tokens consumes ~25 % of the energy. For
+  long-form agentic usage this dominates UX.
+- **Privacy / local-first.** Shared with LiteRT-LM (both are on-device)
+  but worth stating: this repo is a Swift package with no network
+  dependency and a ~1 GB `phys_footprint` — shippable inside an iOS
+  app without server infra.
+
+None of these shows up in a tok/s bar chart. All of them matter for a
+certain class of product (background assistant, long-running agent,
+always-on notetaker, on-the-go with limited charge).
+
+---
+
+## Projection basis
+
+### 32 tok/s decode ceiling (measured, current)
+
+Mac Studio 128-token decode with drafters OFF (PR #79, 2026-04-15):
+chat 32.80, code 33.24, qa 33.15, summary 33.02 tok/s. iPhone 17 Pro
+measures 31.4 tok/s at 2 K under the same defaults. This is the
+**current ANE decode ceiling** on the shipped chunk graph.
+
+#### Why the earlier 43 tok/s projection was retracted
+
+The 43 tok/s figure came from PR #77's compute-unit-split spike:
+`max(c1+c2+c4_ANE, c1+c3_GPU)` ≈ 23 ms/step, grounded in a measured
+0.87–0.99 kernel-overlap factor between ANE and GPU driver queues.
+The projection assumed c3 and c4 could run in parallel. **PR #79
+implemented the full 2-stage pipeline and refuted that assumption
+empirically:**
+
+- Every category regressed by ~24 % (see retraction callout at top).
+- Root cause: c4 takes c3's `hidden_states_out` as input — a strict
+  data dependency. The only overlap window between c3 and c4 within
+  a step is the ~1 µs Swift dict-build, negligible against the
+  ~16 ms GPU c3. The cross-step pipeline (c3 of step N+1 concurrent
+  with c3 of step N) is similarly blocked because c3 of step N+1
+  needs c4 of step N to emit the just-decoded token.
+- PR #75 independently showed that adding ANE-only parallelism does
+  not help because the ANE driver serialises all submissions.
+
+Conclusion: on the current CoreML chunk graph there is **no
+non-speculative decode overlap available**. Three future options
+documented in PR #79's `docs/PHASE_D_PIPELINING_IMPL.md`
+(decoupled c4, speculative h3, model re-chunking) all require
+`conversion/`-side work — none are runtime-only.
+
+### 1 s TTFT (prefill)
+
+Comes from `UNEXPLORED_APPROACHES.md` §A (GPU prefill via MLX-Swift)
+and the `PRIORITY_ROADMAP.md` Phase 5 item 27 estimate. Prefill is
+compute-bound, GPU tensor cores are ~10× more efficient at that
+workload than ANE is at 512-token batch prefill. ANE-only prefill
+today is ~13 s on iPhone 17 Pro for 512 prompt tokens; MLX-Swift GPU
+prefill at A19 Pro's tensor-core rates lands in the ~1 s region. GPU
+is lit briefly during prefill and drops back to idle for decode on
+ANE — this is why the sustained-power advantage is preserved even
+though we use the GPU.
+
+Item 27 has not been implemented. 1 s TTFT is a projection.
+
+### Why speculative decoding is not in the ceiling
+
+Multiple PRs in this session proved the CoreML/ANE speculative-
+decoding path is blocked:
+
+- **v3 (PR #65)** — ruled out decode_q1 vs verify_qK argmax drift.
+- **v4 (PR #66)** — identified chain-mode gap, initially attributed
+  to batched-fp16 ordering in verify_qK.
+- **B.3 (PR #72)** — refuted the batched-fp16 hypothesis; K serial
+  decode_q1 calls reproduced the gap. The real mechanism is
+  **semantic**: verify writes drafter proposals into the KV cache
+  *before* acceptance is decided, contaminating subsequent target
+  argmaxes. See `docs/PHASE_C_TIGHTENING_FINDINGS.md`.
+- **Track A tolerance (PR #76, 2026-04-15)** — output-space tolerance
+  at the acceptance test did not recover meaningful accept rate; the
+  chain contamination is load-bearing, not a numerical tightness
+  issue.
+- **ANE pipelining audit (PR #75)** — ANE driver serialises chunk
+  submissions; Mirror-SD cost-hiding does not get the expected
+  concurrency win even if the semantic bug were fixed.
+
+The speculative path remains technically open via a multi-week
+verify-protocol redesign (delayed KV write-through), but is not a
+forecast input for this plan. The plan's ceiling does not require
+speculation to land.
+
+---
+
+## What changed (why the rewrite)
+
+The previous version of this doc set **"70–110 tok/s at 2K, i.e.
+1.25–2× Google's iOS build"** as the goal. That framing is retired.
+
+- The 56 tok/s LiteRT-LM number is on Metal GPU at 3–5 W. Matching
+  it would require pivoting this repo to MLX-Swift / GPU decode,
+  which is an explicitly rejected direction (the repo's reason for
+  existing is ANE-native placement).
+- Under ANE constraints, the measured decode ceiling is **32 tok/s**.
+  An earlier revision of this doc projected ~43 tok/s via a PR #77
+  compute-unit split and D1b pipelining; PR #79's full
+  implementation empirically refuted that (see retraction callout
+  and §"Projection basis" for the mechanism). 32 tok/s is ~58 % of
+  LiteRT-LM's decode rate — a ~42 % gap, not ~20 %.
+- The speculative-decoding route that was supposed to close the gap
+  is blocked at the verify-chunk write-through layer (see above).
+- Reframing on power + TTFT + tok/s-ceiling is **honest about what
+  ANE can deliver** and **identifies where we actually win**: a
+  different user segment (background-friendly, battery-sensitive,
+  GPU-contended host apps). The decode-rate gap is real; the UX
+  argument has to carry the pitch, not decode parity.
+
+We do not claim parity on decode rate. We claim a better product on
+a different axis triad.
+
+---
+
+## Execution — single tractable decode-adjacent path forward
+
+Only one non-speculative decode-adjacent item remains after the D1b
+refutation: **item 27 (GPU prefill)**, which targets the TTFT axis
+rather than the decode axis. The decode axis is parked at the
+measured 32 tok/s ceiling pending either a model re-conversion
+(PR #79's three future options) or the multi-week verify-protocol
+redesign (C0 option b).
+
+| # | Item | Status | Axis unlocked |
 |---|---|---|---|
-| **iPhone (LiteRT-LM iOS build)** | Google LiteRT-LM | **56** | Google's own iOS benchmark (user-reported 2026-04-14) |
-| Pixel 9 Pro (Tensor G4) | LiteRT-LM Android | 25–30 | public micro-benches; `docs/LITERT_RUNTIME_ANALYSIS.md` |
-| iPhone 15 Pro (A17 Pro) | CoreML (AFM-2B) | ~30 | Apple AFM arxiv 2507.13575 |
-| iPhone 17 Pro (A19 Pro) | **our stack today** | **31.4** | decode profile 2026-04-14 (c1=5.9, c2=6.8, c3=8.1, c4=10.4 ms) |
+| **A** | ~~**D1b chunk pipelining**~~ — **RETRACTED 2026-04-15** by PR #79 full-impl measurement (−24 % on all 4 categories). Structural blocker: `c3 → c4` data dependency. Three future options (decoupled c4 / speculative h3 / model re-chunking) require `conversion/` work. | refuted; plumbing kept OFF-by-default on `feat/chunk-pipelining-d1b` | — |
+| **B** | **Item 27 GPU prefill via MLX-Swift** — offload the 512-token prefill batch to GPU tensor cores. | not started; elevated to **Phase C critical path** (was "stretch"). Sole remaining tractable decode-adjacent lever. | TTFT 13 s → ~1 s (projection) |
 
-So **on the same hardware class (iOS)** we're at 31 tok/s versus
-Google's LiteRT-LM doing 56. They're roughly 1.8× ahead of us on
-iPhone specifically. Target for this plan: **70–110 tok/s** at 2K —
-i.e. 1.25–2× Google's iOS build, and 2–4× their Android number.
+Item B is Swift-side work; no chunk reconversion required. It
+preserves the ANE-resident decode story (decode stays on ANE; GPU
+is used for prefill only).
 
-Google's 56-tok/s iOS number implies they've already extracted a
-significant amount of the Apple-silicon hybrid-compute win. Our
-Tier 2 / Tier 4 async dispatch infrastructure is how we match and
-exceed that; today's stack doesn't schedule GPU alongside ANE at all.
+### Explicitly out of scope
 
----
-
-## Critical question: is drafter training required?
-
-No, but the training-free path caps lower. Two forking routes:
-
-### Route A — drafter-trained (user is here)
-Needs A100-class GPU for ~8–30 hours of distill, depending on drafter
-architecture.
-
-- MTP self-trained heads (other session in progress)
-- HASS / EAGLE-3 retrain
-- Clover-2
-
-**Ceiling: ~110 tok/s** if all tiers land.
-
-### Route B — drafter-free
-Zero training. Uses pre-trained drafters or prompt-based heuristics.
-
-- **Cross-vocabulary SD** with Qwen 2.5 0.5B — drafter is a publicly-
-  shipped pre-trained model; we only adapt vocab at inference time.
-  Already bundled in the repo's ModelDownloader defaults.
-- **Prompt Lookup Decoding** — n-gram match against prompt history
-  (algorithm already merged in PR #36, wiring pending).
-- **SuffixDecoding** — suffix-tree built from session history.
-- **Harmony-Decoding** — target's own shallow layers as drafter, no
-  training, smart phase gate.
-
-**Ceiling: ~85 tok/s** with Mirror SD + staged pipelining on top.
-
-**Both routes share the same async dispatch infrastructure**, so
-investing in it pays off regardless of which drafter lands.
+- Any pivot to MLX-Swift / GPU decode for steady-state inference.
+  That's a different product; the user has rejected it.
+- Further speculative-decoding wiring (items 14 / 14b) until / unless
+  the verify-protocol redesign lands. Not on this plan's critical
+  path.
+- 8K context speedup — tracked separately in `docs/SPEED_8K.md`. The
+  2K plan optimises the shipped config.
+- Chasing LiteRT-LM on tok/s. Different envelope, different claim.
 
 ---
 
-## Recommended route, 2K-focused
+## Risks & honest limits
 
-Assumes MTP training (user's other session) or a drafter-free
-equivalent lands with ≥ 50% accept. Every tier composes with the
-previous.
-
-| Week | Item | Dependency | 2K tok/s (cumulative) |
-|---|---|---|---|
-| 0 | Current baseline (measured) | — | **31** |
-| 1–2 | **Drafter + Q=K verify + KV direct-write**. If trained: MTP or HASS. If not: Cross-vocab SD with Qwen 0.5B + Prompt Lookup wiring. | Drafter artefact ready | **60–62** |
-| 3 | **Mirror SD** (GPU drafter asynchronous with ANE target verify) | Async dispatch infra | **82–85** |
-| 4 | **Union-of-drafters** — Prompt Lookup ∪ SuffixDecoding ∪ {trained drafter \| Qwen}, verify once on miss | Drafter + aux wiring | **94–98** |
-| 5 | **Staged chunk pipelining** — step N+1's chunk1 runs concurrently with step N's chunk3/4 | Async dispatch infra | **115–125** |
-
-Best case by week 5: **120 tok/s @ 2K**. Conservative: **85 tok/s**.
-Either clears Google by > 2×.
-
-Route B (no training anywhere) tops out around week 5 at ~85 tok/s
-because Cross-vocab Qwen's accept rate (40–50 %) is lower than a
-well-trained MTP's (55–65 %).
-
----
-
-## Infrastructure line items (shared, load-bearing)
-
-These unlock multiple tiers. Build them once.
-
-### I1. Async ANE dispatch queues — 4–6 days
-- Multiple `MLModel.prediction` can be kicked off before earlier ones
-  return, giving an ordering-safe pipeline across chunks.
-- Needed for both Mirror SD (GPU drafter concurrent with ANE verify)
-  and staged pipelining (chunk N+1 / chunk N concurrent).
-- Risk: ANE has limited in-flight requests (AsahiLinux RE suggests 8
-  per handle). Need back-pressure.
-- Reference: `github.com/AsahiLinux/docs/wiki/HW:ANE`, `eiln/ane`.
-
-### I2. GPU drafter execution path — 3–4 days
-- Compile drafter artefact with `computeUnits = .cpuAndGPU` (avoid
-  ANE to free the ANE for target).
-- Expose tensors via `IOSurface` so the drafter's hidden-state output
-  can be consumed by ANE verify without CPU copy.
-- Unified memory (Apple silicon UMA) makes cross-unit tensor passing
-  essentially free in bandwidth — a Google Tensor G4 disadvantage.
-
-### I3. KV direct-write in `commitAccepted` — 1–2 days
-- Already scoped as roadmap item 9 (EAGLE-3 Blocker 2).
-- Without this, every accepted speculative token costs one extra T=1
-  decode call, erasing most of the speedup.
-- Swift-only change; writes the accepted KV slice back into the
-  sliding/full cache buffers in place.
-
----
-
-## Per-tier detail
-
-### Tier 1 — Drafter + verify (×2.0)
-
-Pick ONE drafter source. They all plug into the same `verifyCandidates`
-code path, so switching cost is low once the verify path works.
-
-- **MTP self-trained** (user's in-flight work) — best expected accept
-  rate; tight fit with our target's KV-sharing forward.
-- **HASS** (arxiv 2408.15766) — EAGLE variant that trains against
-  inference-mode target outputs, directly fixing our Blocker 1 root
-  cause. ~1 A6000-day to train. Drop-in against our existing verify
-  chunks.
-- **Cross-vocab Qwen 2.5 0.5B** — no training; requires a vocab
-  translation layer (simple lookup). Accept rate lower.
-
-### Tier 2 — Mirror SD (×1.35)
-
-While the target runs `verifyCandidates` on ANE for burst k, the
-drafter runs on GPU preparing burst k+1. Latency of the target verify
-step hides the drafter cost entirely.
-
-- Requires I1 + I2.
-- Apple's unified memory is the key enabler: ship the drafter output
-  directly as an `IOSurface`-backed tensor to the ANE `kv13`/`kv14`
-  inputs. No staging copy.
-- Caveat: drafter forward + target verify must not contend on the same
-  memory region. Use separate scratch pools.
-
-### Tier 3 — Union-of-drafters (×1.15–1.3)
-
-Each drafter source has strong workloads and weak ones. Union takes
-the longest-accepted prefix across all sources, paying for one verify
-pass when all miss.
-
-- Sources to stack:
-  - Prompt Lookup (code / summaries / QA — hits when answer quotes
-    prompt).
-  - SuffixDecoding (multi-turn sessions — hits on self-repetition).
-  - MTP / HASS / Qwen (novel text).
-- Workload mix on typical chat ≈ 20–30 % prompt-quoting, 70–80 % novel
-  → +15–20 % over best single. Code-heavy ≈ +40 %.
-
-### Tier 4 — Staged chunk pipelining (×1.25)
-
-The current decode runs chunk1 → chunk2 → chunk3 → chunk4 strictly
-serial per step. Because chunk3 and chunk4 are KV-read-only (shared
-kv13/kv14 from chunk2), step N+1's chunk1 can start the moment step
-N's chunk2 finishes. That hides roughly one chunk of latency per step.
-
-- Depends on I1.
-- Risk: requires ANE async dispatch with strict ordering guarantees.
-  The current 0f audit found our pipeline synchronous-safe; this
-  pushes into the asynchronous regime, so ping-pong / ring buffers
-  (also 0f) become necessary.
-
----
-
-## TTFT as a separate axis
-
-Decode tok/s is the main metric, but a poor TTFT ruins UX. Covered
-separately (roadmap Phase 5):
-
-- **GPU prefill via MLX-Swift** — crunches prompt on GPU tensor cores,
-  ANE handles decode. Cuts TTFT 13s → 1s at 512 prompt tokens. 7–10
-  days (MLX-Swift is recent and underdocumented).
-- **Per-chunk streaming** — emit first decoded token immediately after
-  chunk4's LM head, before chunks 3/4 of the next position start.
-- **Prefix / system prompt KV caching** — persist the cache across
-  app launches so multi-turn conversations skip prefill entirely.
-
-None of these is on the critical path for tok/s, but they all matter
-for user perception.
-
----
-
-## Items explicitly OUT of scope for 2K
-
-- **MoE retrofit** — the compute savings dominate at 8K+; at 2K the
-  FFN cost is already overwhelmed by dispatch. Defer.
-- **W2 quantization** — bandwidth-limited only matters when weight
-  load is the bottleneck, which it isn't at 2K decode. Quality risk
-  not justified.
-- **BitNet b1.58** — requires QAT from scratch; disproportionate
-  effort for marginal gain at 2K.
-- **TEAL / Deja Vu activation sparsity** — quality-lossy, and the FFN
-  time we'd shave is already small at 2K.
-- **RWKV / Mamba / non-Transformer swap** — 10–14-day conversions +
-  distill. Decouple from the "beat Google at 2K" goal.
-
----
-
-## Risks & mitigations
-
-| Risk | Mitigation |
+| Risk | Mitigation / note |
 |---|---|
-| Async dispatch infrastructure (I1) hits an iOS 18 undocumented quirk | Falls back to synchronous dispatch + pipelining dies quietly; Tier 1 still delivers 2× |
-| MTP self-training fails (user's session) | Route B with Cross-vocab Qwen still gets to ~85 tok/s |
-| Mirror SD's GPU drafter contends with ANE for memory | Separate scratch regions + profile via Instruments' Metal system trace |
-| Staged pipelining exposes the ANE async race ANEMLL warned about | Implement ping-pong / ring buffers as prerequisite (roadmap 0f upgrade) |
+| ~~D1b pipelining hits an iOS-side dispatch quirk~~ | **N/A — D1b retracted 2026-04-15 by PR #79 full-impl measurement; structural, not an iOS quirk.** |
+| GPU prefill (item 27) surfaces a Metal ↔ CoreML handoff cost that eats the TTFT win | First-pass measurement is cheap; if the handoff dominates we revise the TTFT claim. With D1b retracted, item 27 is the only remaining decode-adjacent projection in this doc. |
+| Power-draw advantage is harder to measure than tok/s and easy to wave hands at | Add Instruments energy trace to the benchmark doc before leaning on it as a competitive claim. Treat the 3× battery-life number as an order-of-magnitude until measured. |
+| 32 tok/s decode ceiling is a hard competitive floor — 42 % behind LiteRT-LM — and no tractable non-speculative lever remains | Pitch leans on power + TTFT + background-friendliness; decode parity is explicitly not claimed. If decode parity becomes a requirement, revisit PR #79's three future options (all need model re-conversion). |
 
 ---
 
-## How this relates to other roadmap docs
+## How this relates to other docs
 
-- `PRIORITY_ROADMAP.md` is the comprehensive menu; this doc is the
-  ordered execution path for the 2K competitive goal.
-- `UNEXPLORED_APPROACHES_V6.md` lists the lossless source candidates
-  (V6-4 through V6-11) that back the tiers here.
-- `EAGLE3_INTEGRATION_STATE.md` has the verify-chunk I/O contract
-  that the drafter tiers consume.
-- `MTP_PATH_A_FINDINGS.md` documents why we pivoted to self-trained
-  MTP after Google's bundled drafter failed.
+- `docs/PRIORITY_ROADMAP.md` — the comprehensive menu; item 27 promoted
+  to Phase C critical path here.
+- `docs/HANDOFF.md` — next-session plan aligned with the two-item
+  execution above.
+- `docs/PHASE_B_DECISION.md` — why speculative decoding is no longer
+  a forecast input.
+- `docs/BASELINE_SPEED_AUDIT.md` — per-chunk cost numbers that inform
+  the D1b ceiling estimate.
+- `docs/PHASE_A5_DECISION.md` — historical; superseded (both the
+  A5 union-of-drafters plan and the 56 tok/s parity framing it fed).
