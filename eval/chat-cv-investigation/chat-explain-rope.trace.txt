@@ -1,0 +1,40 @@
+[SpecProfile union bootstrap] replay=21 (377.59ms) target_step=31.55ms
+[UnionDebugCV #0001 src=cv] rCV=1.000 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=22 afterPropose=25 afterRewind=25 afterCommit=23] enginePos[before=22 afterCommit=23] match=0/2
+[UnionDebugCV #0002 src=cv] rCV=0.900 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=23 afterPropose=26 afterRewind=26 afterCommit=24] enginePos[before=23 afterCommit=24] match=0/2
+[UnionDebugCV #0003 src=cv] rCV=0.810 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=24 afterPropose=27 afterRewind=27 afterCommit=25] enginePos[before=24 afterCommit=25] match=0/2
+[UnionDebugCV #0004 src=cv] rCV=0.729 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=25 afterPropose=28 afterRewind=28 afterCommit=26] enginePos[before=25 afterCommit=26] match=0/2
+[UnionDebugCV #0005 src=cv] rCV=0.656 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=26 afterPropose=29 afterRewind=29 afterCommit=27] enginePos[before=26 afterCommit=27] match=0/2
+[UnionDebugCV #0006 src=cv] rCV=0.590 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=27 afterPropose=30 afterRewind=30 afterCommit=28] enginePos[before=27 afterCommit=28] match=0/2
+[UnionDebugCV #0007 src=cv] rCV=0.531 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=28 afterPropose=31 afterRewind=31 afterCommit=29] enginePos[before=28 afterCommit=29] match=0/2
+[UnionDebugCV #0008 src=cv] rCV=0.478 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=29 afterPropose=32 afterRewind=32 afterCommit=30] enginePos[before=29 afterCommit=30] match=0/2
+[UnionDebugCV #0009 src=cv] rCV=0.430 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=30 afterPropose=33 afterRewind=33 afterCommit=31] enginePos[before=30 afterCommit=31] match=0/2
+[UnionDebugCV #0010 src=cv] rCV=0.387 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=31 afterPropose=34 afterRewind=34 afterCommit=32] enginePos[before=31 afterCommit=32] match=0/2
+[UnionDebugCV #0011 src=cv] rCV=0.349 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=32 afterPropose=35 afterRewind=35 afterCommit=33] enginePos[before=32 afterCommit=33] match=0/2
+[UnionDebugCV #0012 src=cv] rCV=0.314 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=33 afterPropose=36 afterRewind=36 afterCommit=35] enginePos[before=33 afterCommit=35] match=1/2
+[UnionDebugCV #0013 src=cv] rCV=0.332 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=35 afterPropose=38 afterRewind=38 afterCommit=36] enginePos[before=35 afterCommit=36] match=0/2
+[UnionDebugCV #0014 src=cv] rCV=0.299 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=36 afterPropose=39 afterRewind=39 afterCommit=37] enginePos[before=36 afterCommit=37] match=0/2
+[UnionDebugCV #0015 src=cv] rCV=0.269 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=37 afterPropose=40 afterRewind=40 afterCommit=38] enginePos[before=37 afterCommit=38] match=0/2
+[UnionDebugCV #0016 src=cv] rCV=0.242 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=38 afterPropose=41 afterRewind=41 afterCommit=39] enginePos[before=38 afterCommit=39] match=0/2
+[UnionDebugCV #0017 src=cv] rCV=0.218 rPL3=1.000 rPL2=1.000 cvProposed=1 cvPos[before=39 afterPropose=42 afterRewind=42 afterCommit=40] enginePos[before=39 afterCommit=40] match=0/2
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=40 afterPropose=40 afterRewind=40 afterCommit=41] enginePos[before=40 afterCommit=41] match=0/0
+[UnionDebugCV #001 a rotation mechanism to inject positional context into the model's input. This rotation7 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=41 afterPropose=41 afterRewind=41 afterCommit=42] enginePos[before=41 afterCommit=42] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=42 afterPropose=42 afterRewind=42 afterCommit=43] enginePos[before=42 afterCommit=43] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=43 afterPropose=43 afterRewind=43 afterCommit=44] enginePos[before=43 afterCommit=44] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=44 afterPropose=44 afterRewind=44 afterCommit=45] enginePos[before=44 afterCommit=45] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=45 afterPropose=45 afterRewind=45 afterCommit=46] enginePos[before=45 afterCommit=46] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=46 afterPropose=46 afterRewind=46 afterCommit=47] enginePos[before=46 afterCommit=47] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=47 afterPropose=47 afterRewind=47 afterCommit=48] enginePos[before=47 afterCommit=48] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=48 afterPropose=48 afterRewind=48 afterCommit=49] enginePos[before=48 afterCommit=49] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=49 afterPropose=49 afterRewind=49 afterCommit=50] enginePos[before=49 afterCommit=50] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=50 afterPropose=50 afterRewind=50 afterCommit=51] enginePos[before=50 afterCommit=51] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=51 afterPropose=51 afterRewind=51 afterCommit=52] enginePos[before=51 afterCommit=52] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=52 afterPropose=52 afterRewind=52 afterCommit=53] enginePos[before=52 afterCommit=53] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=53 afterPropose=53 afterRewind=53 afterCommit=54] enginePos[before=53 afterCommit=54] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=54 afterPropose=54 afterRewind=54 afterCommit=55] enginePos[before=54 afterCommit=55] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=55 afterPropose=55 afterRewind=55 afterCommit=56] enginePos[before=55 afterCommit=56] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=56 afterPropose=56 afterRewind=56 afterCommit=57] enginePos[before=56 afterCommit=57] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=57 afterPropose=57 afterRewind=57 afterCommit=58]  is applied to the embedding vectors, effectively adding a positional sense to how the modelenginePos[before=57 afterCommit=58] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=58 afterPropose=58 afterRewind=58 afterCommit=59] enginePos[before=58 afterCommit=59] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=59 afterPropose=59 afterRewind=59 afterCommit=60] enginePos[before=59 afterCommit=60] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=60 afterPropose=60 afterRewind=60 afterCommit=61] enginePos[before=60 afterCommit=61] match=0/0
+[UnionDebugCV #0017 src=single] rCV=0.196 rPL3=1.000 rPL2=1.000 cvProposed=0 cvPos[before=61 afterPropose=61 afterRewind=61 afterCommit=62] enginePos[before=61 afterCommit=62] match=0/0

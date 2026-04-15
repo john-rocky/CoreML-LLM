@@ -105,6 +105,15 @@ public final class DrafterUnion {
 
         let pos = engine.currentPosition
 
+        // UNION_DEBUG_CV: snapshot CV state before any per-burst work. We
+        // report this for every burst (even ones where CV wasn't proposed)
+        // so drift across "CV skipped" intervals is visible.
+        let cvPosBefore: Int = cvActive?.committedPosition ?? -1
+        let rCVSnapshot = rollingCV
+        let rPL3Snapshot = rollingPL3
+        let rPL2Snapshot = rollingPL2
+        let cvGatePassed = (rollingCV >= crossVocabThreshold)
+
         // 1. Collect per-source proposals.
         var lookupHist = history
         lookupHist.append(nextID)
@@ -122,12 +131,13 @@ public final class DrafterUnion {
 
         var cvBurst: DraftBurst? = nil
         var cvMs: Double = 0
-        if let cv = crossVocab, !crossVocabDisabled, rollingCV >= crossVocabThreshold {
+        if let cv = crossVocab, !crossVocabDisabled, cvGatePassed {
             // Side-effect: writes K Qwen KV slots speculatively. If CV is
             // not picked, we rewind below.
             (cvBurst, cvMs) = try SpecProfile.time { try cv.draftBurst(seed: nextID) }
         }
         let cvProps: [Int32] = cvBurst?.drafts ?? []
+        let cvPosAfterPropose: Int = cvActive?.committedPosition ?? -1
 
         // 2. Selection: longest first, then priority cv > pl-n3 > pl-n2.
         var candidates: [(Source, [Int32])] = []
@@ -137,7 +147,20 @@ public final class DrafterUnion {
 
         guard !candidates.isEmpty else {
             picks[.fallback, default: 0] += 1
-            return try fallbackSingleStep(nextID: &nextID, cvBurst: cvBurst)
+            let emittedFallback = try fallbackSingleStep(nextID: &nextID, cvBurst: cvBurst)
+            let cvPosAfterFallback = cvActive?.committedPosition ?? -1
+            SpecProfile.logUnionDebugCV(
+                cycle: totalCycles, source: Source.fallback.rawValue,
+                rollingCV: rCVSnapshot, rollingPL3: rPL3Snapshot, rollingPL2: rPL2Snapshot,
+                cvProposed: !cvProps.isEmpty,
+                cvPosBefore: cvPosBefore,
+                cvPosAfterPropose: cvPosAfterPropose,
+                cvPosAfterRewind: cvPosAfterPropose, // fallback path doesn't explicitly rewind
+                cvPosAfterCommit: cvPosAfterFallback,
+                enginePosBefore: pos,
+                enginePosAfterCommit: engine.currentPosition,
+                matchCount: 0, compareLen: 0)
+            return emittedFallback
         }
 
         candidates.sort { a, b in
@@ -213,12 +236,14 @@ public final class DrafterUnion {
         //    rewinds/extends correctly. If CV ran but wasn't picked, its
         //    speculative writes don't match the committed prefix — rewind
         //    and replay the actual committed tokens through Qwen.
+        var cvPosAfterRewind: Int = cvActive?.committedPosition ?? -1
         let (_, commitMs) = try SpecProfile.time {
             if let cv = cvActive, let burst = cvBurst {
                 if source == .crossVocab {
                     try cv.applyCommit(matchCount: matchCount, burst: burst)
                 } else {
                     cv.committedPosition = pos
+                    cvPosAfterRewind = cv.committedPosition
                     for k in 0..<committed {
                         let gid = emitted[k]
                         let qid = cv.vocabMap.gemma(gid)
@@ -231,6 +256,7 @@ public final class DrafterUnion {
                 }
             }
         }
+        let cvPosAfterCommit: Int = cvActive?.committedPosition ?? -1
 
         // 9. Update rolling-accept of the chosen source. Sources we ran
         //    but didn't pick get no signal — keep their EMA stable.
@@ -254,6 +280,18 @@ public final class DrafterUnion {
             verifyMs: verifyMs, commitMs: commitMs,
             accepted: matchCount, compareLen: compareLen,
             emitted: emitted.count, matches: matches)
+
+        SpecProfile.logUnionDebugCV(
+            cycle: totalCycles, source: source.rawValue,
+            rollingCV: rCVSnapshot, rollingPL3: rPL3Snapshot, rollingPL2: rPL2Snapshot,
+            cvProposed: !cvProps.isEmpty,
+            cvPosBefore: cvPosBefore,
+            cvPosAfterPropose: cvPosAfterPropose,
+            cvPosAfterRewind: cvPosAfterRewind,
+            cvPosAfterCommit: cvPosAfterCommit,
+            enginePosBefore: pos,
+            enginePosAfterCommit: pos + committed,
+            matchCount: matchCount, compareLen: compareLen)
 
         nextID = carry
         return emitted
