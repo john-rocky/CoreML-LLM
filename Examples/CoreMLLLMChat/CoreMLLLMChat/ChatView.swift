@@ -1,5 +1,6 @@
 import SwiftUI
 import PhotosUI
+import CoreMLLLM
 
 struct ChatView: View {
     @State private var runner = LLMRunner()
@@ -17,6 +18,14 @@ struct ChatView: View {
     // Battery benchmark state
     @State private var benchmarkRunning = false
     @State private var benchmarkStatus: String = ""
+
+    // Compute profile selector (mirrors runner.computeProfile so SwiftUI
+    // can bind to a Picker; saved to UserDefaults via runner on change).
+    @State private var selectedProfileID: String = ComputeProfile.loadPersisted().rawIdentifier
+
+    // Power-bench state
+    @State private var powerBenchRunning = false
+    @State private var powerBenchStatus: String = ""
 
     var body: some View {
         NavigationStack {
@@ -136,6 +145,14 @@ struct ChatView: View {
                         .padding(.horizontal, 10).padding(.vertical, 6)
                         .background(Color.orange.opacity(0.15))
                 }
+                if powerBenchRunning || !powerBenchStatus.isEmpty {
+                    Text(powerBenchStatus)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Color.purple.opacity(0.15))
+                }
 
                 Divider()
                 inputBar
@@ -174,6 +191,26 @@ struct ChatView: View {
                         .disabled(runner.isGenerating || benchmarkRunning)
                     }
                 }
+                // Compute profile picker — persists across launches and
+                // takes effect on next model load.
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Picker("Compute Profile", selection: $selectedProfileID) {
+                            ForEach(ComputeProfile.uiSelectable, id: \.rawIdentifier) { p in
+                                Text(p.displayName).tag(p.rawIdentifier)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "cpu")
+                    }
+                    .disabled(runner.isGenerating || benchmarkRunning || powerBenchRunning)
+                }
+                if runner.isLoaded {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Power") { startPowerBench() }
+                            .disabled(runner.isGenerating || benchmarkRunning || powerBenchRunning)
+                    }
+                }
                 if runner.hasAudio {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("Test") { runAudioTest() }
@@ -198,6 +235,15 @@ struct ChatView: View {
             }
             .onChange(of: selectedPhoto) {
                 loadPhoto()
+            }
+            .onChange(of: selectedProfileID) { _, newID in
+                let profile = ComputeProfile.fromRawIdentifier(newID)
+                runner.setComputeProfile(profile)
+                // Surface a hint — switching profile only takes effect on
+                // next model load.
+                messages.append(ChatMessage(role: .system,
+                    content: "Compute profile set to \(profile.displayName). "
+                           + "Tap Switch and reload the model to apply."))
             }
         }
     }
@@ -404,6 +450,62 @@ struct ChatView: View {
                 benchmarkRunning = false
                 benchmarkStatus = ""
                 messages.append(ChatMessage(role: .system, content: "[Benchmark] Failed: \(error.localizedDescription)"))
+            }
+        }
+    }
+
+    /// Run the cross-profile power+throughput sweep. Loads a fresh model
+    /// per profile, runs N trials, writes Documents/power_bench.csv.
+    private func startPowerBench() {
+        guard let folder = runner.loadedFolderURL else {
+            messages.append(ChatMessage(role: .system,
+                content: "[Power] Load a model first."))
+            return
+        }
+        // Warn if plugged in — the joule estimate only works on battery.
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        let bs = UIDevice.current.batteryState
+        if bs == .charging || bs == .full {
+            messages.append(ChatMessage(role: .system,
+                content: "[Power] Device is charging — joule estimate will be unreliable. Tether to a Mac and run powermetrics for authoritative numbers (see docs/POWER_BENCH.md)."))
+        }
+        powerBenchRunning = true
+        powerBenchStatus = "Power bench starting…"
+        messages.append(ChatMessage(role: .system,
+            content: "[Power] Sweeping compute profiles "
+                   + ComputeProfile.uiSelectable.map(\.displayName).joined(separator: ", ")
+                   + ". This will take ~5-10 minutes; keep the screen on."))
+        UIApplication.shared.isIdleTimerDisabled = true
+
+        Task { @MainActor in
+            defer {
+                UIApplication.shared.isIdleTimerDisabled = false
+                powerBenchRunning = false
+            }
+            do {
+                let bench = PowerBench(llmFolder: folder)
+                let summaries = try await bench.run { line in
+                    powerBenchStatus = line
+                }
+                var lines: [String] = ["[Power RESULT]"]
+                for s in summaries {
+                    lines.append(String(
+                        format: "%@: mean %.1f tok/s  peak %.1f tok/s  cpu %.0f%%  thermal_exit=%@  joules≈%.1f",
+                        s.profile.displayName,
+                        s.meanTokPerSec,
+                        s.peakTokPerSec,
+                        s.meanCPUPercent,
+                        PowerBench.thermalName(s.thermalExit),
+                        s.totalJoulesEstimate))
+                }
+                lines.append("CSV → Documents/power_bench.csv")
+                let text = lines.joined(separator: "\n")
+                print(text)
+                messages.append(ChatMessage(role: .system, content: text))
+                powerBenchStatus = "Power bench done."
+            } catch {
+                messages.append(ChatMessage(role: .system,
+                    content: "[Power] Failed: \(error.localizedDescription)"))
             }
         }
     }

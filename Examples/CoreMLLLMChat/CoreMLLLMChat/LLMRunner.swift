@@ -32,6 +32,19 @@ final class LLMRunner {
     private var llm: CoreMLLLM?
     private var modelFolderURL: URL?
 
+    /// Currently active compute profile. Persisted across launches via
+    /// `ComputeProfile.userDefaultsKey`. Read-only for the UI; change via
+    /// `setComputeProfile(_:)`, which triggers a reload on next model load.
+    private(set) var computeProfile: ComputeProfile = ComputeProfile.loadPersisted()
+
+    /// Persist a new profile choice. Takes effect the next time
+    /// `loadModel(from:)` is called. The chat UI can prompt the user to
+    /// reload the model when this is changed mid-session.
+    func setComputeProfile(_ profile: ComputeProfile) {
+        computeProfile = profile
+        profile.persist()
+    }
+
     // MARK: - Loading
 
     func loadModel(from url: URL) async throws {
@@ -39,7 +52,8 @@ final class LLMRunner {
         modelFolderURL = folder
         loadingStatus = "Loading..."
 
-        llm = try await CoreMLLLM.load(from: folder) { [weak self] status in
+        let profile = computeProfile
+        llm = try await CoreMLLLM.load(from: folder, profile: profile) { [weak self] status in
             Task { @MainActor in
                 self?.loadingStatus = status
             }
@@ -195,6 +209,10 @@ final class LLMRunner {
             abortedThermal: abortedThermal, batteryLog: batteryLog)
     }
     #endif
+
+    /// Folder the chat last loaded a model from — used by the cross-profile
+    /// power bench so it can spin up a separate `CoreMLLLM` per profile.
+    var loadedFolderURL: URL? { modelFolderURL }
 
     static func thermalString(_ s: ProcessInfo.ThermalState) -> String {
         switch s {

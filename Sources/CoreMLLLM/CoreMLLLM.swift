@@ -81,6 +81,11 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// Takes precedence over crossVocabEnabled when both are true.
     public var drafterUnionEnabled: Bool = false
 
+    /// The compute profile this instance was loaded with. Reported as
+    /// `.custom(units)` when the caller used the legacy `computeUnits:`
+    /// parameter. Inspected by the power-bench harness and the UI badge.
+    public private(set) var computeProfile: ComputeProfile = .efficient
+
     // Generation metrics
     public private(set) var tokensPerSecond: Double = 0
     public var mtpAcceptanceRate: Double { mtpEngine?.acceptanceRate ?? 0 }
@@ -158,7 +163,25 @@ public final class CoreMLLLM: @unchecked Sendable {
         computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
         onProgress: ((String) -> Void)? = nil
     ) async throws -> CoreMLLLM {
-        onProgress?("Reading config...")
+        try await load(from: directory,
+                       profile: ComputeProfile.from(computeUnits),
+                       onProgress: onProgress)
+    }
+
+    /// Load a model with a semantic `ComputeProfile`.
+    ///
+    /// - Parameters:
+    ///   - directory: Folder containing model files, embeddings, config
+    ///   - profile: `.efficient` (ANE, default), `.balanced` (`.all`),
+    ///              `.performance` (GPU), or `.custom(MLComputeUnits)`.
+    ///   - onProgress: Optional callback for loading status updates
+    public static func load(
+        from directory: URL,
+        profile: ComputeProfile,
+        onProgress: ((String) -> Void)? = nil
+    ) async throws -> CoreMLLLM {
+        let computeUnits = profile.mlComputeUnits
+        onProgress?("Reading config (profile=\(profile.rawIdentifier))...")
         let config = try ModelConfig.load(from: directory)
 
         // Tokenizer
@@ -167,6 +190,7 @@ public final class CoreMLLLM: @unchecked Sendable {
         let tokenizer = try await AutoTokenizer.from(modelFolder: tokDir)
 
         let llm = CoreMLLLM(config: config, tokenizer: tokenizer)
+        llm.computeProfile = profile
 
         // Auto-detect: chunked or monolithic
         let isChunked = FileManager.default.fileExists(
@@ -342,6 +366,17 @@ public final class CoreMLLLM: @unchecked Sendable {
         computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
         onProgress: ((String) -> Void)? = nil
     ) async throws -> CoreMLLLM {
+        try await load(model: model,
+                       profile: ComputeProfile.from(computeUnits),
+                       onProgress: onProgress)
+    }
+
+    /// Download (if needed) and load a model with a semantic `ComputeProfile`.
+    public static func load(
+        model: ModelDownloader.ModelInfo,
+        profile: ComputeProfile,
+        onProgress: ((String) -> Void)? = nil
+    ) async throws -> CoreMLLLM {
         let downloader = ModelDownloader.shared
         let modelURL: URL
         if let existing = downloader.localModelURL(for: model) {
@@ -351,7 +386,7 @@ public final class CoreMLLLM: @unchecked Sendable {
             modelURL = try await downloader.download(model)
         }
         let directory = modelURL.deletingLastPathComponent()
-        return try await load(from: directory, computeUnits: computeUnits,
+        return try await load(from: directory, profile: profile,
                                onProgress: onProgress)
     }
 
