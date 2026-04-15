@@ -132,15 +132,15 @@ path to beating Google at 2K. Re-evaluate when Phase D exits.
 
 See `docs/SESSION_STATE.md` for the live list. Summary at handoff:
 
-- **Open, held for iPhone baseline**: PR #54 (`feat/drafter-union`) —
-  Phase B Task 1 union orchestrator. Mac verifier proves bookkeeping
-  bit-exact (fallback-only mode). Held per merge discipline; clears
-  when next iPhone trip records baseline + per-source picks.
+- **Merged (2026-04-15)**: PR #54 — Phase B Task 1 DrafterUnion,
+  back-ported KV-hole + carry-double-emit fixes for CV/MTP,
+  CrossVocabDraft ctx auto-detect. Defaults
+  `drafterUnionEnabled = false` / `crossVocabEnabled = false`.
+- **Merged (2026-04-15)**: PR #57 — drafter perf instrumentation
+  (env-var gated per-phase timing logs + ComputePlanAudit extended
+  to Qwen drafter). Ready for the next iPhone trip.
 - **Draft / held**: PR #33 (0d prefill bypass — 6× regression,
   fresh-eyes investigation).
-- **Superseded**: `feat/route-b-task1-prompt-lookup-wiring` SHA
-  `18c5454` is folded into PR #54 as commit 1; branch can be deleted
-  once #54 lands.
 
 ## Key discipline reminders
 
