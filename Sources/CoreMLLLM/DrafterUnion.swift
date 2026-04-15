@@ -166,13 +166,18 @@ public final class DrafterUnion {
                 tokens: verifyTokens, startPosition: pos)
         }
 
-        // 4. Walk acceptance.
+        // 4. Walk acceptance. `matches` records per-position agreement
+        //    across the full compareLen — not just the accepted prefix —
+        //    so downstream profiling can see post-miss tail matches
+        //    (useful for C0 tolerance analysis per PHASE_B_V4 findings).
         var matchCount = 0
+        var matches = [Bool](repeating: false, count: compareLen)
+        var prefixStillMatching = true
         for k in 0..<compareLen {
-            if useProps[k] == targetArgmax[k] {
-                matchCount += 1
-            } else {
-                break
+            let hit = (useProps[k] == targetArgmax[k])
+            matches[k] = hit
+            if prefixStillMatching {
+                if hit { matchCount += 1 } else { prefixStillMatching = false }
             }
         }
 
@@ -248,7 +253,7 @@ public final class DrafterUnion {
             perSourceMs: ["cv": cvMs, "pl3": pl3Ms, "pl2": pl2Ms],
             verifyMs: verifyMs, commitMs: commitMs,
             accepted: matchCount, compareLen: compareLen,
-            emitted: emitted.count)
+            emitted: emitted.count, matches: matches)
 
         nextID = carry
         return emitted
