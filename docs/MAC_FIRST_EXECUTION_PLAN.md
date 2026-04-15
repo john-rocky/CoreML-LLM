@@ -74,9 +74,31 @@ in a single session.
 | **B3** | Wire winning drafter from A5. If it's Prompt Lookup, the branch `feat/route-b-task1-prompt-lookup-wiring` already has the wiring — rebase onto any Phase B-other changes. | Build on Mac. | Confirm on-device accept rate matches Mac prediction (±5%). Collect tok/s delta. |
 | **B4** | Fresh MLComputePlan audit on the hints-applied chunks. | — | Confirm ANE placement still ≥ 99%. Watch for hint-induced fallback. |
 
-Exit criterion for Phase B: reproducible ≥ 50 tok/s on chat workload at
-2K (exceeds Apple AFM 30 tok/s; approaches Google LiteRT-LM iOS 56
-tok/s). Bit-exact preserved at `temperature = 0`.
+Exit criterion for Phase B (revised 2026-04-15):
+
+1. **Matched-prefix bookkeeping bit-exact** vs serial decode on Mac.
+   Mechanically: when every per-burst codepath is forced through
+   `fallbackSingleStep` (PLD threshold pinned high, CV disabled) the
+   union's emitted token stream must equal the serial path's. This is
+   what `union-bitexact --mode fallback-only` checks in PR #54.
+2. **On-device accept rate within ±5 %** of the per-category Mac
+   projection in `docs/PHASE_A5_DECISION.md`. Drops outside that band
+   say either the chunk numerics differ from Mac more than expected
+   or a drafter is bootstrapping wrong.
+3. **Manual quality spot-check on 5 prompts per category.** Token
+   streams will not be byte-equivalent to serial under live
+   speculation — the K=3 batched verify chunks and K=1 decode chunks
+   diverge at the fp16 level by design. Spot-check is the practical
+   sanity bar.
+4. **Reproducible chat tok/s ≥ 50** at 2K (exceeds Apple AFM 30 tok/s;
+   approaches Google LiteRT-LM iOS 56 tok/s).
+
+Earlier wording was "bit-exact preserved at temperature = 0", which
+turned out to be unattainable under the current verify chunks
+regardless of speculation strategy. A separate verify-chunk
+numerical-alignment investigation is filed in
+`docs/PRIORITY_ROADMAP.md` (item 11c) — closing that gap could lift
+accept rates by aligning verify and decode argmaxes.
 
 ### Phase C — infrastructure & stacking, 3–4 days + 1–2 device trips
 

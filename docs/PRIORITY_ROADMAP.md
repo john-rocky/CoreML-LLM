@@ -139,6 +139,7 @@ active. Retrain with `use_cache=True` traces should fix acceptance.
 | **10** | **Sequoia (Y-tree) optimal topology** | +15–33% (e.g. 36→41.6 tok/s) | 1–2 days offline DP | V3 §A4, ANE_SURVEY |
 | **11** | **Traversal Verification** | +10–20% | 0.5 day Swift | V3 §A5 |
 | **11b** | **Verify chunks T=4** — Google uses T=3+1; extend our T=3 | K=4 capability | 0.5 day + reconvert | LITERT_CONTAINER |
+| **11c** | **Verify-chunk numerical alignment (K=3 ↔ K=1)** — fp16 argmaxes from `verify_qK` and `predict` diverge under speculation by design (different SIMD tiling). Investigate whether reconverting verify chunks to match the decode chunk's accumulation order, or normalising via an explicit fp32 logit cast, closes the gap. Surfaced when PR #54 (DrafterUnion) couldn't satisfy the original "bit-exact at temp=0 vs serial" criterion. | could lift accept rates by aligning argmaxes; also enables a stricter Phase B exit gate next time | 1–2 days investigation + possible reconvert | PR #54 thread |
 
 ### Track C — Zero-training auxiliaries (ship alongside A or B)
 
