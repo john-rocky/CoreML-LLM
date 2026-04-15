@@ -329,6 +329,18 @@ final class ChunkedEngine {
         engine.reset()
         print("[Load] ANE prewarm (4 steps) done in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - warmT0))s")
 
+        // Phase D1 spike: one-shot concurrency probe (env-gated).
+        // Runs c1 and c3 both serially and in parallel on separate dispatch
+        // queues, using dummy inputs that don't mutate engine state. Purpose:
+        // determine whether MLModel.prediction on distinct MLModel instances
+        // can actually run concurrently on Mac CoreML / ANE — i.e. whether
+        // staged chunk pipelining is achievable at all. No effect on
+        // subsequent decode; results are printed and discarded.
+        if ProcessInfo.processInfo.environment["CHUNK_PIPELINE_SPIKE"] != nil {
+            try engine.runConcurrencyProbe()
+            engine.reset()
+        }
+
         return engine
     }
 
@@ -1328,6 +1340,85 @@ final class ChunkedEngine {
     }
     func makeDrafterFullMask(position: Int) throws -> MLMultiArray {
         try makeCausalMask(position: position, length: config.contextLength)
+    }
+
+    // MARK: - Phase D1 spike: concurrency probe
+
+    /// One-shot probe: can c1 and c3 `MLModel.prediction` calls overlap on
+    /// separate DispatchQueues? Prints timing + verdict and returns; caller
+    /// must `reset()` afterwards since c1/c2 are actually executed once.
+    func runConcurrencyProbe() throws {
+        print("[Spike] CHUNK_PIPELINE_SPIKE=1 — running concurrency probe")
+        let p = 1
+        let fv: (MLMultiArray) -> MLFeatureValue = { MLFeatureValue(multiArray: $0) }
+        let mF = try makeCausalMask(position: p, length: config.contextLength)
+        let mS = try makeSlidingCausalMask(position: p, W: config.slidingWindow)
+        let uM = try makeUpdateMask(position: p, length: config.contextLength)
+        let cS = try lookupRoPE(table: cosSlidingTable, position: p, dim: 256)
+        let sS = try lookupRoPE(table: sinSlidingTable, position: p, dim: 256)
+        let cF = try lookupRoPE(table: cosFullTable, position: p, dim: 512)
+        let sF = try lookupRoPE(table: sinFullTable, position: p, dim: 512)
+        let rope: [String: MLFeatureValue] = [
+            "causal_mask_full": fv(mF), "causal_mask_sliding": fv(mS), "update_mask": fv(uM),
+            "cos_s": fv(cS), "sin_s": fv(sS), "cos_f": fv(cF), "sin_f": fv(sF)]
+        let hIn = try embedTokens.lookup(0, shape: [1, 1, NSNumber(value: config.hiddenSize)])
+        var d1 = rope
+        d1["hidden_states"] = fv(hIn); d1["per_layer_raw"] = fv(try lookupPerLayerRaw(tokenID: 0))
+        d1["K_sliding_in"] = fv(kSliding1); d1["V_sliding_in"] = fv(vSliding1)
+        d1["K_full_in"] = fv(kFull1); d1["V_full_in"] = fv(vFull1)
+        let c1Inputs = try MLDictionaryFeatureProvider(dictionary: d1)
+
+        // Run c1→c2 once to materialise h2 + kv13/kv14 for c3 inputs.
+        let o1 = try chunk1.prediction(from: c1Inputs)
+        let h1 = o1.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        let plc = o1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
+        var d2 = rope
+        d2["hidden_states"] = fv(h1); d2["per_layer_combined"] = fv(plc)
+        d2["K_sliding_in"] = fv(kSliding2); d2["V_sliding_in"] = fv(vSliding2)
+        d2["K_full_in"] = fv(kFull2); d2["V_full_in"] = fv(vFull2)
+        let o2 = try chunk2.prediction(from: try MLDictionaryFeatureProvider(dictionary: d2))
+        var d3 = rope
+        d3["hidden_states"] = fv(o2.featureValue(for: "hidden_states_out")!.multiArrayValue!)
+        d3["per_layer_combined"] = fv(plc)
+        for k in ["kv13_k", "kv13_v", "kv14_k", "kv14_v"] {
+            d3[k] = fv(o2.featureValue(for: k)!.multiArrayValue!)
+        }
+        let c3Inputs = try MLDictionaryFeatureProvider(dictionary: d3)
+
+        _ = try chunk1.prediction(from: c1Inputs)   // warm
+        _ = try chunk3.prediction(from: c3Inputs)
+        let trials = 10
+        func time(_ block: () throws -> Void) rethrows -> Double {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            for _ in 0..<trials { try block() }
+            return (CFAbsoluteTimeGetCurrent() - t0) / Double(trials)
+        }
+        let sC1 = try time { _ = try self.chunk1.prediction(from: c1Inputs) }
+        let sC3 = try time { _ = try self.chunk3.prediction(from: c3Inputs) }
+        let seq = try time {
+            _ = try self.chunk1.prediction(from: c1Inputs)
+            _ = try self.chunk3.prediction(from: c3Inputs)
+        }
+        let q1 = DispatchQueue(label: "spike.c1", qos: .userInitiated)
+        let q3 = DispatchQueue(label: "spike.c3", qos: .userInitiated)
+        let par = try time {
+            let g = DispatchGroup()
+            var e1: Error?; var e3: Error?
+            g.enter(); q1.async { do { _ = try self.chunk1.prediction(from: c1Inputs) } catch { e1 = error }; g.leave() }
+            g.enter(); q3.async { do { _ = try self.chunk3.prediction(from: c3Inputs) } catch { e3 = error }; g.leave() }
+            g.wait()
+            if let e = e1 ?? e3 { throw e }
+        }
+        let ideal = max(sC1, sC3), sum = sC1 + sC3
+        let overlap = (sum - par) / max(sum - ideal, 1e-6)
+        print(String(format: "[Spike] c1_serial=%.2fms c3_serial=%.2fms seq_both=%.2fms parallel=%.2fms",
+                     sC1 * 1000, sC3 * 1000, seq * 1000, par * 1000))
+        print(String(format: "[Spike] ideal_parallel=%.2fms sum=%.2fms overlap_factor=%.2f (1.0=full overlap, 0.0=serial)",
+                     ideal * 1000, sum * 1000, overlap))
+        let verdict = overlap > 0.5 ? "overlap achievable — pursue Phase D1"
+                    : overlap > 0.15 ? "partial overlap — investigate further"
+                    : "MLModel predictions serialize on ANE — pipelining infeasible here"
+        print("[Spike] VERDICT: \(verdict).")
     }
 }
 
