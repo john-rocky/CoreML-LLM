@@ -106,7 +106,7 @@ public final class CrossVocabSpeculativeEngine {
                "drafter out of sync: drafter=\(drafter.committedPosition) target=\(pos)")
 
         // 1. Draft K tokens.
-        let burst = try drafter.draftBurst(seed: nextID)
+        let (burst, draftMs) = try SpecProfile.time { try drafter.draftBurst(seed: nextID) }
         if burst.drafts.count < K {
             // Unmappable seed or intermediate miss — skip this cycle cleanly.
             // Rewind drafter to P and fall back to a single target decode.
@@ -130,8 +130,9 @@ public final class CrossVocabSpeculativeEngine {
         var verifyTokens = [Int32](repeating: 0, count: K)
         verifyTokens[0] = nextID
         for (i, t) in useProps.enumerated() { verifyTokens[i + 1] = t }
-        let targetArgmax = try engine.verifyCandidates(
-            tokens: verifyTokens, startPosition: pos)
+        let (targetArgmax, verifyMs) = try SpecProfile.time {
+            try engine.verifyCandidates(tokens: verifyTokens, startPosition: pos)
+        }
 
         // 3. Accept prefix (only draft positions).
         var matchCount = 0
@@ -165,7 +166,9 @@ public final class CrossVocabSpeculativeEngine {
         // 5. Advance target position and re-anchor drafter.
         let committed = matchCount + 1
         engine.currentPosition = pos + committed
-        try drafter.applyCommit(matchCount: matchCount, burst: burst)
+        let (_, commitMs) = try SpecProfile.time {
+            try drafter.applyCommit(matchCount: matchCount, burst: burst)
+        }
 
         // 6. Update metrics + rolling accept.
         totalCycles += 1
@@ -174,6 +177,12 @@ public final class CrossVocabSpeculativeEngine {
         let rate = Double(matchCount) / Double(max(compareLen, 1))
         rollingAcceptance = rollingAlpha * rate
             + (1 - rollingAlpha) * rollingAcceptance
+
+        SpecProfile.logBurst(
+            engine: "cv", cycle: totalCycles,
+            draftMs: draftMs, verifyMs: verifyMs, commitMs: commitMs,
+            accepted: matchCount, compareLen: compareLen,
+            emitted: emitted.count, rolling: rollingAcceptance)
 
         // 7. Carry becomes next burst's seed (NOT emitted from this cycle).
         nextID = carry
@@ -198,21 +207,18 @@ public final class CrossVocabSpeculativeEngine {
         // let the drafter drift — acceptance will drop and the gate
         // will disable us.
         let replayCount = min(history.count, targetPos)
-        for i in 0..<replayCount {
-            // Unmappable tokens leave stale Qwen state; acceptance gate
-            // will handle it. We still advance committedPosition so it
-            // tracks the target — write-through means a later correct
-            // write at the same slot overwrites the stale entry.
-            let gid = history[i]
-            let qid = drafter.vocabMap.gemma(gid)
-            if qid >= 0 {
-                _ = try drafter.consume(gemmaToken: gid)
-            } else {
-                // Silent miss: just advance the counter. Pretend the
-                // slot will be repopulated later — in practice many
-                // Gemma-only tokens (markers, etc.) never reappear in
-                // an attention query against that slot.
-                drafter.committedPosition += 1
+        let (_, replayMs) = try SpecProfile.time {
+            for i in 0..<replayCount {
+                let gid = history[i]
+                let qid = drafter.vocabMap.gemma(gid)
+                if qid >= 0 {
+                    _ = try drafter.consume(gemmaToken: gid)
+                } else {
+                    // Silent miss: just advance the counter. Many Gemma-only
+                    // tokens (markers, etc.) never reappear in an attention
+                    // query against that slot.
+                    drafter.committedPosition += 1
+                }
             }
         }
         // If the target ran more positions than we have history for,
@@ -225,13 +231,18 @@ public final class CrossVocabSpeculativeEngine {
         // Emit the current nextID and do one target decode step to
         // advance nextID — matching MtpSpeculativeEngine.bootstrapStep.
         let emitted = nextID
-        let newNext = try engine.predictStep(
-            tokenID: Int(nextID), position: engine.currentPosition)
+        let (newNext, targetStepMs) = try SpecProfile.time {
+            try engine.predictStep(
+                tokenID: Int(nextID), position: engine.currentPosition)
+        }
         engine.currentPosition += 1
         // Bring drafter to the new currentPosition by consuming the
         // token we just committed on the target.
         _ = try drafter.consume(gemmaToken: nextID)
         nextID = Int32(newNext)
+        SpecProfile.logBootstrap(
+            engine: "cv", replayCount: replayCount,
+            replayMs: replayMs, targetStepMs: targetStepMs)
         return [emitted]
     }
 
@@ -239,11 +250,15 @@ public final class CrossVocabSpeculativeEngine {
     /// propose (e.g. unmappable seed). Keeps Gemma and Qwen in sync.
     private func fallbackSingleStep(nextID: inout Int32) throws -> [Int32] {
         let emitted = nextID
-        let newNext = try engine.predictStep(
-            tokenID: Int(nextID), position: engine.currentPosition)
+        let (newNext, targetStepMs) = try SpecProfile.time {
+            try engine.predictStep(
+                tokenID: Int(nextID), position: engine.currentPosition)
+        }
         engine.currentPosition += 1
         _ = try drafter.consume(gemmaToken: nextID)
         nextID = Int32(newNext)
+        SpecProfile.logFallback(
+            engine: "cv", cycle: totalCycles, targetStepMs: targetStepMs)
         return [emitted]
     }
 }

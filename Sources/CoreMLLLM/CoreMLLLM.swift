@@ -251,6 +251,11 @@ public final class CoreMLLLM: @unchecked Sendable {
             } catch {
                 print("[CrossVocab] Failed to load drafter: \(error)")
             }
+            // MLComputePlan audit on the drafter (Phase B Task 2). Runs
+            // only when COMPUTE_PLAN_AUDIT is set, so production load
+            // sees no extra cost. Tells us GPU placement vs CPU fallback
+            // when investigating the iPhone perf regression.
+            await ComputePlanAudit.runDrafter(modelDirectory: directory)
         }
 
         // PLD-only union: still useful when cross-vocab drafter assets are

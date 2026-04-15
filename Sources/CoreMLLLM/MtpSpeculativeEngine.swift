@@ -94,31 +94,33 @@ public final class MtpSpeculativeEngine {
         let maskSwa = try engine.makeDrafterSWAMask(position: max(maskPos, 0))
         let maskFull = try engine.makeDrafterFullMask(position: max(maskPos, 0))
 
-        // Draft K tokens with per-step RoPE updates
+        // Draft K tokens with per-step RoPE updates.
         var proposals = [Int32]()
         proposals.reserveCapacity(K)
         var embedToken = try engine.lookupRawEmbed(nextID)
         var projAct = carryState!
 
-        for k in 0..<K {
-            let draftPos = pos + k
-            let cosSwa = try engine.lookupCosSWA(position: draftPos)
-            let sinSwa = try engine.lookupSinSWA(position: draftPos)
-            let cosFull = try engine.lookupCosFull(position: draftPos)
-            let sinFull = try engine.lookupSinFull(position: draftPos)
+        let (_, draftMs) = try SpecProfile.time {
+            for k in 0..<K {
+                let draftPos = pos + k
+                let cosSwa = try engine.lookupCosSWA(position: draftPos)
+                let sinSwa = try engine.lookupSinSWA(position: draftPos)
+                let cosFull = try engine.lookupCosFull(position: draftPos)
+                let sinFull = try engine.lookupSinFull(position: draftPos)
 
-            let (tokenId, projActOut) = try drafter.draftOne(
-                embedToken: embedToken,
-                projAct: projAct,
-                kv13K: kv13K, kv13V: kv13V,
-                kv14K: kv14K, kv14V: kv14V,
-                cosSwa: cosSwa, sinSwa: sinSwa,
-                cosFull: cosFull, sinFull: sinFull,
-                maskSwa: maskSwa, maskFull: maskFull)
+                let (tokenId, projActOut) = try drafter.draftOne(
+                    embedToken: embedToken,
+                    projAct: projAct,
+                    kv13K: kv13K, kv13V: kv13V,
+                    kv14K: kv14K, kv14V: kv14V,
+                    cosSwa: cosSwa, sinSwa: sinSwa,
+                    cosFull: cosFull, sinFull: sinFull,
+                    maskSwa: maskSwa, maskFull: maskFull)
 
-            proposals.append(tokenId)
-            embedToken = try engine.lookupRawEmbed(tokenId)
-            projAct = projActOut
+                proposals.append(tokenId)
+                embedToken = try engine.lookupRawEmbed(tokenId)
+                projAct = projActOut
+            }
         }
 
         // Verify [nextID, proposals[0..K-2]] at currentPosition.
@@ -135,8 +137,10 @@ public final class MtpSpeculativeEngine {
         var verifyTokens = [Int32](repeating: 0, count: K)
         verifyTokens[0] = nextID
         for (i, t) in useProps.enumerated() { verifyTokens[i + 1] = t }
-        let targetArgmax = try engine.verifyCandidates(
-            tokens: verifyTokens, startPosition: pos)
+        let (targetArgmax, verifyMs) = try SpecProfile.time {
+            try engine.verifyCandidates(
+                tokens: verifyTokens, startPosition: pos)
+        }
 
         // Accept/reject: greedy comparison of the draft positions only.
         var matchCount = 0
@@ -183,6 +187,12 @@ public final class MtpSpeculativeEngine {
         totalAccepted += matchCount
         totalEmitted += emitted.count
 
+        SpecProfile.logBurst(
+            engine: "mtp", cycle: totalRounds,
+            draftMs: draftMs, verifyMs: verifyMs, commitMs: 0,
+            accepted: matchCount, compareLen: compareLen,
+            emitted: emitted.count, rolling: drafter.rollingAcceptance)
+
         // Carry becomes next burst's seed — NOT yielded from this cycle.
         nextID = carry
 
@@ -208,11 +218,16 @@ public final class MtpSpeculativeEngine {
     /// First call: run a normal decode to populate kv13/kv14 and warm up.
     private func bootstrapStep(nextID: inout Int32) throws -> [Int32] {
         let emitted = nextID
-        let newNext = try engine.predictStep(
-            tokenID: Int(nextID), position: engine.currentPosition)
+        let (newNext, targetStepMs) = try SpecProfile.time {
+            try engine.predictStep(
+                tokenID: Int(nextID), position: engine.currentPosition)
+        }
         engine.currentPosition += 1
         nextID = Int32(newNext)
         isBootstrapped = true
+        SpecProfile.logBootstrap(
+            engine: "mtp", replayCount: 0,
+            replayMs: 0, targetStepMs: targetStepMs)
         return [emitted]
     }
 
