@@ -8,14 +8,29 @@ Gemma4Model backbone and exercise 16 decode steps on a held-out prompt set
   1. Final hidden_states (pre-argmax) — cosine similarity target > 0.9999
   2. Argmax token ID — must match exactly across the run
 
-This runs on CPU Python / torch, so it is NOT affected by CoreML fp16
-rounding, palettization error, or ANE placement. It specifically isolates
-the architectural equivalence of the merged module composition — proving
-that the two graphs are mathematically identical given identical inputs.
+Why fp32 on CPU
+---------------
+On iPhone/ANE the decoder runs in fp16 with saturating arithmetic, so
+intermediate products above 65504 simply clamp. PyTorch fp16 on Mac/CPU
+does NOT saturate — it returns ``inf`` which propagates as NaN through the
+later softmax / gating ops. Because the goal here is to prove the 2-chunk
+merged pipeline is mathematically identical to the shipping 4-chunk graph
+(not to reproduce ANE numerics), the whole test runs in fp32: we monkey-
+patch ``MODEL_DTYPE`` before the model modules are imported, load weights
+in fp32, and pass fp32 inputs. Device numerics are validated separately
+on-device (see docs/CHUNK_CONSOLIDATION_BENCH.md).
 
-A separate on-device script (documented in
-docs/CHUNK_CONSOLIDATION_BENCH.md) confirms the compiled mlpackages stay
-numerically faithful after int4 palettization.
+Ground truth
+------------
+The 4-chunk SWA pipeline IS the shipping production code (see
+``build_verify_chunks.py``) — it is what Swift actually runs on device,
+so it serves as the ground-truth reference here. We do NOT compare against
+``Gemma4MonolithicWrapper`` because it is the tracer for a legacy
+single-graph export that (a) has a residual layout bug in its PLE path
+(Conv2d expects NCHW, wrapper feeds BSH), and (b) is not on any shipping
+code path. Device numerics (fp16, int4 palettized weights) are validated
+separately via on-device benchmarks documented in
+``docs/CHUNK_CONSOLIDATION_BENCH.md``.
 
 Usage:
     python test_merged_parity.py                                 # default: 2-chunk vs 4-chunk
@@ -33,11 +48,28 @@ import torch
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
-from ane_ops import MODEL_DTYPE
-from models.gemma4 import Gemma4Model
-from models.gemma4_swa_chunks import SWAChunk1, SWAChunk2, SWAChunk3, SWAChunk4
-from models.gemma4_swa_merged2 import MergedChunk12, MergedChunk34
-from models.gemma4_swa_merged1 import MergedChunk1
+# IMPORTANT: monkey-patch MODEL_DTYPE BEFORE importing the model modules so
+# every ``from ane_ops import MODEL_DTYPE`` picks up fp32. Any later change
+# to ``ane_ops.MODEL_DTYPE`` would NOT propagate to already-imported modules.
+import ane_ops as _ane_ops
+_ane_ops.MODEL_DTYPE = torch.float32
+MODEL_DTYPE = torch.float32
+
+from models.gemma4 import Gemma4Model  # noqa: E402
+from models.gemma4_swa_chunks import SWAChunk1, SWAChunk2, SWAChunk3, SWAChunk4  # noqa: E402
+from models.gemma4_swa_merged2 import MergedChunk12, MergedChunk34  # noqa: E402
+from models.gemma4_swa_merged1 import MergedChunk1  # noqa: E402
+
+# Also propagate fp32 to each model module's local MODEL_DTYPE binding.
+# ``from ane_ops import MODEL_DTYPE`` creates a per-module name that is NOT
+# re-read after import; we must overwrite each one so later attribute lookups
+# inside those modules' functions see fp32.
+import models.gemma4 as _g4
+import models.gemma4_swa_chunks as _gc
+import models.gemma4_swa_merged2 as _gm2
+import models.gemma4_swa_merged1 as _gm1
+for _m in (_g4, _gc, _gm2, _gm1):
+    _m.MODEL_DTYPE = torch.float32
 
 HF_DIR = os.environ.get("GEMMA4_HF_DIR", f"{ROOT}/../output/gemma4-e2b/hf_model")
 
@@ -52,23 +84,34 @@ def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def build_decode_inputs(ctx, W, hidden, nlayers, pld, position, token_id, base):
-    """Build the shared inputs for one decode step at `position`."""
+    """Build the shared inputs for one decode step at `position`.
+
+    Matches ``Gemma4MonolithicWrapper.forward`` exactly:
+    - embedding scaled by sqrt(hidden_size)
+    - per_layer_raw = embed_tokens_per_layer(ids) * per_layer_embed_scale
+      (originally MISSING from this harness — caused every later PLE value
+      to be off by sqrt(256) = 16, which combined with fp16 MLP overflow
+      produced NaN at layer 0. The missing scale is the main harness bug.)
+    - causal_mask_full uses -1e9 as the "masked" sentinel (not -inf), to
+      match the monolithic wrapper and avoid inf propagation.
+    """
     # Embedding + scaled
     emb = base.embed_tokens(torch.tensor([token_id], dtype=torch.long))
     emb = emb.view(1, 1, hidden).to(MODEL_DTYPE)
     emb = emb * (hidden ** 0.5)
 
-    # Raw per-layer embedding (lookup via embed_tokens_per_layer if available)
-    if hasattr(base, "embed_tokens_per_layer"):
-        pl_raw = base.embed_tokens_per_layer(torch.tensor([token_id], dtype=torch.long))
-        pl_raw = pl_raw.view(1, 1, nlayers * pld).to(MODEL_DTYPE)
-    else:
-        pl_raw = torch.zeros(1, 1, nlayers * pld, dtype=MODEL_DTYPE)
+    # Raw per-layer embedding — MUST be scaled by sqrt(per_layer_dim)
+    # (see Gemma4MonolithicWrapper line 103). Dropping this scale leaves
+    # per_layer_raw ~16x smaller than the projection branch, skewing the
+    # PLE sum and producing garbage hidden states downstream.
+    pl_raw = base.embed_tokens_per_layer(torch.tensor([token_id], dtype=torch.long))
+    pl_raw = pl_raw.view(1, 1, nlayers * pld).to(MODEL_DTYPE) * base.per_layer_embed_scale
 
-    # Causal masks (0 for allowed, -inf for masked)
-    mask_full = torch.full((1, 1, 1, ctx), float("-inf"), dtype=MODEL_DTYPE)
+    # Causal masks (0 for allowed, -1e9 for masked — mirrors the wrapper)
+    NEG_BIG = -1e9
+    mask_full = torch.full((1, 1, 1, ctx), NEG_BIG, dtype=MODEL_DTYPE)
     mask_full[..., :position + 1] = 0.0
-    mask_sliding = torch.full((1, 1, 1, W), float("-inf"), dtype=MODEL_DTYPE)
+    mask_sliding = torch.full((1, 1, 1, W), NEG_BIG, dtype=MODEL_DTYPE)
     valid = min(position + 1, W)
     mask_sliding[..., W - valid:] = 0.0
 
@@ -151,8 +194,9 @@ def main():
                         help="Minimum required cosine similarity on hidden states")
     args = parser.parse_args()
 
-    print(f"Loading Gemma 4 E2B from {args.hf_dir}...")
+    print(f"Loading Gemma 4 E2B from {args.hf_dir} (fp32 for CPU stability)...")
     base = Gemma4Model.from_pretrained(args.hf_dir, context_length=args.ctx)
+    base = base.to(torch.float32)
     base.eval()
 
     hidden = base.config.hidden_size
