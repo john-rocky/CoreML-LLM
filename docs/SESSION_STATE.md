@@ -98,6 +98,27 @@ items continue to share the next bundled iPhone trip.
    - Exit: log artifact + placement table from one device run; we
      can choose between the two failure modes (CPU fallback vs slow
      GPU) without burning a second trip.
+   - **Accept-rate ceiling check (bundle in same trip).** Path C
+     shelving (`docs/MTP_PATH_C_FINDINGS.md`) gives an independent
+     corroboration that iPhone acc0 may be capped by item 11c rather
+     than drafter quality. While the trip is running with
+     `SPECULATIVE_PROFILE=1`, also run Union in PLD-only mode (CV
+     disabled) and compare the on-device per-burst accept rate against
+     the Mac oracle-replay accept rate in `eval/accept-rate-bench-v2.json`
+     for the same prompts. Decision branch:
+     – iPhone acc ≪ Mac acc → item 11c is the bottleneck; defer
+       bootstrap work and shift to verify-chunk numerical alignment
+       (coordinate with MTP session on `feature/mtp-speculative-v1`;
+       their `conversion/train_mtp_modules/verify_coreml_equiv.py`
+       and `verify_accept_logic.py` are the methodological baseline,
+       though neither is yet a `verify_qK` vs `decode_q1` target-side
+       diff — that tool is what the 11c investigation has to build).
+     – iPhone acc ≈ Mac acc → Task 3 (bootstrap) and Phase C Mirror
+       SD / async dispatch remain the critical path.
+     First pass can work with the aggregate `accepted=N/M` field
+     already in the `[SpecProfile …]` stream; if aggregate is
+     suggestive but inconclusive, a small follow-up PR can add
+     per-position accept-or-not to SpecProfile.
 3. **Bootstrap optimisation** — gated on Task 2's data. Two
    candidates depending on what the timing log says:
    (i) batched Qwen prefill shape so the N sequential `consume()`
