@@ -47,6 +47,20 @@ struct Smoke {
             print("[smoke] prompt: \(prompt)")
             print("[smoke] max_tokens=\(maxTokens)")
 
+            // Phase D pipelining: disable the drafters so predictStep's
+            // serial-vs-pipelined path is the clean axis under test. Also
+            // record emitted token IDs to a file for bit-exact diff between
+            // the two modes (see docs/PHASE_D_PIPELINING_IMPL.md).
+            let pipelineTrip = ProcessInfo.processInfo.environment["CHUNK_PIPELINE_ENABLED"] == "1"
+            if pipelineTrip {
+                llm.mtpEnabled = false
+                llm.drafterUnionEnabled = false
+                llm.crossVocabEnabled = false
+                print("[smoke] CHUNK_PIPELINE_ENABLED=1 — drafters disabled; " +
+                      "pipeliningEnabled=\(llm.chunkPipeliningEnabled)")
+            }
+            let tokenIDDumpPath = ProcessInfo.processInfo.environment["DUMP_TOKEN_IDS"]
+
             var collected = ""
             let stream = try await llm.stream(prompt, maxTokens: maxTokens)
             for await tok in stream {
@@ -58,6 +72,11 @@ struct Smoke {
             print("[smoke] output length = \(collected.count) chars")
             print("[smoke] mtp accept = \(String(format: "%.2f", llm.mtpAcceptanceRate))")
             print("[smoke] cross-vocab accept = \(String(format: "%.2f", llm.crossVocabAcceptanceRate))")
+            if let path = tokenIDDumpPath {
+                let ids = llm.lastEmittedTokenIDs.map { String($0) }.joined(separator: "\n")
+                try ids.write(toFile: path, atomically: true, encoding: .utf8)
+                print("[smoke] dumped \(llm.lastEmittedTokenIDs.count) token IDs to \(path)")
+            }
             exit(0)
         } catch {
             fputs("[smoke] error: \(error)\n", stderr)
