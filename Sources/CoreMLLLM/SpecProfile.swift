@@ -20,7 +20,19 @@
 //
 //      [SpecProfile union #042 src=cv] draft_total=14.6ms (cv=14.3
 //          pl3=0.05 pl2=0.05) verify=53.2ms commit=0.4ms
-//          accepted=2/2 emitted=3
+//          accepted=2/2 emitted=3 matches=110
+//
+//  The `matches=` field is a per-position bit string of length
+//  `compareLen` (the number of drafter proposals fed into verify
+//  slots 1..K-1). Bit k is '1' when the drafter's k-th proposal
+//  equals target's argmax at position k, else '0'. This preserves
+//  the post-miss tail: a drafter that proposes {A, B, C} where B
+//  misses but C would have matched shows `matches=101` — visible
+//  in the log even though the burst commits only {seed, A}. Useful
+//  for C0-track tolerance analysis (PHASE_B_V4 findings §"drafter
+//  proposals in slots 1..K-1 cause argmax chain drift"). The field
+//  is additive; older `matches=` consumers that only parsed
+//  `accepted=/compareLen` continue to work unchanged.
 //
 //  Bootstrap and fallback emit their own single-line entries with the
 //  same tag-prefix discipline so the consumer can distinguish.
@@ -71,6 +83,10 @@ enum SpecProfile {
 
     /// Per-burst log line for the DrafterUnion path (multiple drafters
     /// run, only one is selected). `perSourceMs` keys: "cv", "pl3", "pl2".
+    /// `matches`, when non-empty, is a per-position bit pattern of length
+    /// `compareLen`: bit k = '1' iff drafter proposal k equals target's
+    /// argmax at slot k. Independent of `accepted` (which stops at the
+    /// first miss), so `matches` exposes the post-miss tail too.
     static func logUnionBurst(cycle: Int,
                               source: String,
                               perSourceMs: [String: Double],
@@ -78,17 +94,23 @@ enum SpecProfile {
                               commitMs: Double,
                               accepted: Int,
                               compareLen: Int,
-                              emitted: Int) {
+                              emitted: Int,
+                              matches: [Bool] = []) {
         guard isEnabled else { return }
         let total = perSourceMs.values.reduce(0, +)
         let cv = perSourceMs["cv"] ?? 0
         let p3 = perSourceMs["pl3"] ?? 0
         let p2 = perSourceMs["pl2"] ?? 0
-        print(String(format:
+        var line = String(format:
             "[SpecProfile union #%04d src=%@] draft_total=%.2fms (cv=%.2f pl3=%.3f pl2=%.3f) "
           + "verify=%.2fms commit=%.2fms accepted=%d/%d emitted=%d",
             cycle, source, total, cv, p3, p2,
-            verifyMs, commitMs, accepted, compareLen, emitted))
+            verifyMs, commitMs, accepted, compareLen, emitted)
+        if !matches.isEmpty {
+            let bits = String(matches.map { $0 ? "1" as Character : "0" })
+            line += " matches=\(bits)"
+        }
+        print(line)
     }
 
     /// One-shot bootstrap log. Bootstrap costs (especially the
