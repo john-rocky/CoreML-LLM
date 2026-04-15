@@ -175,7 +175,7 @@ def build_w8a8_chunk2(cal_data, output_dir):
     mlmodel = ct.convert(
         traced, inputs=in2,
         outputs=[ct.TensorType(name=n) for n in out2],
-        minimum_deployment_target=ct.target.iOS18,
+        minimum_deployment_target=ct.target.iOS26,
         compute_precision=ct.precision.FLOAT16,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
     )

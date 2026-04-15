@@ -56,7 +56,7 @@ fp16 = np.float16
 
 
 def trace_and_convert(model, sample_inputs, input_specs, output_names,
-                      save_path, quantize=True):
+                      save_path, quantize=True, optimize=False):
     t = time.time()
     with torch.no_grad():
         traced = torch.jit.trace(model, sample_inputs, check_trace=False)
@@ -67,7 +67,7 @@ def trace_and_convert(model, sample_inputs, input_specs, output_names,
         traced,
         inputs=input_specs,
         outputs=[ct.TensorType(name=n) for n in output_names],
-        minimum_deployment_target=ct.target.iOS18,
+        minimum_deployment_target=ct.target.iOS26,
         compute_precision=ct.precision.FLOAT16,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
     )
@@ -90,10 +90,30 @@ def trace_and_convert(model, sample_inputs, input_specs, output_names,
         for f in fns
     ) / 1024 / 1024
     print(f"    saved {save_path} ({size_mb:.1f} MB)")
+
+    if optimize:
+        # Post-save MIL graph optimization pass. Replaces the saved package
+        # in-place on success; leaves original untouched on failure.
+        from optimize_mlpackage_graph import optimize_mlpackage
+        t = time.time()
+        tmp_path = save_path + ".opt"
+        res = optimize_mlpackage(save_path, tmp_path)
+        if res.get("ok"):
+            shutil.rmtree(save_path)
+            shutil.move(tmp_path, save_path)
+            print(f"    optimized: {res['ops_before']} -> {res['ops_after']} ops "
+                  f"({res['pct']:+.1f}%), {time.time()-t:.1f}s")
+            if res.get("skipped"):
+                print(f"    skipped passes: {len(res['skipped'])}")
+        else:
+            print(f"    optimize failed: {res.get('error')}; keeping unoptimized")
+            if os.path.exists(tmp_path):
+                shutil.rmtree(tmp_path)
+
     return mlmodel
 
 
-def build_two_chunk(base, out_dir, ctx, W, quantize):
+def build_two_chunk(base, out_dir, ctx, W, quantize, optimize=False):
     """Build MergedChunk12 + MergedChunk34."""
     hidden = base.config.hidden_size
     pld = base.config.hidden_size_per_layer_input
@@ -147,7 +167,8 @@ def build_two_chunk(base, out_dir, ctx, W, quantize):
             "kv13_k", "kv13_v", "kv14_k", "kv14_v",
             "per_layer_combined_out"]
     trace_and_convert(m12, s1, in1, out1,
-                      f"{out_dir}/merged_chunk1.mlpackage", quantize=quantize)
+                      f"{out_dir}/merged_chunk1.mlpackage",
+                      quantize=quantize, optimize=optimize)
     del m12
 
     # ================================================================
@@ -189,11 +210,12 @@ def build_two_chunk(base, out_dir, ctx, W, quantize):
     ]
     out2 = ["token_id", "token_logit", "hidden_states_out"]
     trace_and_convert(m34, s2, in2, out2,
-                      f"{out_dir}/merged_chunk2.mlpackage", quantize=quantize)
+                      f"{out_dir}/merged_chunk2.mlpackage",
+                      quantize=quantize, optimize=optimize)
     del m34
 
 
-def build_one_chunk(base, out_dir, ctx, W, quantize):
+def build_one_chunk(base, out_dir, ctx, W, quantize, optimize=False):
     """Build a single-graph 35-layer variant. Experimental — may fall off ANE."""
     hidden = base.config.hidden_size
     pld = base.config.hidden_size_per_layer_input
@@ -241,7 +263,8 @@ def build_one_chunk(base, out_dir, ctx, W, quantize):
                  "K_sliding_out", "V_sliding_out", "K_full_out", "V_full_out"]
     try:
         trace_and_convert(mfull, s, in_specs, out_names,
-                          f"{out_dir}/merged_full.mlpackage", quantize=quantize)
+                          f"{out_dir}/merged_full.mlpackage",
+                          quantize=quantize, optimize=optimize)
         print("\n[build_merged_chunks] merged_full converted. ")
         print("  NEXT STEP: compile on iPhone 17 Pro and run ComputePlanAudit")
         print("  BEFORE shipping — 35 layers may exceed the ANE per-function stability")
@@ -268,6 +291,11 @@ def main():
                         help="Context length (default: 2048)")
     parser.add_argument("--no-quantize", action="store_true",
                         help="Skip int4 palettization (for parity debugging)")
+    parser.add_argument("--optimize", action="store_true",
+                        help="Apply extra MIL graph optimization passes "
+                             "(optimize_mlpackage_graph.py DEFAULT_PASSES). "
+                             "Typically +5-10% decode speed via op fusion "
+                             "and dead-code removal.")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -281,10 +309,10 @@ def main():
     print(f"\nctx={args.ctx}, W={W}, quantize={'int4' if quantize else 'fp16'}")
 
     if args.mode in ("two", "both"):
-        build_two_chunk(base, args.output, args.ctx, W, quantize)
+        build_two_chunk(base, args.output, args.ctx, W, quantize, optimize=args.optimize)
 
     if args.mode in ("one", "both"):
-        build_one_chunk(base, args.output, args.ctx, W, quantize)
+        build_one_chunk(base, args.output, args.ctx, W, quantize, optimize=args.optimize)
 
     print(f"\n{'='*60}")
     print(f"Merged chunks saved to {args.output}/")

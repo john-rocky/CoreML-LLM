@@ -56,7 +56,7 @@ def trace_and_convert(model, sample_inputs, input_specs, output_names, quantize=
         traced,
         inputs=input_specs,
         outputs=[ct.TensorType(name=n) for n in output_names],
-        minimum_deployment_target=ct.target.iOS18,
+        minimum_deployment_target=ct.target.iOS26,
         compute_precision=ct.precision.FLOAT16,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
     )
@@ -80,7 +80,7 @@ def save_temp(mlmodel, path):
     mlmodel.save(path)
 
 
-def build_multifunction(decode_path, verify_path, output_path):
+def build_multifunction(decode_path, verify_path, output_path, optimize=False):
     """Bundle decode and verify mlpackages into a single multi-function mlpackage."""
     desc = MultiFunctionDescriptor()
     desc.add_function(decode_path, "main", "decode_q1")
@@ -98,6 +98,24 @@ def build_multifunction(decode_path, verify_path, output_path):
     ) / 1024 / 1024
     print(f"    saved {output_path} ({size_mb:.1f} MB)")
 
+    if optimize:
+        # Apply MIL graph optimization passes. save_multifunction preserves
+        # weight dedup across functions; the optimizer operates per-function
+        # and does not disturb the shared weight blob.
+        from optimize_mlpackage_graph import optimize_mlpackage
+        tmp = output_path + ".opt"
+        t = time.time()
+        res = optimize_mlpackage(output_path, tmp)
+        if res.get("ok"):
+            shutil.rmtree(output_path)
+            shutil.move(tmp, output_path)
+            print(f"    optimized: {res['ops_before']} -> {res['ops_after']} ops "
+                  f"({res['pct']:+.1f}%), {time.time()-t:.1f}s")
+        else:
+            print(f"    optimize failed: {res.get('error')}; keeping unoptimized")
+            if os.path.exists(tmp):
+                shutil.rmtree(tmp)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Build multi-function verify chunks")
@@ -111,6 +129,10 @@ def main():
                         help="Context length (default: 2048)")
     parser.add_argument("--no-quantize", action="store_true",
                         help="Skip int4 palettization")
+    parser.add_argument("--optimize", action="store_true",
+                        help="Apply extra MIL graph optimization passes to "
+                             "the final multifunction mlpackages "
+                             "(see optimize_mlpackage_graph.py).")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -259,7 +281,7 @@ def main():
     build_multifunction(
         f"{tmp}/chunk1_decode.mlpackage",
         f"{tmp}/chunk1_verify.mlpackage",
-        f"{args.output}/chunk1.mlpackage")
+        f"{args.output}/chunk1.mlpackage", optimize=args.optimize)
 
     # ================================================================
     # Chunk 2: L8-14, 5 sliding + 2 full, owns KV cache
@@ -352,7 +374,7 @@ def main():
     build_multifunction(
         f"{tmp}/chunk2_decode.mlpackage",
         f"{tmp}/chunk2_verify.mlpackage",
-        f"{args.output}/chunk2.mlpackage")
+        f"{args.output}/chunk2.mlpackage", optimize=args.optimize)
 
     # ================================================================
     # Chunk 3: L15-24, all KV-shared
@@ -414,7 +436,7 @@ def main():
     build_multifunction(
         f"{tmp}/chunk3_decode.mlpackage",
         f"{tmp}/chunk3_verify.mlpackage",
-        f"{args.output}/chunk3.mlpackage")
+        f"{args.output}/chunk3.mlpackage", optimize=args.optimize)
 
     # ================================================================
     # Chunk 4: L25-34 + norm + lm_head, all KV-shared
@@ -478,7 +500,7 @@ def main():
     build_multifunction(
         f"{tmp}/chunk4_decode.mlpackage",
         f"{tmp}/chunk4_verify.mlpackage",
-        f"{args.output}/chunk4.mlpackage")
+        f"{args.output}/chunk4.mlpackage", optimize=args.optimize)
 
     # ================================================================
     # Cleanup temp files

@@ -46,7 +46,7 @@ def do_convert(model, sample_inputs, input_specs, output_names, save_path, quant
     mlmodel = ct.convert(
         traced, inputs=input_specs,
         outputs=[ct.TensorType(name=n) for n in output_names],
-        minimum_deployment_target=ct.target.iOS18,
+        minimum_deployment_target=ct.target.iOS26,
         compute_precision=ct.precision.FLOAT16,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
     )

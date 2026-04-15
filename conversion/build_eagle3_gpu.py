@@ -117,7 +117,7 @@ def main():
         convert_to="mlprogram",
         compute_units=ct.ComputeUnit.CPU_AND_GPU,              # <- KEY DIFF from build_eagle3.py
         compute_precision=ct.precision.FLOAT16,
-        minimum_deployment_target=ct.target.iOS18,
+        minimum_deployment_target=ct.target.iOS26,
     )
     if args.palettize_int4:
         print("  palettizing weights INT4 (group_size=32) — note: may regress GPU perf vs FP16")

@@ -157,7 +157,7 @@ def build_chunk(chunk_cls, base, chunk_name, ctx, output_dir, quant_mode="int4")
     mlmodel = ct.convert(
         traced, inputs=inputs,
         outputs=[ct.TensorType(name=n) for n in outputs],
-        minimum_deployment_target=ct.target.iOS18,
+        minimum_deployment_target=ct.target.iOS26,
         compute_precision=ct.precision.FLOAT16,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
     )
