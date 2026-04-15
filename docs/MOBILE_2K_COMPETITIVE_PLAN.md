@@ -1,7 +1,24 @@
 # Mobile 2K competitive plan — ANE-native value prop
 
-**Status:** 2026-04-15. Supersedes the previous "beat LiteRT-LM at 56
-tok/s" framing. See §"What changed" for the history.
+**Status:** 2026-04-15 late (post D1b-impl retraction). Supersedes
+the previous "beat LiteRT-LM at 56 tok/s" framing. See §"What
+changed" for the history.
+
+> **Retraction callout (2026-04-15 late).** An earlier revision of
+> this doc claimed a **~43 tok/s projected decode ceiling** grounded
+> in PR #77's compute-unit-split spike. **That projection is
+> withdrawn.** PR #79 implemented the full 2-stage pipeline it
+> required and measured a **24 % regression** across all 4 prompt
+> categories (baseline 32.8–33.2 → pipelined 24.9–25.5 tok/s on Mac
+> Studio), with a bit-exact failure on `summary` at token 50 due to
+> fp16 rounding between ANE and GPU backends of chunk 3. The
+> structural blocker is a strict `c3 → c4` data dependency: c4
+> consumes c3's `hidden_states_out`, so the only within-step overlap
+> window is a ~1 µs Swift dict-build against a ~16 ms GPU c3 — pure
+> regression. The numerical claim collapses to the **measured
+> 32 tok/s ANE decode ceiling**. Full analysis in PR #79 /
+> `docs/PHASE_D_PIPELINING_IMPL.md` (branch `feat/chunk-pipelining-d1b`,
+> HEAD 7c21c7b). Value prop below is updated accordingly.
 
 **Goal:** ship the strongest *ANE-native* Gemma 4 E2B runtime on
 iPhone at ctx=2048. The competitive axis is **not** raw decode tok/s —
@@ -12,13 +29,15 @@ power draw, TTFT, and decode tok/s ceiling under ANE constraints.**
 
 ## Value proposition (one-liner)
 
-> ANE-native LLM runtime for Apple Silicon. Target **~43 tok/s at
-> ~1 W sustained**, with **~1 s TTFT** on 512-token prompts — different
+> ANE-native LLM runtime for Apple Silicon. Sustained **~1 W** with
+> **~1 s TTFT** (projected via item 27) on 512-token prompts and a
+> **32 tok/s decode ceiling** (measured, current) — different
 > competitive axis from LiteRT-LM's 56 tok/s at 3–5 W.
 
-Both the 43 tok/s figure and the 1 s TTFT are **projections, not
-shipped numbers**. See §"Projection basis" for what grounds them and
-what has to ship to realise each.
+The 1 s TTFT is a **projection** conditional on item 27 shipping
+(see §"Projection basis"). The 32 tok/s decode figure is the
+**measured ANE ceiling on iPhone 17 Pro / Mac Studio** after PR #79
+retired the 43 tok/s D1b pipelining projection.
 
 ---
 
@@ -27,9 +46,9 @@ what has to ship to realise each.
 Gemma 4 E2B on iPhone 17 Pro, ctx=2048. Power numbers are rough order-
 of-magnitude, not calibrated measurements.
 
-| Axis | LiteRT-LM iOS (Metal GPU) | This repo (ANE, shipped today) | This repo (after D1b + item 27, projected) |
+| Axis | LiteRT-LM iOS (Metal GPU) | This repo (ANE, shipped today) | This repo (after item 27, projected) |
 |---|---:|---:|---:|
-| Decode tok/s @ 2K | **56** | 31 | **~43** |
+| Decode tok/s @ 2K | **56** | **32** (measured ceiling) | **32** (no non-speculative decode lever left) |
 | TTFT @ 512 prompt | ~1–2 s (Metal prefill) | ~13 s (ANE prefill) | **~1 s** (GPU prefill) |
 | Sustained power draw | 3–5 W (GPU active) | **~1 W** (ANE) | ~1 W + brief GPU prefill spikes |
 | Battery life @ continuous decode | baseline | **~3× baseline** | ~3× baseline |
@@ -37,9 +56,18 @@ of-magnitude, not calibrated measurements.
 | Background / always-on friendly | no (thermal + power) | **yes** | yes |
 | Model-placement footprint | fp16 GPU weights | INT4 ANE weights | INT4 ANE weights |
 
-On tok/s-for-tok/s we are **~20 % slower than LiteRT-LM** even if
-everything on the right-hand column ships. We do not claim to match
-them on decode rate. We claim to win a different envelope.
+On tok/s-for-tok/s we are **~42 % slower than LiteRT-LM** on decode
+(32 vs 56). We do not claim parity, and we do not claim to close
+more than a marginal fraction of that gap on the current chunk
+graph — PR #79 showed the non-speculative decode-overlap lever is
+structurally unavailable. We claim to win a different envelope.
+
+The UX argument carries on that asymmetry: **32 tok/s is ~6× human
+read speed (~5 tok/s)**, so decode is already faster than the user
+can follow. Where LiteRT-LM wins 56-vs-32 is a throughput regime the
+typical chat / assistant UX doesn't consume. The product wedge is
+sustained ~1 W, ~1 s TTFT, and the GPU-free host envelope — not
+decode parity.
 
 ---
 
@@ -70,22 +98,37 @@ always-on notetaker, on-the-go with limited charge).
 
 ## Projection basis
 
-### 43 tok/s ceiling (decode)
+### 32 tok/s decode ceiling (measured, current)
 
-Comes from the Phase D compute-unit split spike (PR #77). With
-chunk 3/4 placed on GPU and chunks 1/2 on ANE, the two compute units
-overlap at factor 0.87–0.99 across drivers — the critical-path
-estimate drops from 51.7 ms per step (fully serial, ~19 tok/s on Mac
-Studio audit) to ~23 ms per step at full pipelining, which on iPhone
-translates to ~43 tok/s from the measured 31 tok/s baseline. This
-**requires shipping D1b chunk pipelining** (in flight on
-`feat/chunk-pipelining-d1b`). Until D1b merges and measures on an
-iPhone 17 Pro, 43 tok/s remains a projection.
+Mac Studio 128-token decode with drafters OFF (PR #79, 2026-04-15):
+chat 32.80, code 33.24, qa 33.15, summary 33.02 tok/s. iPhone 17 Pro
+measures 31.4 tok/s at 2 K under the same defaults. This is the
+**current ANE decode ceiling** on the shipped chunk graph.
 
-What ANE-chunk pipelining *cannot* do: PR #75 showed the ANE driver
-serialises all submissions at the driver level, so adding more ANE
-parallelism on the same compute unit does not help. The win is only
-available by splitting across ANE + GPU.
+#### Why the earlier 43 tok/s projection was retracted
+
+The 43 tok/s figure came from PR #77's compute-unit-split spike:
+`max(c1+c2+c4_ANE, c1+c3_GPU)` ≈ 23 ms/step, grounded in a measured
+0.87–0.99 kernel-overlap factor between ANE and GPU driver queues.
+The projection assumed c3 and c4 could run in parallel. **PR #79
+implemented the full 2-stage pipeline and refuted that assumption
+empirically:**
+
+- Every category regressed by ~24 % (see retraction callout at top).
+- Root cause: c4 takes c3's `hidden_states_out` as input — a strict
+  data dependency. The only overlap window between c3 and c4 within
+  a step is the ~1 µs Swift dict-build, negligible against the
+  ~16 ms GPU c3. The cross-step pipeline (c3 of step N+1 concurrent
+  with c3 of step N) is similarly blocked because c3 of step N+1
+  needs c4 of step N to emit the just-decoded token.
+- PR #75 independently showed that adding ANE-only parallelism does
+  not help because the ANE driver serialises all submissions.
+
+Conclusion: on the current CoreML chunk graph there is **no
+non-speculative decode overlap available**. Three future options
+documented in PR #79's `docs/PHASE_D_PIPELINING_IMPL.md`
+(decoupled c4, speculative h3, model re-chunking) all require
+`conversion/`-side work — none are runtime-only.
 
 ### 1 s TTFT (prefill)
 
@@ -138,32 +181,42 @@ The previous version of this doc set **"70–110 tok/s at 2K, i.e.
   it would require pivoting this repo to MLX-Swift / GPU decode,
   which is an explicitly rejected direction (the repo's reason for
   existing is ANE-native placement).
-- Under ANE constraints, the decode ceiling is ~43 tok/s (PR #77
-  split + D1b pipelining). That is ~77 % of LiteRT-LM's throughput.
+- Under ANE constraints, the measured decode ceiling is **32 tok/s**.
+  An earlier revision of this doc projected ~43 tok/s via a PR #77
+  compute-unit split and D1b pipelining; PR #79's full
+  implementation empirically refuted that (see retraction callout
+  and §"Projection basis" for the mechanism). 32 tok/s is ~58 % of
+  LiteRT-LM's decode rate — a ~42 % gap, not ~20 %.
 - The speculative-decoding route that was supposed to close the gap
   is blocked at the verify-chunk write-through layer (see above).
 - Reframing on power + TTFT + tok/s-ceiling is **honest about what
   ANE can deliver** and **identifies where we actually win**: a
   different user segment (background-friendly, battery-sensitive,
-  GPU-contended host apps).
+  GPU-contended host apps). The decode-rate gap is real; the UX
+  argument has to carry the pitch, not decode parity.
 
 We do not claim parity on decode rate. We claim a better product on
 a different axis triad.
 
 ---
 
-## Execution — two tractable paths forward
+## Execution — single tractable decode-adjacent path forward
 
-Neither depends on the speculative-decoding work.
+Only one non-speculative decode-adjacent item remains after the D1b
+refutation: **item 27 (GPU prefill)**, which targets the TTFT axis
+rather than the decode axis. The decode axis is parked at the
+measured 32 tok/s ceiling pending either a model re-conversion
+(PR #79's three future options) or the multi-week verify-protocol
+redesign (C0 option b).
 
 | # | Item | Status | Axis unlocked |
 |---|---|---|---|
-| **A** | **D1b chunk pipelining** — overlap chunk N+1 step *t* with chunk N step *t-1* across ANE+GPU split (PR #77 validated the split; D1b implements the full 4-stage pipeline). | in flight on `feat/chunk-pipelining-d1b` | decode tok/s 31 → ~43 (projection) |
-| **B** | **Item 27 GPU prefill via MLX-Swift** — offload the 512-token prefill batch to GPU tensor cores. | not started; elevated to **Phase C critical path** (was "stretch"). | TTFT 13 s → ~1 s (projection) |
+| **A** | ~~**D1b chunk pipelining**~~ — **RETRACTED 2026-04-15** by PR #79 full-impl measurement (−24 % on all 4 categories). Structural blocker: `c3 → c4` data dependency. Three future options (decoupled c4 / speculative h3 / model re-chunking) require `conversion/` work. | refuted; plumbing kept OFF-by-default on `feat/chunk-pipelining-d1b` | — |
+| **B** | **Item 27 GPU prefill via MLX-Swift** — offload the 512-token prefill batch to GPU tensor cores. | not started; elevated to **Phase C critical path** (was "stretch"). Sole remaining tractable decode-adjacent lever. | TTFT 13 s → ~1 s (projection) |
 
-Both are Swift-side work; no chunk reconversion required. Both preserve
-the ANE-resident decode story (decode stays on ANE; GPU is used for
-prefill only in B, and only for chunks 3/4 in A).
+Item B is Swift-side work; no chunk reconversion required. It
+preserves the ANE-resident decode story (decode stays on ANE; GPU
+is used for prefill only).
 
 ### Explicitly out of scope
 
@@ -182,10 +235,10 @@ prefill only in B, and only for chunks 3/4 in A).
 
 | Risk | Mitigation / note |
 |---|---|
-| D1b pipelining hits an iOS-side dispatch quirk | Falls back to serial execution; decode stays at 31 tok/s baseline. We don't regress. |
-| GPU prefill (item 27) surfaces a Metal ↔ CoreML handoff cost that eats the TTFT win | First-pass measurement is cheap; if the handoff dominates we ship only D1b and revise TTFT claim. |
+| ~~D1b pipelining hits an iOS-side dispatch quirk~~ | **N/A — D1b retracted 2026-04-15 by PR #79 full-impl measurement; structural, not an iOS quirk.** |
+| GPU prefill (item 27) surfaces a Metal ↔ CoreML handoff cost that eats the TTFT win | First-pass measurement is cheap; if the handoff dominates we revise the TTFT claim. With D1b retracted, item 27 is the only remaining decode-adjacent projection in this doc. |
 | Power-draw advantage is harder to measure than tok/s and easy to wave hands at | Add Instruments energy trace to the benchmark doc before leaning on it as a competitive claim. Treat the 3× battery-life number as an order-of-magnitude until measured. |
-| 43 tok/s projection is optimistic — PR #77 overlap was measured on Mac; iPhone ANE/GPU concurrency may differ | PR #77 measured 0.87–0.99 overlap across drivers; iPhone measurement is the gating exit criterion for the claim. |
+| 32 tok/s decode ceiling is a hard competitive floor — 42 % behind LiteRT-LM — and no tractable non-speculative lever remains | Pitch leans on power + TTFT + background-friendliness; decode parity is explicitly not claimed. If decode parity becomes a requirement, revisit PR #79's three future options (all need model re-conversion). |
 
 ---
 

@@ -200,6 +200,16 @@ KV direct-write → **40–60 tok/s @ 2K, 25–35 tok/s @ 8K**.
 > win once item 27 ships. Effort revised up to 7–10 days (MLX-Swift
 > is recent and underdocumented; original 1–2-day estimate was
 > optimistic).
+>
+> **2026-04-15 late — sole critical-path decode-adjacent item.** The
+> D1b chunk-pipelining projection (~43 tok/s via PR #77's
+> compute-unit split) was retracted after PR #79 implemented the
+> full 2-stage pipeline and measured −24 % on all 4 categories; the
+> `c3 → c4` data dependency eliminates the within-step overlap
+> window. See `docs/MOBILE_2K_COMPETITIVE_PLAN.md` §"Projection basis"
+> and `docs/PHASE_B_DECISION.md` §"What this means for the
+> go-forward target". With D1b invalidated, **item 27 is now the
+> single critical-path decode-adjacent item** on this roadmap.
 
 | Priority | What | Gain | Effort | Source |
 |---|---|---|---|---|
