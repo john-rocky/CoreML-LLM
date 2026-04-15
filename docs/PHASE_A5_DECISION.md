@@ -45,7 +45,14 @@ wiring (PR #36, draft branch `feat/route-b-task1-prompt-lookup-wiring`)
 can be combined under a `DrafterUnion` orchestrator that owns the
 three sources and asks each for up to K proposals per cycle.
 
-## Theoretical on-device ceiling
+## Theoretical on-device ceiling (PROJECTION — requires iPhone confirmation)
+
+> ⚠️ All tok/s numbers in this section are **Mac-side projections**
+> derived from measured iPhone baseline chunk times + assumed verify
+> cost. They are NOT iPhone measurements and must be confirmed in
+> Phase B. The product's shipped speed claim is always the
+> iPhone-measured number. See `MAC_FIRST_EXECUTION_PLAN.md` §"What
+> each environment is authoritative for" for the split.
 
 Inputs:
 

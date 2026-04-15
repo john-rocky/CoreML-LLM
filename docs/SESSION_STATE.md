@@ -17,9 +17,11 @@ should be able to cold-start from it in under 10 minutes.
 measurement picked the winning drafter combination. Detailed decision
 in `docs/PHASE_A5_DECISION.md` §Decision.
 
-Headline number: Route B alone gets us to ~56 tok/s (ties Google);
-Mirror SD (Phase C/D async dispatch) is load-bearing for the decisive
-beat.
+Headline number (PROJECTED, not yet measured on iPhone): Route B
+alone gets us to ~56 tok/s at 2K (ties Google LiteRT-LM iOS); Mirror
+SD (Phase C/D async dispatch) is load-bearing for the decisive beat.
+Phase B must confirm this on iPhone — all shipped speed claims are
+iPhone-measured, Mac is only for accept-rate / correctness.
 
 **Phase B — NEXT.** One bundled iPhone trip. Exit criterion: chat
 ≥ 50 tok/s, other categories ≥ 60.
@@ -72,9 +74,22 @@ with each.
 4. **MLComputePlan audit** on the union path. Confirm ANE placement
    stays ≥ 99% under the new orchestrator.
    - Exit: placement table recorded for posterity.
+5. **iPhone-measured verify chunk cost**. The A5 decision doc
+   projected ~52 ms per verify dispatch; the actual number is an
+   unknown that gates whether the 44–63 tok/s ceiling holds. Log a
+   `[Profile]` on a verify call directly.
+   - Exit: real verify ms/dispatch recorded; Phase A5 ceiling numbers
+     updated with measured verify cost instead of the 1.7× estimate.
+6. **Regression sanity check** for PR #45's runtime changes. Load
+   the current main (post-#45 merge) with the 2K model on iPhone and
+   run a baseline prompt — decode should still hit ~31 tok/s. If it
+   regresses, revert #45.
+   - Exit: baseline 31 ±1 tok/s reconfirmed OR regression isolated.
 
-Order 1 → 3 → 2 → 4. Item 1 is the critical path; 3 is free-standing
-and risk-free, good to land first as a warm-up.
+Order 1 → 3 → 2 → 4 → 5 → 6. Item 1 is the critical path. Items 3, 5,
+6 are cheap to bundle into the same trip; 6 should run first (before
+the new orchestrator is enabled) so any regression is cleanly
+attributable.
 
 ---
 
