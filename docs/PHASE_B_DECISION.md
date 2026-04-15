@@ -85,16 +85,57 @@ such that `verify_qK([nextID, d0, d1])[0]` is bit-exact with
 bit-exact in logits, just argmax-stable across slot content). Candidate
 approaches:
 
-- Explicit fp32 upcast on the logit projection in the verify function.
-- Re-quantise verify weights with accumulation-order control.
-- Switch to `MLMultiArray` inputs with explicit fp32 zeroing so batched
-  compute path takes a canonical ordering.
-- Output-space tolerance: instead of byte-exact argmax, compare
-  logit[argmax(chain)] vs logit[argmax(verify[0])] and accept if the
-  margin is below threshold. Changes drafter semantics; cheap to try
-  before re-quantising.
+- ~~Explicit fp32 upcast on the logit projection in the verify
+  function.~~ **REFUTED 2026-04-15 by PR #72 (Track B approach 3).**
+  See `docs/PHASE_C_TIGHTENING_FINDINGS.md`.
+- ~~Re-quantise verify weights with accumulation-order control.~~
+  **REFUTED 2026-04-15 by PR #72 (Track B approach 3).** Both of
+  these are strict subsets of what replacing batched `verify_qK`
+  with K serial `decode_q1` calls already removed — and that swap
+  did not close the chain gap (cross-vocab code stayed at 1.01,
+  chat moved 2.31 → 2.09 within noise).
+- ~~Switch to `MLMultiArray` inputs with explicit fp32 zeroing so
+  batched compute path takes a canonical ordering.~~ Same class —
+  also predicted no-op by PR #72.
+- **Output-space tolerance (Track A).** Instead of byte-exact
+  argmax, compare `logit[argmax(chain)]` vs `logit[argmax(verify[0])]`
+  and accept if the margin is below threshold. A measurement-only
+  relaxation; doesn't require verify to be deterministic. Bench-side
+  patch is ready on PR #73 and lands independently of any chunk
+  re-export.
+- **Delayed KV write-through (verify-protocol redesign).** Verify
+  computes logits but commits KV only after the acceptance decision
+  is made, so subsequent target argmaxes don't condition on
+  drafter-proposal residue at positions P+1..P+K-1. Multi-week work
+  (verify chunk I/O contract re-designed, write-through semantics
+  moved into Swift), but directly addresses the semantic mechanism
+  PR #72 isolated.
 
-Effort: 1–3 days investigation, plus a partial model re-export.
+### 2026-04-15 update — B.3 refutation
+
+PR #72 (`experiment/c0-verify-serial`) replaced the batched
+`verify_qK` call with K serial `decode_q1` calls and ran the v4 chain
+bench. The cross-vocab code category stayed at E[tok/burst] = 1.01
+(oracle = 2.63), qa stayed at 2.04, summary at 1.00, chat moved
+2.31 → 2.09. That rules out batched-compute fp16 as the chain-gap
+mechanism: if joint-K-token fp16 ordering were the cause, removing
+batched compute entirely would have closed the gap.
+
+The mechanism is instead **semantic**: verify writes drafter proposals
+into the KV cache at positions P+1..P+K-1 *before* acceptance is
+decided. Subsequent target argmaxes condition on the contaminated
+cache. Oracle replay avoids this because it never calls verify.
+Serial decode reproduces it exactly (same write sites, sequenced).
+Full detail in `docs/PHASE_C_TIGHTENING_FINDINGS.md`.
+
+Implication: the C0 candidate list collapses to **(a) output-space
+tolerance** (cheap; Track A / PR #73 wiring) and **(b) verify-protocol
+redesign** (multi-week; delays KV write-through until after
+acceptance). The fp32-upcast / accumulation-order variants are dead
+ends.
+
+Effort: (a) is a bench-measurement exercise once verify chunks emit
+top-K logits; (b) is a chunk re-export plus a Swift engine re-design.
 Blocking item for Phase C.
 
 ---

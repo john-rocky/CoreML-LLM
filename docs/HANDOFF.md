@@ -1,29 +1,37 @@
 # Next-session handoff
 
-**Last updated:** end of 2026-04-15 session, post v4 chain-mode bench.
+**Last updated:** 2026-04-15 post B.3 refutation (PR #72) — batched
+fp16 hypothesis is dead; mechanism is semantic KV write-through.
 
 ## Read this first
 
 To resume cleanly, the next session should:
 
-1. **If starting C0 work:** open `docs/NEXT_SESSION_C0.md` first —
-   concrete instructions for the two parallel tracks (loosen /
-   rebuild). Then skim this file for surrounding context.
+1. **If starting C0 work:** open `docs/PHASE_C_TIGHTENING_FINDINGS.md`
+   first — PR #72's B.3 result that rules out the batched-fp16
+   hypothesis and pins the mechanism to semantic KV write-through.
+   Then `docs/NEXT_SESSION_C0.md` for the two-track (loosen / rebuild)
+   branching, **but read the updated candidate list in
+   `docs/PHASE_B_DECISION.md` §"Phase C gating item" §"2026-04-15
+   update — B.3 refutation" before acting on NEXT_SESSION_C0 —
+   approaches 1 and 2 there are now dead.**
 2. Open this file (`docs/HANDOFF.md`) — takes 5 minutes.
 3. Read `docs/PHASE_B_DECISION.md` — **Phase B closes here; Union
-   defaults stay OFF; Phase C is gated on verify-chunk numerical
-   tightening (item "C0").** Consolidates the v3/v4 findings into a
-   concrete go-forward plan.
-3. Read `docs/PHASE_B_V4_CHAIN_FINDINGS.md` — empirical basis for the
-   decision (chain-mode bench reproduces the live gap, mechanism
-   identified).
-4. Read `docs/PHASE_B_V3_ARGMAX_FINDINGS.md` — v3 ruled out the
+   defaults stay OFF; Phase C is gated on item "C0".** Candidate
+   list is now (a) output-space tolerance / (b) verify-protocol
+   redesign; fp32 upcast and accumulation-order variants are dead
+   per B.3.
+4. Read `docs/PHASE_B_V4_CHAIN_FINDINGS.md` — empirical basis for
+   the decision **layered with the 2026-04-15 UPDATE callout that
+   retracts the batched-fp16 speculation**.
+5. Read `docs/PHASE_B_V3_ARGMAX_FINDINGS.md` — v3 ruled out the
    narrower "`decode_q1` vs `verify_qK` drift" hypothesis.
-5. Read `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md` — original live-gap
+6. Read `docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md` — original live-gap
    finding.
-6. Skim `docs/SESSION_STATE.md` for exact PR / branch / task state.
-7. `docs/MAC_FIRST_EXECUTION_PLAN.md` for the phased itinerary.
-8. `docs/PHASE_A5_DECISION.md` — historical, superseded.
+7. Skim `docs/SESSION_STATE.md` for exact PR / branch / task state
+   (gotcha #3 has the short-form B.3 summary).
+8. `docs/MAC_FIRST_EXECUTION_PLAN.md` for the phased itinerary.
+9. `docs/PHASE_A5_DECISION.md` — historical, superseded.
 
 No need to touch MTP Path A, PR #17, or PR #33 — all deprioritised
 with reasons in the roadmap's Rejected table.
@@ -34,25 +42,42 @@ Copy-paste this at the start of the next `/claude` session so the
 model walks in with correct framing:
 
 > Phase B closed 2026-04-15. Union defaults stay OFF on main.
-> Phase C is gated on roadmap item 11c ("C0"): batched `verify_qK`'s
-> argmax at slot 0 is fp16-sensitive to slots 1..K-1 content, which is
-> the dominant driver of the bench-vs-live 3–9× accept-rate gap.
-> Speculative decoding is capped until verify chunks are re-quantised
-> or the acceptance test uses output-space tolerance.
-> Read (in order):
-> 1. docs/PHASE_B_DECISION.md — go-forward plan, rejected / viable /
->    gating options.
-> 2. docs/PHASE_B_V4_CHAIN_FINDINGS.md — empirical basis.
-> 3. docs/PHASE_B_V3_ARGMAX_FINDINGS.md — ruled out the narrower
->    drift hypothesis.
-> 4. docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md — original live-gap finding.
-> 5. docs/HANDOFF.md (this file) + docs/SESSION_STATE.md.
+> Phase C is gated on roadmap item 11c ("C0"). Refutation chain:
+> v3 ruled out decode_q1 ↔ verify_qK drift; v4 hypothesised batched-
+> fp16 ordering inside verify_qK; **B.3 / PR #72 refuted that** by
+> swapping batched verify_qK for K serial decode_q1 calls and seeing
+> no chain-gap closure. The mechanism is **semantic** — verify writes
+> drafter proposals into KV before acceptance is decided, so target
+> argmaxes at subsequent positions condition on the contaminated
+> cache. This is not fixable by tightening verify numerics.
+> Remaining C0 options: (a) output-space tolerance (Track A / PR #73
+> patch-ready, cheap; blocked on verify chunks emitting top-K
+> logits), (b) verify-protocol redesign with delayed KV write-through
+> (multi-week).
 >
-> Start on C0 investigation: pick a verify-chunk tightening approach
-> from `docs/PHASE_B_DECISION.md` §"Phase C gating item" (fp32 upcast
-> / re-quantise / output-space tolerance), prototype on Mac, measure
-> v4 chain numbers before/after. Output-space tolerance is the
-> cheapest first try (bench-only change, no model re-export).
+> Read (in order):
+> 1. docs/PHASE_C_TIGHTENING_FINDINGS.md — B.3 result and mechanism.
+> 2. docs/PHASE_B_DECISION.md — go-forward plan with B.3-updated
+>    candidate list.
+> 3. docs/PHASE_B_V4_CHAIN_FINDINGS.md — empirical basis with the
+>    2026-04-15 UPDATE callout.
+> 4. docs/PHASE_B_V3_ARGMAX_FINDINGS.md — ruled out the narrower
+>    drift hypothesis.
+> 5. docs/PHASE_B_LIVE_ACCEPT_RATE_GAP.md — original live-gap finding.
+> 6. docs/HANDOFF.md (this file) + docs/SESSION_STATE.md.
+>
+> Start options:
+> - **Track A measurement (cheap):** unblock by landing the verify
+>   chunk re-export that emits `logits_fp16` alongside `token_ids`
+>   (conversion/ change, ~1 output-node addition); then Track A
+>   bench (PR #73 wiring) measures how many chain flips are
+>   within-margin and should be tolerated.
+> - **Non-speculative D1 spike (also cheap, unblocked now):** staged
+>   chunk pipelining per HANDOFF §"Phase D". Doesn't depend on
+>   verify numerics and is independent of the C0 question.
+> - Verify-protocol redesign (option (b)) is multi-week and should
+>   wait until Track A has quantified whether tolerance alone
+>   recovers a useful fraction of the chain gap.
 >
 > Bench + `bench*` helpers on CoreMLLLM are public (merged).
 > Docs auto-merge; bench/harness code auto-merges too.
@@ -155,7 +180,7 @@ iPhone trip with PR #57 env vars on (SPECULATIVE_PROFILE=1, COMPUTE_PLAN_AUDIT=1
 
 </details>
 
-#### Actual Phase B priority ordering (post-PR #62)
+#### Actual Phase B priority ordering (post-PR #62, updated post-B.3)
 
 1. ~~**Rebuild accept-rate-bench with target-argmax mode**~~ —
    **DONE 2026-04-15** (v3). `decode_q1`/`verify_qK` fp16 drift is
@@ -163,11 +188,15 @@ iPhone trip with PR #57 env vars on (SPECULATIVE_PROFILE=1, COMPUTE_PLAN_AUDIT=1
    `docs/PHASE_B_V3_ARGMAX_FINDINGS.md`.
 2. ~~**Chain-following argmax mode**~~ — **DONE 2026-04-15** (v4).
    Drafter proposals in verify slots 1..K-1 reproduce the live gap
-   directionally on code/qa/summary. Mechanism identified: fp16
-   sensitivity of batched verify_qK to slot 1..K-1 content, breaking
-   PL's byte-exact n-gram matching. See
-   `docs/PHASE_B_V4_CHAIN_FINDINGS.md` and
-   `eval/accept-rate-bench-v4-chain.json`.
+   directionally on code/qa/summary. v4 attributed this to fp16
+   sensitivity of batched verify_qK to slot 1..K-1 content.
+   **Mechanism attribution updated 2026-04-15 by PR #72 (B.3):**
+   batched fp16 is NOT the mechanism — K serial `decode_q1` calls
+   reproduce the chain gap within noise, so joint-K-token compute
+   isn't load-bearing. The mechanism is semantic: verify's KV
+   write-through at P+1..P+K-1 contaminates subsequent target
+   argmaxes. See `docs/PHASE_C_TIGHTENING_FINDINGS.md` and the
+   UPDATE callout in `docs/PHASE_B_V4_CHAIN_FINDINGS.md`.
 3. **Union-shape decision.** Per v4 §"Implications":
     - **PL-only Union:** rejected (net-regression on 3/4 categories
       in chain-mode numbers).
