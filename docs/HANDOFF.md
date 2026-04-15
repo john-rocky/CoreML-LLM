@@ -6,8 +6,11 @@
 
 To resume cleanly, the next session should:
 
-1. Open this file (`docs/HANDOFF.md`) — takes 5 minutes.
-2. Read `docs/PHASE_B_DECISION.md` — **Phase B closes here; Union
+1. **If starting C0 work:** open `docs/NEXT_SESSION_C0.md` first —
+   concrete instructions for the two parallel tracks (loosen /
+   rebuild). Then skim this file for surrounding context.
+2. Open this file (`docs/HANDOFF.md`) — takes 5 minutes.
+3. Read `docs/PHASE_B_DECISION.md` — **Phase B closes here; Union
    defaults stay OFF; Phase C is gated on verify-chunk numerical
    tightening (item "C0").** Consolidates the v3/v4 findings into a
    concrete go-forward plan.
