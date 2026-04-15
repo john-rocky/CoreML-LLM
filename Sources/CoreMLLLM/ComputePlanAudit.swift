@@ -22,11 +22,35 @@ enum ComputePlanAudit {
     }
 
     /// Run the audit for all decode chunks found in `modelDirectory`.
+    /// Auto-detects the layout: if `merged_full.mlpackage` exists the 1-chunk
+    /// variant is audited; if `merged_chunk1/2.mlpackage` exist the 2-chunk
+    /// variant is audited; otherwise the default 4-chunk split is used.
+    /// Any layout that is present on disk gets audited — a dev can diff the
+    /// ANE placement of all three on the same run.
     static func run(modelDirectory: URL,
                     computeUnits: MLComputeUnits = .cpuAndNeuralEngine) async {
         guard isEnabled else { return }
 
-        let chunkNames = ["chunk1", "chunk2", "chunk3", "chunk4"]
+        // Always audit the 4-chunk baseline if present (it is the fallback
+        // used by the prefill / speculative-verify paths).
+        var chunkNames: [String] = []
+        let candidates: [[String]] = [
+            ["chunk1", "chunk2", "chunk3", "chunk4"],
+            ["merged_chunk1", "merged_chunk2"],
+            ["merged_full"],
+        ]
+        for group in candidates {
+            let allPresent = group.allSatisfy { name in
+                FileManager.default.fileExists(
+                    atPath: modelDirectory.appendingPathComponent("\(name).mlmodelc").path)
+                || FileManager.default.fileExists(
+                    atPath: modelDirectory.appendingPathComponent("\(name).mlpackage").path)
+            }
+            if allPresent { chunkNames.append(contentsOf: group) }
+        }
+        if chunkNames.isEmpty {
+            chunkNames = ["chunk1", "chunk2", "chunk3", "chunk4"]  // best-effort
+        }
         var totalOps = 0
         var totalFallbacks = 0
 

@@ -59,6 +59,32 @@ This is not "item 11c" (`decode_q1` ↔ `verify_qK` drift); v3 already
 ruled that out as the dominant factor. This is a *within-verify_qK*
 sensitivity to batch content, and it explains the remaining gap.
 
+> **UPDATE 2026-04-15 by PR #72 (Track B approach 3).** The
+> speculation above — that "the batched multi-function `verify_qK`
+> compute path has fp16 ordering / reduction differences that depend
+> on all K input tokens jointly" — is **refuted**. PR #72 replaced
+> the batched `verify_qK` call with K serial `decode_q1` calls (no
+> joint-K-token compute at all) and re-ran the v4 chain bench. The
+> cross-vocab code category stayed at 1.01 (oracle 2.63); qa stayed
+> at 2.04; summary at 1.00; chat moved 2.31 → 2.09 within noise. If
+> batched fp16 ordering were the mechanism, removing the batched
+> path would have closed most of the gap. It didn't.
+>
+> The actual mechanism is **semantic, not numerical**: verify writes
+> drafter proposals into the KV cache at positions P+1..P+K-1 *before*
+> the acceptance decision. Subsequent target argmaxes (at the next
+> committed position) read attention over a cache containing possibly-
+> rejected drafter tokens, which is a real semantic difference from
+> oracle replay (which never calls verify) and from the "clean" chain
+> a pure `decode_q1` loop would produce. Serial decode reproduces the
+> gap exactly because it writes KV at the same sites the batched path
+> does — just sequenced. See
+> `docs/PHASE_C_TIGHTENING_FINDINGS.md` for the per-category table
+> and `docs/PHASE_B_DECISION.md` §"Phase C gating item" for the
+> resulting C0 candidate-list update (fp32 upcast / accumulation-order
+> are dead; output-space tolerance and verify-protocol redesign
+> remain).
+
 ---
 
 ## Per-category results (E[tok/burst])
