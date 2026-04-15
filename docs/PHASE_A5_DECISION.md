@@ -40,10 +40,13 @@ across their proposals against the target's verify argmax. One verify
 pass per burst regardless of how many drafters ran. Rolling-accept
 gate disables drafting below ~0.2 acceptance so we never regress.
 
-The already-merged `CrossVocabSpeculativeEngine` and prompt-lookup
-wiring (PR #36, draft branch `feat/route-b-task1-prompt-lookup-wiring`)
-can be combined under a `DrafterUnion` orchestrator that owns the
-three sources and asks each for up to K proposals per cycle.
+All three sources live under the `DrafterUnion` orchestrator
+(`Sources/CoreMLLLM/DrafterUnion.swift`, landed in PR #54) that
+asks each for up to K proposals per cycle and picks the best
+according to the priority policy documented inline there. Opt-in
+via `drafterUnionEnabled = true` — default off on main since the
+Qwen drafter perf regresses on iPhone (see `docs/SESSION_STATE.md`
+active tasks).
 
 ## Theoretical on-device ceiling (PROJECTION — requires iPhone confirmation)
 
@@ -100,13 +103,17 @@ The qualitative conclusion: **Route B's union-of-drafters alone
 matches Google only once Mirror SD hides drafter cost**. Without
 Mirror SD, the chat regression drags the average below Google.
 
-What the *current main* branch delivers today is less than either of
-these averages, because only cross-vocab is wired (prompt-lookup
-wiring is still on `feat/route-b-task1-prompt-lookup-wiring`, union
-orchestrator not built). Running main on iPhone right now would
-exercise cross-vocab alone: projected 30/34/42/41 tok/s on
-chat/code/qa/summary, average **~37 tok/s**. The 48 and 56 numbers
-above require Phase B (union) and Phase C (Mirror SD) landings.
+What the *current main* branch delivers today (post-PR #54):
+DrafterUnion is wired, but both `drafterUnionEnabled` and
+`crossVocabEnabled` default to `false`, so the default path runs
+pure target decode at ~31 tok/s. Opting in via
+`drafterUnionEnabled = true` on iPhone 17 Pro was measured at
+**1.8 tok/s decode and 25+ s TTFT on short prompts** — the Qwen
+drafter was roughly 10× slower than the 24 ms estimate, likely
+running on CPU rather than GPU. The 48 and 56 averages above assume
+Mac-measured drafter cost plus Mirror-SD overlap, neither of which
+reflects iPhone reality today. Perf investigation (PR #57) lands
+the timing logs needed to isolate the regression.
 
 ## Known limits of this estimate
 

@@ -71,7 +71,7 @@ in a single session.
 |---|---|---|---|
 | **B1** | Runtime hints V6-1 (`reshapeFrequency = .infrequent`) + V6-2 (`MLComputePlan` warm-pool). Numerically identical to baseline. | Edit `ChunkedEngine.load`, build on Mac. | Decode tok/s delta (expect +1–2%), no bit-exact regression. |
 | **B2** | Blockwise-32 W4 palettization. | Reconvert chunks with `granularity="per_block", block_size=32"` via `conversion/build_*.py`, push to iPhone over USB using `push-model.sh`. | Quality spot-check only (same tok/s expected). |
-| **B3** | Wire winning drafter from A5. If it's Prompt Lookup, the branch `feat/route-b-task1-prompt-lookup-wiring` already has the wiring — rebase onto any Phase B-other changes. | Build on Mac. | Confirm on-device accept rate matches Mac prediction (±5%). Collect tok/s delta. |
+| **B3** | Wire winning drafter from A5 — DONE via PR #54's DrafterUnion orchestrator on `Sources/CoreMLLLM/DrafterUnion.swift`. Enable with `drafterUnionEnabled = true` after the perf investigation resolves the iPhone regression. | Opt-in flag; no new Swift build needed. | iPhone accept rate vs Mac prediction (currently blocked by drafter perf, see PR #57). |
 | **B4** | Fresh MLComputePlan audit on the hints-applied chunks. | — | Confirm ANE placement still ≥ 99%. Watch for hint-induced fallback. |
 
 Exit criterion for Phase B (revised 2026-04-15):

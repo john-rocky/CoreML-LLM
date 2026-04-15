@@ -286,8 +286,10 @@ for repetitive / long-prompt workloads.**
   iOS 18 SDPA fusion re-test → absorbed (Phase 0/1/2/3/5).
 - **LITERT_RUNTIME_ANALYSIS.md** / **LITERT_CONTAINER_ANALYSIS.md**: Google's
   runtime / container format — Verify T=4, mixed INT8/INT4 per layer → absorbed.
-- **MTP_PATH_A_FINDINGS.md**: Phase 2 Track A critical path. See for I/O
-  contract, PyTorch reimpl plan, parity gates.
+- **MTP_PATH_A_FINDINGS.md**: archived — Path A was abandoned
+  2026-04-14 (TFLite drafter's target-distribution mismatch). Kept
+  for the I/O contract and parity-gate methodology, referenced by
+  the self-trained Path C effort in the sibling session.
 - **EAGLE3_INTEGRATION_STATE.md**: Phase 2 Track B state. Blocker 1 reframed,
   Blocker 2 remains.
 
