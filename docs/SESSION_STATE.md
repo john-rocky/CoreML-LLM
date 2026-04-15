@@ -80,11 +80,11 @@ with each.
    `[Profile]` on a verify call directly.
    - Exit: real verify ms/dispatch recorded; Phase A5 ceiling numbers
      updated with measured verify cost instead of the 1.7× estimate.
-6. **Regression sanity check** for PR #45's runtime changes. Load
-   the current main (post-#45 merge) with the 2K model on iPhone and
-   run a baseline prompt — decode should still hit ~31 tok/s. If it
-   regresses, revert #45.
-   - Exit: baseline 31 ±1 tok/s reconfirmed OR regression isolated.
+6. ~~**Regression sanity check** for PR #45's runtime changes~~ —
+   **DONE 2026-04-15**. On-device measurement (backup 2K model,
+   `Explain what a transformer is...` prompt) held steady-state
+   at 31.4–32.8 tok/s, c1=5.5 c2=6.7 c3=8.0 c4=10.1 ms. Matches
+   pre-#45 baseline within noise. PR #45 confirmed regression-free.
 
 Order 1 → 3 → 2 → 4 → 5 → 6. Item 1 is the critical path. Items 3, 5,
 6 are cheap to bundle into the same trip; 6 should run first (before
