@@ -58,9 +58,12 @@ public final class ModelDownloader: NSObject {
             self.folderName = folderName
         }
 
-        /// Gemma 4 E2B — multimodal (image + audio + text), 2.8 GB, ANE-optimized.
+        /// Gemma 4 E2B — multimodal (image + audio + video + text), 3.1 GB,
+        /// ANE-optimized. Includes a native video vision encoder
+        /// (`vision_video.mlmodelc`, 64 tokens/frame) so the Swift 2×2 pool
+        /// no longer sits in the video path.
         public static let gemma4e2b = ModelInfo(
-            id: "gemma4-e2b", name: "Gemma 4 E2B", size: "2.8 GB",
+            id: "gemma4-e2b", name: "Gemma 4 E2B", size: "3.1 GB",
             downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
             folderName: "gemma4-e2b")
 
@@ -542,6 +545,14 @@ public final class ModelDownloader: NSObject {
             .init(remotePath: "vision.mlmodelc/model.mil", localPath: "vision.mlmodelc/model.mil", estimatedSize: 50_000),
             .init(remotePath: "vision.mlmodelc/metadata.json", localPath: "vision.mlmodelc/metadata.json", estimatedSize: 1_000),
             .init(remotePath: "vision.mlmodelc/analytics/coremldata.bin", localPath: "vision.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
+            // Video-grade vision encoder (Gemma 4's `video_processor` path,
+            // 64 tokens/frame natively). When absent, the app transparently
+            // falls back to Swift-side 2×2 pooling of the still-image encoder.
+            .init(remotePath: "vision_video.mlmodelc/weights/weight.bin", localPath: "vision_video.mlmodelc/weights/weight.bin", estimatedSize: 338_081_024),
+            .init(remotePath: "vision_video.mlmodelc/coremldata.bin", localPath: "vision_video.mlmodelc/coremldata.bin", estimatedSize: 418),
+            .init(remotePath: "vision_video.mlmodelc/model.mil", localPath: "vision_video.mlmodelc/model.mil", estimatedSize: 711_289),
+            .init(remotePath: "vision_video.mlmodelc/metadata.json", localPath: "vision_video.mlmodelc/metadata.json", estimatedSize: 2_721),
+            .init(remotePath: "vision_video.mlmodelc/analytics/coremldata.bin", localPath: "vision_video.mlmodelc/analytics/coremldata.bin", estimatedSize: 243),
             // Audio encoder (Conformer 12-layer, INT8)
             .init(remotePath: "audio.mlmodelc/weights/weight.bin", localPath: "audio.mlmodelc/weights/weight.bin", estimatedSize: 295_373_248),
             .init(remotePath: "audio.mlmodelc/coremldata.bin", localPath: "audio.mlmodelc/coremldata.bin", estimatedSize: 1_000),
