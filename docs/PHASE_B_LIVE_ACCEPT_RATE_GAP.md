@@ -162,19 +162,24 @@ and pl-n3 code don't reach the break-even burst budget.
 
 **The A5 decision should be revisited.** Options:
 
-1. **Ship PL-only union** (drop CV entirely): CV's 47 ms draft cost
-   almost always exceeds its emit value. On summary PL-n2/n3 alone
-   might still beat baseline. On chat/qa Union devolves to straight
-   fallback (no PL matches) which reads as baseline — no regression,
-   no gain.
-2. **Raise rolling-gate thresholds** so CV/PL gate off aggressively
-   and the system collapses to baseline faster. Changes the tok/s
-   floor from "net-regression" to "approximately baseline."
-3. **Defer Union entirely** until Mirror SD (Phase C) hides drafter
-   cost. Without the 47 ms CV burst on the critical path, the math
-   changes: even at 0.11 draft-rate, Mirror SD keeps verify the sole
-   critical-path cost (32 ms) and Union ties baseline on CV bursts
-   rather than regressing.
+1. ~~**Ship PL-only union**~~ — **Rejected 2026-04-15 by v4 chain
+   bench.** pl-n2 chain E[tok/burst]: chat 1.48, code 2.01, qa 1.00,
+   summary 1.00. Break-even needs ≥ 2.6. Net-regression on 3 of 4
+   categories. See `docs/PHASE_B_DECISION.md`.
+2. ~~**Raise rolling-gate thresholds**~~ — **Noted but not
+   implemented.** Under Union default OFF, gate tuning affects no
+   out-of-box user. Existing gates (CV 0.20, PL 0.05) already
+   collapse to baseline. File if a user reports regression after
+   opting in.
+3. ~~**Defer Union until Mirror SD**~~ — **Amended 2026-04-15 late
+   by v4.** Mirror SD alone does not unlock Phase B: v4 showed
+   acceptance ceiling is set by `verify_qK`'s fp16 batch-content
+   sensitivity, not drafter speed. The correct gating item is
+   **verify-chunk numerical tightening** (roadmap item 11c, now
+   "C0"), which must close the batched-verify drift before Mirror
+   SD can yield a speculative speedup.
+
+See `docs/PHASE_B_DECISION.md` for the consolidated go-forward.
 
 Option 3 aligns with Phase A5's own caveat:
 
