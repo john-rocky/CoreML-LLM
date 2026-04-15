@@ -42,6 +42,12 @@ public final class CoreMLLLM: @unchecked Sendable {
     private var visionModelURL: URL?
     private var visionConfig: MLModelConfiguration?
 
+    // Optional video-grade vision encoder (max_soft_tokens=70 → 64
+    // tokens/frame). When present, replaces the Phase 1 Swift 2×2 pool.
+    private var videoVisionModel: MLModel?
+    private var videoVisionModelURL: URL?
+    private var videoVisionConfig: MLModelConfiguration?
+
     // Audio (lazy loaded to save memory)
     private var audioModel: MLModel?
     private var audioModelURL: URL?
@@ -283,6 +289,22 @@ public final class CoreMLLLM: @unchecked Sendable {
             llm.visionConfig = cfg
         }
 
+        // Optional video-grade vision encoder. Ships alongside
+        // vision.mlpackage when the HF release was built with
+        // `convert_gemma4_multimodal.py --video-vision`.
+        let videoVisionCompiled = directory.appendingPathComponent("vision_video.mlmodelc")
+        let videoVisionPkg = directory.appendingPathComponent("vision_video.mlpackage")
+        if FileManager.default.fileExists(atPath: videoVisionCompiled.path) {
+            llm.videoVisionModelURL = videoVisionCompiled
+        } else if FileManager.default.fileExists(atPath: videoVisionPkg.path) {
+            llm.videoVisionModelURL = videoVisionPkg
+        }
+        if llm.videoVisionModelURL != nil {
+            let cfg = MLModelConfiguration()
+            cfg.computeUnits = .cpuAndGPU
+            llm.videoVisionConfig = cfg
+        }
+
         // Audio model (optional, lazy loaded on first audio)
         let audioCompiled = directory.appendingPathComponent("audio.mlmodelc")
         let audioPkg = directory.appendingPathComponent("audio.mlpackage")
@@ -434,6 +456,108 @@ public final class CoreMLLLM: @unchecked Sendable {
         let hasAudioInput = audioFeatures != nil
         let chatPrompt = buildPrompt(messages, hasImage: hasImage, hasAudio: hasAudioInput,
                                      audioTokenCount: actualAudioTokens)
+        return try streamFromPrompt(
+            chatPrompt,
+            imageFeatures: imageFeatures,
+            imageNumTokens: imageFeatures != nil ? 256 : 0,
+            audioFeatures: audioFeatures,
+            audioTokenCount: actualAudioTokens,
+            maxTokens: maxTokens
+        )
+    }
+
+    // MARK: - Video API
+
+    /// Stream tokens with a video prompt. Frames are sampled at `options.fps`
+    /// (capped to `options.maxFrames`); each frame contributes 256 vision
+    /// soft tokens plus a `MM:SS` timestamp label, matching the Gemma 4
+    /// video chat template. If `options.includeAudio` is set and the asset
+    /// has an audio track, its PCM is fed through the Conformer encoder.
+    ///
+    /// Watch the prompt length: each frame costs ~261 tokens, so on a 2K
+    /// chunk you want `maxFrames <= 7` and on 8K `maxFrames <= 30`.
+    public func stream(_ messages: [Message], videoURL: URL,
+                       videoOptions: VideoProcessor.Options = .init(),
+                       maxTokens: Int = 2048) async throws -> AsyncStream<String> {
+        let frames = try await VideoProcessor.extractFrames(
+            from: videoURL, options: videoOptions)
+        guard !frames.isEmpty else {
+            throw CoreMLLLMError.videoDecodeFailed
+        }
+        let pcm: [Float]? = videoOptions.includeAudio
+            ? try await VideoProcessor.extractAudioPCM16k(from: videoURL)
+            : nil
+
+        let tokensPerFrame = videoOptions.tokensPerFrame
+        let combined = try concatFrameFeatures(frames.map { $0.image },
+                                                tokensPerFrame: tokensPerFrame)
+
+        var audioFeatures: MLMultiArray?
+        var actualAudioTokens = 0
+        if let pcm, !pcm.isEmpty, supportsAudio {
+            let (features, tokenCount) = try processAudio(pcm)
+            audioFeatures = features
+            actualAudioTokens = tokenCount
+        }
+
+        let videoBlock = buildVideoBlock(timestamps: frames.map { $0.timestampSeconds },
+                                          tokensPerFrame: tokensPerFrame)
+        let audioBlock = actualAudioTokens > 0
+            ? "<|audio>" + String(repeating: "<|audio|>", count: actualAudioTokens) + "<audio|>"
+            : ""
+        let chatPrompt = buildGemmaMediaPrompt(messages, mediaBlock: videoBlock,
+                                                audioBlock: audioBlock)
+
+        return try streamFromPrompt(
+            chatPrompt,
+            imageFeatures: combined,
+            imageNumTokens: frames.count * tokensPerFrame,
+            audioFeatures: audioFeatures,
+            audioTokenCount: actualAudioTokens,
+            maxTokens: maxTokens
+        )
+    }
+
+    /// Generate a full response from a video prompt.
+    public func generate(_ messages: [Message], videoURL: URL,
+                         videoOptions: VideoProcessor.Options = .init(),
+                         maxTokens: Int = 2048) async throws -> String {
+        var result = ""
+        for await token in try await stream(messages, videoURL: videoURL,
+                                             videoOptions: videoOptions,
+                                             maxTokens: maxTokens) {
+            result += token
+        }
+        return result
+    }
+
+    /// Single-prompt convenience for video.
+    public func generate(_ prompt: String, videoURL: URL,
+                         videoOptions: VideoProcessor.Options = .init(),
+                         maxTokens: Int = 2048) async throws -> String {
+        try await generate([Message(role: .user, content: prompt)],
+                            videoURL: videoURL, videoOptions: videoOptions,
+                            maxTokens: maxTokens)
+    }
+
+    public func stream(_ prompt: String, videoURL: URL,
+                       videoOptions: VideoProcessor.Options = .init(),
+                       maxTokens: Int = 2048) async throws -> AsyncStream<String> {
+        try await stream([Message(role: .user, content: prompt)],
+                          videoURL: videoURL, videoOptions: videoOptions,
+                          maxTokens: maxTokens)
+    }
+
+    // MARK: - Private core stream
+
+    private func streamFromPrompt(
+        _ chatPrompt: String,
+        imageFeatures: MLMultiArray?,
+        imageNumTokens: Int,
+        audioFeatures: MLMultiArray?,
+        audioTokenCount: Int,
+        maxTokens: Int
+    ) throws -> AsyncStream<String> {
         let tokenIDs = tokenizer.encode(text: chatPrompt)
 
         reset()
@@ -444,9 +568,10 @@ public final class CoreMLLLM: @unchecked Sendable {
 
         let mutableSelf = self
         let imgFeats = imageFeatures
+        let imgTokenLimit = imageNumTokens
         let audFeats = audioFeatures
         let tokens = tokenIDs
-        let audTokenCount = actualAudioTokens
+        let audTokenCount = audioTokenCount
         let ctxLimit = config.contextLength
 
         return AsyncStream { continuation in
@@ -459,7 +584,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                     var nextID = 0
 
                     func multimodalEmbedding(for tid: Int) -> MLMultiArray? {
-                        if tid == IMAGE_TOKEN_ID, let f = imgFeats, imageIdx < 256 {
+                        if tid == IMAGE_TOKEN_ID, let f = imgFeats, imageIdx < imgTokenLimit {
                             let emb = engine?.sliceFeature(f, at: imageIdx)
                                 ?? ImageProcessor.sliceFeature(f, at: imageIdx,
                                     hiddenSize: mutableSelf.config.hiddenSize)
@@ -488,6 +613,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                                 nextID = try engine.runPrefill(
                                     tokenIDs: batch,
                                     imageFeatures: imgFeats,
+                                    imageNumTokens: imgTokenLimit,
                                     audioFeatures: audFeats,
                                     audioNumTokens: audTokenCount
                                 )
@@ -822,6 +948,14 @@ public final class CoreMLLLM: @unchecked Sendable {
         return try ImageProcessor.process(image, with: vm)
     }
 
+    private func processVideoFrame(_ image: CGImage) throws -> MLMultiArray {
+        if videoVisionModel == nil, let url = videoVisionModelURL, let cfg = videoVisionConfig {
+            videoVisionModel = try MLModel(contentsOf: url, configuration: cfg)
+        }
+        guard let vm = videoVisionModel else { throw CoreMLLLMError.visionNotAvailable }
+        return try ImageProcessor.processVideoFrame(image, with: vm)
+    }
+
     // MARK: - Private: audio
 
     /// Returns (features, actualTokenCount).
@@ -888,6 +1022,134 @@ public final class CoreMLLLM: @unchecked Sendable {
         return p + "<|turn>model\n"
     }
 
+    /// Build the per-frame video block for the Gemma 4 chat template:
+    ///   `MM:SS <|image><|image|>×K<image|>` joined by single spaces.
+    private func buildVideoBlock(timestamps: [Double], tokensPerFrame: Int) -> String {
+        let placeholder = String(repeating: "<|image|>", count: tokensPerFrame)
+        return timestamps
+            .map { "\(VideoProcessor.timestampLabel($0)) <|image>\(placeholder)<image|>" }
+            .joined(separator: " ")
+    }
+
+    /// Gemma prompt variant that injects an arbitrary media block (already
+    /// formatted) instead of the single-image block. Used by the video path.
+    private func buildGemmaMediaPrompt(_ messages: [Message],
+                                        mediaBlock: String,
+                                        audioBlock: String) -> String {
+        let lastUserIdx = messages.lastIndex { $0.role == .user }
+        var p = "<bos>"
+        for (i, m) in messages.enumerated() {
+            switch m.role {
+            case .user:
+                let isLast = i == lastUserIdx
+                var mediaPrefix = ""
+                if isLast && !mediaBlock.isEmpty { mediaPrefix += mediaBlock + "\n" }
+                if isLast && !audioBlock.isEmpty { mediaPrefix += audioBlock + "\n" }
+                p += "<|turn>user\n\(mediaPrefix)\(m.content)<turn|>\n"
+            case .assistant:
+                p += "<|turn>model\n\(m.content)<turn|>\n"
+            case .system:
+                break
+            }
+        }
+        return p + "<|turn>model\n"
+    }
+
+    // MARK: - Private: video feature concatenation
+
+    /// Run each frame through the vision encoder and concatenate to a single
+    /// (1, N*tokensPerFrame, H) MLMultiArray.
+    ///
+    /// The still-image encoder emits 280 tokens per frame (256 real + 24
+    /// padding for a square input, laid out as a 16×16 grid). For video we
+    /// want a lower token budget per frame (Gemma 4's `video_processor`
+    /// uses `max_soft_tokens=70` ≈ 64 real). We cover three cases here:
+    ///   - `tokensPerFrame = 64`, `vision_video.mlpackage` present:
+    ///       use the purpose-built video encoder which already emits 64
+    ///       tokens/frame — no Swift-side pooling needed.
+    ///   - `tokensPerFrame = 256`: raw passthrough (first 256 of 280).
+    ///   - `tokensPerFrame = 64`, no video encoder: 2×2 average-pool the
+    ///       16×16 grid to 8×8 (Phase 1 fallback).
+    ///   - other:                   first `tokensPerFrame` tokens of the 280
+    ///                              (not semantically meaningful — debug only).
+    private func concatFrameFeatures(_ frames: [CGImage],
+                                      tokensPerFrame: Int) throws -> MLMultiArray {
+        precondition(!frames.isEmpty)
+        if tokensPerFrame == 64, videoVisionModelURL != nil {
+            return try concatVideoFrameFeatures(frames)
+        }
+        let hidden = config.hiddenSize
+        let total = frames.count * tokensPerFrame
+        let out = try MLMultiArray(
+            shape: [1, NSNumber(value: total), NSNumber(value: hidden)],
+            dataType: .float16)
+        let dst = out.dataPointer.bindMemory(to: UInt16.self, capacity: total * hidden)
+        memset(dst, 0, total * hidden * MemoryLayout<UInt16>.stride)
+        for (i, frame) in frames.enumerated() {
+            let feat = try processImage(frame)
+            let src = feat.dataPointer.bindMemory(to: UInt16.self, capacity: feat.count)
+            let dstFrame = dst.advanced(by: i * tokensPerFrame * hidden)
+            if tokensPerFrame == 64 {
+                pool16x16To8x8(src: src, dst: dstFrame, hidden: hidden)
+            } else {
+                memcpy(dstFrame, src,
+                       tokensPerFrame * hidden * MemoryLayout<UInt16>.stride)
+            }
+        }
+        return out
+    }
+
+    /// Video-encoder path for `concatFrameFeatures`. The encoder emits
+    /// (1, 64, hidden) per frame; we memcpy each block into the combined
+    /// (1, N·64, hidden) buffer. Kept separate from the still-image path
+    /// so the pool fallback is easy to delete once every shipped model
+    /// bundle includes `vision_video.mlpackage`.
+    private func concatVideoFrameFeatures(_ frames: [CGImage]) throws -> MLMultiArray {
+        precondition(!frames.isEmpty)
+        let hidden = config.hiddenSize
+        let perFrame = 64
+        let total = frames.count * perFrame
+        let out = try MLMultiArray(
+            shape: [1, NSNumber(value: total), NSNumber(value: hidden)],
+            dataType: .float16)
+        let dst = out.dataPointer.bindMemory(to: UInt16.self, capacity: total * hidden)
+        memset(dst, 0, total * hidden * MemoryLayout<UInt16>.stride)
+        for (i, frame) in frames.enumerated() {
+            let feat = try processVideoFrame(frame)
+            let src = feat.dataPointer.bindMemory(to: UInt16.self, capacity: feat.count)
+            let dstFrame = dst.advanced(by: i * perFrame * hidden)
+            memcpy(dstFrame, src,
+                   perFrame * hidden * MemoryLayout<UInt16>.stride)
+        }
+        return out
+    }
+
+    /// Average-pool a 16×16 token grid (256 tokens, row-major) down to 8×8
+    /// (64 tokens) by averaging each 2×2 block in fp32 and writing back
+    /// fp16. `src` must point to 256 × hidden fp16 values; `dst` to 64 ×
+    /// hidden fp16 values.
+    private func pool16x16To8x8(src: UnsafeMutablePointer<UInt16>,
+                                 dst: UnsafeMutablePointer<UInt16>,
+                                 hidden: Int) {
+        for by in 0..<8 {
+            for bx in 0..<8 {
+                let dstOff = (by * 8 + bx) * hidden
+                for d in 0..<hidden {
+                    var sum: Float = 0
+                    for dy in 0..<2 {
+                        for dx in 0..<2 {
+                            let r = by * 2 + dy
+                            let c = bx * 2 + dx
+                            let srcIdx = (r * 16 + c) * hidden + d
+                            sum += Float(Float16(bitPattern: src[srcIdx]))
+                        }
+                    }
+                    dst[dstOff + d] = (Float16(sum * 0.25)).bitPattern
+                }
+            }
+        }
+    }
+
     private func buildQwenPrompt(_ messages: [Message]) -> String {
         var p = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
         for m in messages {
@@ -913,6 +1175,7 @@ public enum CoreMLLLMError: LocalizedError {
     case prefillNotAvailable
     case visionNotAvailable
     case audioNotAvailable
+    case videoDecodeFailed
     /// The verify-chunk pipeline does not expose a `logits_fp16` output yet.
     /// Returned by `benchVerifyTopK` / `verifyCandidatesWithLogits` until the
     /// Track B re-export (`feat/c0-verify-requant`) lands on `main`.
@@ -926,6 +1189,7 @@ public enum CoreMLLLMError: LocalizedError {
         case .prefillNotAvailable: return "Prefill chunks not loaded"
         case .visionNotAvailable: return "Vision model not available"
         case .audioNotAvailable: return "Audio model not available"
+        case .videoDecodeFailed: return "Could not decode any frames from video"
         case .verifyLogitsNotExposed:
             return "verify chunk 4 does not expose `logits_fp16` (Track B re-export pending)"
         }

@@ -9,6 +9,7 @@ let package = Package(
     ],
     products: [
         .library(name: "CoreMLLLM", targets: ["CoreMLLLM"]),
+        .executable(name: "video-test", targets: ["VideoTest"]),
         .executable(name: "accept-rate-bench", targets: ["AcceptRateBench"]),
         .executable(name: "coreml-llm-smoke", targets: ["CoreMLLLMSmoke"]),
         .executable(name: "union-bitexact", targets: ["UnionBitExact"]),
@@ -22,6 +23,11 @@ let package = Package(
             dependencies: [
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .executableTarget(
+            name: "VideoTest",
+            dependencies: ["CoreMLLLM"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(

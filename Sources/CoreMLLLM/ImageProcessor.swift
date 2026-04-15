@@ -85,6 +85,85 @@ public enum ImageProcessor {
         return features
     }
 
+    /// Process a single video frame through the video-grade vision encoder.
+    ///
+    /// Matches the `video_processor` path in Gemma 4 (max_soft_tokens=70 →
+    /// 64 real tokens on a square input). The frame is letter-cropped to
+    /// 384×384 and tiled into a 24×24 patch grid (576 real + 54 padding =
+    /// 630 total), which is the fixed input shape the CoreML-converted
+    /// video encoder expects.
+    ///
+    /// Returns `(1, 64, hidden_size)` — same layout the per-frame feature
+    /// slot expects, so no Swift-side pooling is needed.
+    public static func processVideoFrame(
+        _ image: CGImage,
+        with videoVisionModel: MLModel
+    ) throws -> MLMultiArray {
+        let ps = 16
+        let side = 384              // 24 · 16
+        let Hp = side / ps          // 24
+        let Wp = side / ps          // 24
+        let realPatches = Hp * Wp   // 576
+        let total = 630
+        let pd = ps * ps * 3        // 768 per patch
+
+        // 1. Draw into a 384×384 RGBA canvas. Caller is expected to have
+        //    already center-cropped to square; if not, the bicubic resize
+        //    below will squash the aspect ratio — that matches what HF's
+        //    video processor does for unpadded square inputs.
+        var pixels = [UInt8](repeating: 0, count: side * side * 4)
+        let bitmap = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        let ctx = CGContext(data: &pixels, width: side, height: side,
+                            bitsPerComponent: 8, bytesPerRow: side * 4,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: bitmap.rawValue)!
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
+
+        // 2. Build pixel_values (1, 630, 768) fp32 and
+        //    pixel_position_ids (1, 630, 2) int32. Padding patches (indices
+        //    576..629) get position id (-1, -1) to match the HF convention.
+        let pv = try MLMultiArray(shape: [1, NSNumber(value: total), NSNumber(value: pd)],
+                                  dataType: .float32)
+        let pid = try MLMultiArray(shape: [1, NSNumber(value: total), 2], dataType: .int32)
+        let pvp = pv.dataPointer.bindMemory(to: Float.self, capacity: total * pd)
+        let pidp = pid.dataPointer.bindMemory(to: Int32.self, capacity: total * 2)
+        memset(pvp, 0, total * pd * MemoryLayout<Float>.stride)
+
+        var pi = 0
+        for py in 0..<Hp {
+            for px in 0..<Wp {
+                var o = pi * pd
+                for dy in 0..<ps {
+                    for dx in 0..<ps {
+                        let srcIdx = ((py * ps + dy) * side + (px * ps + dx)) * 4
+                        pvp[o]   = Float(pixels[srcIdx])   / 255
+                        pvp[o+1] = Float(pixels[srcIdx+1]) / 255
+                        pvp[o+2] = Float(pixels[srcIdx+2]) / 255
+                        o += 3
+                    }
+                }
+                pidp[pi * 2]     = Int32(px)
+                pidp[pi * 2 + 1] = Int32(py)
+                pi += 1
+            }
+        }
+        for i in realPatches..<total {
+            pidp[i * 2]     = -1
+            pidp[i * 2 + 1] = -1
+        }
+
+        let input = try MLDictionaryFeatureProvider(dictionary: [
+            "pixel_values": MLFeatureValue(multiArray: pv),
+            "pixel_position_ids": MLFeatureValue(multiArray: pid),
+        ])
+        guard let features = try videoVisionModel.prediction(from: input)
+                .featureValue(for: "image_features")?.multiArrayValue else {
+            throw CoreMLLLMError.predictionFailed
+        }
+        return features
+    }
+
     /// Extract a single image feature token from the vision output.
     public static func sliceFeature(_ features: MLMultiArray, at index: Int,
                                      hiddenSize: Int) -> MLMultiArray {

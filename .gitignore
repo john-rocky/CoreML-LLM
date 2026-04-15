@@ -43,3 +43,4 @@ output/
 *.mov
 *.gif
 Examples/CoreMLLLMChat/gemma4-e2b/
+.claude/
