@@ -142,6 +142,6 @@ public extension ComputeProfile {
 
     /// Persist this profile so the next app launch picks it up.
     func persist(to defaults: UserDefaults = .standard) {
-        defaults.set(rawIdentifier, forKey: userDefaultsKey)
+        defaults.set(rawIdentifier, forKey: Self.userDefaultsKey)
     }
 }
