@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax, repeat_kv_ane
+from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax, ane_fused_softmax, repeat_kv_ane
 
 from .gemma4 import Gemma4Model
 
@@ -109,7 +109,7 @@ def _run_layer_stateless(
     # All fp16 ANE-friendly attention (manual softmax, no float32)
     attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
     attn_weights = attn_weights + causal_mask
-    attn_weights = ane_softmax(attn_weights, dim=-1)
+    attn_weights = ane_fused_softmax(attn_weights, dim=-1)
     attn_output = torch.matmul(attn_weights, V_expanded)
 
     attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(1, 1, -1)

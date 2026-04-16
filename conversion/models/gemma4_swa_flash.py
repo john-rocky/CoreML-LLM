@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax
+from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax, ane_fused_softmax
 
 from .gemma4 import Gemma4Model
 
@@ -172,7 +172,7 @@ def _run_layer_flash(
         # Standard attention (sliding layers, or full when ctx is small)
         attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
         attn_weights = attn_weights + mask
-        attn_weights = ane_softmax(attn_weights, dim=-1)
+        attn_weights = ane_fused_softmax(attn_weights, dim=-1)
         attn_output = torch.matmul(attn_weights, V_expanded)
 
     attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(1, 1, -1)

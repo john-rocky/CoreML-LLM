@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax
+from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax, ane_fused_softmax
 
 from .gemma4 import Gemma4Model
 
@@ -127,7 +127,7 @@ def _run_layer_prefill(
     # the decomposed op sequence). Keeping manual attention for correctness.
     attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
     attn_weights = attn_weights + causal_mask
-    attn_weights = ane_softmax(attn_weights, dim=-1)
+    attn_weights = ane_fused_softmax(attn_weights, dim=-1)
     attn_output = torch.matmul(attn_weights, V_expanded)
 
     # Back to (1, hidden, 1, N) format for o_proj
