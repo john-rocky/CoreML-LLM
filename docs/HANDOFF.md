@@ -48,7 +48,7 @@ their own quantized target.
 | MLState stateful KV | error −14 | ANE compiler rejects `coreml_update_state`; GPU-only. Confirmed still broken on iOS 26. |
 | W8A8 activation quant | ANECCompile() FAILED | iPhone ANE compiler rejects quantize/dequantize MIL ops |
 | W2/W3 post-training palettization | Complete gibberish | Requires QAT (multi-day GPU), not post-training |
-| LayerSkip at L14 | Not viable | (Reported by separate session) |
+| LayerSkip at L14 | 0/60 match (0.0%) | chunk3 (L15-24) skip produces random tokens; L14 hidden is useless without refinement. Measured 2026-04-16 via `LAYERSKIP_PROBE=1`. |
 
 ### Why 32 tok/s is the hard ceiling
 
@@ -84,6 +84,12 @@ stay on `.cpuAndNeuralEngine`. Swift fast-switches based on batch size.
 Weights shared — no double download.
 
 Effort: 7–10 days. No training, no calibration.
+
+**Mac measurement (2026-04-16, PR #86):** GPU prefill on Mac Studio
+was 9.7× slower than ANE (278 ms → 2697 ms). This is expected — Mac
+GPU goes through Metal/CoreML overhead without tensor cores. The
+target is iPhone A19 Pro GPU with tensor cores (3.75 TFLOPS). Decode
+regression: none (33.0 → 32.9 tok/s). iPhone measurement pending.
 
 ### Video multimodal — Phase 2
 
