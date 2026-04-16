@@ -402,6 +402,11 @@ final class ChunkedEngine {
     private var profileC3: Double = 0
     private var profileC4: Double = 0
 
+    // LayerSkip probe: measures early-exit accuracy (chunk3 skipped)
+    private let layerSkipProbe = ProcessInfo.processInfo.environment["LAYERSKIP_PROBE"] == "1"
+    private var lsProbeTotal: Int = 0
+    private var lsProbeMatch: Int = 0
+
     func predictStep(tokenID: Int, position: Int,
                      imageEmbedding: MLMultiArray? = nil) throws -> Int {
         let ctx = config.contextLength
@@ -511,6 +516,21 @@ final class ChunkedEngine {
         let out4 = try chunk4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4))
         let tC4End = CFAbsoluteTimeGetCurrent()
         profileC4 += (tC4End - tC4Start)
+
+        // LayerSkip probe: skip chunk3, feed h2 directly to chunk4
+        if layerSkipProbe {
+            var d4skip = shared; d4skip["hidden_states"] = MLFeatureValue(multiArray: h2)
+            let skipOut = try chunk4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4skip))
+            let skipToken = skipOut.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+            let realToken = out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+            lsProbeTotal += 1
+            if skipToken == realToken { lsProbeMatch += 1 }
+            if lsProbeTotal == 1 || lsProbeTotal % 10 == 0 {
+                let rate = Double(lsProbeMatch) / Double(lsProbeTotal) * 100
+                print(String(format: "[LayerSkip] %d/%d match (%.1f%%) — skip=%d real=%d",
+                             lsProbeMatch, lsProbeTotal, rate, skipToken, realToken))
+            }
+        }
 
         profilePredict += (CFAbsoluteTimeGetCurrent() - t1)
         profileCount += 1
