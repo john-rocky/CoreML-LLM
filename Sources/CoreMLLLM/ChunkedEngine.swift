@@ -1141,6 +1141,7 @@ final class ChunkedEngine {
                                      audioNumTokens: Int = 50) throws -> MLMultiArray {
         let IMAGE_TOKEN_ID = 258880
         let AUDIO_TOKEN_ID = 258881
+        let VIDEO_TOKEN_ID = 258884
         let hidden = config.hiddenSize
         let arr = try MLMultiArray(shape: [1, NSNumber(value: N), NSNumber(value: hidden)], dataType: .float16)
         memset(arr.dataPointer, 0, N * hidden * MemoryLayout<UInt16>.stride)
@@ -1150,7 +1151,11 @@ final class ChunkedEngine {
         var imageIdx = 0
         var audioIdx = 0
         for (i, tid) in tokenIDs.enumerated() {
-            if tid == IMAGE_TOKEN_ID, let fp = imgPtr, imageIdx < imageNumTokens {
+            // Image and video share the same `imageFeatures` buffer; the
+            // video path concatenates frames into the same per-token
+            // (1, N, hidden) layout the image path uses.
+            if (tid == IMAGE_TOKEN_ID || tid == VIDEO_TOKEN_ID),
+               let fp = imgPtr, imageIdx < imageNumTokens {
                 memcpy(dst.advanced(by: i * hidden), fp.advanced(by: imageIdx * hidden),
                        hidden * MemoryLayout<UInt16>.stride)
                 imageIdx += 1
@@ -1169,15 +1174,20 @@ final class ChunkedEngine {
 
     private func buildPrefillPLR(tokenIDs: [Int], N: Int) throws -> MLMultiArray {
         let IMAGE_TOKEN_ID = 258880
+        let AUDIO_TOKEN_ID = 258881
+        let VIDEO_TOKEN_ID = 258884
         let totalDim = config.numLayers * config.perLayerDim
         let arr = try MLMultiArray(shape: [1, NSNumber(value: N), NSNumber(value: totalDim)], dataType: .float16)
         memset(arr.dataPointer, 0, N * totalDim * MemoryLayout<UInt16>.stride)
         let dst = arr.dataPointer.bindMemory(to: UInt16.self, capacity: N * totalDim)
         for (i, tid) in tokenIDs.enumerated() {
-            // Image positions get zero PLE — the per_layer_model_projection from
-            // hidden_states (vision features) is computed inside chunk1 on ANE.
-            // Adding per_layer_raw from IMAGE_TOKEN_ID corrupts PLE with nonsense.
-            if tid == IMAGE_TOKEN_ID || tid == 258881 { continue }  // image/audio: zero PLE
+            // Multimodal positions get zero PLE — the per_layer_model_projection
+            // from hidden_states (vision/audio features) is computed inside
+            // chunk1 on ANE. Adding per_layer_raw from a placeholder token
+            // corrupts PLE with nonsense.
+            if tid == IMAGE_TOKEN_ID || tid == AUDIO_TOKEN_ID || tid == VIDEO_TOKEN_ID {
+                continue
+            }
             let raw = embedPerLayer.lookupRaw(tid)
             memcpy(dst.advanced(by: i * totalDim), raw, totalDim * MemoryLayout<UInt16>.stride)
         }
