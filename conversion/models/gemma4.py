@@ -272,6 +272,28 @@ class Gemma4Model(nn.Module):
             self.lm_head.weight.data = embed_w.unsqueeze(-1).unsqueeze(-1)
             print("Tied lm_head weights to embed_tokens")
 
+        # layer_scalar hard-delete probe: if every layer's learnable scalar
+        # is exactly 1.0 (true for the HF-released Gemma 4 E2B checkpoint),
+        # the per-layer multiply at the end of each block is an identity
+        # and can be removed from the graph. Gate the forward branch with a
+        # Python bool so trace drops the op entirely. Any non-unity value
+        # keeps the multiply intact.
+        ones_ref = torch.ones(1, dtype=MODEL_DTYPE)
+        scalars_all_one = all(
+            torch.allclose(layer.layer_scalar.detach().to(MODEL_DTYPE), ones_ref)
+            for layer in self.layers
+        )
+        for layer in self.layers:
+            layer.use_layer_scalar = not scalars_all_one
+        if scalars_all_one:
+            print("layer_scalar: all 1.0 — skipping 35 per-layer multiplies")
+        else:
+            print("layer_scalar: non-unity values found — keeping multiplies")
+
+        # Fold pre-norm RMSNorm scales into the downstream Conv weights.
+        # See fuse_pre_norms() for the math (lossless, weights-only).
+        self.fuse_pre_norms()
+
         # NOTE: We previously pre-scaled q_norm.weight by sqrt(head_dim) so
         # Fused SDPA's internal /sqrt(d) would cancel and recover Gemma 4's
         # effective scale=1.0 attention. However, in fp16, scaling Q by sqrt(d)
@@ -281,6 +303,59 @@ class Gemma4Model(nn.Module):
         # as v0.2.0. Costs SDPA fusion (more ops) but preserves correctness.
 
         print(f"Loaded {loaded} weight tensors")
+
+    def fuse_pre_norms(self) -> None:
+        """Fold pre-norm RMSNorm scales into the in-channels of downstream Conv2d.
+
+        Lossless (weights-only) fusion for the two pre-norms per decoder layer:
+          input_layernorm          -> q_proj, k_proj, v_proj  (k/v only when owned)
+          pre_feedforward_layernorm -> gate_proj, up_proj
+
+        Math: ``conv_W(norm(x) * s) == conv_{W * s_in}(norm(x))`` where the
+        scale is broadcast along the Conv's input-channel axis. After
+        absorption each norm's ``affine`` flag flips False so the post-norm
+        multiply is skipped at forward time.
+
+        The per-norm absorption is performed in a single pass across all
+        downstream Convs that the norm fans out to; the shared
+        ``absorb_rmsnorm_scale_into_conv`` helper flips ``affine=False`` on
+        the first call and returns early on subsequent calls, so applying it
+        naively to a fan-out would only scale the first Conv. Inlined here
+        to scale every fan-out target before clearing the affine flag.
+
+        Post-norm RMSNorms (``post_attention_layernorm``,
+        ``post_feedforward_layernorm``, ``post_per_layer_input_norm``) are
+        **not** absorbed: their scale is applied after the layer_norm, whose
+        variance includes the (non-uniform) scale vector, so the absorption
+        is not arithmetically equivalent. QK-norms are likewise skipped
+        because RoPE couples head_dim pairs non-trivially.
+        """
+        fused = 0
+        for layer_idx, layer in enumerate(self.layers):
+            # input_layernorm → q_proj (always), k_proj / v_proj (owned only).
+            in_ln = layer.input_layernorm
+            if in_ln.affine:
+                scale = in_ln.weight.data.view(1, -1, 1, 1)
+                with torch.no_grad():
+                    targets = [layer.self_attn["q_proj"]]
+                    if not self.config.is_kv_shared(layer_idx):
+                        targets.append(layer.self_attn["k_proj"])
+                        targets.append(layer.self_attn["v_proj"])
+                    for conv in targets:
+                        conv.weight.data.mul_(scale.to(conv.weight.dtype))
+                in_ln.affine = False
+                fused += 1
+
+            # pre_feedforward_layernorm → gate_proj, up_proj (always).
+            pre_ff = layer.pre_feedforward_layernorm
+            if pre_ff.affine:
+                scale = pre_ff.weight.data.view(1, -1, 1, 1)
+                with torch.no_grad():
+                    for conv in (layer.mlp["gate_proj"], layer.mlp["up_proj"]):
+                        conv.weight.data.mul_(scale.to(conv.weight.dtype))
+                pre_ff.affine = False
+                fused += 1
+        print(f"fuse_pre_norms: folded {fused} RMSNorm scales into Conv weights")
 
     def _map_weight_name(self, hf_name: str) -> str | None:
         """Map HuggingFace weight name to local parameter name."""

@@ -39,8 +39,21 @@ from .gemma4 import Gemma4Model
 
 
 def v_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    mean_sq = x.pow(2).mean(-1, keepdim=True) + eps
-    return x * torch.rsqrt(mean_sq)
+    # RMSNorm without learnable scale (HF Gemma 4 v_norm has with_scale=False).
+    # Uses the cat-trick (layer_norm over [x, -x]) instead of rsqrt so it maps
+    # to ANE's native LayerNorm kernel. Math is identical: first half of
+    # layer_norm([x, -x]) == x / sqrt(mean(x^2) + eps).
+    hd = x.size(-1)
+    doubled = torch.cat([x, -x], dim=-1)
+    normed = F.layer_norm(
+        doubled,
+        normalized_shape=(2 * hd,),
+        weight=None,
+        bias=None,
+        eps=float(eps),
+    )
+    normed, _ = torch.chunk(normed, 2, dim=-1)
+    return normed
 
 
 def _run_layer_swa(
@@ -175,7 +188,8 @@ def _run_layer_swa(
     gated = gated.squeeze(2).permute(0, 2, 1)
     hidden_states = layer.post_per_layer_input_norm(gated)
     hidden_states = residual_pl + hidden_states
-    hidden_states = hidden_states * layer.layer_scalar.to(MODEL_DTYPE)
+    if getattr(layer, "use_layer_scalar", True):
+        hidden_states = hidden_states * layer.layer_scalar.to(MODEL_DTYPE)
 
     return (hidden_states, K_sliding_out, V_sliding_out, K_full_out, V_full_out,
             kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v)
@@ -442,8 +456,9 @@ class SWAChunk4(nn.Module):
         normed = self.norm(hidden_states)
         x = normed.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
         logits = self.lm_head(x).squeeze(2).permute(0, 2, 1)
-        if self.softcap > 0:
-            logits = torch.tanh(logits / self.softcap) * self.softcap
+        # Softcap (tanh(logits/c)*c) dropped: it is monotonic in logits, so
+        # argmax(softcap(logits)) == argmax(logits). For sampling paths the
+        # Swift runtime should apply softcap to the single selected scalar.
         token_id, token_logit = self.argmax(logits.squeeze(0))
         # Output normed hidden state for Medusa speculative decoding heads.
         # Shape: (1, 1, hidden_size) — the last hidden state before lm_head.
@@ -629,7 +644,8 @@ def _run_layer_verify(
     gated = gated.squeeze(2).permute(0, 2, 1)
     hidden_states = layer.post_per_layer_input_norm(gated)
     hidden_states = residual_pl + hidden_states
-    hidden_states = hidden_states * layer.layer_scalar.to(MODEL_DTYPE)
+    if getattr(layer, "use_layer_scalar", True):
+        hidden_states = hidden_states * layer.layer_scalar.to(MODEL_DTYPE)
 
     return (hidden_states, K_sliding_out, V_sliding_out, K_full_out, V_full_out,
             kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v)
@@ -826,8 +842,7 @@ class SWAVerifyChunk4(nn.Module):
         normed = self.norm(hidden_states)
         x = normed.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)  # (1, hidden, 1, K)
         logits = self.lm_head(x).squeeze(2).permute(0, 2, 1)  # (1, K, vocab)
-        if self.softcap > 0:
-            logits = torch.tanh(logits / self.softcap) * self.softcap
+        # Softcap dropped (monotonic; argmax-invariant). See SWAChunk4.forward.
         # Per-position argmax
         token_ids = torch.argmax(logits, dim=-1).to(torch.int32)  # (1, K)
         # Return hidden_states for MTP drafter carry state
