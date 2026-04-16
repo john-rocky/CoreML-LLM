@@ -236,21 +236,133 @@ to preserve fusion. Worth retesting on iOS 26.
 
 ---
 
-## Recommended execution order
+## Hypothesis S0: GPU verify + ANE decode (heterogeneous speculation)
 
-| # | Hypothesis | Test cost | If works |
-|---|---|---|---|
-| 1 | **S1 Dual-KV** (chain bench test) | <1 day | Unblocks ALL speculation |
-| 2 | **A2 Runtime hints** | 0.5 day | Free +1-2 tok/s |
-| 3 | **A1 GPU prefill** (iPhone test) | 0 (PR ready) | TTFT 13s → ~1s |
-| 4 | **S2 Chunk 3+4 merge** (conversion + test) | 1-2 days | ~41 tok/s |
-| 5 | **B1 Prefill bypass** | 0.5 day | TTFT -47% |
-| 6 | **B2 SDPA re-test** | 1 day | +5-10% attention |
+**Status:** NOT REFUTED. Genuinely new architecture not discussed in any
+existing doc. Highest theoretical ceiling of all hypotheses.
 
-S1 first because it's the cheapest test with the highest potential
-payoff. If the chain bench confirms the hypothesis, the entire
-speculative decoding infrastructure (already built and tested) comes
-back to life.
+### The core insight
+
+Every failed speculation attempt assumed verify runs on ANE. ANE's
+4-chunk serial dispatch makes verify K=3 cost ~2× decode — too
+expensive for the math to close. **Move verify to GPU where it's a
+single monolithic dispatch.**
+
+### Why the math works
+
+```
+ANE decode (4 chunks serial):        52 ms/token
+GPU verify K=3 (monolithic, 1 dispatch): ~60 ms (estimated)
+
+cycle = 60 ms for E[tok/burst] tokens
+break-even = 60 / 52 = 1.15
+
+oracle code PL-n3:   2.94 / 1.15 = 2.56× → 79 tok/s
+oracle chat CV:      2.31 / 1.15 = 2.01× → 62 tok/s
+oracle summary:      3.26 / 1.15 = 2.83× → 88 tok/s
+```
+
+Break-even is 1.15. Every drafter clears it comfortably. Compare to
+ANE verify where break-even is 2.0-3.0 (most drafters fail).
+
+### Why GPU verify doesn't have the 4-chunk overhead
+
+GPU has no 15-layer compiler threshold. All 35 layers compile into
+one `.mlpackage` with `computeUnits = .cpuAndGPU`. One dispatch
+processes K=3 tokens with GPU batch parallelism. No serial chunk
+round-trips.
+
+### KV handoff: zero-copy via unified memory
+
+Apple Silicon's unified memory means ANE and GPU share the same
+address space. IOSurface-backed MLMultiArray enables:
+
+1. ANE decode writes KV to IOSurface → GPU reads same IOSurface
+2. GPU verify writes accepted KV → ANE reads same IOSurface
+3. Zero memcpy, zero DMA — same physical pages.
+
+### Within-cycle contamination
+
+GPU verify has the same within-cycle contamination as ANE verify
+(position P+2 sees d1's KV at P+1). But the chain-acceptance logic
+handles this: if d1 is rejected, we stop before checking P+2.
+Contamination only occurs at accepted positions where d_k == t_k,
+meaning the KV is clean by definition.
+
+The across-cycle contamination (rejected-token KV residue from
+previous cycles) can be addressed by either:
+- KV snapshot/restore around GPU verify (cheap at ~0.3ms for 60MB)
+- OR accepting the residue and re-running one decode_q1 for the
+  bonus token (52ms), still well within budget
+
+### What's needed
+
+| Item | Work | Days |
+|---|---|---|
+| Monolithic GPU verify model | Convert 35-layer Gemma 4 as single mlpackage, `.cpuAndGPU` | 2-3 |
+| KV I/O contract alignment | Ensure monolithic verify's KV layout matches 4-chunk decode's layout | 1 |
+| Swift orchestration | ANE decode → drafter → GPU verify → accept → KV writeback | 2-3 |
+| iPhone measurement | GPU verify latency on A19 Pro tensor cores | 1 trip |
+
+Total: ~7-10 days if the monolithic model compiles.
+
+### Risks
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| Memory: 2 model sets (~2GB) on 8GB iPhone | jetsam | Measure `phys_footprint`; consider weight sharing |
+| Monolithic 35-layer GPU compilation fails | blocker | Try 2-chunk GPU variant as fallback |
+| iPhone A19 GPU slower than estimated | math breaks | Mac test showed GPU slow, but Mac lacks tensor cores |
+| KV layout mismatch between chunked and monolithic | incorrect output | Validate with per-layer cosine similarity |
+
+### Why no existing doc refutes this
+
+- PR #75 "ANE serialises submissions" — irrelevant. This is ANE+GPU,
+  not ANE+ANE.
+- PHASE_B_DECISION "verify-chunk write-through" — assumes ANE verify.
+  GPU verify is a different execution path.
+- Mirror SD "blocked by 11c + ANE serialisation" — Mirror SD puts
+  the DRAFTER on GPU and verify on ANE. This is the REVERSE: decode
+  on ANE, verify on GPU.
+
+### Confidence: MEDIUM
+
+The math is compelling (break-even 1.15 vs ANE's 2.0-3.0). The risk
+is implementation complexity + monolithic compilation feasibility.
+Highest ceiling of any hypothesis: **62-88 tok/s** at oracle rates.
+
+---
+
+## Revised S1 status: Dual-KV alone is insufficient
+
+The earlier S1 (Dual-KV) analysis was updated after deeper
+investigation. The dominant contamination source is **within-cycle**
+(v3 argmax → v4 chain drop), not across-cycle. Dual-KV only fixes
+across-cycle. Additionally, even with oracle rates, ANE verify's
+2.0× cost ratio means break-even requires E[tok/burst] > 3.0,
+which most drafters don't clear.
+
+Dual-KV remains useful as a COMPONENT of the GPU verify architecture
+(addressing across-cycle contamination for the bonus token), but is
+NOT a standalone fix. Confidence downgraded from MEDIUM-HIGH to LOW
+as a standalone hypothesis.
+
+---
+
+## Recommended execution order (revised)
+
+| # | Hypothesis | Test cost | If works | Ceiling |
+|---|---|---|---|---|
+| 1 | **A2 Runtime hints** | 0.5 day | Free +1-2 tok/s | 33 tok/s |
+| 2 | **A1 GPU prefill** (iPhone test) | 0 (PR ready) | TTFT 13s → ~1s | — |
+| 3 | **B1 Prefill bypass** | 0.5 day | TTFT -47% | — |
+| 4 | **S2 Chunk 3+4 merge** | 1-2 days | ~41 tok/s | 41 tok/s |
+| 5 | **S0 GPU verify** | 7-10 days | 62-88 tok/s | 88 tok/s |
+| 6 | **B2 SDPA re-test** | 1 day | +5-10% | ~34 tok/s |
+
+S0 (GPU verify) is now the highest-ceiling item. Items 1-3 are quick
+wins to ship immediately. S2 is a stepping stone. S0 is the moon shot
+that could decisively beat LiteRT-LM.
 
 ---
 
