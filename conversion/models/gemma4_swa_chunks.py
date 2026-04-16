@@ -38,12 +38,16 @@ from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax
 from .gemma4 import Gemma4Model
 
 
-def v_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def v_norm(x: torch.Tensor, hd: int, eps: float = 1e-6) -> torch.Tensor:
     # RMSNorm without learnable scale (HF Gemma 4 v_norm has with_scale=False).
     # Uses the cat-trick (layer_norm over [x, -x]) instead of rsqrt so it maps
     # to ANE's native LayerNorm kernel. Math is identical: first half of
     # layer_norm([x, -x]) == x / sqrt(mean(x^2) + eps).
-    hd = x.size(-1)
+    #
+    # `hd` is passed as a Python int from the caller (config.get_head_dim)
+    # rather than derived via x.size(-1): under torch.jit.trace the latter
+    # emits an aten::Int on a traced shape tensor, which coremltools 9.0
+    # rejects when lowering the normalized_shape tuple.
     doubled = torch.cat([x, -x], dim=-1)
     normed = F.layer_norm(
         doubled,
@@ -97,7 +101,7 @@ def _run_layer_swa(
         k = layer.self_attn["k_proj"](x).view(1, num_kv_heads, hd, 1).permute(0, 1, 3, 2).to(MODEL_DTYPE)
         v = layer.self_attn["v_proj"](x).view(1, num_kv_heads, hd, 1).permute(0, 1, 3, 2).to(MODEL_DTYPE)
         k = layer.self_attn["k_norm"](k.reshape(1, num_kv_heads, hd)).view(1, num_kv_heads, 1, hd)
-        v = v_norm(v)
+        v = v_norm(v, hd)
         if is_full:
             _, k = apply_rotary_pos_emb(k, k, cos_f, sin_f)
         else:
@@ -537,7 +541,7 @@ def _run_layer_verify(
         k = k.permute(0, 2, 1, 3).contiguous().view(seq_len, num_kv_heads, hd)
         k = layer.self_attn["k_norm"](k)
         k = k.view(1, seq_len, num_kv_heads, hd).permute(0, 2, 1, 3)
-        v = v_norm(v)
+        v = v_norm(v, hd)
 
         # RoPE on K
         if is_full:
