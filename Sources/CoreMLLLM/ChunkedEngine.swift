@@ -678,6 +678,20 @@ final class ChunkedEngine {
               "total=\(String(format: "%.1f", totalPrefill*1000))ms " +
               "(\(realLen) tokens, \(String(format: "%.0f", Double(realLen)/totalPrefill)) tok/s)")
 
+        // Transfer 4-chunk KV caches → merged KV caches so the 2-chunk
+        // decode path sees the prefilled context.
+        if layout != .four, let ksM = kSlidingM, let vsM = vSlidingM,
+           let kfM = kFullM, let vfM = vFullM {
+            copyKVSlots(from: kSliding1, to: ksM, srcRange: 0..<7, dstOffset: 0)
+            copyKVSlots(from: vSliding1, to: vsM, srcRange: 0..<7, dstOffset: 0)
+            copyKVSlots(from: kSliding2, to: ksM, srcRange: 0..<5, dstOffset: 7)
+            copyKVSlots(from: vSliding2, to: vsM, srcRange: 0..<5, dstOffset: 7)
+            copyKVSlots(from: kFull1, to: kfM, srcRange: 0..<1, dstOffset: 0)
+            copyKVSlots(from: vFull1, to: vfM, srcRange: 0..<1, dstOffset: 0)
+            copyKVSlots(from: kFull2, to: kfM, srcRange: 0..<2, dstOffset: 1)
+            copyKVSlots(from: vFull2, to: vfM, srcRange: 0..<2, dstOffset: 1)
+        }
+
         return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
     }
 
@@ -1341,6 +1355,22 @@ final class ChunkedEngine {
     private func kvMapChunk2Full() -> [(String, Int, MLMultiArray, Int)] {
         [("K1",0,kFull2,512),("V1",0,vFull2,512),
          ("kv14_k",1,kFull2,512),("kv14_v",1,vFull2,512)]
+    }
+
+    /// Copy contiguous KV slots from one MLMultiArray to another.
+    /// Both arrays have shape (slots, 1, seqLen, maxHd) with fp16.
+    private func copyKVSlots(from src: MLMultiArray, to dst: MLMultiArray,
+                             srcRange: Range<Int>, dstOffset: Int) {
+        let seqLen = src.shape[2].intValue
+        let maxHd = src.shape[3].intValue
+        let slotBytes = seqLen * maxHd * MemoryLayout<UInt16>.stride
+        let srcBase = src.dataPointer.assumingMemoryBound(to: UInt8.self)
+        let dstBase = dst.dataPointer.assumingMemoryBound(to: UInt8.self)
+        for (i, srcSlot) in srcRange.enumerated() {
+            let sOff = srcSlot * slotBytes
+            let dOff = (dstOffset + i) * slotBytes
+            memcpy(dstBase.advanced(by: dOff), srcBase.advanced(by: sOff), slotBytes)
+        }
     }
 
     /// Slice a single feature vector from vision encoder output.

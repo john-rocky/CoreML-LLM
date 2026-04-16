@@ -177,6 +177,57 @@ Post a comment on the consolidation PR with:
   4. One tok/s number per layout at 8K (optional, signals whether the
      ctx-dependent compute growth is stable)
 
+## Actual results (2026-04-17, iPhone 17 Pro, iOS 26)
+
+### Build
+
+- Branch: `device-bench` (0eb5828)
+- Conversion: iOS18, FP16, CPU_AND_NE, INT4 per_grouped_channel g=32
+- Parity: PASS (cos=1.000000, top-1 16/16 for both 2-chunk and 1-chunk)
+
+### 1-chunk (merged_full, 35 layers)
+
+ANE compilation failed on device:
+```
+ANE model load has failed for on-device compiled macho. Must re-compile the E5 bundle.
+```
+35 layers exceeds iPhone 17 Pro ANE per-function compilation limit.
+**Verdict: dead on arrival.**
+
+### 2-chunk (merged_chunk1 15L + merged_chunk2 20L)
+
+ANE compilation succeeded. Correct output verified.
+
+```
+[Profile-2chunk] emb=0.4ms mask=0.3ms | m1=13.1 m2=17.8 (sum=30.9ms) | predict=31.2ms (31.7 tok/s)
+```
+
+| Layout  | Dispatches | Sum (ms) | tok/s | Delta |
+|---------|-----------|----------|-------|-------|
+| 4-chunk | 4         | ~31      | ~31   | baseline |
+| 2-chunk | 2         | 30.9     | 31.7  | **+2%** |
+
+**Dispatch overhead is not the bottleneck.** Halving dispatches from 4→2
+saved only ~0.8 ms, not the predicted ~4.6 ms. The ~2.3 ms/dispatch
+estimate from BASELINE_SPEED_AUDIT includes pipeline stall time that
+overlaps with compute — the true non-overlapped dispatch cost is <0.5 ms.
+
+### Bug found during integration
+
+Prefill uses the 4-chunk path (writing to kSliding1/2, kFull1/2) but
+2-chunk decode reads from kSlidingM/kFullM. Without an explicit copy
+after prefill, the decode path started with empty KV and produced
+repeating output. Fixed with `copyKVSlots()` in `ChunkedEngine.swift`.
+
+### Conclusion
+
+Chunk consolidation is **not a viable speed optimization** for this model.
+The per-layer compute dominates wall-clock, not ANE dispatch overhead.
+At 8K context the per-layer cost grows further, making the dispatch
+fraction even smaller (<1%).
+
+Artifacts preserved at `~/Downloads/coreml-llm-artifacts/merged-2chunk-2k/`.
+
 ## Known open items
 
 - Prefill path still uses the 4-chunk layout. Merging prefill chunks
