@@ -104,6 +104,15 @@ final class ChunkedEngine {
         let mlConfig = MLModelConfiguration()
         mlConfig.computeUnits = computeUnits
 
+        // Prefill chunks use GPU for compute-bound batch processing (TTFT win).
+        // Decode chunks stay on ANE for bandwidth-bound single-token inference.
+        let prefillConfig = MLModelConfiguration()
+        let useGPUPrefill = ProcessInfo.processInfo.environment["GPU_PREFILL"] == "1"
+        prefillConfig.computeUnits = useGPUPrefill ? .cpuAndGPU : computeUnits
+        if useGPUPrefill {
+            print("[Load] GPU_PREFILL=1 — prefill chunks will use .cpuAndGPU")
+        }
+
         func findModel(_ name: String) -> URL? {
             let compiled = directory.appendingPathComponent("\(name).mlmodelc")
             if FileManager.default.fileExists(atPath: compiled.path) { return compiled }
@@ -112,12 +121,12 @@ final class ChunkedEngine {
             return nil
         }
 
-        func loadOne(_ name: String) throws -> MLModel {
+        func loadOne(_ name: String, config cfg: MLModelConfiguration) throws -> MLModel {
             guard let url = findModel(name) else {
                 throw CoreMLLLMError.modelNotFound(name)
             }
             let t0 = CFAbsoluteTimeGetCurrent()
-            let m = try MLModel(contentsOf: url, configuration: mlConfig)
+            let m = try MLModel(contentsOf: url, configuration: cfg)
             let dt = CFAbsoluteTimeGetCurrent() - t0
             print("[Load] \(name) done in \(String(format: "%.1f", dt))s")
             return m
@@ -132,11 +141,11 @@ final class ChunkedEngine {
         let loadT0 = CFAbsoluteTimeGetCurrent()
         try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
             for name in ["chunk1", "chunk2", "chunk3", "chunk4"] {
-                group.addTask { (name, try loadOne(name)) }
+                group.addTask { (name, try loadOne(name, config: mlConfig)) }
             }
             if hasPrefillFiles {
                 for name in ["prefill_chunk1", "prefill_chunk2", "prefill_chunk3", "prefill_chunk4"] {
-                    group.addTask { (name, try loadOne(name)) }
+                    group.addTask { (name, try loadOne(name, config: prefillConfig)) }
                 }
             }
             for try await (name, model) in group {
@@ -539,6 +548,8 @@ final class ChunkedEngine {
 
         reset()
 
+        let prefillT0 = CFAbsoluteTimeGetCurrent()
+
         let hiddenIn = try buildPrefillHidden(tokenIDs: tokenIDs, N: N, imageFeatures: imageFeatures,
                                                 imageNumTokens: imageNumTokens,
                                                 audioFeatures: audioFeatures, audioNumTokens: audioNumTokens)
@@ -550,7 +561,10 @@ final class ChunkedEngine {
         let sinF = try buildPrefillRoPE(table: sinFullTable, N: N, dim: 512)
         let lastMask = try makeLastPositionMask(N: N, realLen: realLen)
 
+        let prepDt = CFAbsoluteTimeGetCurrent() - prefillT0
+
         // Prefill chunk 1
+        let pc1T0 = CFAbsoluteTimeGetCurrent()
         let out1 = try p1.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: hiddenIn),
             "causal_mask": MLFeatureValue(multiArray: causal),
@@ -558,6 +572,7 @@ final class ChunkedEngine {
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
         ]))
+        let pc1Dt = CFAbsoluteTimeGetCurrent() - pc1T0
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
 
@@ -572,6 +587,7 @@ final class ChunkedEngine {
         }
 
         // Prefill chunk 2
+        let pc2T0 = CFAbsoluteTimeGetCurrent()
         let out2 = try p2.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h1),
             "causal_mask": MLFeatureValue(multiArray: causal),
@@ -579,6 +595,7 @@ final class ChunkedEngine {
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
         ]))
+        let pc2Dt = CFAbsoluteTimeGetCurrent() - pc2T0
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
 
         for (name, slot, kv, hd) in kvMapChunk2Sliding() {
@@ -607,6 +624,7 @@ final class ChunkedEngine {
         ]
 
         // Prefill chunk 3
+        let pc3T0 = CFAbsoluteTimeGetCurrent()
         var d3: [String: MLFeatureValue] = [
             "hidden_states": MLFeatureValue(multiArray: h2),
             "causal_mask": MLFeatureValue(multiArray: causal),
@@ -616,8 +634,10 @@ final class ChunkedEngine {
         d3.merge(sharedKV) { _, b in b }
         let h3 = try p3.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
             .featureValue(for: "hidden_states_out")!.multiArrayValue!
+        let pc3Dt = CFAbsoluteTimeGetCurrent() - pc3T0
 
         // Prefill chunk 4
+        let pc4T0 = CFAbsoluteTimeGetCurrent()
         var d4: [String: MLFeatureValue] = [
             "hidden_states": MLFeatureValue(multiArray: h3),
             "causal_mask": MLFeatureValue(multiArray: causal),
@@ -627,6 +647,17 @@ final class ChunkedEngine {
         d4.merge(sharedRoPE) { _, b in b }
         d4.merge(sharedKV) { _, b in b }
         let out4 = try p4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4))
+        let pc4Dt = CFAbsoluteTimeGetCurrent() - pc4T0
+
+        let totalPrefill = CFAbsoluteTimeGetCurrent() - prefillT0
+        print("[Prefill] prep=\(String(format: "%.1f", prepDt*1000))ms " +
+              "c1=\(String(format: "%.1f", pc1Dt*1000))ms " +
+              "c2=\(String(format: "%.1f", pc2Dt*1000))ms " +
+              "c3=\(String(format: "%.1f", pc3Dt*1000))ms " +
+              "c4=\(String(format: "%.1f", pc4Dt*1000))ms " +
+              "total=\(String(format: "%.1f", totalPrefill*1000))ms " +
+              "(\(realLen) tokens, \(String(format: "%.0f", Double(realLen)/totalPrefill)) tok/s)")
+
         return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
     }
 
