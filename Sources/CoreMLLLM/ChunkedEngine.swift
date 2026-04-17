@@ -97,6 +97,37 @@ final class ChunkedEngine {
     private(set) var lastKV14K: MLMultiArray?
     private(set) var lastKV14V: MLMultiArray?
 
+    // 11c write-after-accept: per-T raw K/V slices captured from the last
+    // verify call, used by commitAccepted to selectively write only the
+    // accepted prefix into persistent kSliding/kFull buffers.
+    // Shapes: new_K_sliding_cN (num_slots, 1, K, 256), new_K_full_cN (num_slots, 1, K, 512).
+    private var lastNewKSliding1: MLMultiArray?  // (7, 1, K, 256)
+    private var lastNewVSliding1: MLMultiArray?
+    private var lastNewKFull1: MLMultiArray?     // (1, 1, K, 512)
+    private var lastNewVFull1: MLMultiArray?
+    private var lastNewKSliding2: MLMultiArray?  // (5, 1, K, 256)
+    private var lastNewVSliding2: MLMultiArray?
+    private var lastNewKFull2: MLMultiArray?     // (2, 1, K, 512)
+    private var lastNewVFull2: MLMultiArray?
+    /// Tokens that were the verify input — needed by commitAccepted to detect
+    /// which accepted positions match a verified slice (writeable) vs which
+    /// need a fresh T=1 step (correction or bonus past the verify range).
+    private var lastVerifyInputTokens: [Int32] = []
+
+    /// Test-only KV snapshot. Returns a byte-copy of all 8 persistent KV
+    /// buffers, so a test can run two paths and assert byte-identical state.
+    internal func _kvSnapshotBytes() -> [String: Data] {
+        func snap(_ a: MLMultiArray) -> Data {
+            return Data(bytes: a.dataPointer, count: a.count * MemoryLayout<UInt16>.stride)
+        }
+        return [
+            "kSliding1": snap(kSliding1), "vSliding1": snap(vSliding1),
+            "kFull1": snap(kFull1), "vFull1": snap(vFull1),
+            "kSliding2": snap(kSliding2), "vSliding2": snap(vSliding2),
+            "kFull2": snap(kFull2), "vFull2": snap(vFull2),
+        ]
+    }
+
     // MARK: - Loading
 
     static func load(from directory: URL, config: ModelConfig,
@@ -382,6 +413,11 @@ final class ChunkedEngine {
             memset(buf.dataPointer, 0, buf.count * MemoryLayout<UInt16>.stride)
         }
         currentPosition = 0
+        lastVerifyInputTokens = []
+        lastNewKSliding1 = nil; lastNewVSliding1 = nil
+        lastNewKFull1 = nil;    lastNewVFull1 = nil
+        lastNewKSliding2 = nil; lastNewVSliding2 = nil
+        lastNewKFull2 = nil;    lastNewVFull2 = nil
         profileEmbed = 0
         profilePredict = 0
         profileCount = 0
@@ -772,13 +808,13 @@ final class ChunkedEngine {
         ]))
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
-        // Copy back updated KV caches from verify
-        copyBack(out1, "K_sliding_out", into: kSliding1)
-        copyBack(out1, "V_sliding_out", into: vSliding1)
-        copyBack(out1, "K_full_out", into: kFull1)
-        copyBack(out1, "V_full_out", into: vFull1)
+        // 11c: capture per-T K/V slices for selective commit; do NOT write to persistent cache yet.
+        lastNewKSliding1 = out1.featureValue(for: "new_K_sliding")?.multiArrayValue
+        lastNewVSliding1 = out1.featureValue(for: "new_V_sliding")?.multiArrayValue
+        lastNewKFull1    = out1.featureValue(for: "new_K_full")?.multiArrayValue
+        lastNewVFull1    = out1.featureValue(for: "new_V_full")?.multiArrayValue
 
-        // Verify chunk 2: write-through KV, outputs updated kv13/kv14
+        // Verify chunk 2: emits per-T slices + within-verify extended kv13/kv14 for chunks 3/4.
         let out2 = try verifyChunk2!.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h1),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
@@ -793,17 +829,18 @@ final class ChunkedEngine {
             "V_full_in": MLFeatureValue(multiArray: vFull2),
         ]))
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
-        // Copy back updated KV caches
-        copyBack(out2, "K_sliding_out", into: kSliding2)
-        copyBack(out2, "V_sliding_out", into: vSliding2)
-        copyBack(out2, "K_full_out", into: kFull2)
-        copyBack(out2, "V_full_out", into: vFull2)
+        lastNewKSliding2 = out2.featureValue(for: "new_K_sliding")?.multiArrayValue
+        lastNewVSliding2 = out2.featureValue(for: "new_V_sliding")?.multiArrayValue
+        lastNewKFull2    = out2.featureValue(for: "new_K_full")?.multiArrayValue
+        lastNewVFull2    = out2.featureValue(for: "new_V_full")?.multiArrayValue
         let kv13k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
         let kv13v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
         let kv14k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
         let kv14v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
         lastKV13K = kv13k; lastKV13V = kv13v
         lastKV14K = kv14k; lastKV14V = kv14v
+        // Remember verify inputs for commitAccepted's match check.
+        lastVerifyInputTokens = tokens
 
         let shared: [String: MLFeatureValue] = [
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
@@ -904,10 +941,11 @@ final class ChunkedEngine {
         ]))
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
-        copyBack(out1, "K_sliding_out", into: kSliding1)
-        copyBack(out1, "V_sliding_out", into: vSliding1)
-        copyBack(out1, "K_full_out", into: kFull1)
-        copyBack(out1, "V_full_out", into: vFull1)
+        // 11c: capture per-T K/V slices; persistent cache untouched until commitAccepted.
+        lastNewKSliding1 = out1.featureValue(for: "new_K_sliding")?.multiArrayValue
+        lastNewVSliding1 = out1.featureValue(for: "new_V_sliding")?.multiArrayValue
+        lastNewKFull1    = out1.featureValue(for: "new_K_full")?.multiArrayValue
+        lastNewVFull1    = out1.featureValue(for: "new_V_full")?.multiArrayValue
 
         // Verify chunk 2
         let out2 = try verifyChunk2!.prediction(from: MLDictionaryFeatureProvider(dictionary: [
@@ -924,16 +962,17 @@ final class ChunkedEngine {
             "V_full_in": MLFeatureValue(multiArray: vFull2),
         ]))
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
-        copyBack(out2, "K_sliding_out", into: kSliding2)
-        copyBack(out2, "V_sliding_out", into: vSliding2)
-        copyBack(out2, "K_full_out", into: kFull2)
-        copyBack(out2, "V_full_out", into: vFull2)
+        lastNewKSliding2 = out2.featureValue(for: "new_K_sliding")?.multiArrayValue
+        lastNewVSliding2 = out2.featureValue(for: "new_V_sliding")?.multiArrayValue
+        lastNewKFull2    = out2.featureValue(for: "new_K_full")?.multiArrayValue
+        lastNewVFull2    = out2.featureValue(for: "new_V_full")?.multiArrayValue
         let kv13k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
         let kv13v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
         let kv14k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
         let kv14v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
         lastKV13K = kv13k; lastKV13V = kv13v
         lastKV14K = kv14k; lastKV14V = kv14v
+        lastVerifyInputTokens = tokens
 
         let shared: [String: MLFeatureValue] = [
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
@@ -1427,9 +1466,124 @@ extension ChunkedEngine: SpeculativeTarget {
     }
 
     public func commitAccepted(_ tokens: [Int32]) throws {
-        // Write-through: verify already wrote KV for all K positions.
-        // Rejected entries are masked out by causal mask in future steps.
-        // Just advance the position counter.
-        currentPosition += tokens.count
+        // 11c write-after-accept:
+        //   For each accepted token at position currentPosition + t:
+        //     - if it equals the verify input at slot t (i.e. that verify K/V is
+        //       valid for this token), commit verify slice t into persistent cache.
+        //     - else (correction, or beyond the verify range), run a T=1 predictStep
+        //       to compute and write its K/V.
+        //   Then advance currentPosition by tokens.count.
+        let N = tokens.count
+        if N == 0 { return }
+        let P = currentPosition
+
+        let inputs = lastVerifyInputTokens
+        let K = inputs.count
+        var M = 0
+        while M < N && M < K && tokens[M] == inputs[M] {
+            M += 1
+        }
+
+        if M > 0 {
+            try commitKVSlices(count: M, basePosition: P)
+        }
+
+        // Tail tokens (correction / bonus / beyond verify range): compute K/V via T=1.
+        for t in M..<N {
+            _ = try predictStep(tokenID: Int(tokens[t]), position: P + t)
+        }
+
+        currentPosition = P + N
+    }
+
+    /// Commits the first `count` per-T K/V slices captured during the most
+    /// recent verify call into the persistent IOSurface-backed caches.
+    /// Sliding caches are shifted left by `count` and the new slices appended.
+    /// Full caches are scattered into ctx-positions [basePosition .. basePosition+count-1].
+    /// `count` MUST be ≤ K (the verify batch size) and ≤ verify slice tensors' second dim.
+    private func commitKVSlices(count M: Int, basePosition P: Int) throws {
+        guard M > 0,
+              let nKs1 = lastNewKSliding1, let nVs1 = lastNewVSliding1,
+              let nKf1 = lastNewKFull1,    let nVf1 = lastNewVFull1,
+              let nKs2 = lastNewKSliding2, let nVs2 = lastNewVSliding2,
+              let nKf2 = lastNewKFull2,    let nVf2 = lastNewVFull2 else {
+            // No staged slices — caller must have called verifyCandidates first.
+            // (PromptLookupLoop's stub-zero path is no longer supported; callers must
+            //  pass actual accepted tokens.)
+            return
+        }
+        let W = config.slidingWindow
+        let ctx = config.contextLength
+        let maxHd = 512
+        let slidingHd = 256
+
+        // Sliding writes (shift left by M, append M new rows per slot).
+        commitSlidingSlots(buf: kSliding1, slices: nKs1, slotCount: 7,
+                           M: M, W: W, slidingHd: slidingHd, maxHd: maxHd)
+        commitSlidingSlots(buf: vSliding1, slices: nVs1, slotCount: 7,
+                           M: M, W: W, slidingHd: slidingHd, maxHd: maxHd)
+        commitSlidingSlots(buf: kSliding2, slices: nKs2, slotCount: 5,
+                           M: M, W: W, slidingHd: slidingHd, maxHd: maxHd)
+        commitSlidingSlots(buf: vSliding2, slices: nVs2, slotCount: 5,
+                           M: M, W: W, slidingHd: slidingHd, maxHd: maxHd)
+
+        // Full writes (scatter at positions P..P+M-1; full hd == maxHd, no padding).
+        commitFullSlots(buf: kFull1, slices: nKf1, slotCount: 1,
+                        M: M, P: P, ctx: ctx, fullHd: maxHd)
+        commitFullSlots(buf: vFull1, slices: nVf1, slotCount: 1,
+                        M: M, P: P, ctx: ctx, fullHd: maxHd)
+        commitFullSlots(buf: kFull2, slices: nKf2, slotCount: 2,
+                        M: M, P: P, ctx: ctx, fullHd: maxHd)
+        commitFullSlots(buf: vFull2, slices: nVf2, slotCount: 2,
+                        M: M, P: P, ctx: ctx, fullHd: maxHd)
+    }
+
+    private func commitSlidingSlots(buf: MLMultiArray, slices: MLMultiArray,
+                                    slotCount: Int,
+                                    M: Int, W: Int, slidingHd: Int, maxHd: Int) {
+        let bufBase = buf.dataPointer.bindMemory(to: UInt16.self, capacity: buf.count)
+        let srcBase = slices.dataPointer.bindMemory(to: UInt16.self, capacity: slices.count)
+        let K = slices.shape[2].intValue
+        precondition(M <= K, "commitSlidingSlots: M=\(M) > K=\(K)")
+        let bytesPerSlidingRow = slidingHd * MemoryLayout<UInt16>.stride
+        let bytesPadHigh       = (maxHd - slidingHd) * MemoryLayout<UInt16>.stride
+        for slot in 0..<slotCount {
+            let slotPtr = bufBase.advanced(by: slot * W * maxHd)
+            // Shift left by M positions: dst rows [0..W-M-1] = src rows [M..W-1].
+            memmove(slotPtr,
+                    slotPtr.advanced(by: M * maxHd),
+                    (W - M) * maxHd * MemoryLayout<UInt16>.stride)
+            // Append M new rows at end, zero-padded high half (maxHd-slidingHd).
+            let srcSlot = srcBase.advanced(by: slot * K * slidingHd)
+            for n in 0..<M {
+                let dstRow = slotPtr.advanced(by: (W - M + n) * maxHd)
+                let srcRow = srcSlot.advanced(by: n * slidingHd)
+                memcpy(dstRow, srcRow, bytesPerSlidingRow)
+                if bytesPadHigh > 0 {
+                    memset(dstRow.advanced(by: slidingHd), 0, bytesPadHigh)
+                }
+            }
+        }
+    }
+
+    private func commitFullSlots(buf: MLMultiArray, slices: MLMultiArray,
+                                 slotCount: Int,
+                                 M: Int, P: Int, ctx: Int, fullHd: Int) {
+        let bufBase = buf.dataPointer.bindMemory(to: UInt16.self, capacity: buf.count)
+        let srcBase = slices.dataPointer.bindMemory(to: UInt16.self, capacity: slices.count)
+        let K = slices.shape[2].intValue
+        precondition(M <= K, "commitFullSlots: M=\(M) > K=\(K)")
+        let bytesPerRow = fullHd * MemoryLayout<UInt16>.stride
+        for slot in 0..<slotCount {
+            let slotPtr = bufBase.advanced(by: slot * ctx * fullHd)
+            let srcSlot = srcBase.advanced(by: slot * K * fullHd)
+            for n in 0..<M {
+                let pos = P + n
+                precondition(pos < ctx, "commitFullSlots: pos \(pos) >= ctx \(ctx)")
+                memcpy(slotPtr.advanced(by: pos * fullHd),
+                       srcSlot.advanced(by: n * fullHd),
+                       bytesPerRow)
+            }
+        }
     }
 }

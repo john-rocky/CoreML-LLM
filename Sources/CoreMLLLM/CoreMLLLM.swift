@@ -37,6 +37,11 @@ public final class CoreMLLLM: @unchecked Sendable {
     private var monolithicModel: MLModel?
     private var monolithicState: MLState?
 
+    /// Test-only accessor for the chunked engine. `internal` so tests in the
+    /// same module (via @testable import) can exercise low-level paths like
+    /// commitAccepted / KV snapshot. Do NOT use from production code.
+    internal var _testChunkedEngine: ChunkedEngine? { chunkedEngine }
+
     // Vision (lazy loaded to save memory)
     private var visionModel: MLModel?
     private var visionModelURL: URL?

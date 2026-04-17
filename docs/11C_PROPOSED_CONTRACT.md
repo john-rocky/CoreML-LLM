@@ -1,6 +1,14 @@
 # 11C Proposed Contract: Write-After-Accept Verify Protocol
 
-**Status:** Spec only — 2026-04-17. No code modified.
+**Status:** Spec — 2026-04-17. Implementation in progress on `feat/verify-protocol-redesign`.
+
+## Resolutions (2026-04-17 implementation session)
+
+Three ambiguities in the original spec were resolved before code work began:
+
+- **A1 — `update_indicator` STAYS as a chunk1/chunk2 input.** It is still required inside the graph to scatter the K new positions into the ctx-length `K_for_attn` for full-attention layers. Only the graph *output* changes: chunks return raw `k_padded` slices instead of the blended ctx-length cache. Mask shapes are unchanged.
+- **B — chunks 3 and 4 are UNCHANGED.** The original concern (argmax[1]/[2] would lose dependence on d_0/d_1) is already addressed by chunk2's existing `kv13_k`/`kv13_v`/`kv14_k`/`kv14_v` outputs, which it emits in their *extended* within-verify form (W- or ctx-sized, with the K new positions blended in). Chunks 3/4 consume these as inputs and attend correctly, exactly as today. The fix is purely that **Swift does not write these extended views back to persistent kv13/kv14 storage**. Persistent kv13/kv14 are slots of `kSliding2`/`kFull2`, and Swift commits only N accepted per-T slices to those slots through the new per-T outputs (same path as the other sliding/full layers).
+- **C — Bonus token (K+1):** when N==K+1, Swift runs one T=1 `predictStep` with input `embed(token_ids[K-1])` (NOT the verify hidden state) at position `currentPosition + K` after writing the K verified slices. This populates the bonus token's KV in the persistent cache.
 
 ---
 
