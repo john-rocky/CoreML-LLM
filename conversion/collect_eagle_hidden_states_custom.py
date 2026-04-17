@@ -423,9 +423,14 @@ def main():
         if not buffer:
             return 0
         B = len(buffer)
-        max_N = max(N for _, N in buffer)
-        # Pad to max_N in this batch (NOT seq_len — tighter → less wasted compute)
-        batched = torch.full((B, max_N), pad_id, dtype=torch.long, device=device)
+        # With --compile we MUST pad to a FIXED shape or torch.compile re-compiles on
+        # every batch whose max_N differs (~40s per recompile on A100, fatal). Without
+        # --compile, tighter in-batch max_N saves a bit of wasted padding compute.
+        if args.compile:
+            PAD_TO = args.seq_len
+        else:
+            PAD_TO = max(N for _, N in buffer)
+        batched = torch.full((B, PAD_TO), pad_id, dtype=torch.long, device=device)
         for bi, (ids_1d, N) in enumerate(buffer):
             batched[bi, :N] = ids_1d.to(device)
 
@@ -480,9 +485,13 @@ def main():
                 _flush_batch(buffer)
                 buffer = []
 
-        # Flush remainder
+        # Flush remainder (may be < BATCH_SIZE). Under --compile, a smaller B
+        # triggers recompilation; skip the tail instead (≤ BATCH_SIZE-1 samples lost).
         if buffer:
-            _flush_batch(buffer)
+            if args.compile and len(buffer) != BATCH_SIZE:
+                print(f"  Skipping {len(buffer)} tail samples to avoid recompile under --compile")
+            else:
+                _flush_batch(buffer)
             buffer = []
 
     elapsed = time.time() - t0
