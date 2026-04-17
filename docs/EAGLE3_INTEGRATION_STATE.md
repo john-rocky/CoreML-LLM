@@ -2,7 +2,25 @@
 
 Working document for the EAGLE-3 integration on MacBook Air (M3 16GB). Written so a new session can pick up without re-deriving context.
 
-**Last updated:** 2026-04-13. Active branch: `feature/eagle3-speculative` (not merged to main). Status: **Phase 2A + 2B done, Phase 3 benched, speculative currently slower than baseline** — two independent blockers documented below.
+**Last updated:** 2026-04-17. Active branch: `feature/eagle3-speculative` (not merged to main). Status: **Phase 2A + 2B done, Phase 3 benched, speculative currently slower than baseline. Retrain prepared on 2026-04-13 but never executed — abandoned for MTP work.**
+
+---
+
+## 2026-04-17 correction — retrain status
+
+Earlier sections (below) imply the Blocker 1 retrain is in progress. As of 2026-04-17, it is **not**:
+
+- `training_data_custom.pt` (2026-04-13) — corpus collected.
+- `claude/eagle3-retrain-custom` last commit 2026-04-13 21:26 (`2ae26a4`, standalone training script).
+- `claude/eagle3-full-retrain` last commit 2026-04-14 00:50 (`fa614ad`, notebook-exact training).
+- No commits on either branch after 2026-04-14 00:50. Work moved to `feature/mtp-drafter-conversion` starting 2026-04-14 01:49.
+- No retrained `eagle3_draft_best.pt` or `eagle3_eval.json` exists on disk. Custom-target acc[0] has never been measured.
+
+Additionally, the 2026-04-17 MTP investigation (`docs/MTP_INVESTIGATION_SUMMARY.md`) surfaced a third blocker that applies to EAGLE-3 as well:
+
+- **Blocker 3 (11c): verify-vs-decode fp16 drift** — sets iPhone acceptance break-even at ~77%. Even a successful retrain landing at 50-60% would not produce a net speedup on device until 11c closes.
+
+Revival cost: ~$0 Colab A100 ~25 min to run the already-written training script on `training_data_custom.pt`. But **do not revive before Blocker 3 (11c) closes** — same gating as MTP.
 
 ---
 
