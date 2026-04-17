@@ -113,6 +113,12 @@ final class LLMRunner {
         var thermal: ProcessInfo.ThermalState
     }
 
+    struct ThermalSample {
+        var t: TimeInterval
+        var state: ProcessInfo.ThermalState
+        var batteryLevel: Float
+    }
+
     struct BenchmarkResult {
         var duration: TimeInterval
         var totalTokens: Int
@@ -124,11 +130,59 @@ final class LLMRunner {
         var thermalEnd: ProcessInfo.ThermalState
         var abortedThermal: Bool = false
         var batteryLog: [(TimeInterval, Float)] = []
+        var thermalTrajectory: [LLMRunner.ThermalSample] = []
+
+        // iPhone 17 Pro nominal battery capacity. Override for other devices.
+        // Source: Apple spec sheet (14.03 Wh = 50508 J).
+        var batteryCapacityWh: Double = 14.03
 
         var batteryDelta: Float { batteryStart - batteryEnd }
         var drainedPercent: Double { Double(batteryDelta) * 100.0 }
         var drainedPerMinute: Double { duration > 0 ? drainedPercent / (duration / 60.0) : 0 }
+        var drainedPerHour: Double { drainedPerMinute * 60.0 }
         var tokensPerPercent: Double { drainedPercent > 0 ? Double(totalTokens) / drainedPercent : 0 }
+
+        /// Energy per decoded token in millijoules, derived from battery-gauge delta.
+        /// Coarse (1% gauge resolution); trust only for runs ≥ 10 min.
+        var mJPerToken: Double {
+            guard totalTokens > 0, drainedPercent > 0 else { return 0 }
+            let joules = drainedPercent / 100.0 * batteryCapacityWh * 3600.0
+            return joules * 1000.0 / Double(totalTokens)
+        }
+
+        var timeToFair: TimeInterval? {
+            thermalTrajectory.first { $0.state == .fair || $0.state == .serious || $0.state == .critical }?.t
+        }
+        var timeToSerious: TimeInterval? {
+            thermalTrajectory.first { $0.state == .serious || $0.state == .critical }?.t
+        }
+
+        func csv() -> String {
+            var lines = ["t_seconds,battery_pct,thermal_state,source"]
+            for s in thermalTrajectory {
+                let pct = s.batteryLevel >= 0 ? Int(s.batteryLevel * 100) : -1
+                lines.append("\(Int(s.t)),\(pct),\(LLMRunner.thermalString(s.state)),thermal")
+            }
+            for (t, lvl) in batteryLog {
+                let pct = lvl >= 0 ? Int(lvl * 100) : -1
+                lines.append("\(Int(t)),\(pct),,battery")
+            }
+            lines.append("")
+            lines.append("# summary")
+            lines.append("# duration_s=\(Int(duration))")
+            lines.append("# total_tokens=\(totalTokens)")
+            lines.append("# avg_tok_per_sec=\(String(format: "%.2f", avgTokPerSec))")
+            lines.append("# drained_percent=\(String(format: "%.2f", drainedPercent))")
+            lines.append("# drained_per_hour=\(String(format: "%.2f", drainedPerHour))")
+            lines.append("# mJ_per_token=\(String(format: "%.2f", mJPerToken))")
+            lines.append("# time_to_fair_s=\(timeToFair.map { String(Int($0)) } ?? "never")")
+            lines.append("# time_to_serious_s=\(timeToSerious.map { String(Int($0)) } ?? "never")")
+            lines.append("# thermal_start=\(LLMRunner.thermalString(thermalStart))")
+            lines.append("# thermal_end=\(LLMRunner.thermalString(thermalEnd))")
+            lines.append("# aborted_thermal=\(abortedThermal)")
+            lines.append("# battery_capacity_wh=\(batteryCapacityWh)")
+            return lines.joined(separator: "\n")
+        }
     }
 
     private static let benchmarkPrompt =
@@ -150,6 +204,10 @@ final class LLMRunner {
         var abortedThermal = false
         var batteryLog: [(TimeInterval, Float)] = [(0, startBat)]
         var lastLoggedLevel = startBat
+        var thermalTrajectory: [ThermalSample] = [
+            ThermalSample(t: 0, state: startThermal, batteryLevel: startBat)
+        ]
+        var nextThermalSampleAt: TimeInterval = 30
         let prompt = ChatMessage(role: .user, content: Self.benchmarkPrompt)
 
         func isThermalUnsafe() -> Bool {
@@ -169,6 +227,13 @@ final class LLMRunner {
                     batteryLog.append((elapsed, currentLevel))
                     lastLoggedLevel = currentLevel
                 }
+                if elapsed >= nextThermalSampleAt {
+                    thermalTrajectory.append(ThermalSample(
+                        t: elapsed,
+                        state: ProcessInfo.processInfo.thermalState,
+                        batteryLevel: currentLevel))
+                    nextThermalSampleAt += 30
+                }
                 if totalTokens % 20 == 0 {
                     onProgress(BenchmarkProgress(
                         elapsed: elapsed, totalTokens: totalTokens, round: round,
@@ -185,14 +250,17 @@ final class LLMRunner {
 
         let endTime = Date()
         let endBat = UIDevice.current.batteryLevel
+        let endThermal = ProcessInfo.processInfo.thermalState
         let dur = endTime.timeIntervalSince(startTime)
         batteryLog.append((dur, endBat))
+        thermalTrajectory.append(ThermalSample(t: dur, state: endThermal, batteryLevel: endBat))
         return BenchmarkResult(
             duration: dur, totalTokens: totalTokens, rounds: round,
             avgTokPerSec: dur > 0 ? Double(totalTokens) / dur : 0,
             batteryStart: startBat, batteryEnd: endBat,
-            thermalStart: startThermal, thermalEnd: ProcessInfo.processInfo.thermalState,
-            abortedThermal: abortedThermal, batteryLog: batteryLog)
+            thermalStart: startThermal, thermalEnd: endThermal,
+            abortedThermal: abortedThermal, batteryLog: batteryLog,
+            thermalTrajectory: thermalTrajectory)
     }
     #endif
 

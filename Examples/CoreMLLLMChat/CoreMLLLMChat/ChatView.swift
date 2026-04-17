@@ -167,9 +167,11 @@ struct ChatView: View {
                 if runner.isLoaded {
                     ToolbarItem(placement: .topBarTrailing) {
                         Menu("Bench") {
-                            Button("5 min")  { startBenchmark(minutes: 5) }
-                            Button("10 min") { startBenchmark(minutes: 10) }
-                            Button("30 min") { startBenchmark(minutes: 30) }
+                            Button("2 min (speed)")  { startBenchmark(minutes: 2) }
+                            Button("5 min")          { startBenchmark(minutes: 5) }
+                            Button("15 min (power)") { startBenchmark(minutes: 15) }
+                            Button("30 min")         { startBenchmark(minutes: 30) }
+                            Button("60 min")         { startBenchmark(minutes: 60) }
                         }
                         .disabled(runner.isGenerating || benchmarkRunning)
                     }
@@ -384,6 +386,15 @@ struct ChatView: View {
                 let logLines = result.batteryLog.map { entry in
                     "  \(String(format: "%5.0f", entry.0))s → \(Int(entry.1 * 100))%"
                 }.joined(separator: "\n")
+                let thermalLines = result.thermalTrajectory.map { s in
+                    "  \(String(format: "%5.0f", s.t))s → \(LLMRunner.thermalString(s.state))  bat=\(s.batteryLevel >= 0 ? "\(Int(s.batteryLevel * 100))%" : "?")"
+                }.joined(separator: "\n")
+                let ttf = result.timeToFair.map { "\(Int($0))s" } ?? "never"
+                let tts = result.timeToSerious.map { "\(Int($0))s" } ?? "never"
+                let mJ = result.mJPerToken
+                let mJStr = mJ > 0 ? String(format: "%.1f mJ/tok", mJ) : "n/a (gauge noise, need ≥10 min run)"
+                let csvPath = saveBenchmarkCSV(result)
+                let csvLine = csvPath.map { "CSV           : \($0)" } ?? "CSV           : (save failed)"
                 let summary = """
                 [Benchmark RESULT]
                 Duration      : \(Int(result.duration))s (\(String(format: "%.1f", result.duration / 60.0)) min)
@@ -391,9 +402,15 @@ struct ChatView: View {
                 Total tokens  : \(result.totalTokens)
                 Avg tok/s     : \(String(format: "%.2f", result.avgTokPerSec))
                 Battery       : \(bs)% → \(be)%  (Δ \(String(format: "%.2f", result.drainedPercent))%)
-                Drain rate    : \(String(format: "%.3f", result.drainedPerMinute))%/min
+                Drain rate    : \(String(format: "%.3f", result.drainedPerMinute))%/min (~\(String(format: "%.1f", result.drainedPerHour))%/hr)
                 Tokens/%SoC   : \(String(format: "%.0f", result.tokensPerPercent))
+                Energy/token  : \(mJStr)
                 Thermal       : \(LLMRunner.thermalString(result.thermalStart)) → \(LLMRunner.thermalString(result.thermalEnd))\(abortNote)
+                Time→fair     : \(ttf)
+                Time→serious  : \(tts)
+                \(csvLine)
+                Thermal trajectory:
+                \(thermalLines)
                 Battery log:
                 \(logLines)
                 """
@@ -405,6 +422,21 @@ struct ChatView: View {
                 benchmarkStatus = ""
                 messages.append(ChatMessage(role: .system, content: "[Benchmark] Failed: \(error.localizedDescription)"))
             }
+        }
+    }
+
+    private func saveBenchmarkCSV(_ result: LLMRunner.BenchmarkResult) -> String? {
+        let fm = FileManager.default
+        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
+        let ts = Int(Date().timeIntervalSince1970)
+        let url = docs.appendingPathComponent("bench-\(ts).csv")
+        do {
+            try result.csv().write(to: url, atomically: true, encoding: .utf8)
+            print("[Benchmark] CSV saved: \(url.path)")
+            return url.lastPathComponent
+        } catch {
+            print("[Benchmark] CSV save failed: \(error)")
+            return nil
         }
     }
 

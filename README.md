@@ -28,6 +28,22 @@ Ground-truth ANE placement measured via `MLComputePlan` (7,294 / 7,310 dispatche
 
 > **Memory:** ~1 GB `phys_footprint` (the iOS jetsam basis), measured via `task_vm_info`. Previous versions of this README quoted ~250 MB from Xcode's memory gauge, which underreports when CoreML loads INT4 palettized weights. The actual number is ~873 MB after load, ~981 MB during inference. `os_proc_available` remains ~5 GB on iPhone 17 Pro (8 GB RAM).
 
+### Power & Thermal (Gemma 4 E2B @ ctx=2048, iPhone 17 Pro, 15-min sustained decode)
+
+| Metric | Value | Source |
+|---|---:|---|
+| Energy per token | _pending real run — numbers added after first 15-min bench_ | `BenchmarkResult.mJPerToken` |
+| Battery drain | _pending_ | `drainedPerHour` (%/hr) |
+| Sustained tok/s (15 min avg) | _pending_ | `BenchmarkResult.avgTokPerSec` |
+| Time → thermal `fair` | _pending_ | `ProcessInfo.thermalState` sampled every 30s |
+| Time → thermal `serious` | _pending_ | same |
+
+Methodology is in [docs/POWER_BENCHMARK_PLAN.md](docs/POWER_BENCHMARK_PLAN.md). The sample app's **Bench → 15 min (power)** button reproduces these numbers and writes a CSV to the app's Documents directory for post-hoc analysis.
+
+**Why publish this at all:** GPU-based on-device LLM engines (llama.cpp Metal, MLX, LiteRT-LM iOS GPU path) draw significantly more current for the same token rate. Nobody publishes mJ/token or time-to-thermal-throttle because those numbers only look good if your compute is primarily on the ANE. This section is how that advantage becomes visible.
+
+> **Honest caveat:** `mJ/token` is derived from iOS's 1%-resolution battery gauge, not a lab power meter. Trust only for runs ≥ 10 min. See the plan doc for the error model and what we explicitly don't claim.
+
 ## Pre-converted Models
 
 | Model | Size | Multimodal | Download |
