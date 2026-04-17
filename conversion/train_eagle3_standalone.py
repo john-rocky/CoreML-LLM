@@ -238,6 +238,13 @@ def main():
     parser.add_argument("--warmup", type=int, default=500)
     parser.add_argument("--eval-every", type=int, default=200)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--preload", action="store_true",
+                        help="Load memmap-v1 data fully into CPU RAM before training. "
+                             "Eliminates disk random-read penalty at training time — "
+                             "in-RAM fancy indexing is 100× faster than memmap "
+                             "scatter reads. Requires enough system RAM for the "
+                             "active tensors (~138 GB for 30k × seq_len=512). Only "
+                             "preloads tensors the trainer actually uses (skips h_in).")
     args = parser.parse_args()
 
     device = args.device
@@ -266,13 +273,32 @@ def main():
         shapes = raw["shapes"]
         dtypes = raw["dtypes"]
 
+        # Only the keys the trainer actually uses. `h_in` is collected for
+        # completeness but the current training recipe only uses h_tgt + e_in +
+        # tok_tgt + fusion_{L8,L17,L34}, so we skip loading/preloading h_in.
+        USED_KEYS = ["h_tgt", "e_in", "tok_tgt", "fusion_L8", "fusion_L17", "fusion_L34"]
+
         def _open_mm(key):
             path = os.path.join(data_dir, f"{key}.dat")
             arr = np.memmap(path, dtype=np.dtype(dtypes[key]), mode="r", shape=shapes[key])
             return torch.from_numpy(arr)  # shares storage with memmap; no RAM copy
 
-        # Open all memmap-backed tensors
-        mm_tensors = {k: _open_mm(k) for k in shapes}
+        # Open memmap handles for every used tensor
+        mm_tensors = {k: _open_mm(k) for k in USED_KEYS}
+
+        if args.preload:
+            total_bytes = sum(np.prod(shapes[k]) * np.dtype(dtypes[k]).itemsize for k in USED_KEYS)
+            print(f"  Preloading {len(USED_KEYS)} tensors → {total_bytes / 1e9:.1f} GB into CPU RAM...")
+            t_preload = time.time()
+            for k in USED_KEYS:
+                # `np.array(memmap, copy=True)` forces a sequential read of the
+                # entire .dat file into a regular in-RAM numpy array. Sequential
+                # read on local SSD is ~1–3 GB/s, so this takes ~60–120 s for a
+                # 138 GB dataset. After this, the torch tensor is fully in RAM.
+                print(f"    {k} ({np.prod(shapes[k]) * np.dtype(dtypes[k]).itemsize / 1e9:.1f} GB)...", flush=True)
+                ram_np = np.array(mm_tensors[k].numpy(), copy=True)
+                mm_tensors[k] = torch.from_numpy(ram_np)
+            print(f"  Preload done in {time.time() - t_preload:.0f}s")
         train_idx = raw["train_idx"]
         test_idx  = raw["test_idx"]
 
@@ -290,12 +316,8 @@ def main():
             def shape(self):
                 return (self.subset.shape[0],) + tuple(self.full.shape[1:])
 
-        train_data = {k: _IdxView(mm_tensors[k], train_idx)
-                      for k in ["h_in", "e_in", "h_tgt", "tok_tgt",
-                                "fusion_L8", "fusion_L17", "fusion_L34"]}
-        test_data  = {k: _IdxView(mm_tensors[k], test_idx)
-                      for k in ["h_in", "e_in", "h_tgt", "tok_tgt",
-                                "fusion_L8", "fusion_L17", "fusion_L34"]}
+        train_data = {k: _IdxView(mm_tensors[k], train_idx) for k in USED_KEYS}
+        test_data  = {k: _IdxView(mm_tensors[k], test_idx)  for k in USED_KEYS}
 
         N_train = train_idx.shape[0]
         lm_head_weight = raw["lm_head_weight"]
