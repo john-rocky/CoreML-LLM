@@ -643,6 +643,34 @@ final class ChunkedEngine {
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
         ]
 
+        // B1 bypass: chunks 3+4 are KV-shared read-only (no KV writes). For
+        // prompt tokens 0..N-2 their hidden-state outputs are discarded; only
+        // position N-1 needs chunks 3+4 to produce the first decode token.
+        // Skip the prefill chunks 3+4 entirely and use the decode Q=1 path
+        // at position N-1 instead. Decode chunks 1+2 re-run for that single
+        // position (writes same KV values as prefill — idempotent).
+        //
+        // Expected saving: -47% prefill time (Apple AFM tech report, "Block 2
+        // does not produce any keys or values, the prefill stage is able to
+        // bypass all of its computation").
+        //
+        // Multimodal caveat: predictStep uses embedTokens.lookup for input.
+        // Works when the last prompt token is text (chat-template suffix).
+        // If the last token is a vision/audio placeholder the text lookup
+        // is wrong — bench against non-bypass before shipping multimodal.
+        let bypass = ProcessInfo.processInfo.environment["PREFILL_BYPASS"] == "1"
+        if bypass {
+            let totalPrefill = CFAbsoluteTimeGetCurrent() - prefillT0
+            print("[Prefill] BYPASS prep=\(String(format: "%.1f", prepDt*1000))ms " +
+                  "c1=\(String(format: "%.1f", pc1Dt*1000))ms " +
+                  "c2=\(String(format: "%.1f", pc2Dt*1000))ms " +
+                  "c3/4=skipped " +
+                  "total=\(String(format: "%.1f", totalPrefill*1000))ms " +
+                  "(\(realLen) tokens, \(String(format: "%.0f", Double(realLen)/totalPrefill)) tok/s)")
+            let lastTokenID = tokenIDs[realLen - 1]
+            return try predictStep(tokenID: lastTokenID, position: realLen - 1)
+        }
+
         // Prefill chunk 3
         let pc3T0 = CFAbsoluteTimeGetCurrent()
         var d3: [String: MLFeatureValue] = [
