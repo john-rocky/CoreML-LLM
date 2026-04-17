@@ -41,6 +41,11 @@ public final class CoreMLLLM: @unchecked Sendable {
     // assets aren't in the model directory).
     private var speculativeLoop: SpeculativeLoop?
 
+    /// Test-only accessor for the chunked engine. `internal` so tests in the
+    /// same module (via @testable import) can exercise low-level paths like
+    /// commitAccepted / KV snapshot. Do NOT use from production code.
+    internal var _testChunkedEngine: ChunkedEngine? { chunkedEngine }
+
     // Vision (lazy loaded to save memory)
     private var visionModel: MLModel?
     private var visionModelURL: URL?
