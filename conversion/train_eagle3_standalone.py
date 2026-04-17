@@ -261,14 +261,32 @@ def main():
     raw = torch.load(args.data, map_location="cpu")
 
     if raw.get("format") == "memmap-v1":
-        data_dir = raw["data_dir"]
-        # If the manifest was moved (e.g., downloaded to a new host), also try
-        # the sibling .data directory next to the manifest path.
-        if not os.path.isdir(data_dir):
-            fallback = args.data[:-3] + ".data" if args.data.endswith(".pt") else args.data + ".data"
-            if os.path.isdir(fallback):
-                data_dir = fallback
-                print(f"  Manifest data_dir not found; using sibling: {data_dir}")
+        # Resolve data_dir with sibling-first semantics. The manifest stores
+        # an absolute path from the machine where collection ran; if the user
+        # moved both .pt + .data dir (common: Drive → local), the sibling is
+        # what they want, not the stale manifest path. We can't just "exists"
+        # check the manifest path either — Drive may remain mounted so the
+        # stale dir appears to exist while its .dat files don't.
+        sibling = args.data[:-3] + ".data" if args.data.endswith(".pt") else args.data + ".data"
+        manifest_dir = raw["data_dir"]
+
+        def _has_memmap_files(d):
+            return os.path.isdir(d) and os.path.isfile(os.path.join(d, "h_tgt.dat"))
+
+        if _has_memmap_files(sibling):
+            data_dir = sibling
+            if os.path.abspath(sibling) != os.path.abspath(manifest_dir):
+                print(f"  Using sibling data dir: {data_dir}")
+                print(f"  (manifest-stored data_dir was: {manifest_dir})")
+        elif _has_memmap_files(manifest_dir):
+            data_dir = manifest_dir
+        else:
+            raise SystemExit(
+                f"\nERROR: memmap data directory not found at either location:\n"
+                f"  sibling:  {sibling}  (expected next to --data)\n"
+                f"  manifest: {manifest_dir}  (stored at collection time)\n"
+                f"Re-collect, or copy the .data directory next to the .pt file."
+            )
 
         shapes = raw["shapes"]
         dtypes = raw["dtypes"]
