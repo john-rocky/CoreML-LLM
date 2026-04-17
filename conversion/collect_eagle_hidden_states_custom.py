@@ -393,8 +393,12 @@ def main():
 
     hidden_size = model.config.hidden_size
     embed_scale = hidden_size ** 0.5
-    # LM head weight for target token computation
-    lm_head_weight = model.lm_head.weight.data.squeeze(-1).squeeze(-1).clone().cpu().half()  # Conv2d → (vocab, hidden)
+    # LM head weight for target token computation. Keep both a GPU-resident fp16
+    # copy (for fast argmax during collection — vocab=262144 × hidden=1536 fp32
+    # matmul on CPU is ~1s/sample, dominates wallclock) and a CPU fp16 copy (for
+    # serialization into the output .pt).
+    lm_head_weight_gpu = model.lm_head.weight.data.squeeze(-1).squeeze(-1).to(MODEL_DTYPE)  # (vocab, hidden) GPU
+    lm_head_weight = lm_head_weight_gpu.detach().cpu().half()
     print(f"hidden_size={hidden_size}, embed_scale={embed_scale:.2f}, vocab={lm_head_weight.shape[0]}")
 
     # Load corpus
@@ -451,10 +455,17 @@ def main():
         # hiddens_B: (B, max_N, hidden) ; fusion_list_B: [3 × (B, max_N, hidden)]
         embeds_B = model.embed_tokens(batched).to(MODEL_DTYPE) * embed_scale  # (B, max_N, hidden)
 
+        # LM head argmax on GPU (fp16 matmul — ~50ms for B=16 seq=512, vs ~16s
+        # if done on CPU per-sample). Only argmax is needed, not full logits, so
+        # fp16 precision is sufficient.
+        logits_B = F.linear(hiddens_B[:, 1:], lm_head_weight_gpu)  # (B, max_N-1, vocab)
+        tok_tgt_B = logits_B.argmax(dim=-1)  # (B, max_N-1) int64
+
         # Single GPU→CPU sync for the whole batch (amortized)
         hiddens_B_cpu = hiddens_B.cpu().half()
         embeds_B_cpu = embeds_B.cpu().half()
         fusion_cpu = [f.cpu().half() for f in fusion_list_B]
+        tok_tgt_B_cpu = tok_tgt_B.cpu()
 
         for bi, (_, N) in enumerate(buffer):
             hiddens = hiddens_B_cpu[bi, :N]  # (N, hidden)
@@ -467,9 +478,7 @@ def main():
             for fi, fh in enumerate(fusion_cpu):
                 all_fusion[fi].append(fh[bi, :N-1])
 
-            # Target tokens via LM head (CPU; ~15ms for N=512, tiny next to forward)
-            logits = F.linear(hiddens[1:].float(), lm_head_weight.float())
-            all_tok_tgt.append(logits.argmax(dim=-1))
+            all_tok_tgt.append(tok_tgt_B_cpu[bi, :N-1])
 
             total_pairs += N - 1
             collected += 1
