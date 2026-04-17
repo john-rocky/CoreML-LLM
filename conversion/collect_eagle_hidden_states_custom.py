@@ -489,10 +489,12 @@ def main():
         # hiddens_B: (B, max_N, hidden) ; fusion_list_B: [3 × (B, max_N, hidden)]
         embeds_B = model.embed_tokens(batched).to(MODEL_DTYPE) * embed_scale  # (B, max_N, hidden)
 
-        # LM head argmax on GPU (fp16 matmul — ~50ms for B=16 seq=512, vs ~16s
-        # if done on CPU per-sample). Only argmax is needed, not full logits, so
-        # fp16 precision is sufficient.
-        logits_B = F.linear(hiddens_B[:, 1:], lm_head_weight_gpu)  # (B, max_N-1, vocab)
+        # LM head argmax on GPU. MUST be fp32 — with vocab=262144 and
+        # hidden=1536, fp16 matmul overflows to Inf/NaN in ~some output
+        # columns, causing argmax to consistently land on token 0. Using
+        # fp32 keeps it correct at ~3 GB extra transient memory per batch
+        # (B=16, seq=512, vocab=262144 fp32 logits ≈ 8.5 GB).
+        logits_B = F.linear(hiddens_B[:, 1:].float(), lm_head_weight_gpu.float())
         tok_tgt_B = logits_B.argmax(dim=-1)  # (B, max_N-1) int64
 
         # Single GPU→CPU sync for the whole batch (amortized)
