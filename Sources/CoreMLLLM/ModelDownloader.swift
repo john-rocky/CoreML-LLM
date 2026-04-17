@@ -41,6 +41,13 @@ public final class ModelDownloader: NSObject {
     private var activeTaskFileIndex: [Int: Int] = [:]
     private var activeTaskBytes: [Int: Int64] = [:]
 
+    // A background URLSession can carry over tasks from a prior process.
+    // We adopt those (or cancel orphans) once on init via getAllTasks; until
+    // adoption completes we defer download/resume so we don't spawn fresh
+    // tasks that would race with — and double-download — the survivors.
+    private var tasksAdopted = false
+    private var pendingAdoptionActions: [() -> Void] = []
+
     // MARK: - Types
 
     public struct ModelInfo: Identifiable, Sendable {
@@ -100,6 +107,38 @@ public final class ModelDownloader: NSObject {
         config.timeoutIntervalForResource = 7200
         config.httpMaximumConnectionsPerHost = maxConcurrentDownloads
         session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        session.getAllTasks { [weak self] tasks in
+            DispatchQueue.main.async { self?.adoptExistingTasks(tasks) }
+        }
+    }
+
+    /// Claim background tasks that survived a prior app process. Tasks whose
+    /// `taskDescription` matches a file in the restored `pendingFiles` are
+    /// reattached to the in-memory state; everything else is an orphan
+    /// (different model, stale state) and gets cancelled. Without this,
+    /// `resumeDownload` would create a second task for the same file and
+    /// `completedBytes` would be counted twice.
+    private func adoptExistingTasks(_ tasks: [URLSessionTask]) {
+        var pathToIndex: [String: Int] = [:]
+        for (i, f) in pendingFiles.enumerated() { pathToIndex[f.localPath] = i }
+        for t in tasks {
+            if let dl = t as? URLSessionDownloadTask,
+               let desc = t.taskDescription,
+               let idx = pathToIndex[desc] {
+                activeDownloadTasks[t.taskIdentifier] = dl
+                activeTaskFileIndex[t.taskIdentifier] = idx
+            } else {
+                t.cancel()
+            }
+        }
+        tasksAdopted = true
+        let actions = pendingAdoptionActions
+        pendingAdoptionActions.removeAll()
+        for a in actions { a() }
+    }
+
+    private func runAfterAdoption(_ action: @escaping () -> Void) {
+        if tasksAdopted { action() } else { pendingAdoptionActions.append(action) }
     }
 
     // MARK: - Public
@@ -170,46 +209,49 @@ public final class ModelDownloader: NSObject {
         if !repair, let existing = localModelURL(for: model) { return existing }
 
         return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.main.async { [self] in
-                // Resume paused download for same model
-                if isPaused && currentModel?.id == model.id {
-                    downloadContinuation = continuation
-                    resumeDownload()
-                    return
-                }
+            DispatchQueue.main.async { [weak self] in
+                self?.runAfterAdoption {
+                    guard let self else { return }
+                    // Resume paused download for same model
+                    if self.isPaused && self.currentModel?.id == model.id {
+                        self.downloadContinuation = continuation
+                        self.resumeDownload()
+                        return
+                    }
 
-                // Cancel any in-progress download for a different model
-                if isDownloading {
-                    cancelDownload()
-                }
+                    // Cancel any in-progress download for a different model
+                    if self.isDownloading {
+                        self.cancelDownload()
+                    }
 
-                downloadContinuation = continuation
-                currentModel = model
-                downloadingModelId = model.id
-                isDownloading = true
-                isPaused = false
-                progress = 0
-                status = "Starting..."
+                    self.downloadContinuation = continuation
+                    self.currentModel = model
+                    self.downloadingModelId = model.id
+                    self.isDownloading = true
+                    self.isPaused = false
+                    self.progress = 0
+                    self.status = "Starting..."
 
-                let dest = modelsDirectory.appendingPathComponent(model.folderName)
-                destDir = dest
-                try? fileManager.createDirectory(at: dest, withIntermediateDirectories: true)
+                    let dest = self.modelsDirectory.appendingPathComponent(model.folderName)
+                    self.destDir = dest
+                    try? self.fileManager.createDirectory(at: dest, withIntermediateDirectories: true)
 
-                if model.downloadURL.contains("huggingface.co") {
-                    buildHuggingFaceFileList(model)
-                    fillDownloadSlots()
-                } else {
-                    try? fileManager.removeItem(at: dest)
-                    try? fileManager.createDirectory(at: dest, withIntermediateDirectories: true)
-                    pendingFiles = [DownloadFile(
-                        remotePath: model.downloadURL,
-                        localPath: "__archive.zip",
-                        estimatedSize: 350_000_000
-                    )]
-                    totalBytesForAllFiles = 350_000_000
-                    completedBytes = 0
-                    nextFileIndex = 0
-                    fillDownloadSlots()
+                    if model.downloadURL.contains("huggingface.co") {
+                        self.buildHuggingFaceFileList(model)
+                        self.fillDownloadSlots()
+                    } else {
+                        try? self.fileManager.removeItem(at: dest)
+                        try? self.fileManager.createDirectory(at: dest, withIntermediateDirectories: true)
+                        self.pendingFiles = [DownloadFile(
+                            remotePath: model.downloadURL,
+                            localPath: "__archive.zip",
+                            estimatedSize: 350_000_000
+                        )]
+                        self.totalBytesForAllFiles = 350_000_000
+                        self.completedBytes = 0
+                        self.nextFileIndex = 0
+                        self.fillDownloadSlots()
+                    }
                 }
             }
         }
@@ -232,13 +274,17 @@ public final class ModelDownloader: NSObject {
 
     public func resumeDownload() {
         guard isPaused else { return }
-        isPaused = false
-        status = "Resuming..."
+        runAfterAdoption { [weak self] in
+            guard let self, self.isPaused else { return }
+            self.isPaused = false
+            self.status = "Resuming..."
 
-        // Re-scan from beginning — fillDownloadSlots skips completed files on disk.
-        nextFileIndex = 0
-        completedBytes = 0
-        fillDownloadSlots()
+            // Re-scan from beginning — fillDownloadSlots skips completed files
+            // on disk and skips files an adopted task is already fetching.
+            self.nextFileIndex = 0
+            self.completedBytes = 0
+            self.fillDownloadSlots()
+        }
     }
 
     public func cancelDownload() {
@@ -331,9 +377,16 @@ public final class ModelDownloader: NSObject {
             return
         }
 
+        // Files currently being fetched by an adopted or in-flight task.
+        // Without this guard, restarting the loop after a pause/relaunch could
+        // hand the same file to a second task and double-count its bytes.
+        var activeIndices = Set(activeTaskFileIndex.values)
+
         while activeDownloadTasks.count < maxConcurrentDownloads && nextFileIndex < pendingFiles.count {
             let idx = nextFileIndex
             nextFileIndex += 1
+
+            if activeIndices.contains(idx) { continue }
 
             let file = pendingFiles[idx]
             guard let dest = destDir else { continue }
@@ -370,6 +423,7 @@ public final class ModelDownloader: NSObject {
 
             activeDownloadTasks[task.taskIdentifier] = task
             activeTaskFileIndex[task.taskIdentifier] = idx
+            activeIndices.insert(idx)
         }
 
         // All files dispatched and all tasks completed → finish
@@ -383,12 +437,45 @@ public final class ModelDownloader: NSObject {
 
     private func updateProgress() {
         let inFlight = activeTaskBytes.values.reduce(0 as Int64, +)
+        let bytes = completedBytes + inFlight
         let total = Double(max(totalBytesForAllFiles, 1))
-        let done = Double(completedBytes + inFlight)
-        progress = min(done / total, 0.99)
-        let mbDone = done / 1_000_000
+        progress = min(Double(bytes) / total, 0.99)
+        let mbDone = Double(bytes) / 1_000_000
         let mbTotal = Double(totalBytesForAllFiles) / 1_000_000
         status = String(format: "%.0f / %.0f MB", mbDone, mbTotal)
+
+        // Safety stop: estimates and actuals agree to within a few percent on
+        // this repo. If we cross 1.5x the estimate, the most likely cause is
+        // a duplicate-download bug (e.g. a leftover background task fetching
+        // the same 2.35 GB file as the new one). Abort so we don't burn the
+        // user's data plan or fill the disk.
+        if totalBytesForAllFiles > 0,
+           bytes > Int64(Double(totalBytesForAllFiles) * 1.5) {
+            abortOversizeDownload(bytes: bytes)
+        }
+    }
+
+    private func abortOversizeDownload(bytes: Int64) {
+        for task in activeDownloadTasks.values { task.cancel() }
+        activeDownloadTasks.removeAll()
+        activeTaskFileIndex.removeAll()
+        activeTaskBytes.removeAll()
+        pendingFiles = []
+        nextFileIndex = 0
+        isDownloading = false
+        isPaused = false
+        downloadingModelId = nil
+        cleanupPersistedState()
+        let mbDone = bytes / 1_000_000
+        let mbTotal = totalBytesForAllFiles / 1_000_000
+        status = "Stopped: \(mbDone) MB exceeds expected \(mbTotal) MB"
+        let err = NSError(
+            domain: "CoreMLLLM.ModelDownloader", code: -2,
+            userInfo: [NSLocalizedDescriptionKey:
+                "Download aborted: \(mbDone) MB exceeds expected \(mbTotal) MB by 50%+. " +
+                "Likely a duplicate-download bug — restart the app and retry."])
+        downloadContinuation?.resume(throwing: err)
+        downloadContinuation = nil
     }
 
     private func finishDownload() {
