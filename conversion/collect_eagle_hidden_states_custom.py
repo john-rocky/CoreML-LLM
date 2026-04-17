@@ -363,6 +363,16 @@ def main():
 
     device = args.device
 
+    # Let cuDNN benchmark Conv2d algorithms on first call per unique shape. With
+    # fixed (B, seq_len) shape this runs once at warmup and caches the fastest
+    # kernel per op. Observed empirically: Gemma4Model's Conv2d(1×1) layers on
+    # A100 default to a 10× suboptimal algorithm without this flag, making the
+    # forward compute-bound at ~0.2% utilization.
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     # Get HF model path
     hf_dir = args.hf_dir
     if hf_dir is None:
@@ -378,6 +388,8 @@ def main():
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(hf_dir)
+    if not getattr(tokenizer, "is_fast", False):
+        print("  WARN: slow (Python) tokenizer in use — install `tokenizers` for Rust fast path")
 
     hidden_size = model.config.hidden_size
     embed_scale = hidden_size ** 0.5
