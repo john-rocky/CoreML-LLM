@@ -29,6 +29,8 @@ import os
 import random
 import time
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -243,39 +245,96 @@ def main():
     random.seed(SEED)
     torch.manual_seed(SEED)
 
-    # Load data
+    # Load data — supports both legacy in-file tensors and memmap-v1 manifest.
+    # memmap-v1 (produced by the streaming collector): the .pt holds only metadata
+    # + lm_head_weight + train/test index tensors. Large tensors live as memmap
+    # files in a sibling `.data/` directory and are opened lazily here — fancy
+    # indexing via batch_idx reads only the selected rows into RAM.
     print(f"Loading {args.data}...")
     raw = torch.load(args.data, map_location="cpu")
-    print(f"  Train: {raw['train_h_in'].shape[0]:,} pairs")
-    print(f"  Test:  {raw['test_h_in'].shape[0]:,} pairs")
-    print(f"  Hidden: {raw['hidden_size']}, Teacher: {raw['meta']['teacher']}")
-    print(f"  Fusion layers: {raw.get('fusion_layers', 'MISSING')}")
 
-    if "train_fusion_L8" not in raw:
-        print("ERROR: training data missing fusion layer hiddens. Re-run collect with latest script.")
-        return 1
+    if raw.get("format") == "memmap-v1":
+        data_dir = raw["data_dir"]
+        # If the manifest was moved (e.g., downloaded to a new host), also try
+        # the sibling .data directory next to the manifest path.
+        if not os.path.isdir(data_dir):
+            fallback = args.data[:-3] + ".data" if args.data.endswith(".pt") else args.data + ".data"
+            if os.path.isdir(fallback):
+                data_dir = fallback
+                print(f"  Manifest data_dir not found; using sibling: {data_dir}")
 
-    # Organize into train/test dicts for easy access
-    train_data = {
-        "h_tgt": raw["train_h_tgt"],
-        "e_in": raw["train_e_in"],
-        "tok_tgt": raw["train_tok_tgt"],
-        "fusion_L8": raw["train_fusion_L8"],
-        "fusion_L17": raw["train_fusion_L17"],
-        "fusion_L34": raw["train_fusion_L34"],
-    }
-    test_data = {
-        "h_tgt": raw["test_h_tgt"],
-        "e_in": raw["test_e_in"],
-        "tok_tgt": raw["test_tok_tgt"],
-        "fusion_L8": raw["test_fusion_L8"],
-        "fusion_L17": raw["test_fusion_L17"],
-        "fusion_L34": raw["test_fusion_L34"],
-    }
-    del raw
+        shapes = raw["shapes"]
+        dtypes = raw["dtypes"]
 
-    N_train = train_data["h_tgt"].shape[0]
-    lm_head_weight = torch.load(args.data, map_location="cpu")["lm_head_weight"]
+        def _open_mm(key):
+            path = os.path.join(data_dir, f"{key}.dat")
+            arr = np.memmap(path, dtype=np.dtype(dtypes[key]), mode="r", shape=shapes[key])
+            return torch.from_numpy(arr)  # shares storage with memmap; no RAM copy
+
+        # Open all memmap-backed tensors
+        mm_tensors = {k: _open_mm(k) for k in shapes}
+        train_idx = raw["train_idx"]
+        test_idx  = raw["test_idx"]
+
+        # Wrap in an index-aware view so data[key][batch_idx] semantics work as
+        # before. train_idx/test_idx are applied lazily per batch.
+        class _IdxView:
+            def __init__(self, full_tensor, subset_idx):
+                self.full = full_tensor
+                self.subset = subset_idx
+            def __getitem__(self, batch_idx):
+                # batch_idx indexes into subset; translate to full-tensor indices
+                real_idx = self.subset[batch_idx]
+                return self.full[real_idx]
+            @property
+            def shape(self):
+                return (self.subset.shape[0],) + tuple(self.full.shape[1:])
+
+        train_data = {k: _IdxView(mm_tensors[k], train_idx)
+                      for k in ["h_in", "e_in", "h_tgt", "tok_tgt",
+                                "fusion_L8", "fusion_L17", "fusion_L34"]}
+        test_data  = {k: _IdxView(mm_tensors[k], test_idx)
+                      for k in ["h_in", "e_in", "h_tgt", "tok_tgt",
+                                "fusion_L8", "fusion_L17", "fusion_L34"]}
+
+        N_train = train_idx.shape[0]
+        lm_head_weight = raw["lm_head_weight"]
+
+        print(f"  Format: memmap-v1, data_dir={data_dir}")
+        print(f"  Train: {N_train:,} pairs")
+        print(f"  Test:  {test_idx.shape[0]:,} pairs")
+        print(f"  Hidden: {raw['hidden_size']}, Teacher: {raw['meta']['teacher']}")
+        print(f"  Fusion layers: {raw.get('fusion_layers', 'MISSING')}")
+    else:
+        # Legacy single-file format
+        print(f"  Train: {raw['train_h_in'].shape[0]:,} pairs")
+        print(f"  Test:  {raw['test_h_in'].shape[0]:,} pairs")
+        print(f"  Hidden: {raw['hidden_size']}, Teacher: {raw['meta']['teacher']}")
+        print(f"  Fusion layers: {raw.get('fusion_layers', 'MISSING')}")
+
+        if "train_fusion_L8" not in raw:
+            print("ERROR: training data missing fusion layer hiddens. Re-run collect with latest script.")
+            return 1
+
+        train_data = {
+            "h_tgt": raw["train_h_tgt"],
+            "e_in": raw["train_e_in"],
+            "tok_tgt": raw["train_tok_tgt"],
+            "fusion_L8": raw["train_fusion_L8"],
+            "fusion_L17": raw["train_fusion_L17"],
+            "fusion_L34": raw["train_fusion_L34"],
+        }
+        test_data = {
+            "h_tgt": raw["test_h_tgt"],
+            "e_in": raw["test_e_in"],
+            "tok_tgt": raw["test_tok_tgt"],
+            "fusion_L8": raw["test_fusion_L8"],
+            "fusion_L17": raw["test_fusion_L17"],
+            "fusion_L34": raw["test_fusion_L34"],
+        }
+        N_train = train_data["h_tgt"].shape[0]
+        lm_head_weight = raw["lm_head_weight"]
+        del raw
 
     # Build draft
     print("Building EAGLE3Draft...")

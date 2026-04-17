@@ -31,6 +31,7 @@ Numerics: batching is bit-identical to B=1 modulo matmul reduction order
 from __future__ import annotations
 
 import argparse, gc, json, os, sys, time
+import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -409,10 +410,43 @@ def main():
             texts.append(json.loads(line)["text"])
     print(f"  {len(texts)} sequences")
 
-    # Collect hidden states + fusion layer hiddens
-    all_h_in, all_e_in, all_h_tgt, all_tok_tgt = [], [], [], []
-    all_fusion = [[], [], []]  # 3 fusion layers × list of (N-1, hidden)
+    # Collect hidden states + fusion layer hiddens via disk-backed memmap.
+    # Rationale: at 30k samples × 512 tokens × 1536 hidden × fp16, the six 2D
+    # tensors (h_in, e_in, h_tgt, 3× fusion) would need ~280 GB of CPU RAM if
+    # held in lists. Colab high-RAM tops out at 80 GB, so accumulating in-
+    # memory OOMs around 38% completion. Instead, allocate sparse memmap files
+    # on disk sized to an upper bound (num_samples × (seq_len-1) pairs) and
+    # write each batch's output directly at a cursor. Final disk usage is
+    # bounded by actual pairs (shorter sequences shrink it); sparse allocation
+    # means unwritten regions consume no disk.
     num = min(args.num_samples, len(texts))
+    max_pairs = num * (args.seq_len - 1)
+
+    output_abs = os.path.abspath(args.output)
+    data_dir = output_abs[:-3] + ".data" if output_abs.endswith(".pt") else output_abs + ".data"
+    os.makedirs(data_dir, exist_ok=True)
+
+    print(f"  Streaming memmap files under: {data_dir}")
+    print(f"  Upper bound: {max_pairs:,} pairs × hidden={hidden_size} × fp16")
+    print(f"    per-tensor cap on disk: {max_pairs * hidden_size * 2 / 1e9:.1f} GB")
+    print(f"    7-tensor cap on disk:   {(max_pairs * hidden_size * 2 * 6 + max_pairs * 8) / 1e9:.1f} GB (sparse)")
+
+    def _make_mm(name, shape, dtype):
+        path = os.path.join(data_dir, name)
+        return np.memmap(path, dtype=dtype, mode="w+", shape=shape), path
+
+    h_in_mm,    h_in_path    = _make_mm("h_in.dat",    (max_pairs, hidden_size), np.float16)
+    e_in_mm,    e_in_path    = _make_mm("e_in.dat",    (max_pairs, hidden_size), np.float16)
+    h_tgt_mm,   h_tgt_path   = _make_mm("h_tgt.dat",   (max_pairs, hidden_size), np.float16)
+    tok_tgt_mm, tok_tgt_path = _make_mm("tok_tgt.dat", (max_pairs,),            np.int64)
+    fusion_mm_list = []
+    fusion_paths = {}
+    for l in [8, 17, 34]:
+        mm, p = _make_mm(f"fusion_L{l}.dat", (max_pairs, hidden_size), np.float16)
+        fusion_mm_list.append(mm)
+        fusion_paths[l] = p
+
+    cursor = 0
     collected = 0
     skipped = 0
     total_pairs = 0
@@ -434,8 +468,8 @@ def main():
     print(f"  Batch size: {BATCH_SIZE} (pad_id={pad_id})")
 
     def _flush_batch(buffer):
-        """Process a buffer of (ids_1d_cpu, N) into collected lists. Returns count processed."""
-        nonlocal collected, total_pairs
+        """Process a buffer of (ids_1d_cpu, N): forward + write to memmap at cursor."""
+        nonlocal collected, total_pairs, cursor
         if not buffer:
             return 0
         B = len(buffer)
@@ -468,19 +502,23 @@ def main():
         tok_tgt_B_cpu = tok_tgt_B.cpu()
 
         for bi, (_, N) in enumerate(buffer):
-            hiddens = hiddens_B_cpu[bi, :N]  # (N, hidden)
-            embeds  = embeds_B_cpu[bi, :N]   # (N, hidden)
+            n_pairs = N - 1
+            if cursor + n_pairs > max_pairs:
+                print(f"  WARN: memmap upper bound hit at cursor={cursor}, skipping remainder")
+                break
 
-            all_h_in.append(hiddens[:-1])
-            all_e_in.append(embeds[1:])
-            all_h_tgt.append(hiddens[1:])
+            hiddens_np = hiddens_B_cpu[bi, :N].numpy()  # (N, hidden) fp16
+            embeds_np  = embeds_B_cpu[bi, :N].numpy()
 
-            for fi, fh in enumerate(fusion_cpu):
-                all_fusion[fi].append(fh[bi, :N-1])
+            h_in_mm[cursor:cursor + n_pairs]  = hiddens_np[:-1]
+            e_in_mm[cursor:cursor + n_pairs]  = embeds_np[1:]
+            h_tgt_mm[cursor:cursor + n_pairs] = hiddens_np[1:]
+            tok_tgt_mm[cursor:cursor + n_pairs] = tok_tgt_B_cpu[bi, :n_pairs].numpy().astype(np.int64)
+            for fi, fm in enumerate(fusion_mm_list):
+                fm[cursor:cursor + n_pairs] = fusion_cpu[fi][bi, :n_pairs].numpy()
 
-            all_tok_tgt.append(tok_tgt_B_cpu[bi, :N-1])
-
-            total_pairs += N - 1
+            cursor += n_pairs
+            total_pairs += n_pairs
             collected += 1
 
             if collected % 500 == 0:
@@ -524,29 +562,57 @@ def main():
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    # Concatenate + split
-    h_in = torch.cat(all_h_in, dim=0)
-    e_in = torch.cat(all_e_in, dim=0)
-    h_tgt = torch.cat(all_h_tgt, dim=0)
-    tok_tgt = torch.cat(all_tok_tgt, dim=0)
-    fusion_tensors = [torch.cat(af, dim=0) for af in all_fusion]  # 3 × (M, hidden)
+    # Flush + trim memmap files to actual used size (cursor). The files were
+    # allocated for upper-bound max_pairs; unused rows at the tail are
+    # truncated off disk.
+    M = cursor
+    for mm in [h_in_mm, e_in_mm, h_tgt_mm, tok_tgt_mm, *fusion_mm_list]:
+        mm.flush()
+    del h_in_mm, e_in_mm, h_tgt_mm, tok_tgt_mm, fusion_mm_list
+    gc.collect()
 
-    M = h_in.shape[0]
+    # Truncate each .dat file to actual size
+    def _truncate(path, row_bytes, rows):
+        os.truncate(path, row_bytes * rows)
+
+    _truncate(h_in_path,    hidden_size * 2, M)
+    _truncate(e_in_path,    hidden_size * 2, M)
+    _truncate(h_tgt_path,   hidden_size * 2, M)
+    _truncate(tok_tgt_path, 8, M)
+    for l in [8, 17, 34]:
+        _truncate(fusion_paths[l], hidden_size * 2, M)
+
+    # Random train/test split over M pairs. Index arrays are small (120 MB max),
+    # safe to hold in RAM.
     split = int(M * (1 - args.test_split))
     perm = torch.randperm(M)
+    train_idx = perm[:split].contiguous()
+    test_idx  = perm[split:].contiguous()
 
-    save_dict = {
-        "train_h_in": h_in[perm[:split]], "train_e_in": e_in[perm[:split]],
-        "train_h_tgt": h_tgt[perm[:split]], "train_tok_tgt": tok_tgt[perm[:split]],
-        "test_h_in": h_in[perm[split:]], "test_e_in": e_in[perm[split:]],
-        "test_h_tgt": h_tgt[perm[split:]], "test_tok_tgt": tok_tgt[perm[split:]],
-        # Fusion layer hiddens (L8, L17, L34)
-        "train_fusion_L8":  fusion_tensors[0][perm[:split]],
-        "train_fusion_L17": fusion_tensors[1][perm[:split]],
-        "train_fusion_L34": fusion_tensors[2][perm[:split]],
-        "test_fusion_L8":   fusion_tensors[0][perm[split:]],
-        "test_fusion_L17":  fusion_tensors[1][perm[split:]],
-        "test_fusion_L34":  fusion_tensors[2][perm[split:]],
+    # Manifest .pt — tiny, only holds metadata and small tensors (indices + LM head).
+    # The large tensors stay on disk as memmap files under `data_dir`. The trainer
+    # side loads them via np.memmap and wraps in torch.from_numpy for fancy
+    # indexing in the existing batch-index pipeline (no IterableDataset needed).
+    manifest = {
+        "format": "memmap-v1",
+        "data_dir": data_dir,
+        "total_pairs": M,
+        "train_idx": train_idx,
+        "test_idx": test_idx,
+        "shapes": {
+            "h_in":      (M, hidden_size),
+            "e_in":      (M, hidden_size),
+            "h_tgt":     (M, hidden_size),
+            "tok_tgt":   (M,),
+            "fusion_L8":  (M, hidden_size),
+            "fusion_L17": (M, hidden_size),
+            "fusion_L34": (M, hidden_size),
+        },
+        "dtypes": {
+            "h_in": "float16", "e_in": "float16", "h_tgt": "float16",
+            "tok_tgt": "int64",
+            "fusion_L8": "float16", "fusion_L17": "float16", "fusion_L34": "float16",
+        },
         "fusion_layers": [8, 17, 34],
         "lm_head_weight": lm_head_weight,
         "embed_scale": embed_scale,
@@ -562,13 +628,19 @@ def main():
             "test_pairs": M - split,
         },
     }
+    os.makedirs(os.path.dirname(output_abs), exist_ok=True)
+    torch.save(manifest, args.output)
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    torch.save(save_dict, args.output)
-    size_gb = os.path.getsize(args.output) / 1e9
-    print(f"\nSaved: {args.output} ({size_gb:.2f} GB)")
-    print(f"  Train: {split:,} / Test: {M-split:,}")
-    print(f"\nNext: load this in train_eagle3_draft.ipynb (no target model needed).")
+    manifest_mb = os.path.getsize(args.output) / 1e6
+    data_bytes = sum(
+        os.path.getsize(os.path.join(data_dir, f))
+        for f in os.listdir(data_dir)
+    )
+    print(f"\nSaved manifest: {args.output} ({manifest_mb:.1f} MB — contains lm_head_weight + indices)")
+    print(f"  Data dir:     {data_dir} ({data_bytes / 1e9:.1f} GB across 7 memmap files)")
+    print(f"  Train: {split:,} / Test: {M-split:,} pairs")
+    print(f"\nNext: run train_eagle3_standalone.py — it auto-detects format=memmap-v1 and")
+    print(f"      loads the memmap tensors with constant CPU RAM usage.")
 
 
 if __name__ == "__main__":
