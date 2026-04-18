@@ -5,6 +5,34 @@ import Foundation
 import UIKit
 #endif
 
+/// Which compute units the next `loadModel` call should request.
+/// Reload is required to apply — the selection is baked into the
+/// per-chunk `MLModelConfiguration` at load time.
+enum ComputeMode: String, CaseIterable, Identifiable {
+    case aneOnly
+    case gpuOnly
+    case gpuPrefill
+    case splitChunk3
+    case all
+
+    var id: String { rawValue }
+
+    /// Shared UserDefaults key. Referenced by `LLMRunner` (reader) and
+    /// `ModelPickerView` (writer) so the selection from the picker flows
+    /// into the next load without extra plumbing.
+    static let storageKey = "LLMRunner.computeMode"
+
+    var label: String {
+        switch self {
+        case .aneOnly:     return "ANE"
+        case .gpuOnly:     return "GPU"
+        case .gpuPrefill:  return "ANE + GPU prefill"
+        case .splitChunk3: return "ANE + c3→GPU (spike)"
+        case .all:         return "All"
+        }
+    }
+}
+
 /// Thin @Observable wrapper around CoreMLLLM for the chat app.
 ///
 /// Delegates all inference to the CoreMLLLM package. Adds app-specific
@@ -20,6 +48,14 @@ final class LLMRunner {
     var hasAudio = false
     var maxAudioDuration: TimeInterval = 10.0
 
+    /// Current compute-unit preference. Read-only here — the source of
+    /// truth is UserDefaults, written by `ModelPickerView`'s picker.
+    /// `loadModel` reads this to decide `computeUnits:` + env gates.
+    var computeMode: ComputeMode {
+        let raw = UserDefaults.standard.string(forKey: ComputeMode.storageKey) ?? ""
+        return ComputeMode(rawValue: raw) ?? .aneOnly
+    }
+
     // MTP speculation metrics
     var mtpAcceptanceRate: Double = 0
     var mtpTokensPerRound: Double = 0
@@ -30,7 +66,7 @@ final class LLMRunner {
     var crossVocabTokensPerCycle: Double = 0
 
     private var llm: CoreMLLLM?
-    private var modelFolderURL: URL?
+    private(set) var modelFolderURL: URL?
 
     // MARK: - Loading
 
@@ -62,7 +98,9 @@ final class LLMRunner {
         modelFolderURL = folder
         loadingStatus = "Loading..."
 
-        llm = try await CoreMLLLM.load(from: folder) { [weak self] status in
+        let units = Self.applyComputeMode(computeMode)
+
+        llm = try await CoreMLLLM.load(from: folder, computeUnits: units) { [weak self] status in
             Task { @MainActor in
                 self?.loadingStatus = status
             }
@@ -74,7 +112,30 @@ final class LLMRunner {
         maxAudioDuration = llm!.maxAudioDuration
         isLoaded = true
         loadingStatus = "Ready"
-        print("[LLMRunner] loaded: vision=\(hasVision) audio=\(hasAudio) model=\(modelName)")
+        print("[LLMRunner] loaded: vision=\(hasVision) audio=\(hasAudio) model=\(modelName) compute=\(computeMode.label)")
+    }
+
+    /// Translate `ComputeMode` into the `MLComputeUnits` + env-gate state
+    /// that `ChunkedEngine.load` observes. Env gates are cleared first so
+    /// flipping modes doesn't leave stale flags set.
+    @discardableResult
+    private static func applyComputeMode(_ mode: ComputeMode) -> MLComputeUnits {
+        setenv("GPU_PREFILL", "0", 1)
+        setenv("COMPUTE_UNIT_SPLIT", "0", 1)
+        switch mode {
+        case .aneOnly:
+            return .cpuAndNeuralEngine
+        case .gpuOnly:
+            return .cpuAndGPU
+        case .gpuPrefill:
+            setenv("GPU_PREFILL", "1", 1)
+            return .cpuAndNeuralEngine
+        case .splitChunk3:
+            setenv("COMPUTE_UNIT_SPLIT", "1", 1)
+            return .cpuAndNeuralEngine
+        case .all:
+            return .all
+        }
     }
 
     // MARK: - Generation
