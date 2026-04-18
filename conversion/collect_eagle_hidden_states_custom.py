@@ -39,9 +39,22 @@ from tqdm import tqdm
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
+# Override MODEL_DTYPE to bf16 for collection to avoid fp16 overflow in
+# unscaled attention + MLP at long sequence lengths. Empirically fp16 fails
+# at N >= ~200 on A100 (L0 post_attn norm hits ~40k, MLP gate*up overflows),
+# producing NaN in h_tgt for every pair. bf16 has fp32 exponent range so
+# this can't happen. On A100 bf16 is native and same speed as fp16. CoreML
+# chunks on device still use fp16 (that path has additional softcap / mask
+# handling). We convert collected bf16 → fp16 at memmap write time.
+import ane_ops as _ane_ops
+import models.gemma4_swa_chunks as _swa_chunks
+_ane_ops.MODEL_DTYPE = torch.bfloat16
+_swa_chunks.MODEL_DTYPE = torch.bfloat16
+
 from models.gemma4 import Gemma4Model, Gemma4Config
 from models.gemma4_swa_chunks import _run_layer_swa, v_norm
 from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax
+MODEL_DTYPE = torch.bfloat16  # local override — forward_batch uses this
 
 
 def forward_all(model, input_ids, position):
@@ -383,7 +396,8 @@ def main():
 
     print(f"Loading custom Gemma4Model from {hf_dir}...")
     model = Gemma4Model.from_pretrained(hf_dir, context_length=args.seq_len)
-    model = model.half().to(device).eval()
+    # bf16 instead of .half() — fp16 overflows in forward at N >= ~200.
+    model = model.to(torch.bfloat16).to(device).eval()
     for p in model.parameters():
         p.requires_grad = False
 
@@ -489,15 +503,17 @@ def main():
         # hiddens_B: (B, max_N, hidden) ; fusion_list_B: [3 × (B, max_N, hidden)]
         embeds_B = model.embed_tokens(batched).to(MODEL_DTYPE) * embed_scale  # (B, max_N, hidden)
 
-        # LM head argmax on GPU. MUST be fp32 — with vocab=262144 and
-        # hidden=1536, fp16 matmul overflows to Inf/NaN in ~some output
-        # columns, causing argmax to consistently land on token 0. Using
-        # fp32 keeps it correct at ~3 GB extra transient memory per batch
-        # (B=16, seq=512, vocab=262144 fp32 logits ≈ 8.5 GB).
+        # LM head argmax on GPU, in fp32. The collector runs forward_batch
+        # in bf16 (see module-level MODEL_DTYPE override — fp16 overflows at
+        # long N). Downcast to fp32 here for the vocab-size matmul to avoid
+        # any precision loss at the final argmax step.
         logits_B = F.linear(hiddens_B[:, 1:].float(), lm_head_weight_gpu.float())
         tok_tgt_B = logits_B.argmax(dim=-1)  # (B, max_N-1) int64
 
-        # Single GPU→CPU sync for the whole batch (amortized)
+        # Single GPU→CPU sync for the whole batch. .half() converts bf16→fp16
+        # for the memmap storage (numpy doesn't support bf16 natively).
+        # Hidden magnitudes are bounded after the final RMSNorm so this
+        # downcast doesn't overflow.
         hiddens_B_cpu = hiddens_B.cpu().half()
         embeds_B_cpu = embeds_B.cpu().half()
         fusion_cpu = [f.cpu().half() for f in fusion_list_B]
