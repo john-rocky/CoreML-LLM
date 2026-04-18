@@ -1003,3 +1003,164 @@ Target: LiteRT-LM 56.5 tok/s -- achievable with S1 + S2 + MTP.
 | 2 | chunk3+4 merge on-device bench | +10% | 1 day (LiteChunk2 exists) | None |
 | 3 | MTP drafter integration | x2.8 | 3-4 days (Path A) | Blocker 2 resolved |
 | 4 | Dispatch pipelining | +5% | 0.5 day Swift | None |
+
+---
+
+## 2026-04-18 addendum — runtime code re-audit
+
+**Scope:** Full re-read of `/tmp/LiteRT-LM/runtime/` (cloned fresh 2026-04-18,
+~10K lines across executor / kv_cache / mtp_drafter / session / pipeline /
+threadpool) with a focused lens on speed optimizations not already captured
+above.
+
+### New finding (top priority)
+
+**Pending-Token Skip** — the single new actionable optimization from this pass.
+
+Code: `/tmp/LiteRT-LM/runtime/executor/llm_litert_compiled_model_executor.cc:1797-1802`
+and `llm_executor_processed_tokens.h:114-116`.
+
+Mechanism: at the end of prefill, if exactly 1 unprefilled token remains,
+LiteRT-LM does **not** run the graph — it stashes the token as a "pending
+input token" on the executor. That token is consumed on the first decode
+step as its input, so the normal `tokenize → feed → full-forward → sample`
+chain loses one forward pass.
+
+Why this matters for us: our current handoff runs one extra ANE dispatch
+(~13 ms) at the prefill→decode seam. Skipping it is a lossless TTFT win.
+It is **orthogonal** to Phase 0 item `0d` (prefill bypass of chunk3+4 for
+N-1 prompt tokens): `0d` trims chunks 3+4 for all non-last tokens, `0j`
+skips the whole graph for the single last token. Stacked they replicate
+LiteRT-LM's exact handoff.
+
+Tracked as Phase 0 item **0j** in `docs/PRIORITY_ROADMAP.md` (added
+2026-04-18, ~1 day Swift, no reconversion needed).
+
+### Re-confirmed (not new)
+
+The re-read confirmed the findings in this doc's original 2026-04-14 body:
+- Single-forward verify with internal `dynamic_update_slice`, stale KV
+  masked out via position counter + causal mask (§B1.3 above)
+- KV sharing base ↔ drafter via handle duplication, not memory isolation
+  (§B2 — see correction below for why the `.Duplicate()` semantics matter)
+- Orthogonal model decomposition on the NPU path (§B3 #463-473)
+- Session clone / checkpoint for KV rewind (§B4 #496)
+- Chunked prefill via `GetOptimizedPrefillWorkGroups` (§B3 #456-458)
+- Warmup inference + GPU weight-upload staging (§B4 #480-483)
+
+### Retraction: initial "MTP retry via Duplicate()" hypothesis
+
+The first pass of this re-audit (before cross-checking the LiteRT C API)
+produced a hypothesis that LiteRT-LM's MTP drafter isolates draft/verify
+KV via `TensorBuffer::Duplicate()` — implying a mechanical workaround for
+our verify-chunk write-through issue (item 11c in PRIORITY_ROADMAP).
+
+**That hypothesis is wrong.** Verified via the LiteRT C API header
+`litert/c/litert_tensor_buffer.h`:
+
+```c
+// Create a duplicate of the current tensor buffer. It will increase the
+// reference count of a managed tensor buffer. And the number decreases
+// when LiteRtDestroyTensorBuffer() is called.
+LiteRtStatus LiteRtDuplicateTensorBuffer(LiteRtTensorBuffer tensor_buffer);
+```
+
+Runtime implementation in `litert/runtime/tensor_buffer.h`:
+
+```cpp
+// Used to duplicate the current tensor buffer. Internally it increases
+// reference count to the underlying buffer.
+void Duplicate() const { Ref(); }
+```
+
+`Duplicate()` is a **ref-count increment on a single underlying buffer**,
+not an allocate-and-copy. The `.Duplicate()` calls in
+`llm_litert_mtp_drafter.cc:285-286, 396, 411` therefore do **not** isolate
+draft/verify KV memory — they only extend handle lifetime across async
+invocations. LiteRT-LM's actual mechanism is exactly what §B1.3 of this
+doc already described (mask + position advance).
+
+Implication: LiteRT-LM's design does **not** provide a new path around
+item 11c. Our verify-chunk write-through semantics are not the delta. The
+blocker remains drafter-quality / numerical compatibility between the
+drafter's training target and our HF trunk, same as documented in
+`MTP_INVESTIGATION_LITERT.md` (2026-04-17) and the Path A/C autopsies.
+
+### Minor items worth a profile pass but not promoted to Phase 0
+
+Not promoted because gains are speculative without measurement:
+- **CPU-ANE stage overlap via callback chaining** —
+  `session_basic.cc:593-605` and `tasks.cc:299-340`. Prefill-complete
+  callback immediately schedules `RunDecodeAsync`; tokenization runs on
+  a worker thread while the previous forward pass is in-flight. If our
+  Swift runtime serializes any of {tokenize, sample, constraint-mask}
+  against the ANE dispatch, hiding them behind it yields up to ~5% decode
+  throughput. Profile first; only implement if profiler shows gap.
+- **Dynamic-KV growth by `kv_increment_size`** — `kv_cache.cc:424-452`.
+  Grows KV via `ExpandBuffer()` in fixed increments rather than
+  pre-allocating max context. Possible memory-use improvement if we care
+  about idle memory; no throughput impact.
+
+### Verify sizing divergence from LiteRT-LM (our K vs their K+1)
+
+Re-audit surfaced a **structural divergence** between LiteRT-LM's
+`verify_4` signature and our verify chunks that is worth making explicit
+alongside §B1.3:
+
+| | LiteRT-LM `verify_4` | Our verify chunks |
+|---|---|---|
+| verify input length | **K+1 = 4** (seed + K drafts) | **K** (seed + K−1 drafts) |
+| KV write positions per cycle | K+1 | K |
+| Counter advance on full-accept | num_accepted + 1 ≤ K+1 | matchCount + 1 ≤ K |
+| "All-accept KV hole" risk | **impossible by construction** | **dissolved by engine-side cap** |
+
+Google sized verify to K+1 so every input position gets a KV slot and
+the counter can advance up to K+1 safely. Our verify is sized to K, so
+advancing by K+1 on full-accept would leave position P+K without a KV
+write — the "all-accept KV hole" that was reported as a bug against
+`MtpSpeculativeEngine.swift` and `CrossVocabSpeculativeEngine.swift`.
+
+**Status (verified 2026-04-18):** the hole is already closed in-tree via
+commit `1d9c990` ("fix: commit at most K positions per speculative
+cycle"). Two coordinated changes:
+
+1. **Engine side** — `MtpSpeculativeEngine.swift:135` and
+   `CrossVocabSpeculativeEngine.swift:128` cap verified drafts to `K−1`
+   (`let useProps = Array(proposals.prefix(K - 1))`), so `compareLen =
+   K−1`, `matchCount ≤ K−1`, `committed = matchCount + 1 ≤ K`. Never
+   over-commits past what was written. The inline comment at
+   `MtpSpeculativeEngine.swift:130-134` explicitly names the phenomenon
+   ("the all-accept KV hole that lets the next burst read garbage").
+2. **Qwen-side `applyCommit`** — `CrossVocabDraft.swift:306-325` handles
+   the full-accept case by explicitly issuing
+   `stepQwen(lastQwenProposal, position: P+K)` to write the trailing
+   Qwen KV slot, then sets `committedPosition = P + K + 1`. Do **not**
+   remove this write: the Qwen drafter maintains its own KV separately
+   from the target KV, and skipping the write here would create the
+   same hole on the Qwen side.
+
+No code change is needed. The bug reports calling for `committed =
+min(matchCount + 1, K)` are stale — the K−1 cap already guarantees
+that bound, and the proposed change to remove the `stepQwen(...,
+position: P+K)` call in `applyCommit` would regress the Qwen-side hole.
+
+**Performance implication (worth tracking).** The K−1 cap is a no-model-
+change fix but costs us **one draft slot per cycle**. LiteRT-LM's
+theoretical per-cycle headroom is K+1 accepted tokens; ours is K. If we
+ever re-export the verify chunks from K to K+1 input positions, we
+recover that slot and match LiteRT-LM's upper bound. That re-export
+belongs under `PRIORITY_ROADMAP.md` item 11c's "(b) verify-protocol
+redesign" track — multi-week due to chunk re-export plus Swift engine
+re-wiring, so not on the critical path until speculative decoding is
+otherwise unblocked.
+
+### Audit method note
+
+The audit used five parallel Explore agents (NPU executor / main executor
++ KV cache / MTP drafter / pipeline+session+threading / prefill+components
++ magic-numbers) to cover the 10K-line scope without blowing the main
+context. The agents correctly surfaced the findings above, but one
+reported `.Duplicate()` as "buffer isolation" which was only caught by
+verifying the C API definition afterwards. Future runtime audits should
+verify any claimed memory-isolation primitive against the implementing
+C API before acting on it.

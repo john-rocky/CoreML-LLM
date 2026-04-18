@@ -50,9 +50,20 @@ Run these **now**, before any speculative or conversion work. They either
 | **0g** | **SRAM 32 MB working-set check** — tune prefillN per chunk to avoid 30% cliff | avoid 30% drop | 0.5 day analysis | SOURCES (Orion) |
 | **0h** | **`reshapeFrequency = .infrequent` hint** (iOS 18.2+) — skip per-call shape-trace | ~0.5 ms/step | 0.5 day Swift | V6 §V6-1 |
 | **0i** | **MLComputePlan warm-pool** — materialize plan once, reuse across predictions | ~0.8 ms first-call, cold-path shaves | 1 day Swift | V6 §V6-2 |
+| **0j** ⭐ | **Pending-Token Skip** — on the last prefill chunk, if exactly 1 token remains, store it as `pendingInputToken` and **skip the graph entirely**. That token is consumed on the first decode step without an extra forward pass. Orthogonal to 0d (which trims chunk3+4 across all but the last prompt token); 0j trims the whole graph for the single final token. Together they replicate LiteRT-LM's prefill→decode handoff. | one ANE dispatch (~13 ms) off TTFT | 1 day Swift | `docs/LITERT_RUNTIME_ANALYSIS.md` §"2026-04-18 addendum", `/tmp/LiteRT-LM/runtime/executor/llm_litert_compiled_model_executor.cc:1797-1802` |
 
 0a result: no compute-op fallback to fix. Bottleneck is 4× per-step
 dispatch overhead, not per-op device placement.
+
+**0j is the top-priority new Phase 0 item** (added 2026-04-18 from LiteRT-LM
+runtime re-audit). It is the ONLY genuinely new speed-up found in that audit —
+LiteRT-LM's other notable design elements (single-forward verify, mask-based
+KV invalidation, session-clone KV rewind, CPU/NPU orthogonal decomposition)
+are all already covered by `docs/LITERT_RUNTIME_ANALYSIS.md` (2026-04-14) and
+nothing in today's re-read changed those conclusions. See the audit
+addendum in LITERT_RUNTIME_ANALYSIS.md for why the initial "revisit MTP"
+hypothesis (based on a misreading of `TensorBuffer::Duplicate()`) was
+retracted.
 
 ---
 
@@ -139,7 +150,7 @@ active. Retrain with `use_cache=True` traces should fix acceptance.
 | **10** | **Sequoia (Y-tree) optimal topology** | +15–33% (e.g. 36→41.6 tok/s) | 1–2 days offline DP | V3 §A4, ANE_SURVEY |
 | **11** | **Traversal Verification** | +10–20% | 0.5 day Swift | V3 §A5 |
 | **11b** | **Verify chunks T=4** — Google uses T=3+1; extend our T=3 | K=4 capability | 0.5 day + reconvert | LITERT_CONTAINER |
-| **11c** | **Verify-chunk write-through semantics (was: numerical tightening)** — v4 chain-mode bench (`docs/PHASE_B_V4_CHAIN_FINDINGS.md`) first framed this as batch-content fp16 sensitivity in `verify_qK`. **B.3 / PR #72 (2026-04-15) refuted that framing:** replacing batched `verify_qK` with K serial `decode_q1` did not close the chain gap (cross-vocab code stayed at 1.01 vs oracle 2.63; chat 2.31→2.09 within noise). The real mechanism is **semantic, not numerical** — verify writes drafter proposals into KV at positions P+1..P+K-1 *before* acceptance is decided, so subsequent target argmaxes condition on contaminated cache. Candidate fixes shrink to: **(a) output-space tolerance** in the acceptance test (Track A / PR #73 patch-ready — cheap measurement-only change) and **(b) verify-protocol redesign** to delay KV write-through until after acceptance (multi-week chunk re-export + Swift engine re-design). ~~fp32 upcast on the logit projection~~ and ~~accumulation-order-controlled re-quant~~ are **dead ends** — strict subsets of what PR #72 already removed. | **Phase C gating** | (a) ~1 day bench work after verify logits output lands; (b) multi-week | `docs/PHASE_C_TIGHTENING_FINDINGS.md`, `docs/PHASE_B_DECISION.md`, `docs/PHASE_B_V4_CHAIN_FINDINGS.md`, PR #72 |
+| **11c** | **Verify-chunk write-through semantics (was: numerical tightening)** — v4 chain-mode bench (`docs/PHASE_B_V4_CHAIN_FINDINGS.md`) first framed this as batch-content fp16 sensitivity in `verify_qK`. **B.3 / PR #72 (2026-04-15) refuted that framing:** replacing batched `verify_qK` with K serial `decode_q1` did not close the chain gap (cross-vocab code stayed at 1.01 vs oracle 2.63; chat 2.31→2.09 within noise). The real mechanism is **semantic, not numerical** — verify writes drafter proposals into KV at positions P+1..P+K-1 *before* acceptance is decided, so subsequent target argmaxes condition on contaminated cache. Candidate fixes shrink to: **(a) output-space tolerance** in the acceptance test (Track A / PR #73 patch-ready — cheap measurement-only change) and **(b) verify-protocol redesign** to delay KV write-through until after acceptance (multi-week chunk re-export + Swift engine re-design). ~~fp32 upcast on the logit projection~~ and ~~accumulation-order-controlled re-quant~~ are **dead ends** — strict subsets of what PR #72 already removed. **2026-04-18 note:** separately, our verify chunks are sized to `K` input positions (vs LiteRT-LM's `K+1` in `verify_4`) and write KV to `K` slots, so the engine-side K−1 cap (commit `1d9c990`) is load-bearing to avoid an "all-accept KV hole" at position P+K. The K−1 cap costs one draft slot per cycle. Re-exporting verify to `K+1` input positions would recover that slot and match LiteRT-LM's per-cycle ceiling; this is another concrete task under the "(b) verify-protocol redesign" track. See `LITERT_RUNTIME_ANALYSIS.md` §"Verify sizing divergence from LiteRT-LM". No code change needed now — the hole is already dissolved in-tree. | **Phase C gating** | (a) ~1 day bench work after verify logits output lands; (b) multi-week | `docs/PHASE_C_TIGHTENING_FINDINGS.md`, `docs/PHASE_B_DECISION.md`, `docs/PHASE_B_V4_CHAIN_FINDINGS.md`, `docs/LITERT_RUNTIME_ANALYSIS.md` §2026-04-18 addendum, PR #72 |
 
 ### Track C — Zero-training auxiliaries (ship alongside A or B)
 
