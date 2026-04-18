@@ -102,21 +102,21 @@ final class ChunkedEngine {
 
     static func load(from directory: URL, config: ModelConfig,
                      computeUnits: MLComputeUnits) async throws -> ChunkedEngine {
-        // iOS 18+ MLOptimizationHints — two complementary hints:
+        // iOS 18+ MLOptimizationHints:
         //
-        //   .specializationStrategy = .fastPrediction
+        //   .specializationStrategy = .fastPrediction (DEFAULT ON)
         //     Trades a longer first-load specialization for shorter per-
         //     prediction wall time. Set LLM_FAST_PREDICTION=0 to disable.
         //
-        //   .reshapeFrequency = .infrequent
-        //     Decode shape is fixed (single token); prefill chunks have static
-        //     shapes per chunk. This signals the runtime to skip per-call
-        //     reshape pathways. Set LLM_INFREQUENT_RESHAPE=0 to disable.
-        //
-        // Both default ON — they're zero-runtime-cost / specialization-time
-        // trades that directly reduce ANE busy time per dispatch.
+        //   .reshapeFrequency = .infrequent (DEFAULT OFF — opt-in)
+        //     Tells the runtime decode/prefill shapes are static. In theory
+        //     this skips per-call reshape pathways for ~1-3% latency win.
+        //     IN PRACTICE on iPhone 17 Pro (A19 Pro, iOS 26) this triggers
+        //     "MILCompilerForANE error: failed to compile ANE model using
+        //     ANEF" during chunk load. Default off until investigated;
+        //     opt-in via LLM_INFREQUENT_RESHAPE=1 to A/B on other devices.
         let fastPredictionEnabled = ProcessInfo.processInfo.environment["LLM_FAST_PREDICTION"] != "0"
-        let infrequentReshapeEnabled = ProcessInfo.processInfo.environment["LLM_INFREQUENT_RESHAPE"] != "0"
+        let infrequentReshapeEnabled = ProcessInfo.processInfo.environment["LLM_INFREQUENT_RESHAPE"] == "1"
         func applyHints(_ cfg: MLModelConfiguration) {
             if #available(iOS 18.0, macOS 15.0, *) {
                 var hints = MLOptimizationHints()
