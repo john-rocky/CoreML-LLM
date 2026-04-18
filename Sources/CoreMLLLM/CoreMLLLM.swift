@@ -560,23 +560,6 @@ public final class CoreMLLLM: @unchecked Sendable {
     ) throws -> AsyncStream<String> {
         let tokenIDs = tokenizer.encode(text: chatPrompt)
 
-        // Debug: dump prompt + token-ID breakdown for video diagnostics.
-        // Remove once the "still images" investigation concludes.
-        print("[DEBUG prompt] length=\(chatPrompt.count) chars, \(tokenIDs.count) tokens")
-        print("[DEBUG prompt text]\n\(chatPrompt)")
-        let vid = 258884, img = 258880, aud = 258881
-        let vidCount = tokenIDs.filter { $0 == vid }.count
-        let imgCount = tokenIDs.filter { $0 == img }.count
-        let audCount = tokenIDs.filter { $0 == aud }.count
-        print("[DEBUG tokens] video(\(vid))=\(vidCount) image(\(img))=\(imgCount) audio(\(aud))=\(audCount)")
-        if vidCount + imgCount > 0 {
-            for (i, t) in tokenIDs.enumerated() {
-                if t == vid || t == img || t == aud {
-                    print("  tok[\(i)] = \(t)")
-                }
-            }
-        }
-
         reset()
 
         // Clear recording buffers and record the prompt IDs for this turn.
