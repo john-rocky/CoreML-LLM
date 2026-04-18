@@ -760,25 +760,57 @@ final class ChunkedEngine {
 
         reset()
 
+        // ---- Pending-Token Skip decision ---------------------------------
+        // LiteRT-LM-style optimization: process only the first (realLen-1)
+        // prompt tokens through prefill chunks 1+2 (KV writes), skip
+        // chunks 3+4 entirely, and let the first decode step consume the
+        // stashed last prompt token — writing its KV and sampling the
+        // first generated token in one dispatch. Saves roughly half the
+        // prefill cost at the price of one decode step.
+        //
+        // Disabled when:
+        //   - realLen < 2 (nothing to pend)
+        //   - last prompt token is a multimodal placeholder (predictStep
+        //     would need image/audio features we can't reconstruct here)
+        //   - multimodal features are present at all (safety margin;
+        //     avoids per-token index drift between prefill and decode)
+        let IMAGE_TOKEN_ID = 258880
+        let AUDIO_TOKEN_ID = 258881
+        let VIDEO_TOKEN_ID = 258884
+        let pendingSkipEnabled = ProcessInfo.processInfo.environment["LLM_PENDING_TOKEN_SKIP"] == "1"
+        let lastPromptTid = tokenIDs[realLen - 1]
+        let lastIsMultimodal = lastPromptTid == IMAGE_TOKEN_ID
+            || lastPromptTid == AUDIO_TOKEN_ID
+            || lastPromptTid == VIDEO_TOKEN_ID
+        let hasMultimodalFeatures = imageFeatures != nil || audioFeatures != nil
+        let pendingSkip = pendingSkipEnabled && realLen >= 2
+            && !lastIsMultimodal && !hasMultimodalFeatures
+
+        let prefillTokens: [Int] = pendingSkip
+            ? Array(tokenIDs.prefix(realLen - 1))
+            : tokenIDs
+        let prefillLen = prefillTokens.count
+        // ------------------------------------------------------------------
+
         let prefillT0 = CFAbsoluteTimeGetCurrent()
 
-        let hiddenIn = try buildPrefillHidden(tokenIDs: tokenIDs, N: N, imageFeatures: imageFeatures,
+        let hiddenIn = try buildPrefillHidden(tokenIDs: prefillTokens, N: N, imageFeatures: imageFeatures,
                                                 imageNumTokens: imageNumTokens,
                                                 audioFeatures: audioFeatures, audioNumTokens: audioNumTokens)
-        let plRaw = try buildPrefillPLR(tokenIDs: tokenIDs, N: N)
+        let plRaw = try buildPrefillPLR(tokenIDs: prefillTokens, N: N)
         // If the prompt has any vision placeholders, use the
         // vision-group-aware mask so each contiguous run of image/video
         // tokens (= one frame / one image) attends bidirectionally
         // within itself — matching HF's `mm_token_type_ids` behavior.
-        let hasVision = tokenIDs.contains { $0 == 258880 || $0 == 258884 }
+        let hasVision = prefillTokens.contains { $0 == IMAGE_TOKEN_ID || $0 == VIDEO_TOKEN_ID }
         let causal = hasVision
-            ? try makePrefillVisionMask(tokenIDs: tokenIDs, N: N)
+            ? try makePrefillVisionMask(tokenIDs: prefillTokens, N: N)
             : try makePrefillCausalMask(N: N)
         let cosS = try buildPrefillRoPE(table: cosSlidingTable, N: N, dim: 256)
         let sinS = try buildPrefillRoPE(table: sinSlidingTable, N: N, dim: 256)
         let cosF = try buildPrefillRoPE(table: cosFullTable, N: N, dim: 512)
         let sinF = try buildPrefillRoPE(table: sinFullTable, N: N, dim: 512)
-        let lastMask = try makeLastPositionMask(N: N, realLen: realLen)
+        let lastMask = try makeLastPositionMask(N: N, realLen: prefillLen)
 
         let prepDt = CFAbsoluteTimeGetCurrent() - prefillT0
 
@@ -798,11 +830,11 @@ final class ChunkedEngine {
         // Write KV from chunk1 prefill → decode sliding/full caches
         for (name, slot, kv, hd) in kvMapChunk1Sliding() {
             try writeSlidingFromPrefill(src: out1, name: name, cache: kv, slot: slot,
-                                        realLen: realLen, hd: hd)
+                                        realLen: prefillLen, hd: hd)
         }
         for (name, slot, kv, hd) in kvMapChunk1Full() {
             try writeFullFromPrefill(src: out1, name: name, cache: kv, slot: slot,
-                                     realLen: realLen, hd: hd)
+                                     realLen: prefillLen, hd: hd)
         }
 
         // Prefill chunk 2
@@ -819,11 +851,11 @@ final class ChunkedEngine {
 
         for (name, slot, kv, hd) in kvMapChunk2Sliding() {
             try writeSlidingFromPrefill(src: out2, name: name, cache: kv, slot: slot,
-                                        realLen: realLen, hd: hd)
+                                        realLen: prefillLen, hd: hd)
         }
         for (name, slot, kv, hd) in kvMapChunk2Full() {
             try writeFullFromPrefill(src: out2, name: name, cache: kv, slot: slot,
-                                     realLen: realLen, hd: hd)
+                                     realLen: prefillLen, hd: hd)
         }
 
         let kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
@@ -841,6 +873,34 @@ final class ChunkedEngine {
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
         ]
+
+        // Pending-Token Skip (LLM_PENDING_TOKEN_SKIP=1): prefill chunks 1+2
+        // already wrote KV for positions 0..realLen-2 (prefillLen = realLen-1
+        // tokens were passed in). Skip chunks 3+4 of prefill and let the
+        // first decode step write KV at position realLen-1 AND sample the
+        // first generated token in the same dispatch. Semantically cleaner
+        // than PREFILL_BYPASS because there is no redundant KV write at the
+        // last position (PREFILL_BYPASS would have prefill c1/c2 and decode
+        // c1/c2 both write position realLen-1, idempotent but wasteful).
+        if pendingSkip {
+            let preDecodeTotal = CFAbsoluteTimeGetCurrent() - prefillT0
+            print("[Prefill] PENDING_SKIP prep=\(String(format: "%.1f", prepDt*1000))ms " +
+                  "c1=\(String(format: "%.1f", pc1Dt*1000))ms " +
+                  "c2=\(String(format: "%.1f", pc2Dt*1000))ms " +
+                  "c3/4=skipped " +
+                  "prefill=\(String(format: "%.1f", preDecodeTotal*1000))ms " +
+                  "(\(prefillLen) prefilled + 1 pending)")
+            let nextToken = try predictStep(tokenID: lastPromptTid, position: realLen - 1)
+            if let cache = prefixCache {
+                do {
+                    let blobs = captureKVSnapshot()
+                    try cache.store(tokenIDs: tokenIDs, buffers: blobs, position: realLen)
+                } catch {
+                    print("[PrefixCache] store failed: \(error)")
+                }
+            }
+            return nextToken
+        }
 
         // B1 bypass: chunks 3+4 are KV-shared read-only (no KV writes). For
         // prompt tokens 0..N-2 their hidden-state outputs are discarded; only
