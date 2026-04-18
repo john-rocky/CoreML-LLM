@@ -102,33 +102,27 @@ final class ChunkedEngine {
 
     static func load(from directory: URL, config: ModelConfig,
                      computeUnits: MLComputeUnits) async throws -> ChunkedEngine {
-        // iOS 18+ MLOptimizationHints:
+        // iOS 18+ MLOptimizationHints.specializationStrategy = .fastPrediction
+        // trades a longer first-load specialization for shorter per-prediction
+        // wall time. Enabled by default — the added load-time cost (~seconds)
+        // is amortized across the session, and a shorter ANE busy window per
+        // dispatch directly reduces sustained heat per token.
         //
-        //   .specializationStrategy = .fastPrediction (DEFAULT ON)
-        //     Trades a longer first-load specialization for shorter per-
-        //     prediction wall time. Set LLM_FAST_PREDICTION=0 to disable.
+        // Set LLM_FAST_PREDICTION=0 to disable (opt-out).
         //
-        //   .reshapeFrequency = .infrequent (DEFAULT OFF — opt-in)
-        //     Tells the runtime decode/prefill shapes are static. In theory
-        //     this skips per-call reshape pathways for ~1-3% latency win.
-        //     IN PRACTICE on iPhone 17 Pro (A19 Pro, iOS 26) this triggers
-        //     "MILCompilerForANE error: failed to compile ANE model using
-        //     ANEF" during chunk load. Default off until investigated;
-        //     opt-in via LLM_INFREQUENT_RESHAPE=1 to A/B on other devices.
+        // Removed: .reshapeFrequency = .infrequent. Worked stand-alone but
+        // combined with LLM_PREFIX_CACHE=1 reproducibly triggered
+        // "MILCompilerForANE error: failed to compile ANE model using ANEF"
+        // on iPhone 17 Pro (A19 Pro, iOS 26). 1-3% gain not worth the
+        // instability; removed entirely rather than left as opt-in to
+        // prevent accidental enable.
         let fastPredictionEnabled = ProcessInfo.processInfo.environment["LLM_FAST_PREDICTION"] != "0"
-        let infrequentReshapeEnabled = ProcessInfo.processInfo.environment["LLM_INFREQUENT_RESHAPE"] == "1"
         func applyHints(_ cfg: MLModelConfiguration) {
+            guard fastPredictionEnabled else { return }
             if #available(iOS 18.0, macOS 15.0, *) {
                 var hints = MLOptimizationHints()
-                if fastPredictionEnabled {
-                    hints.specializationStrategy = .fastPrediction
-                }
-                if infrequentReshapeEnabled {
-                    hints.reshapeFrequency = .infrequent
-                }
-                if fastPredictionEnabled || infrequentReshapeEnabled {
-                    cfg.optimizationHints = hints
-                }
+                hints.specializationStrategy = .fastPrediction
+                cfg.optimizationHints = hints
             }
         }
 
@@ -147,9 +141,6 @@ final class ChunkedEngine {
         }
         if fastPredictionEnabled {
             print("[Load] MLOptimizationHints.specializationStrategy = .fastPrediction")
-        }
-        if infrequentReshapeEnabled {
-            print("[Load] MLOptimizationHints.reshapeFrequency = .infrequent")
         }
 
         // Self-heal: remove any `prefill_chunk{i}.mlmodelc` directories that
