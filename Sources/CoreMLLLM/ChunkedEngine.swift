@@ -277,13 +277,16 @@ final class ChunkedEngine {
             }
         }
 
-        // SWA KV buffers — IOSurface-backed for zero-copy CPU↔ANE transfer
+        // SWA KV buffers — IOSurface-backed for zero-copy CPU↔ANE transfer.
+        // Slot counts (num_sliding_in_chunk / num_full_in_chunk) and num_kv_heads
+        // are read from each chunk's input description so E2B (nkv=1, 7/1, 5/2)
+        // and E4B (nkv=2, 10/2, 10/2) both allocate the right shapes.
         let maxHd = 512
         let ctx = configuredCtx
         let W = config.slidingWindow
-        func ioSurfaceArray(slots: Int, seqLen: Int) throws -> MLMultiArray {
+        func ioSurfaceArray(slots: Int, nkv: Int, seqLen: Int) throws -> MLMultiArray {
             let width = maxHd
-            let height = slots * 1 * seqLen
+            let height = slots * nkv * seqLen
             var pixelBuffer: CVPixelBuffer?
             let attrs: [String: Any] = [
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
@@ -297,19 +300,35 @@ final class ChunkedEngine {
                 CVPixelBufferLockBaseAddress(pb, [])
                 memset(CVPixelBufferGetBaseAddress(pb)!, 0, CVPixelBufferGetDataSize(pb))
                 CVPixelBufferUnlockBaseAddress(pb, [])
-                let shape: [NSNumber] = [NSNumber(value: slots), 1,
+                let shape: [NSNumber] = [NSNumber(value: slots), NSNumber(value: nkv),
                                           NSNumber(value: seqLen), NSNumber(value: maxHd)]
                 return try MLMultiArray(pixelBuffer: pb, shape: shape)
             }
             // Fallback to standard allocation
-            print("[KV] IOSurface failed for \(slots)x\(seqLen)x\(maxHd), using standard MLMultiArray")
+            print("[KV] IOSurface failed for \(slots)x\(nkv)x\(seqLen)x\(maxHd), using standard MLMultiArray")
             let arr = try MLMultiArray(
-                shape: [NSNumber(value: slots), 1, NSNumber(value: seqLen), NSNumber(value: maxHd)],
+                shape: [NSNumber(value: slots), NSNumber(value: nkv),
+                        NSNumber(value: seqLen), NSNumber(value: maxHd)],
                 dataType: .float16)
-            memset(arr.dataPointer, 0, slots * seqLen * maxHd * MemoryLayout<UInt16>.stride)
+            memset(arr.dataPointer, 0, slots * nkv * seqLen * maxHd * MemoryLayout<UInt16>.stride)
             return arr
         }
-        print("[KV] Allocating IOSurface-backed KV cache buffers (ctx=\(ctx))")
+
+        // Probe the chunk models for expected KV shapes. Shape is (slots, nkv, seqLen, maxHd).
+        func kvShape(_ model: MLModel, _ name: String) -> (slots: Int, nkv: Int)? {
+            guard let desc = model.modelDescription.inputDescriptionsByName[name],
+                  let c = desc.multiArrayConstraint else { return nil }
+            let s = c.shape
+            guard s.count == 4 else { return nil }
+            return (s[0].intValue, s[1].intValue)
+        }
+        let c1KS = kvShape(c1!, "K_sliding_in") ?? (7, 1)
+        let c1KF = kvShape(c1!, "K_full_in")    ?? (1, 1)
+        let c2KS = kvShape(c2!, "K_sliding_in") ?? (5, 1)
+        let c2KF = kvShape(c2!, "K_full_in")    ?? (2, 1)
+        print("[KV] Allocating IOSurface-backed KV cache buffers (ctx=\(ctx)) — " +
+              "c1 sliding=\(c1KS.slots)x\(c1KS.nkv) full=\(c1KF.slots)x\(c1KF.nkv), " +
+              "c2 sliding=\(c2KS.slots)x\(c2KS.nkv) full=\(c2KF.slots)x\(c2KF.nkv)")
 
         let engine = try ChunkedEngine(
             chunk1: c1, chunk2: c2, chunk3: c3, chunk4: c4,
@@ -320,10 +339,14 @@ final class ChunkedEngine {
             perLayerProjF32: projF32, perLayerNormWeight: normWeight,
             cosSlidingTable: cosS, sinSlidingTable: sinS,
             cosFullTable: cosF, sinFullTable: sinF,
-            kSliding1: ioSurfaceArray(slots: 7, seqLen: W), vSliding1: ioSurfaceArray(slots: 7, seqLen: W),
-            kFull1: ioSurfaceArray(slots: 1, seqLen: ctx), vFull1: ioSurfaceArray(slots: 1, seqLen: ctx),
-            kSliding2: ioSurfaceArray(slots: 5, seqLen: W), vSliding2: ioSurfaceArray(slots: 5, seqLen: W),
-            kFull2: ioSurfaceArray(slots: 2, seqLen: ctx), vFull2: ioSurfaceArray(slots: 2, seqLen: ctx),
+            kSliding1: ioSurfaceArray(slots: c1KS.slots, nkv: c1KS.nkv, seqLen: W),
+            vSliding1: ioSurfaceArray(slots: c1KS.slots, nkv: c1KS.nkv, seqLen: W),
+            kFull1:    ioSurfaceArray(slots: c1KF.slots, nkv: c1KF.nkv, seqLen: ctx),
+            vFull1:    ioSurfaceArray(slots: c1KF.slots, nkv: c1KF.nkv, seqLen: ctx),
+            kSliding2: ioSurfaceArray(slots: c2KS.slots, nkv: c2KS.nkv, seqLen: W),
+            vSliding2: ioSurfaceArray(slots: c2KS.slots, nkv: c2KS.nkv, seqLen: W),
+            kFull2:    ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx),
+            vFull2:    ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx),
             config: config, prefillN: prefillN)
 
         // ANE pipeline prewarm (Phase 0b): four dummy decode steps at load

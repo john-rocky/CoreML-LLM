@@ -34,14 +34,36 @@ import coremltools as ct
 from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
 
 from ane_ops import MODEL_DTYPE
+from config import MODEL_REGISTRY
 from models.gemma4 import Gemma4Model
 from models.gemma4_swa_chunks import (
     SWAChunk1, SWAChunk2, SWAChunk3, SWAChunk4,
     SWAVerifyChunk1, SWAVerifyChunk2, SWAVerifyChunk3, SWAVerifyChunk4,
+    compute_chunk_boundaries,
 )
 
-HF_DIR = os.environ.get("GEMMA4_HF_DIR", f"{ROOT}/../output/gemma4-e2b/hf_model")
+DEFAULT_HF_DIR = os.environ.get("GEMMA4_HF_DIR", f"{ROOT}/../output/gemma4-e2b/hf_model")
 fp16 = np.float16
+
+
+def _resolve_hf_dir(model_name: str, override: str | None) -> str:
+    """Return a local HF dir: --hf-dir override wins, else auto-download by registry entry."""
+    if override:
+        return override
+    if model_name in MODEL_REGISTRY:
+        from huggingface_hub import snapshot_download
+        repo = MODEL_REGISTRY[model_name].hf_repo
+        local = os.path.join(ROOT, "..", "output", model_name, "hf_model")
+        if not os.path.isdir(local) or not any(
+            fn.endswith(".safetensors") for fn in os.listdir(local)
+        ):
+            print(f"Downloading {repo} to {local}...")
+            snapshot_download(
+                repo, local_dir=local,
+                allow_patterns=["*.safetensors", "*.json", "tokenizer*", "*.txt", "*.model"],
+            )
+        return local
+    return DEFAULT_HF_DIR
 
 
 def trace_and_convert(model, sample_inputs, input_specs, output_names, quantize=True):
@@ -101,17 +123,26 @@ def build_multifunction(decode_path, verify_path, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Build multi-function verify chunks")
-    parser.add_argument("--output", type=str, default="/tmp/gemma4-multi",
-                        help="Output directory")
-    parser.add_argument("--hf-dir", type=str, default=HF_DIR,
-                        help="HuggingFace model directory")
+    parser.add_argument("--model", type=str, default="gemma4-e2b",
+                        help="Model name in MODEL_REGISTRY (gemma4-e2b | gemma4-e4b)")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output directory (default: ../output/<model>/chunks)")
+    parser.add_argument("--hf-dir", type=str, default=None,
+                        help="Override HF model directory (skip auto-download)")
     parser.add_argument("--K", type=int, default=3,
                         help="Number of draft tokens for verification (default: 3)")
-    parser.add_argument("--ctx", type=int, default=2048,
-                        help="Context length (default: 2048)")
+    parser.add_argument("--ctx", type=int, default=None,
+                        help="Context length (default: registry entry's default)")
     parser.add_argument("--no-quantize", action="store_true",
                         help="Skip int4 palettization")
     args = parser.parse_args()
+
+    if args.output is None:
+        args.output = os.path.join(ROOT, "..", "output", args.model, "chunks")
+    if args.ctx is None and args.model in MODEL_REGISTRY:
+        args.ctx = MODEL_REGISTRY[args.model].default_context_length
+    elif args.ctx is None:
+        args.ctx = 2048
 
     os.makedirs(args.output, exist_ok=True)
     tmp = os.path.join(args.output, "_tmp")
@@ -119,38 +150,47 @@ def main():
 
     K = args.K
     CTX = args.ctx
-    W = 512
     quantize = not args.no_quantize
 
-    print(f"Loading Gemma 4 E2B from {args.hf_dir}...")
-    base = Gemma4Model.from_pretrained(args.hf_dir, context_length=CTX)
+    hf_dir = _resolve_hf_dir(args.model, args.hf_dir)
+    print(f"Loading {args.model} from {hf_dir}...")
+    base = Gemma4Model.from_pretrained(hf_dir, context_length=CTX)
     base.eval()
 
     hidden = base.config.hidden_size
     pld = base.config.hidden_size_per_layer_input
     nlayers = base.config.num_hidden_layers
-    max_hd = 512
+    W = base.config.sliding_window
+    hd_s = base.config.head_dim
+    hd_f = base.config.global_head_dim
+    max_hd = hd_f
+    boundaries = compute_chunk_boundaries(base.config)
 
     print(f"\nK={K}, CTX={CTX}, W={W}, hidden={hidden}, pld={pld}, nlayers={nlayers}")
+    print(f"head_dim={hd_s}, global_head_dim={hd_f}, num_kv_heads={base.config.num_key_value_heads}")
+    print(f"KV producers: sliding=L{base.config.kv_sliding_producer}, full=L{base.config.kv_full_producer}")
+    print(f"Chunk boundaries: {boundaries}")
     print(f"Quantize: {'int4' if quantize else 'fp16'}\n")
 
     # ================================================================
     # Common input specs for chunks 3/4 (shared KV)
     # ================================================================
+    nkv = base.config.num_key_value_heads
+
     def shared_kv_inputs(seq, prefix_name="per_layer_combined"):
         return [
             ct.TensorType(name="hidden_states",       shape=(1, seq, hidden),       dtype=fp16),
             ct.TensorType(name="causal_mask_full",     shape=(1, 1, seq, CTX),       dtype=fp16),
             ct.TensorType(name="causal_mask_sliding",  shape=(1, 1, seq, W),         dtype=fp16),
             ct.TensorType(name=prefix_name,            shape=(1, seq, nlayers * pld), dtype=fp16),
-            ct.TensorType(name="cos_s",                shape=(1, 1, seq, 256),       dtype=fp16),
-            ct.TensorType(name="sin_s",                shape=(1, 1, seq, 256),       dtype=fp16),
-            ct.TensorType(name="cos_f",                shape=(1, 1, seq, 512),       dtype=fp16),
-            ct.TensorType(name="sin_f",                shape=(1, 1, seq, 512),       dtype=fp16),
-            ct.TensorType(name="kv13_k",               shape=(1, 1, W, 256),         dtype=fp16),
-            ct.TensorType(name="kv13_v",               shape=(1, 1, W, 256),         dtype=fp16),
-            ct.TensorType(name="kv14_k",               shape=(1, 1, CTX, 512),       dtype=fp16),
-            ct.TensorType(name="kv14_v",               shape=(1, 1, CTX, 512),       dtype=fp16),
+            ct.TensorType(name="cos_s",                shape=(1, 1, seq, hd_s),      dtype=fp16),
+            ct.TensorType(name="sin_s",                shape=(1, 1, seq, hd_s),      dtype=fp16),
+            ct.TensorType(name="cos_f",                shape=(1, 1, seq, hd_f),      dtype=fp16),
+            ct.TensorType(name="sin_f",                shape=(1, 1, seq, hd_f),      dtype=fp16),
+            ct.TensorType(name="kv13_k",               shape=(1, nkv, W, hd_s),      dtype=fp16),
+            ct.TensorType(name="kv13_v",               shape=(1, nkv, W, hd_s),      dtype=fp16),
+            ct.TensorType(name="kv14_k",               shape=(1, nkv, CTX, hd_f),    dtype=fp16),
+            ct.TensorType(name="kv14_v",               shape=(1, nkv, CTX, hd_f),    dtype=fp16),
         ]
 
     def shared_kv_samples(seq):
@@ -159,40 +199,42 @@ def main():
             torch.zeros(1, 1, seq, CTX, dtype=torch.float16),
             torch.zeros(1, 1, seq, W, dtype=torch.float16),
             torch.zeros(1, seq, nlayers * pld, dtype=torch.float16),
-            torch.zeros(1, 1, seq, 256, dtype=torch.float16),
-            torch.zeros(1, 1, seq, 256, dtype=torch.float16),
-            torch.zeros(1, 1, seq, 512, dtype=torch.float16),
-            torch.zeros(1, 1, seq, 512, dtype=torch.float16),
-            torch.zeros(1, 1, W, 256, dtype=torch.float16),
-            torch.zeros(1, 1, W, 256, dtype=torch.float16),
-            torch.zeros(1, 1, CTX, 512, dtype=torch.float16),
-            torch.zeros(1, 1, CTX, 512, dtype=torch.float16),
+            torch.zeros(1, 1, seq, hd_s, dtype=torch.float16),
+            torch.zeros(1, 1, seq, hd_s, dtype=torch.float16),
+            torch.zeros(1, 1, seq, hd_f, dtype=torch.float16),
+            torch.zeros(1, 1, seq, hd_f, dtype=torch.float16),
+            torch.zeros(1, nkv, W, hd_s, dtype=torch.float16),
+            torch.zeros(1, nkv, W, hd_s, dtype=torch.float16),
+            torch.zeros(1, nkv, CTX, hd_f, dtype=torch.float16),
+            torch.zeros(1, nkv, CTX, hd_f, dtype=torch.float16),
         )
 
     # ================================================================
-    # Chunk 1: L0-7, 7 sliding + 1 full, owns KV cache
+    # Chunk 1: own KV cache
     # ================================================================
+    c1_start, c1_end = boundaries[0]
     print("=" * 60)
-    print("CHUNK 1 (L0-7)")
+    print(f"CHUNK 1 (L{c1_start}-{c1_end-1})")
     print("=" * 60)
 
     # -- Decode Q=1 --
     print("\n  [decode_q1]")
-    swa1 = SWAChunk1(base).eval()
+    swa1 = SWAChunk1(base, c1_start, c1_end).eval()
+    ns1, nf1 = swa1.num_sliding, swa1.num_full
     s1 = (
         torch.zeros(1, 1, hidden, dtype=torch.float16),
         torch.zeros(1, 1, 1, CTX, dtype=torch.float16),
         torch.zeros(1, 1, 1, W, dtype=torch.float16),
         torch.zeros(1, 1, CTX, 1, dtype=torch.float16),
         torch.zeros(1, 1, nlayers * pld, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 256, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 256, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 512, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 512, dtype=torch.float16),
-        torch.zeros(7, 1, W, max_hd, dtype=torch.float16),
-        torch.zeros(7, 1, W, max_hd, dtype=torch.float16),
-        torch.zeros(1, 1, CTX, max_hd, dtype=torch.float16),
-        torch.zeros(1, 1, CTX, max_hd, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_f, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_f, dtype=torch.float16),
+        torch.zeros(ns1, nkv, W, max_hd, dtype=torch.float16),
+        torch.zeros(ns1, nkv, W, max_hd, dtype=torch.float16),
+        torch.zeros(max(nf1, 1), nkv, CTX, max_hd, dtype=torch.float16),
+        torch.zeros(max(nf1, 1), nkv, CTX, max_hd, dtype=torch.float16),
     )
     in1 = [
         ct.TensorType(name="hidden_states",       shape=s1[0].shape,  dtype=fp16),
@@ -217,21 +259,21 @@ def main():
 
     # -- Verify Q=K (write-through) --
     print(f"\n  [verify_qK] K={K} (write-through)")
-    vc1 = SWAVerifyChunk1(base, seq_len=K).eval()
+    vc1 = SWAVerifyChunk1(base, seq_len=K, start=c1_start, end=c1_end).eval()
     vs1 = (
         torch.zeros(1, K, hidden, dtype=torch.float16),
         torch.zeros(1, 1, K, CTX, dtype=torch.float16),
         torch.zeros(1, 1, K, W, dtype=torch.float16),
         torch.zeros(1, 1, CTX, K, dtype=torch.float16),  # update_indicator
         torch.zeros(1, K, nlayers * pld, dtype=torch.float16),
-        torch.zeros(1, 1, K, 256, dtype=torch.float16),
-        torch.zeros(1, 1, K, 256, dtype=torch.float16),
-        torch.zeros(1, 1, K, 512, dtype=torch.float16),
-        torch.zeros(1, 1, K, 512, dtype=torch.float16),
-        torch.zeros(7, 1, W, max_hd, dtype=torch.float16),
-        torch.zeros(7, 1, W, max_hd, dtype=torch.float16),
-        torch.zeros(1, 1, CTX, max_hd, dtype=torch.float16),
-        torch.zeros(1, 1, CTX, max_hd, dtype=torch.float16),
+        torch.zeros(1, 1, K, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, K, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, K, hd_f, dtype=torch.float16),
+        torch.zeros(1, 1, K, hd_f, dtype=torch.float16),
+        torch.zeros(ns1, nkv, W, max_hd, dtype=torch.float16),
+        torch.zeros(ns1, nkv, W, max_hd, dtype=torch.float16),
+        torch.zeros(max(nf1, 1), nkv, CTX, max_hd, dtype=torch.float16),
+        torch.zeros(max(nf1, 1), nkv, CTX, max_hd, dtype=torch.float16),
     )
     vin1 = [
         ct.TensorType(name="hidden_states",       shape=vs1[0].shape,  dtype=fp16),
@@ -262,29 +304,31 @@ def main():
         f"{args.output}/chunk1.mlpackage")
 
     # ================================================================
-    # Chunk 2: L8-14, 5 sliding + 2 full, owns KV cache
+    # Chunk 2: own KV cache; emits producer KV (kv13_*/kv14_* aliases)
     # ================================================================
+    c2_start, c2_end = boundaries[1]
     print("\n" + "=" * 60)
-    print("CHUNK 2 (L8-14)")
+    print(f"CHUNK 2 (L{c2_start}-{c2_end-1})")
     print("=" * 60)
 
     # -- Decode Q=1 --
     print("\n  [decode_q1]")
-    swa2 = SWAChunk2(base).eval()
+    swa2 = SWAChunk2(base, c2_start, c2_end).eval()
+    ns2, nf2 = swa2.num_sliding, swa2.num_full
     s2 = (
         torch.zeros(1, 1, hidden, dtype=torch.float16),
         torch.zeros(1, 1, 1, CTX, dtype=torch.float16),
         torch.zeros(1, 1, 1, W, dtype=torch.float16),
         torch.zeros(1, 1, CTX, 1, dtype=torch.float16),
         torch.zeros(1, 1, nlayers * pld, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 256, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 256, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 512, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 512, dtype=torch.float16),
-        torch.zeros(5, 1, W, max_hd, dtype=torch.float16),
-        torch.zeros(5, 1, W, max_hd, dtype=torch.float16),
-        torch.zeros(2, 1, CTX, max_hd, dtype=torch.float16),
-        torch.zeros(2, 1, CTX, max_hd, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_f, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_f, dtype=torch.float16),
+        torch.zeros(ns2, nkv, W, max_hd, dtype=torch.float16),
+        torch.zeros(ns2, nkv, W, max_hd, dtype=torch.float16),
+        torch.zeros(nf2, nkv, CTX, max_hd, dtype=torch.float16),
+        torch.zeros(nf2, nkv, CTX, max_hd, dtype=torch.float16),
     )
     in2 = [
         ct.TensorType(name="hidden_states",       shape=s2[0].shape,  dtype=fp16),
@@ -309,21 +353,21 @@ def main():
 
     # -- Verify Q=K (write-through) --
     print(f"\n  [verify_qK] K={K} (write-through)")
-    vc2 = SWAVerifyChunk2(base, seq_len=K).eval()
+    vc2 = SWAVerifyChunk2(base, seq_len=K, start=c2_start, end=c2_end).eval()
     vs2 = (
         torch.zeros(1, K, hidden, dtype=torch.float16),
         torch.zeros(1, 1, K, CTX, dtype=torch.float16),
         torch.zeros(1, 1, K, W, dtype=torch.float16),
         torch.zeros(1, 1, CTX, K, dtype=torch.float16),  # update_indicator
         torch.zeros(1, K, nlayers * pld, dtype=torch.float16),
-        torch.zeros(1, 1, K, 256, dtype=torch.float16),
-        torch.zeros(1, 1, K, 256, dtype=torch.float16),
-        torch.zeros(1, 1, K, 512, dtype=torch.float16),
-        torch.zeros(1, 1, K, 512, dtype=torch.float16),
-        torch.zeros(5, 1, W, max_hd, dtype=torch.float16),
-        torch.zeros(5, 1, W, max_hd, dtype=torch.float16),
-        torch.zeros(2, 1, CTX, max_hd, dtype=torch.float16),
-        torch.zeros(2, 1, CTX, max_hd, dtype=torch.float16),
+        torch.zeros(1, 1, K, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, K, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, K, hd_f, dtype=torch.float16),
+        torch.zeros(1, 1, K, hd_f, dtype=torch.float16),
+        torch.zeros(ns2, nkv, W, max_hd, dtype=torch.float16),
+        torch.zeros(ns2, nkv, W, max_hd, dtype=torch.float16),
+        torch.zeros(nf2, nkv, CTX, max_hd, dtype=torch.float16),
+        torch.zeros(nf2, nkv, CTX, max_hd, dtype=torch.float16),
     )
     vin2 = [
         ct.TensorType(name="hidden_states",       shape=vs2[0].shape,  dtype=fp16),
@@ -355,29 +399,30 @@ def main():
         f"{args.output}/chunk2.mlpackage")
 
     # ================================================================
-    # Chunk 3: L15-24, all KV-shared
+    # Chunk 3: all KV-shared
     # ================================================================
+    c3_start, c3_end = boundaries[2]
     print("\n" + "=" * 60)
-    print("CHUNK 3 (L15-24, KV-shared)")
+    print(f"CHUNK 3 (L{c3_start}-{c3_end-1}, KV-shared)")
     print("=" * 60)
 
     # -- Decode Q=1 --
     print("\n  [decode_q1]")
-    swa3 = SWAChunk3(base).eval()
+    swa3 = SWAChunk3(base, c3_start, c3_end).eval()
     s3_decode = (
         torch.zeros(1, 1, hidden, dtype=torch.float16),
         torch.zeros(1, 1, 1, CTX, dtype=torch.float16),
         torch.zeros(1, 1, 1, W, dtype=torch.float16),
         torch.zeros(1, 1, CTX, 1, dtype=torch.float16),
         torch.zeros(1, 1, nlayers * pld, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 256, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 256, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 512, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 512, dtype=torch.float16),
-        torch.zeros(1, 1, W, 256, dtype=torch.float16),
-        torch.zeros(1, 1, W, 256, dtype=torch.float16),
-        torch.zeros(1, 1, CTX, 512, dtype=torch.float16),
-        torch.zeros(1, 1, CTX, 512, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_f, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_f, dtype=torch.float16),
+        torch.zeros(1, nkv, W, hd_s, dtype=torch.float16),
+        torch.zeros(1, nkv, W, hd_s, dtype=torch.float16),
+        torch.zeros(1, nkv, CTX, hd_f, dtype=torch.float16),
+        torch.zeros(1, nkv, CTX, hd_f, dtype=torch.float16),
     )
     in3_decode = [
         ct.TensorType(name="hidden_states",       shape=s3_decode[0].shape,  dtype=fp16),
@@ -401,7 +446,7 @@ def main():
 
     # -- Verify Q=K --
     print(f"\n  [verify_qK] K={K}")
-    vc3 = SWAVerifyChunk3(base, seq_len=K).eval()
+    vc3 = SWAVerifyChunk3(base, seq_len=K, start=c3_start, end=c3_end).eval()
     s3_verify = shared_kv_samples(K)
     in3_verify = shared_kv_inputs(K)
     verify3 = trace_and_convert(vc3, s3_verify, in3_verify, ["hidden_states_out"],
@@ -417,29 +462,30 @@ def main():
         f"{args.output}/chunk3.mlpackage")
 
     # ================================================================
-    # Chunk 4: L25-34 + norm + lm_head, all KV-shared
+    # Chunk 4: all KV-shared + norm + lm_head
     # ================================================================
+    c4_start, c4_end = boundaries[3]
     print("\n" + "=" * 60)
-    print("CHUNK 4 (L25-34 + LM head, KV-shared)")
+    print(f"CHUNK 4 (L{c4_start}-{c4_end-1} + LM head, KV-shared)")
     print("=" * 60)
 
     # -- Decode Q=1 --
     print("\n  [decode_q1]")
-    swa4 = SWAChunk4(base).eval()
+    swa4 = SWAChunk4(base, c4_start, c4_end).eval()
     s4_decode = (
         torch.zeros(1, 1, hidden, dtype=torch.float16),
         torch.zeros(1, 1, 1, CTX, dtype=torch.float16),
         torch.zeros(1, 1, 1, W, dtype=torch.float16),
         torch.zeros(1, 1, CTX, 1, dtype=torch.float16),
         torch.zeros(1, 1, nlayers * pld, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 256, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 256, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 512, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 512, dtype=torch.float16),
-        torch.zeros(1, 1, W, 256, dtype=torch.float16),
-        torch.zeros(1, 1, W, 256, dtype=torch.float16),
-        torch.zeros(1, 1, CTX, 512, dtype=torch.float16),
-        torch.zeros(1, 1, CTX, 512, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_f, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_f, dtype=torch.float16),
+        torch.zeros(1, nkv, W, hd_s, dtype=torch.float16),
+        torch.zeros(1, nkv, W, hd_s, dtype=torch.float16),
+        torch.zeros(1, nkv, CTX, hd_f, dtype=torch.float16),
+        torch.zeros(1, nkv, CTX, hd_f, dtype=torch.float16),
     )
     in4_decode = [
         ct.TensorType(name="hidden_states",       shape=s4_decode[0].shape,  dtype=fp16),
@@ -464,7 +510,7 @@ def main():
 
     # -- Verify Q=K --
     print(f"\n  [verify_qK] K={K}")
-    vc4 = SWAVerifyChunk4(base, seq_len=K).eval()
+    vc4 = SWAVerifyChunk4(base, seq_len=K, start=c4_start, end=c4_end).eval()
     s4_verify = shared_kv_samples(K)
     in4_verify = shared_kv_inputs(K)
     verify4 = trace_and_convert(vc4, s4_verify, in4_verify,
@@ -487,10 +533,8 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"Multi-function chunks saved to {args.output}/")
-    print(f"  chunk1.mlpackage — L0-7   (decode_q1 + verify_qK, K={K})")
-    print(f"  chunk2.mlpackage — L8-14  (decode_q1 + verify_qK, K={K})")
-    print(f"  chunk3.mlpackage — L15-24 (decode_q1 + verify_qK, K={K})")
-    print(f"  chunk4.mlpackage — L25-34 (decode_q1 + verify_qK, K={K})")
+    for i, (s, e) in enumerate(boundaries, start=1):
+        print(f"  chunk{i}.mlpackage — L{s}-{e-1} (decode_q1 + verify_qK, K={K})")
     print(f"\nEach mlpackage has two functions:")
     print(f"  decode_q1 (default) — standard Q=1 autoregressive decode")
     print(f"  verify_qK           — Q={K} batched speculative verification")

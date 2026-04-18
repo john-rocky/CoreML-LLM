@@ -80,7 +80,17 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
             folderName: "qwen2.5-0.5b")
 
-        public static let defaults: [ModelInfo] = [gemma4e2b, qwen25_05b]
+        /// Gemma 4 E4B — 42 layers, hidden=2560, 2 KV heads, text-only decoder.
+        /// INT4 palettized, ctx=2048. Baseline ~14 tok/s on iPhone 17 Pro.
+        /// A local build (`conversion/build_gemma4_bundle.py --model gemma4-e4b`)
+        /// + USB sideload to `Documents/Models/gemma4-e4b/` is also supported —
+        /// the app treats the folder as "downloaded" once present.
+        public static let gemma4e4b = ModelInfo(
+            id: "gemma4-e4b", name: "Gemma 4 E4B", size: "5.5 GB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml/resolve/main",
+            folderName: "gemma4-e4b")
+
+        public static let defaults: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b]
     }
 
     private struct DownloadFile: Codable {
@@ -564,6 +574,13 @@ public final class ModelDownloader: NSObject {
     // MARK: - HuggingFace File List
 
     private func buildHuggingFaceFileList(_ model: ModelInfo) {
+        // E4B lives in its own repo with a flat layout (chunks at the root,
+        // text-only — no prefill, vision, or audio). E2B lives under swa/ +
+        // prefill/ + vision/audio at root.
+        if model.id == "gemma4-e4b" {
+            buildE4BFileList()
+            return
+        }
         // 2K-context shipping model lives at the repo root on HF:
         //   - Decode chunks:  swa/chunk{1-4}.mlmodelc/
         //   - Prefill chunks: prefill/chunk{1-4}.mlmodelc/  (remote name is
@@ -664,6 +681,67 @@ public final class ModelDownloader: NSObject {
         }
 
         // Large files first (sorted biggest-first) so all 4 connections saturate immediately
+        largeFiles.sort { $0.estimatedSize > $1.estimatedSize }
+        pendingFiles = largeFiles + smallFiles
+        totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
+        completedBytes = 0
+        nextFileIndex = 0
+    }
+
+    /// Gemma 4 E4B layout on `mlboydaisuke/gemma-4-E4B-coreml`. Text-only
+    /// decoder with a flat directory tree (no `swa/` or `prefill/` prefixes,
+    /// no vision/audio towers). Produced by
+    /// `conversion/build_gemma4_bundle.py --model gemma4-e4b`.
+    private func buildE4BFileList() {
+        func mlc(_ name: String, weightSize: Int64) -> [DownloadFile] {
+            [.init(remotePath: "\(name).mlmodelc/weights/weight.bin",
+                   localPath: "\(name).mlmodelc/weights/weight.bin", estimatedSize: weightSize),
+             .init(remotePath: "\(name).mlmodelc/coremldata.bin",
+                   localPath: "\(name).mlmodelc/coremldata.bin", estimatedSize: 1_200),
+             .init(remotePath: "\(name).mlmodelc/model.mil",
+                   localPath: "\(name).mlmodelc/model.mil", estimatedSize: 1_250_000),
+             .init(remotePath: "\(name).mlmodelc/metadata.json",
+                   localPath: "\(name).mlmodelc/metadata.json", estimatedSize: 25_000),
+             .init(remotePath: "\(name).mlmodelc/analytics/coremldata.bin",
+                   localPath: "\(name).mlmodelc/analytics/coremldata.bin", estimatedSize: 250)]
+        }
+
+        // Chunk weight sizes (observed from the shipping bundle; larger than E2B
+        // because hidden=2560 and intermediate=10240 doubles the MLP wide).
+        let chunkFiles: [DownloadFile] =
+              mlc("chunk1", weightSize: 586_000_000)   // 558.8 MB
+            + mlc("chunk2", weightSize: 572_000_000)   // 545.7 MB
+            + mlc("chunk3", weightSize: 413_000_000)   // 393.6 MB
+            + mlc("chunk4", weightSize: 754_000_000)   // 718.9 MB (includes LM head)
+
+        let extraFiles: [DownloadFile] = [
+            .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 800),
+            .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 32_200_000),
+            .init(remotePath: "hf_model/tokenizer_config.json", localPath: "hf_model/tokenizer_config.json", estimatedSize: 2_200),
+            .init(remotePath: "hf_model/config.json", localPath: "hf_model/config.json", estimatedSize: 5_200),
+            .init(remotePath: "hf_model/generation_config.json", localPath: "hf_model/generation_config.json", estimatedSize: 300),
+            .init(remotePath: "embed_tokens_q8.bin", localPath: "embed_tokens_q8.bin", estimatedSize: 671_088_640),
+            .init(remotePath: "embed_tokens_scales.bin", localPath: "embed_tokens_scales.bin", estimatedSize: 524_288),
+            .init(remotePath: "embed_tokens_per_layer_q8.bin", localPath: "embed_tokens_per_layer_q8.bin", estimatedSize: 2_825_912_320),
+            .init(remotePath: "embed_tokens_per_layer_scales.bin", localPath: "embed_tokens_per_layer_scales.bin", estimatedSize: 524_288),
+            .init(remotePath: "per_layer_projection.bin", localPath: "per_layer_projection.bin", estimatedSize: 55_050_240),
+            .init(remotePath: "per_layer_norm_weight.bin", localPath: "per_layer_norm_weight.bin", estimatedSize: 512),
+            .init(remotePath: "cos_sliding.npy", localPath: "cos_sliding.npy", estimatedSize: 2_097_280),
+            .init(remotePath: "sin_sliding.npy", localPath: "sin_sliding.npy", estimatedSize: 2_097_280),
+            .init(remotePath: "cos_full.npy", localPath: "cos_full.npy", estimatedSize: 4_194_432),
+            .init(remotePath: "sin_full.npy", localPath: "sin_full.npy", estimatedSize: 4_194_432),
+        ]
+
+        var largeFiles: [DownloadFile] = []
+        var smallFiles: [DownloadFile] = []
+        let threshold: Int64 = 10_000_000
+        for file in chunkFiles + extraFiles {
+            if file.estimatedSize >= threshold {
+                largeFiles.append(file)
+            } else {
+                smallFiles.append(file)
+            }
+        }
         largeFiles.sort { $0.estimatedSize > $1.estimatedSize }
         pendingFiles = largeFiles + smallFiles
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }

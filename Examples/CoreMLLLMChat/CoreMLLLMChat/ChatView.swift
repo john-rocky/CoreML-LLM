@@ -305,11 +305,13 @@ struct ChatView: View {
     }
 
     private func loadModel(from folderURL: URL) {
-        // Use bundled model if available (for testing without HF download)
-        let bundled = Bundle.main.url(forResource: "gemma4-e2b", withExtension: nil)
-        let folder = bundled ?? folderURL
+        // Always honor the user's selection from ModelPickerView. The previous
+        // `Bundle.main.url(forResource: "gemma4-e2b")` fallback silently
+        // overrode E4B selections when a bundled E2B existed in the Xcode
+        // project — breaking multi-model switching.
+        let folder = folderURL
         let modelURL = folder.appendingPathComponent("model.mlpackage")
-        messages.append(ChatMessage(role: .system, content: "Loading model..."))
+        messages.append(ChatMessage(role: .system, content: "Loading \(folder.lastPathComponent)..."))
         // Detached so the synchronous MLModel(contentsOf:) calls inside
         // loadChunked can't block the main actor / UI thread.
         Task.detached(priority: .userInitiated) {
