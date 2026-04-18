@@ -109,6 +109,13 @@ final class ChunkedEngine {
         // dispatch directly reduces sustained heat per token.
         //
         // Set LLM_FAST_PREDICTION=0 to disable (opt-out).
+        //
+        // Removed: .reshapeFrequency = .infrequent. Worked stand-alone but
+        // combined with LLM_PREFIX_CACHE=1 reproducibly triggered
+        // "MILCompilerForANE error: failed to compile ANE model using ANEF"
+        // on iPhone 17 Pro (A19 Pro, iOS 26). 1-3% gain not worth the
+        // instability; removed entirely rather than left as opt-in to
+        // prevent accidental enable.
         let fastPredictionEnabled = ProcessInfo.processInfo.environment["LLM_FAST_PREDICTION"] != "0"
         func applyHints(_ cfg: MLModelConfiguration) {
             guard fastPredictionEnabled else { return }
@@ -443,6 +450,51 @@ final class ChunkedEngine {
         self.config = config; self.prefillN = prefillN
     }
 
+    // MARK: - Prefix cache (LLM_PREFIX_CACHE=1)
+
+    /// Disk-backed prefix cache. nil unless `LLM_PREFIX_CACHE=1` was set
+    /// when CoreMLLLM was loaded. Owned externally so the same cache can
+    /// be shared across reloads of the engine.
+    var prefixCache: PrefixCache?
+
+    /// Threshold below which a cache hit is ignored — re-prefilling small
+    /// prefixes is cheaper than per-token decode of the delta.
+    private let prefixCacheMinHit: Int = 64
+
+    /// Snapshot the 8 persistent KV buffers as a list of Data blobs in the
+    /// canonical order: kSliding1, vSliding1, kFull1, vFull1, kSliding2,
+    /// vSliding2, kFull2, vFull2.
+    func captureKVSnapshot() -> [Data] {
+        let bufs = [kSliding1, vSliding1, kFull1, vFull1,
+                    kSliding2, vSliding2, kFull2, vFull2]
+        return bufs.map { buf in
+            let bytes = buf.count * MemoryLayout<UInt16>.stride
+            return Data(bytes: buf.dataPointer, count: bytes)
+        }
+    }
+
+    /// Restore the 8 persistent KV buffers from snapshot data and set
+    /// `currentPosition`. Sizes must exactly match the live buffer sizes;
+    /// throws if not (cached snapshot from a different model / context len).
+    func restoreKVSnapshot(_ blobs: [Data], position: Int) throws {
+        let bufs = [kSliding1, vSliding1, kFull1, vFull1,
+                    kSliding2, vSliding2, kFull2, vFull2]
+        precondition(blobs.count == bufs.count, "snapshot buffer count mismatch")
+        for (i, buf) in bufs.enumerated() {
+            let expected = buf.count * MemoryLayout<UInt16>.stride
+            guard blobs[i].count == expected else {
+                throw NSError(
+                    domain: "ChunkedEngine", code: 100,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "snapshot buffer \(i) size mismatch (got \(blobs[i].count), need \(expected))"])
+            }
+            blobs[i].withUnsafeBytes { src in
+                memcpy(buf.dataPointer, src.baseAddress!, expected)
+            }
+        }
+        currentPosition = position
+    }
+
     // MARK: - Reset
 
     func reset() {
@@ -673,6 +725,39 @@ final class ChunkedEngine {
         let realLen = tokenIDs.count
         precondition(realLen > 0 && realLen <= N)
 
+        // ---- Prefix cache lookup (text-only) -----------------------------
+        // If a previously cached snapshot covers a prefix of this prompt,
+        // restore the KV state at that position and per-token decode the
+        // delta tokens. Skips the expensive batched prefill entirely.
+        // Multimodal prompts (image / audio) bypass the cache to avoid
+        // shape/feature mismatches.
+        if let cache = prefixCache,
+           imageFeatures == nil, audioFeatures == nil,
+           let match = cache.longestPrefixMatch(tokenIDs: tokenIDs),
+           match.matchLen >= prefixCacheMinHit,
+           match.matchLen < tokenIDs.count {
+            let cacheT0 = CFAbsoluteTimeGetCurrent()
+            do {
+                let blobs = try PrefixCache.readBlob(at: match.blobURL,
+                                                      expecting: match.entry)
+                try restoreKVSnapshot(blobs, position: match.matchLen)
+                var nextID = 0
+                for i in match.matchLen..<tokenIDs.count {
+                    nextID = try predictStep(tokenID: tokenIDs[i], position: i)
+                    currentPosition = i + 1
+                }
+                let dt = CFAbsoluteTimeGetCurrent() - cacheT0
+                let delta = tokenIDs.count - match.matchLen
+                print("[PrefixCache] HIT match=\(match.matchLen)/\(tokenIDs.count) " +
+                      "delta=\(delta) restore+decode=\(String(format: "%.1f", dt*1000))ms")
+                return nextID
+            } catch {
+                print("[PrefixCache] restore failed (\(error)) — full prefill fallback")
+                reset()  // restore() may have left partial state
+            }
+        }
+        // ------------------------------------------------------------------
+
         reset()
 
         let prefillT0 = CFAbsoluteTimeGetCurrent()
@@ -820,7 +905,21 @@ final class ChunkedEngine {
               "total=\(String(format: "%.1f", totalPrefill*1000))ms " +
               "(\(realLen) tokens, \(String(format: "%.0f", Double(realLen)/totalPrefill)) tok/s)")
 
-        return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+        let nextToken = out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+
+        // Snapshot the KV state for future prefix-match hits. Text-only and
+        // only when caching is enabled. Multimodal snapshots are skipped
+        // (image/audio embeddings aren't part of the cache key contract).
+        if let cache = prefixCache, imageFeatures == nil, audioFeatures == nil {
+            do {
+                let blobs = captureKVSnapshot()
+                try cache.store(tokenIDs: tokenIDs, buffers: blobs, position: realLen)
+            } catch {
+                print("[PrefixCache] store failed: \(error)")
+            }
+        }
+
+        return nextToken
     }
 
     // MARK: - Batched speculative verification (Q=K)

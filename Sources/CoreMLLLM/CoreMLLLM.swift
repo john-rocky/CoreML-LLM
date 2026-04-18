@@ -188,6 +188,35 @@ public final class CoreMLLLM: @unchecked Sendable {
             // COMPUTE_PLAN_AUDIT env var or UserDefaults key is set.
             await ComputePlanAudit.run(modelDirectory: directory,
                                        computeUnits: computeUnits)
+
+            // Optional disk-backed prefix cache (LLM_PREFIX_CACHE=1).
+            // Cache directory is namespaced by model directory's last
+            // path component (e.g. "gemma4-e2b") so multiple models
+            // don't collide. Capacity defaults to 256 MB which fits
+            // 3-7 snapshots at 2K context (more at 8K = fewer entries).
+            if let engine = llm.chunkedEngine,
+               ProcessInfo.processInfo.environment["LLM_PREFIX_CACHE"] == "1" {
+                do {
+                    let cachesDir = try FileManager.default.url(
+                        for: .cachesDirectory, in: .userDomainMask,
+                        appropriateFor: nil, create: true)
+                    let modelTag = directory.lastPathComponent.isEmpty
+                        ? "default" : directory.lastPathComponent
+                    let cacheDir = cachesDir
+                        .appendingPathComponent("coreml-llm-prefix-cache")
+                        .appendingPathComponent(modelTag)
+                    let capStr = ProcessInfo.processInfo
+                        .environment["LLM_PREFIX_CACHE_MB"]
+                    let capMB = Int(capStr ?? "") ?? 256
+                    engine.prefixCache = try PrefixCache(
+                        directory: cacheDir,
+                        capacityBytes: capMB * 1024 * 1024)
+                    print("[PrefixCache] enabled at \(cacheDir.path) " +
+                          "cap=\(capMB)MB existing=\(engine.prefixCache!.totalBytes()/(1024*1024))MB")
+                } catch {
+                    print("[PrefixCache] init failed: \(error)")
+                }
+            }
         } else {
             let mlConfig = MLModelConfiguration()
             mlConfig.computeUnits = computeUnits
