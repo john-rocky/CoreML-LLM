@@ -574,8 +574,26 @@ public final class CoreMLLLM: @unchecked Sendable {
         let audTokenCount = audioTokenCount
         let ctxLimit = config.contextLength
 
+        // Decode-loop QoS: defaults to inherited (.userInitiated when called from
+        // UI). Set LLM_DECODE_QOS=utility (or background) to bias toward
+        // efficiency cores — trades a small tok/s loss for cooler sustained
+        // operation. CPU memcpy/copyBack between ANE dispatches is the
+        // dominant CPU draw at 31 tok/s; E-cores cut that ~4x.
+        let qosEnv = ProcessInfo.processInfo.environment["LLM_DECODE_QOS"]?.lowercased()
+        let decodePriority: TaskPriority?
+        switch qosEnv {
+        case "background": decodePriority = .background
+        case "utility":    decodePriority = .utility
+        case "userinitiated", "user": decodePriority = .userInitiated
+        case "high":       decodePriority = .high
+        default:           decodePriority = nil  // inherit
+        }
+        if decodePriority != nil {
+            print("[QoS] LLM_DECODE_QOS=\(qosEnv!) — decode loop priority overridden")
+        }
+
         return AsyncStream { continuation in
-            Task {
+            Task(priority: decodePriority) {
                 do {
                     let IMAGE_TOKEN_ID = 258880
                     let AUDIO_TOKEN_ID = 258881

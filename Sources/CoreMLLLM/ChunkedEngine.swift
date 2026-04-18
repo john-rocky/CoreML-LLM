@@ -57,6 +57,30 @@ final class ChunkedEngine {
     private var kFull2: MLMultiArray     // (2, 1, ctx, maxHd)
     private var vFull2: MLMultiArray
 
+    // Optional double-buffer KV outputs for `MLPredictionOptions.outputBackings`.
+    // When non-nil, chunk1/chunk2 KV outputs are written directly into these
+    // sibling buffers; we then swap the (in, out) roles instead of memcpy'ing
+    // ~99 MB/step back into the input buffers (`copyBack`). Falls back to
+    // copyBack if the model doesn't honor the supplied backings (Apple docs:
+    // "if a model output cannot use the backing you provide, the model will
+    // use a default one").
+    //
+    // Enable via env var: LLM_DOUBLE_BUFFER_KV=1
+    var kSliding1Out: MLMultiArray?
+    var vSliding1Out: MLMultiArray?
+    var kFull1Out: MLMultiArray?
+    var vFull1Out: MLMultiArray?
+    var kSliding2Out: MLMultiArray?
+    var vSliding2Out: MLMultiArray?
+    var kFull2Out: MLMultiArray?
+    var vFull2Out: MLMultiArray?
+    private var doubleBufferEnabled: Bool { kSliding1Out != nil }
+    // Tracks whether outputBackings was honored on the last attempt; if any
+    // chunk fell back, future steps still try (model may honor next time).
+    private var doubleBufferFallbackC1: Bool = false
+    private var doubleBufferFallbackC2: Bool = false
+    private var doubleBufferAnnounced: Bool = false
+
     // Phase 0e scratch pool: buffers rewritten each decode step instead of
     // freshly allocated. Holds the three largest per-step masks; smaller
     // buffers (RoPE rows, embeddings, plRaw) keep the allocating path since
@@ -371,6 +395,22 @@ final class ChunkedEngine {
             vFull2:    ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx),
             config: config, prefillN: prefillN)
 
+        // Optional double-buffer KV: allocate sibling output backings so
+        // chunk1/chunk2 can write KV directly into pre-allocated buffers
+        // instead of paying ~10 ms/step in copyBack memcpy. Off by default;
+        // enable with LLM_DOUBLE_BUFFER_KV=1 to A/B test on iPhone.
+        if ProcessInfo.processInfo.environment["LLM_DOUBLE_BUFFER_KV"] == "1" {
+            engine.kSliding1Out = try ioSurfaceArray(slots: 7, seqLen: W)
+            engine.vSliding1Out = try ioSurfaceArray(slots: 7, seqLen: W)
+            engine.kFull1Out = try ioSurfaceArray(slots: 1, seqLen: ctx)
+            engine.vFull1Out = try ioSurfaceArray(slots: 1, seqLen: ctx)
+            engine.kSliding2Out = try ioSurfaceArray(slots: 5, seqLen: W)
+            engine.vSliding2Out = try ioSurfaceArray(slots: 5, seqLen: W)
+            engine.kFull2Out = try ioSurfaceArray(slots: 2, seqLen: ctx)
+            engine.vFull2Out = try ioSurfaceArray(slots: 2, seqLen: ctx)
+            print("[KV] LLM_DOUBLE_BUFFER_KV=1 — outputBackings + swap enabled")
+        }
+
         // ANE pipeline prewarm (Phase 0b): four dummy decode steps at load
         // time force the ANE compiler to finalize dispatch schedules and
         // resident weight layouts before the first user token arrives —
@@ -422,8 +462,17 @@ final class ChunkedEngine {
     // MARK: - Reset
 
     func reset() {
-        for buf in [kSliding1, vSliding1, kFull1, vFull1,
-                    kSliding2, vSliding2, kFull2, vFull2] {
+        var buffers: [MLMultiArray] = [
+            kSliding1, vSliding1, kFull1, vFull1,
+            kSliding2, vSliding2, kFull2, vFull2,
+        ]
+        // Also zero the double-buffer siblings so a swap after reset doesn't
+        // surface stale KV from the previous conversation.
+        for opt in [kSliding1Out, vSliding1Out, kFull1Out, vFull1Out,
+                    kSliding2Out, vSliding2Out, kFull2Out, vFull2Out] {
+            if let b = opt { buffers.append(b) }
+        }
+        for buf in buffers {
             memset(buf.dataPointer, 0, buf.count * MemoryLayout<UInt16>.stride)
         }
         currentPosition = 0
@@ -432,6 +481,7 @@ final class ChunkedEngine {
         profileCount = 0
         profileMask = 0
         profileC1 = 0; profileC2 = 0; profileC3 = 0; profileC4 = 0
+        profileANEWait = 0; profileCopyBack = 0
     }
 
     // MARK: - Single-token decode step
@@ -446,6 +496,16 @@ final class ChunkedEngine {
     private var profileC2: Double = 0
     private var profileC3: Double = 0
     private var profileC4: Double = 0
+    // CPU-vs-ANE split: ANE wait = time spent inside chunk.prediction(from:);
+    // copyBack = CPU memcpy of KV tensors after each chunk; cpuPrep = remainder
+    // (mask/embed/dictionary build). Sum should approximate total wall time.
+    private var profileANEWait: Double = 0
+    private var profileCopyBack: Double = 0
+
+    // Print [Profile] / [ANE/CPU] every step instead of every 10 steps. Useful
+    // for short prompts where the 10-step gate would never fire. Set
+    // LLM_PROFILE_EVERY_STEP=1 to enable.
+    private let profileEveryStep = ProcessInfo.processInfo.environment["LLM_PROFILE_EVERY_STEP"] == "1"
 
     // LayerSkip probe: measures early-exit accuracy (chunk3 skipped)
     private let layerSkipProbe = ProcessInfo.processInfo.environment["LAYERSKIP_PROBE"] == "1"
@@ -485,7 +545,7 @@ final class ChunkedEngine {
 
         // Chunk 1
         let tC1Start = CFAbsoluteTimeGetCurrent()
-        let out1 = try chunk1.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+        let in1 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: hiddenIn),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
             "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
@@ -497,19 +557,59 @@ final class ChunkedEngine {
             "V_sliding_in": MLFeatureValue(multiArray: vSliding1),
             "K_full_in": MLFeatureValue(multiArray: kFull1),
             "V_full_in": MLFeatureValue(multiArray: vFull1),
-        ]))
+        ])
+        let tC1Wait0 = CFAbsoluteTimeGetCurrent()
+        let out1: MLFeatureProvider
+        if doubleBufferEnabled, let kSO = kSliding1Out, let vSO = vSliding1Out,
+           let kFO = kFull1Out, let vFO = vFull1Out {
+            let opts = MLPredictionOptions()
+            opts.outputBackings = [
+                "K_sliding_out": kSO, "V_sliding_out": vSO,
+                "K_full_out": kFO,    "V_full_out": vFO,
+            ]
+            out1 = try chunk1.prediction(from: in1, options: opts)
+        } else {
+            out1 = try chunk1.prediction(from: in1)
+        }
+        let tC1Wait1 = CFAbsoluteTimeGetCurrent()
+        profileANEWait += (tC1Wait1 - tC1Wait0)
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
-        copyBack(out1, "K_sliding_out", into: kSliding1)
-        copyBack(out1, "V_sliding_out", into: vSliding1)
-        copyBack(out1, "K_full_out", into: kFull1)
-        copyBack(out1, "V_full_out", into: vFull1)
+        let tC1Cb0 = CFAbsoluteTimeGetCurrent()
+        if doubleBufferEnabled,
+           let kSO = kSliding1Out, let vSO = vSliding1Out,
+           let kFO = kFull1Out, let vFO = vFull1Out,
+           let outKS = out1.featureValue(for: "K_sliding_out")?.multiArrayValue,
+           outKS.dataPointer == kSO.dataPointer {
+            // outputBackings honored: swap (in, out) roles — no memcpy needed.
+            // Explicit triple-assignment instead of `swap(&a, &b!)` which
+            // unwraps to a temporary in Swift and silently fails to write back.
+            let oldKS = kSliding1; kSliding1 = kSO; kSliding1Out = oldKS
+            let oldVS = vSliding1; vSliding1 = vSO; vSliding1Out = oldVS
+            let oldKF = kFull1;    kFull1    = kFO; kFull1Out    = oldKF
+            let oldVF = vFull1;    vFull1    = vFO; vFull1Out    = oldVF
+            if !doubleBufferAnnounced {
+                print("[KV] chunk1 outputBackings honored — copyBack skipped")
+                doubleBufferAnnounced = true
+            }
+            doubleBufferFallbackC1 = false
+        } else {
+            if doubleBufferEnabled && !doubleBufferFallbackC1 {
+                print("[KV] chunk1 outputBackings NOT honored — falling back to copyBack")
+                doubleBufferFallbackC1 = true
+            }
+            copyBack(out1, "K_sliding_out", into: kSliding1)
+            copyBack(out1, "V_sliding_out", into: vSliding1)
+            copyBack(out1, "K_full_out", into: kFull1)
+            copyBack(out1, "V_full_out", into: vFull1)
+        }
         let tC1End = CFAbsoluteTimeGetCurrent()
+        profileCopyBack += (tC1End - tC1Cb0)
         profileC1 += (tC1End - tC1Start)
 
         // Chunk 2
         let tC2Start = CFAbsoluteTimeGetCurrent()
-        let out2 = try chunk2.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+        let in2 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h1),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
             "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
@@ -521,12 +621,46 @@ final class ChunkedEngine {
             "V_sliding_in": MLFeatureValue(multiArray: vSliding2),
             "K_full_in": MLFeatureValue(multiArray: kFull2),
             "V_full_in": MLFeatureValue(multiArray: vFull2),
-        ]))
+        ])
+        let tC2Wait0 = CFAbsoluteTimeGetCurrent()
+        let out2: MLFeatureProvider
+        if doubleBufferEnabled, let kSO = kSliding2Out, let vSO = vSliding2Out,
+           let kFO = kFull2Out, let vFO = vFull2Out {
+            let opts = MLPredictionOptions()
+            opts.outputBackings = [
+                "K_sliding_out": kSO, "V_sliding_out": vSO,
+                "K_full_out": kFO,    "V_full_out": vFO,
+            ]
+            out2 = try chunk2.prediction(from: in2, options: opts)
+        } else {
+            out2 = try chunk2.prediction(from: in2)
+        }
+        let tC2Wait1 = CFAbsoluteTimeGetCurrent()
+        profileANEWait += (tC2Wait1 - tC2Wait0)
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
-        copyBack(out2, "K_sliding_out", into: kSliding2)
-        copyBack(out2, "V_sliding_out", into: vSliding2)
-        copyBack(out2, "K_full_out", into: kFull2)
-        copyBack(out2, "V_full_out", into: vFull2)
+        let tC2Cb0 = CFAbsoluteTimeGetCurrent()
+        if doubleBufferEnabled,
+           let kSO = kSliding2Out, let vSO = vSliding2Out,
+           let kFO = kFull2Out, let vFO = vFull2Out,
+           let outKS = out2.featureValue(for: "K_sliding_out")?.multiArrayValue,
+           outKS.dataPointer == kSO.dataPointer {
+            let oldKS = kSliding2; kSliding2 = kSO; kSliding2Out = oldKS
+            let oldVS = vSliding2; vSliding2 = vSO; vSliding2Out = oldVS
+            let oldKF = kFull2;    kFull2    = kFO; kFull2Out    = oldKF
+            let oldVF = vFull2;    vFull2    = vFO; vFull2Out    = oldVF
+            doubleBufferFallbackC2 = false
+        } else {
+            if doubleBufferEnabled && !doubleBufferFallbackC2 {
+                print("[KV] chunk2 outputBackings NOT honored — falling back to copyBack")
+                doubleBufferFallbackC2 = true
+            }
+            copyBack(out2, "K_sliding_out", into: kSliding2)
+            copyBack(out2, "V_sliding_out", into: vSliding2)
+            copyBack(out2, "K_full_out", into: kFull2)
+            copyBack(out2, "V_full_out", into: vFull2)
+        }
+        let tC2Cb1 = CFAbsoluteTimeGetCurrent()
+        profileCopyBack += (tC2Cb1 - tC2Cb0)
         let kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
         let kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
         let kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
@@ -550,16 +684,22 @@ final class ChunkedEngine {
         // Chunk 3
         let tC3Start = CFAbsoluteTimeGetCurrent()
         var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
-        let h3 = try chunk3.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
+        let in3 = try MLDictionaryFeatureProvider(dictionary: d3)
+        let tC3Wait0 = CFAbsoluteTimeGetCurrent()
+        let h3 = try chunk3.prediction(from: in3)
             .featureValue(for: "hidden_states_out")!.multiArrayValue!
         let tC3End = CFAbsoluteTimeGetCurrent()
+        profileANEWait += (tC3End - tC3Wait0)
         profileC3 += (tC3End - tC3Start)
 
         // Chunk 4
         let tC4Start = CFAbsoluteTimeGetCurrent()
         var d4 = shared; d4["hidden_states"] = MLFeatureValue(multiArray: h3)
-        let out4 = try chunk4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4))
+        let in4 = try MLDictionaryFeatureProvider(dictionary: d4)
+        let tC4Wait0 = CFAbsoluteTimeGetCurrent()
+        let out4 = try chunk4.prediction(from: in4)
         let tC4End = CFAbsoluteTimeGetCurrent()
+        profileANEWait += (tC4End - tC4Wait0)
         profileC4 += (tC4End - tC4Start)
 
         // LayerSkip probe: skip chunk3, feed h2 directly to chunk4
@@ -579,7 +719,7 @@ final class ChunkedEngine {
 
         profilePredict += (CFAbsoluteTimeGetCurrent() - t1)
         profileCount += 1
-        if profileCount == 1 || profileCount % 10 == 0 {
+        if profileCount == 1 || profileCount % 10 == 0 || profileEveryStep {
             let n = Double(profileCount)
             let eMs = profileEmbed / n * 1000
             let pMs = profilePredict / n * 1000
@@ -588,11 +728,19 @@ final class ChunkedEngine {
             let c2 = profileC2 / n * 1000
             let c3 = profileC3 / n * 1000
             let c4 = profileC4 / n * 1000
+            let aneMs = profileANEWait / n * 1000
+            let cbMs = profileCopyBack / n * 1000
+            let totalMs = eMs + pMs
+            let cpuActiveMs = totalMs - aneMs
+            let cpuPct = totalMs > 0 ? (cpuActiveMs / totalMs * 100) : 0
             print(String(format:
                 "[Profile] emb=%.1fms mask=%.1fms | c1=%.1f c2=%.1f c3=%.1f c4=%.1f " +
                 "(sum=%.1fms) | predict=%.1fms total=%.1fms (%.1f tok/s)",
                 eMs, mMs, c1, c2, c3, c4, c1 + c2 + c3 + c4,
-                pMs, eMs + pMs, 1000.0 / (eMs + pMs)))
+                pMs, totalMs, 1000.0 / totalMs))
+            print(String(format:
+                "[ANE/CPU] ANE_wait=%.1fms copyBack=%.1fms cpu_active=%.1fms (%.0f%% CPU)",
+                aneMs, cbMs, cpuActiveMs, cpuPct))
         }
 
         return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
