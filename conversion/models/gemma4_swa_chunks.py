@@ -1,26 +1,25 @@
-"""Gemma 4 Sliding Window Attention (SWA) chunks.
+"""Gemma 4 Sliding Window Attention (SWA) chunks — E2B and E4B.
 
 Key optimization: exploit Gemma 4's native sliding window attention
-(W=512) to make 28/35 layers O(W) instead of O(ctx).
+(W=512) to make most layers O(W) instead of O(ctx).
 
-Architecture:
-- 35 layers = 28 sliding (W=512) + 7 full (ctx)
-- Layers 0-14: own KV caches
-- Layers 15-34: all KV-shared (read from L13/L14)
-- L13 is sliding → kv13 is W-sized
-- L14 is full → kv14 is ctx-sized
+Architecture (both variants):
+- own-KV region 0..kv_full_producer; shared region kv_full_producer+1..N-1
+- Shared sliding layers read from `kv_sliding_producer`'s cache (W-sized)
+- Shared full layers read from `kv_full_producer`'s cache (ctx-sized)
+- E2B: N=35, producers L13/L14; E4B: N=42, producers L22/L23
+
+The output tensor names kv13_k/kv13_v/kv14_k/kv14_v are opaque aliases
+for the sliding/full producer KVs (preserved across variants so
+Sources/CoreMLLLM/ChunkedEngine.swift needs no edit).
 
 KV tensor shapes:
-- Sliding K/V cache: (num_sliding_in_chunk, 1, W, max_hd)
+- Sliding K/V cache: (num_sliding_in_chunk, num_kv_heads, W, max_hd)
   - Shift-based update: cat([K[:, :, 1:], new_k], dim=2)
-- Full K/V cache: (num_full_in_chunk, 1, ctx, max_hd)
-  - Mask-based update (same as before)
+- Full K/V cache: (num_full_in_chunk, num_kv_heads, ctx, max_hd)
+  - Mask-based update
 
-Chunk layer breakdown:
-  chunk1 (L0-7): 7 sliding (L0-3,5-7) + 1 full (L4)
-  chunk2 (L8-14): 5 sliding (L8,10-13) + 2 full (L9,14)
-  chunk3 (L15-24): all shared, reads kv13 (W-sized) and kv14 (ctx-sized)
-  chunk4 (L25-34): all shared + norm + lm_head
+Chunk layout is derived from config via `compute_chunk_boundaries(config)`.
 
 Two causal masks:
 - causal_mask_full: (1, 1, 1, ctx) — for full attention layers
@@ -110,15 +109,16 @@ def _run_layer_swa(
             K_for_attn = K_sliding_out[..., :hd]
             V_for_attn = V_sliding_out[..., :hd]
 
-        # Store kv13/kv14 for sharing
-        if layer_idx == 13:
-            # L13 is sliding → kv13 is W-sized (1, 1, W, 256)
-            kv_store_13_k = K_sliding_out[..., :256]
-            kv_store_13_v = V_sliding_out[..., :256]
-        elif layer_idx == 14:
-            # L14 is full → kv14 is ctx-sized (1, 1, ctx, 512)
-            kv_store_14_k = K_full_out[..., :512]
-            kv_store_14_v = V_full_out[..., :512]
+        # Store producer-layer KV for sharing. Output names stay kv13/kv14 (aliases)
+        # to avoid churn in Sources/CoreMLLLM/ChunkedEngine.swift — they are opaque
+        # feature labels, not literal layer-13/14 references. Actual producers come
+        # from config (E2B: L13/L14, E4B: L22/L23).
+        if layer_idx == config.kv_sliding_producer:
+            kv_store_13_k = K_sliding_out[..., :config.head_dim]
+            kv_store_13_v = V_sliding_out[..., :config.head_dim]
+        elif layer_idx == config.kv_full_producer:
+            kv_store_14_k = K_full_out[..., :config.global_head_dim]
+            kv_store_14_v = V_full_out[..., :config.global_head_dim]
     else:
         # Shared: read from kv13 or kv14
         if is_full:
@@ -200,19 +200,39 @@ def _layer_kv_map(start: int, end: int, config):
     return sliding_map, full_map
 
 
-class SWAChunk1(nn.Module):
-    """Layers 0-7: 7 sliding (L0-3, L5-7) + 1 full (L4). Own KV cache.
-    Computes PLE (per_layer_combined) internally from per_layer_raw input.
-    """
-    START, END = 0, 8
+def compute_chunk_boundaries(config) -> list[tuple[int, int]]:
+    """Derive 4 decode-chunk boundaries from the Gemma4 config.
 
-    def __init__(self, model: Gemma4Model):
+    chunk2 must end at kv_full_producer+1 so it can emit the shared KV.
+    chunk1 splits the own-KV region roughly in half; chunks 3 and 4 split
+    the remaining shared region in half.
+
+    For E2B (35 layers, producers L13/L14) returns [(0,8),(8,15),(15,25),(25,35)]
+    — matches the pre-E4B hardcoded layout.
+    For E4B (42 layers, producers L22/L23) returns [(0,12),(12,24),(24,33),(33,42)].
+    """
+    n = config.num_hidden_layers
+    own_end = config.kv_full_producer + 1
+    c1_end = (own_end + 1) // 2
+    c3_end = own_end + (n - own_end) // 2
+    return [(0, c1_end), (c1_end, own_end), (own_end, c3_end), (c3_end, n)]
+
+
+class SWAChunk1(nn.Module):
+    """First decode chunk. Own KV cache. Computes PLE (per_layer_combined) from per_layer_raw.
+    Boundaries are config-driven; for E2B (L0-7) it is 7 sliding + 1 full, for E4B (L0-11)
+    it is 10 sliding + 2 full.
+    """
+
+    def __init__(self, model: Gemma4Model, start: int = 0, end: int = 8):
         super().__init__()
         self.config = model.config
-        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
-        self.sliding_map, self.full_map = _layer_kv_map(self.START, self.END, model.config)
-        self.num_sliding = len(self.sliding_map)  # 7
-        self.num_full = len(self.full_map)  # 1
+        self.start = start
+        self.end = end
+        self.layers = nn.ModuleList([model.layers[i] for i in range(start, end)])
+        self.sliding_map, self.full_map = _layer_kv_map(start, end, model.config)
+        self.num_sliding = len(self.sliding_map)
+        self.num_full = len(self.full_map)
         # PLE computation modules (moved from Swift → ANE)
         self.per_layer_model_projection = model.per_layer_model_projection
         self.per_layer_projection_norm = model.per_layer_projection_norm
@@ -259,18 +279,18 @@ class SWAChunk1(nn.Module):
         config = self.config
         # Compute PLE internally (8ms savings vs Swift BLAS)
         per_layer_combined = self._compute_ple(hidden_states, per_layer_raw)
-        dummy_13_k = torch.zeros(1, 1, 1, 256, dtype=MODEL_DTYPE)
-        dummy_13_v = torch.zeros(1, 1, 1, 256, dtype=MODEL_DTYPE)
-        dummy_14_k = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
-        dummy_14_v = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
+        dummy_13_k = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        dummy_13_v = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        dummy_14_k = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+        dummy_14_v = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
 
         K_sliding_outs = []
         V_sliding_outs = []
         K_full_outs = []
         V_full_outs = []
 
-        for local_idx in range(self.END - self.START):
-            layer_idx = self.START + local_idx
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
             is_full = config.is_full_attention(layer_idx)
             if is_full:
                 fi = self.full_map[layer_idx]
@@ -309,36 +329,37 @@ class SWAChunk1(nn.Module):
 
 
 class SWAChunk2(nn.Module):
-    """Layers 8-14: 5 sliding (L8, L10-13) + 2 full (L9, L14). Own KV cache.
-    L13 is sliding → outputs kv13 (W-sized sliding).
-    L14 is full → outputs kv14 (ctx-sized full).
+    """Second decode chunk. Own KV cache. Ends at kv_full_producer+1 so it emits
+    the sliding (kv13_*) and full (kv14_*) producer caches for chunks 3-4.
+    For E2B (L8-14): 5 sliding + 2 full. For E4B (L12-23): 10 sliding + 2 full.
     """
-    START, END = 8, 15
 
-    def __init__(self, model: Gemma4Model):
+    def __init__(self, model: Gemma4Model, start: int = 8, end: int = 15):
         super().__init__()
         self.config = model.config
-        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
-        self.sliding_map, self.full_map = _layer_kv_map(self.START, self.END, model.config)
-        self.num_sliding = len(self.sliding_map)  # 5
-        self.num_full = len(self.full_map)  # 2
+        self.start = start
+        self.end = end
+        self.layers = nn.ModuleList([model.layers[i] for i in range(start, end)])
+        self.sliding_map, self.full_map = _layer_kv_map(start, end, model.config)
+        self.num_sliding = len(self.sliding_map)
+        self.num_full = len(self.full_map)
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding, update_mask,
                 per_layer_combined, cos_s, sin_s, cos_f, sin_f,
                 K_sliding_in, V_sliding_in, K_full_in, V_full_in):
         config = self.config
-        kv13_k = torch.zeros(1, 1, 1, 256, dtype=MODEL_DTYPE)
-        kv13_v = torch.zeros(1, 1, 1, 256, dtype=MODEL_DTYPE)
-        kv14_k = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
-        kv14_v = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
+        kv13_k = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        kv13_v = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        kv14_k = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+        kv14_v = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
 
         K_sliding_outs = []
         V_sliding_outs = []
         K_full_outs = []
         V_full_outs = []
 
-        for local_idx in range(self.END - self.START):
-            layer_idx = self.START + local_idx
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
             is_full = config.is_full_attention(layer_idx)
             if is_full:
                 fi = self.full_map[layer_idx]
@@ -378,13 +399,16 @@ class SWAChunk2(nn.Module):
 
 
 class SWAChunk3(nn.Module):
-    """Layers 15-24: all KV-shared. Reads kv13 (W-sized) and kv14 (ctx-sized)."""
-    START, END = 15, 25
+    """Third decode chunk. All layers are KV-shared; reads kv13 (W-sized) and kv14 (ctx-sized).
+    For E2B: L15-24 (10 shared). For E4B: L24-32 (9 shared).
+    """
 
-    def __init__(self, model: Gemma4Model):
+    def __init__(self, model: Gemma4Model, start: int = 15, end: int = 25):
         super().__init__()
         self.config = model.config
-        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
+        self.start = start
+        self.end = end
+        self.layers = nn.ModuleList([model.layers[i] for i in range(start, end)])
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding, update_mask,
                 per_layer_combined, cos_s, sin_s, cos_f, sin_f,
@@ -393,8 +417,8 @@ class SWAChunk3(nn.Module):
         dummy_K = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
         dummy_V = dummy_K
 
-        for local_idx in range(self.END - self.START):
-            layer_idx = self.START + local_idx
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
             hidden_states, *_ = _run_layer_swa(
                 self.layers[local_idx], layer_idx, hidden_states,
                 cos_s, sin_s, cos_f, sin_f,
@@ -407,13 +431,16 @@ class SWAChunk3(nn.Module):
 
 
 class SWAChunk4(nn.Module):
-    """Layers 25-34: all KV-shared. + norm + lm_head."""
-    START, END = 25, 35
+    """Final decode chunk. All KV-shared + final norm + lm_head + argmax.
+    For E2B: L25-34 (10 shared). For E4B: L33-41 (9 shared).
+    """
 
-    def __init__(self, model: Gemma4Model):
+    def __init__(self, model: Gemma4Model, start: int = 25, end: int = 35):
         super().__init__()
         self.config = model.config
-        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
+        self.start = start
+        self.end = end
+        self.layers = nn.ModuleList([model.layers[i] for i in range(start, end)])
         self.norm = model.norm
         self.lm_head = nn.Conv2d(model.lm_head.in_channels, model.lm_head.out_channels,
                                   kernel_size=1, bias=False)
@@ -428,8 +455,8 @@ class SWAChunk4(nn.Module):
         dummy_K = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
         dummy_V = dummy_K
 
-        for local_idx in range(self.END - self.START):
-            layer_idx = self.START + local_idx
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
             hidden_states, *_ = _run_layer_swa(
                 self.layers[local_idx], layer_idx, hidden_states,
                 cos_s, sin_s, cos_f, sin_f,
@@ -568,13 +595,13 @@ def _run_layer_verify(
             K_for_attn = K_sliding_out[si:si+1][..., :hd]
             V_for_attn = V_sliding_out[si:si+1][..., :hd]
 
-        # Store kv13/kv14 for sharing
-        if layer_idx == 13:
-            kv_store_13_k = K_sliding_out[si:si+1][..., :256]
-            kv_store_13_v = V_sliding_out[si:si+1][..., :256]
-        elif layer_idx == 14:
-            kv_store_14_k = K_full_out[fi:fi+1][..., :512]
-            kv_store_14_v = V_full_out[fi:fi+1][..., :512]
+        # Store producer-layer KV for sharing (same alias convention as decode path).
+        if layer_idx == config.kv_sliding_producer:
+            kv_store_13_k = K_sliding_out[si:si+1][..., :config.head_dim]
+            kv_store_13_v = V_sliding_out[si:si+1][..., :config.head_dim]
+        elif layer_idx == config.kv_full_producer:
+            kv_store_14_k = K_full_out[fi:fi+1][..., :config.global_head_dim]
+            kv_store_14_v = V_full_out[fi:fi+1][..., :config.global_head_dim]
     else:
         # Shared: read from kv13 or kv14
         if is_full:
@@ -636,20 +663,21 @@ def _run_layer_verify(
 
 
 class SWAVerifyChunk1(nn.Module):
-    """Verify version of chunk1 (L0-7): Q=K with KV write-through.
+    """Verify version of chunk1: Q=K with KV write-through.
 
     Computes K/V projections and writes them to the cache (shift for sliding,
     scatter for full-attn). Rejected entries are masked by causal mask later.
     Outputs hidden_states, updated KV caches, and per_layer_combined.
     """
-    START, END = 0, 8
 
-    def __init__(self, model: Gemma4Model, seq_len: int):
+    def __init__(self, model: Gemma4Model, seq_len: int, start: int = 0, end: int = 8):
         super().__init__()
         self.config = model.config
         self.seq_len = seq_len
-        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
-        self.sliding_map, self.full_map = _layer_kv_map(self.START, self.END, model.config)
+        self.start = start
+        self.end = end
+        self.layers = nn.ModuleList([model.layers[i] for i in range(start, end)])
+        self.sliding_map, self.full_map = _layer_kv_map(start, end, model.config)
         # PLE modules (same weights as decode chunk1)
         self.per_layer_model_projection = model.per_layer_model_projection
         self.per_layer_projection_norm = model.per_layer_projection_norm
@@ -690,8 +718,8 @@ class SWAVerifyChunk1(nn.Module):
 
         kv13_k = kv13_v = kv14_k = kv14_v = None
 
-        for local_idx in range(self.END - self.START):
-            layer_idx = self.START + local_idx
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
             (hidden_states, K_sliding_in, V_sliding_in, K_full_in, V_full_in,
              kv13_k, kv13_v, kv14_k, kv14_v) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states, K,
@@ -709,18 +737,19 @@ class SWAVerifyChunk1(nn.Module):
 
 
 class SWAVerifyChunk2(nn.Module):
-    """Verify version of chunk2 (L8-14): Q=K with KV write-through.
+    """Verify version of chunk2: Q=K with KV write-through.
 
-    Writes K/V for all K positions. Extracts updated kv13/kv14 for chunks 3-4.
+    Writes K/V for all K positions. Emits updated kv13/kv14 for chunks 3-4.
     """
-    START, END = 8, 15
 
-    def __init__(self, model: Gemma4Model, seq_len: int):
+    def __init__(self, model: Gemma4Model, seq_len: int, start: int = 8, end: int = 15):
         super().__init__()
         self.config = model.config
         self.seq_len = seq_len
-        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
-        self.sliding_map, self.full_map = _layer_kv_map(self.START, self.END, model.config)
+        self.start = start
+        self.end = end
+        self.layers = nn.ModuleList([model.layers[i] for i in range(start, end)])
+        self.sliding_map, self.full_map = _layer_kv_map(start, end, model.config)
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
                 update_indicator, per_layer_combined, cos_s, sin_s, cos_f, sin_f,
@@ -730,8 +759,8 @@ class SWAVerifyChunk2(nn.Module):
 
         kv13_k = kv13_v = kv14_k = kv14_v = None
 
-        for local_idx in range(self.END - self.START):
-            layer_idx = self.START + local_idx
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
             (hidden_states, K_sliding_in, V_sliding_in, K_full_in, V_full_in,
              kv13_k, kv13_v, kv14_k, kv14_v) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states, K,
@@ -750,17 +779,18 @@ class SWAVerifyChunk2(nn.Module):
 
 
 class SWAVerifyChunk3(nn.Module):
-    """Verify version of chunk3 (L15-24): Q=K, shared KV from kv13/kv14.
+    """Verify version of chunk3: Q=K, shared KV from kv13/kv14.
 
-    All layers are KV-shared — no cache writes. Just reads kv13/kv14.
+    All layers are KV-shared — no cache writes. Reads kv13/kv14 only.
     """
-    START, END = 15, 25
 
-    def __init__(self, model: Gemma4Model, seq_len: int):
+    def __init__(self, model: Gemma4Model, seq_len: int, start: int = 15, end: int = 25):
         super().__init__()
         self.config = model.config
         self.seq_len = seq_len
-        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
+        self.start = start
+        self.end = end
+        self.layers = nn.ModuleList([model.layers[i] for i in range(start, end)])
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
                 per_layer_combined, cos_s, sin_s, cos_f, sin_f,
@@ -768,8 +798,8 @@ class SWAVerifyChunk3(nn.Module):
         config = self.config
         K = self.seq_len
 
-        for local_idx in range(self.END - self.START):
-            layer_idx = self.START + local_idx
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
             (hidden_states, _, _, _, _,
              _, _, _, _) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states, K,
@@ -786,17 +816,18 @@ class SWAVerifyChunk3(nn.Module):
 
 
 class SWAVerifyChunk4(nn.Module):
-    """Verify version of chunk4 (L25-34): Q=K, shared KV + norm + lm_head.
+    """Verify version of chunk4: Q=K, shared KV + final norm + lm_head.
 
     Outputs per-position token IDs (1, K) and hidden_states for MTP carry state.
     """
-    START, END = 25, 35
 
-    def __init__(self, model: Gemma4Model, seq_len: int):
+    def __init__(self, model: Gemma4Model, seq_len: int, start: int = 25, end: int = 35):
         super().__init__()
         self.config = model.config
         self.seq_len = seq_len
-        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
+        self.start = start
+        self.end = end
+        self.layers = nn.ModuleList([model.layers[i] for i in range(start, end)])
         self.norm = model.norm
         self.lm_head = nn.Conv2d(model.lm_head.in_channels, model.lm_head.out_channels,
                                   kernel_size=1, bias=False)
@@ -809,8 +840,8 @@ class SWAVerifyChunk4(nn.Module):
         config = self.config
         K = self.seq_len
 
-        for local_idx in range(self.END - self.START):
-            layer_idx = self.START + local_idx
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
             (hidden_states, _, _, _, _,
              _, _, _, _) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states, K,

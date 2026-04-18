@@ -47,6 +47,13 @@ MODEL_REGISTRY: dict[str, ConversionConfig] = {
         max_context_length=131072,
         description="Gemma 4 E2B Instruct - Google's smallest Gemma 4 text decoder",
     ),
+    "gemma4-e4b": ConversionConfig(
+        hf_repo="google/gemma-4-E4B-it",
+        architecture="gemma4",
+        default_context_length=2048,
+        max_context_length=131072,
+        description="Gemma 4 E4B Instruct - 4B-effective text decoder (42 layers, hidden=2560, 2 KV heads)",
+    ),
 }
 
 
