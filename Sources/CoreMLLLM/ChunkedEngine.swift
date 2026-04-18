@@ -574,7 +574,14 @@ final class ChunkedEngine {
                                                 imageNumTokens: imageNumTokens,
                                                 audioFeatures: audioFeatures, audioNumTokens: audioNumTokens)
         let plRaw = try buildPrefillPLR(tokenIDs: tokenIDs, N: N)
-        let causal = try makePrefillCausalMask(N: N)
+        // If the prompt has any vision placeholders, use the
+        // vision-group-aware mask so each contiguous run of image/video
+        // tokens (= one frame / one image) attends bidirectionally
+        // within itself — matching HF's `mm_token_type_ids` behavior.
+        let hasVision = tokenIDs.contains { $0 == 258880 || $0 == 258884 }
+        let causal = hasVision
+            ? try makePrefillVisionMask(tokenIDs: tokenIDs, N: N)
+            : try makePrefillCausalMask(N: N)
         let cosS = try buildPrefillRoPE(table: cosSlidingTable, N: N, dim: 256)
         let sinS = try buildPrefillRoPE(table: sinSlidingTable, N: N, dim: 256)
         let cosF = try buildPrefillRoPE(table: cosFullTable, N: N, dim: 512)
@@ -1220,6 +1227,7 @@ final class ChunkedEngine {
                                      audioNumTokens: Int = 50) throws -> MLMultiArray {
         let IMAGE_TOKEN_ID = 258880
         let AUDIO_TOKEN_ID = 258881
+        let VIDEO_TOKEN_ID = 258884
         let hidden = config.hiddenSize
         let arr = try MLMultiArray(shape: [1, NSNumber(value: N), NSNumber(value: hidden)], dataType: .float16)
         memset(arr.dataPointer, 0, N * hidden * MemoryLayout<UInt16>.stride)
@@ -1229,7 +1237,11 @@ final class ChunkedEngine {
         var imageIdx = 0
         var audioIdx = 0
         for (i, tid) in tokenIDs.enumerated() {
-            if tid == IMAGE_TOKEN_ID, let fp = imgPtr, imageIdx < imageNumTokens {
+            // Image and video share the same `imageFeatures` buffer; the
+            // video path concatenates frames into the same per-token
+            // (1, N, hidden) layout the image path uses.
+            if (tid == IMAGE_TOKEN_ID || tid == VIDEO_TOKEN_ID),
+               let fp = imgPtr, imageIdx < imageNumTokens {
                 memcpy(dst.advanced(by: i * hidden), fp.advanced(by: imageIdx * hidden),
                        hidden * MemoryLayout<UInt16>.stride)
                 imageIdx += 1
@@ -1248,25 +1260,80 @@ final class ChunkedEngine {
 
     private func buildPrefillPLR(tokenIDs: [Int], N: Int) throws -> MLMultiArray {
         let IMAGE_TOKEN_ID = 258880
+        let AUDIO_TOKEN_ID = 258881
+        let VIDEO_TOKEN_ID = 258884
         let totalDim = config.numLayers * config.perLayerDim
         let arr = try MLMultiArray(shape: [1, NSNumber(value: N), NSNumber(value: totalDim)], dataType: .float16)
         memset(arr.dataPointer, 0, N * totalDim * MemoryLayout<UInt16>.stride)
         let dst = arr.dataPointer.bindMemory(to: UInt16.self, capacity: N * totalDim)
         for (i, tid) in tokenIDs.enumerated() {
-            // Image positions get zero PLE — the per_layer_model_projection from
-            // hidden_states (vision features) is computed inside chunk1 on ANE.
-            // Adding per_layer_raw from IMAGE_TOKEN_ID corrupts PLE with nonsense.
-            if tid == IMAGE_TOKEN_ID || tid == 258881 { continue }  // image/audio: zero PLE
+            // Multimodal positions get zero PLE — the per_layer_model_projection
+            // from hidden_states (vision/audio features) is computed inside
+            // chunk1 on ANE. Adding per_layer_raw from a placeholder token
+            // corrupts PLE with nonsense.
+            if tid == IMAGE_TOKEN_ID || tid == AUDIO_TOKEN_ID || tid == VIDEO_TOKEN_ID {
+                continue
+            }
             let raw = embedPerLayer.lookupRaw(tid)
             memcpy(dst.advanced(by: i * totalDim), raw, totalDim * MemoryLayout<UInt16>.stride)
         }
         return arr
     }
 
+    /// Prefill causal mask (strict causal). Used for text-only / image
+    /// prefills where no per-frame vision grouping is needed.
     private func makePrefillCausalMask(N: Int) throws -> MLMultiArray {
         let mask = try MLMultiArray(shape: [1, 1, NSNumber(value: N), NSNumber(value: N)], dataType: .float16)
         let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: N * N)
         for i in 0..<N { for j in 0..<N { mp[i * N + j] = j <= i ? 0 : 0xFC00 } }
+        return mask
+    }
+
+    /// Vision-group-aware prefill causal mask, matching HF
+    /// `create_causal_mask_mapping` + `token_type_ids_mask_function`:
+    /// each contiguous run of `<|video|>` (or `<|image|>`) tokens forms a
+    /// "vision group" that attends bidirectionally within itself. Between
+    /// groups, and between text and vision, standard causal masking
+    /// applies. Without this, each video frame's 64 tokens can only see
+    /// earlier tokens in the same frame — which robs the model of the 2D
+    /// image representation it was trained to build per frame and leads
+    /// to the "series of still images" framing seen on-device.
+    ///
+    /// HF only applies this relaxation to sliding-attention layers. Our
+    /// prefill chunks share a single `causal_mask` across sliding+full
+    /// layers, so the unmask leaks to full-attention layers too; the
+    /// effect is benign (full-attention is already causal → at worst we
+    /// unmask a few extra positions inside a vision group that full
+    /// attention would have seen later anyway).
+    private func makePrefillVisionMask(tokenIDs: [Int], N: Int) throws -> MLMultiArray {
+        let IMAGE_TOKEN_ID = 258880
+        let VIDEO_TOKEN_ID = 258884
+        let mask = try MLMultiArray(shape: [1, 1, NSNumber(value: N), NSNumber(value: N)], dataType: .float16)
+        let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: N * N)
+
+        // Group ids: -1 for text/other, 0/1/2/... for each contiguous
+        // run of vision placeholder tokens.
+        var groupIds = [Int](repeating: -1, count: N)
+        var currentGroup = -1
+        var prevWasVision = false
+        for i in 0..<min(N, tokenIDs.count) {
+            let isVision = tokenIDs[i] == IMAGE_TOKEN_ID || tokenIDs[i] == VIDEO_TOKEN_ID
+            if isVision {
+                if !prevWasVision { currentGroup += 1 }
+                groupIds[i] = currentGroup
+            }
+            prevWasVision = isVision
+        }
+
+        // Fill mask: causal by default, unmask pairs that share a vision
+        // group so the group attends bidirectionally within itself.
+        for i in 0..<N {
+            let gi = groupIds[i]
+            for j in 0..<N {
+                let sameGroup = gi >= 0 && groupIds[j] == gi
+                mp[i * N + j] = (j <= i || sameGroup) ? 0 : 0xFC00
+            }
+        }
         return mask
     }
 

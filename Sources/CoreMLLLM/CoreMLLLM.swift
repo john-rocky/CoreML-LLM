@@ -579,12 +579,19 @@ public final class CoreMLLLM: @unchecked Sendable {
                 do {
                     let IMAGE_TOKEN_ID = 258880
                     let AUDIO_TOKEN_ID = 258881
+                    let VIDEO_TOKEN_ID = 258884
                     var imageIdx = 0
                     var audioIdx = 0
                     var nextID = 0
 
                     func multimodalEmbedding(for tid: Int) -> MLMultiArray? {
-                        if tid == IMAGE_TOKEN_ID, let f = imgFeats, imageIdx < imgTokenLimit {
+                        // Image and video share the same `imgFeats` buffer:
+                        // video frames are concatenated by `concatFrameFeatures`
+                        // into the same (1, N, hidden) layout the image path
+                        // uses, so a single counter walks both placeholder
+                        // streams correctly.
+                        if (tid == IMAGE_TOKEN_ID || tid == VIDEO_TOKEN_ID),
+                           let f = imgFeats, imageIdx < imgTokenLimit {
                             let emb = engine?.sliceFeature(f, at: imageIdx)
                                 ?? ImageProcessor.sliceFeature(f, at: imageIdx,
                                     hiddenSize: mutableSelf.config.hiddenSize)
@@ -618,7 +625,9 @@ public final class CoreMLLLM: @unchecked Sendable {
                                     audioNumTokens: audTokenCount
                                 )
                             }
-                            imageIdx = tokens[0..<prefillLen].filter { $0 == IMAGE_TOKEN_ID }.count
+                            imageIdx = tokens[0..<prefillLen].filter {
+                                $0 == IMAGE_TOKEN_ID || $0 == VIDEO_TOKEN_ID
+                            }.count
                             audioIdx = tokens[0..<prefillLen].filter { $0 == AUDIO_TOKEN_ID }.count
                             engine.currentPosition = prefillLen
 
@@ -1023,9 +1032,16 @@ public final class CoreMLLLM: @unchecked Sendable {
     }
 
     /// Build the per-frame video block for the Gemma 4 chat template:
-    ///   `MM:SS <|image><|image|>×K<image|>` joined by single spaces.
+    ///   `MM:SS <|image><|video|>×K<image|>` joined by single spaces.
+    ///
+    /// The Gemma 4 tokenizer has separate placeholder ids for image
+    /// (`<|image|>` 258880) and video (`<|video|>` 258884). HF's
+    /// `Gemma4Processor` uses the video token inside each frame block so
+    /// the model knows the sequence is a video, not a series of stills —
+    /// using `<|image|>` here makes the model describe frames as
+    /// independent images. BOI/EOI tags stay shared with the image path.
     private func buildVideoBlock(timestamps: [Double], tokensPerFrame: Int) -> String {
-        let placeholder = String(repeating: "<|image|>", count: tokensPerFrame)
+        let placeholder = String(repeating: "<|video|>", count: tokensPerFrame)
         return timestamps
             .map { "\(VideoProcessor.timestampLabel($0)) <|image>\(placeholder)<image|>" }
             .joined(separator: " ")

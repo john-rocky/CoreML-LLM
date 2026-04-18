@@ -37,18 +37,24 @@ Generated text
 
 | Token | ID | Role |
 |-------|------|------|
-| `<\|image>` (BOI) | 255999 | Begin-of-image marker (text token, normal embedding) |
-| `<\|image\|>` | 258880 | Image placeholder (replaced with vision features) |
-| `<image\|>` (EOI) | 258882 | End-of-image marker (text token, normal embedding) |
+| `<\|image>` (BOI) | 255999 | Begin-of-image marker (text token, normal embedding). Shared by image and video frames. |
+| `<\|image\|>` | 258880 | **Image** placeholder (replaced with vision features) |
+| `<\|video\|>` | 258884 | **Video frame** placeholder (replaced with vision features). Distinct id from `<\|image\|>` so the model treats the sequence as a video, not a series of stills. |
+| `<image\|>` (EOI) | 258882 | End-of-image marker (text token, normal embedding). Shared by image and video frames. |
 
 ## Prompt Format
 
-For a single square image:
+Single square image:
 ```
 <bos><|turn>user\n<|image><|image|>×256<image|>\nDescribe this image<turn|>\n<|turn>model\n
 ```
 
-BOI and EOI are regular text tokens — they get their normal text embeddings. Only the 256 `<|image|>` positions get vision encoder features injected.
+Video clip (N frames at fps=1.0, tokensPerFrame=64):
+```
+<bos><|turn>user\n00:00 <|image><|video|>×64<image|> 00:02 <|image><|video|>×64<image|> … MM:SS <|image><|video|>×64<image|>\nDescribe this video<turn|>\n<|turn>model\n
+```
+
+BOI and EOI are regular text tokens — they get their normal text embeddings. Only the placeholder positions (`<|image|>` for images, `<|video|>` for video frames) get vision encoder features injected. Both go through the same `imgFeats` buffer in Swift; the prefill / decode paths in `ChunkedEngine` and `CoreMLLLM` recognize either id as a substitution slot.
 
 ## HF vs Our Approach
 
