@@ -400,14 +400,17 @@ final class ChunkedEngine {
         // instead of paying ~10 ms/step in copyBack memcpy. Off by default;
         // enable with LLM_DOUBLE_BUFFER_KV=1 to A/B test on iPhone.
         if ProcessInfo.processInfo.environment["LLM_DOUBLE_BUFFER_KV"] == "1" {
-            engine.kSliding1Out = try ioSurfaceArray(slots: 7, seqLen: W)
-            engine.vSliding1Out = try ioSurfaceArray(slots: 7, seqLen: W)
-            engine.kFull1Out = try ioSurfaceArray(slots: 1, seqLen: ctx)
-            engine.vFull1Out = try ioSurfaceArray(slots: 1, seqLen: ctx)
-            engine.kSliding2Out = try ioSurfaceArray(slots: 5, seqLen: W)
-            engine.vSliding2Out = try ioSurfaceArray(slots: 5, seqLen: W)
-            engine.kFull2Out = try ioSurfaceArray(slots: 2, seqLen: ctx)
-            engine.vFull2Out = try ioSurfaceArray(slots: 2, seqLen: ctx)
+            // Mirror the (slots, nkv, seqLen) shape detected from each chunk's
+            // KV input so the sibling output backings match — required for the
+            // outputBackings dataPointer compare to succeed.
+            engine.kSliding1Out = try ioSurfaceArray(slots: c1KS.slots, nkv: c1KS.nkv, seqLen: W)
+            engine.vSliding1Out = try ioSurfaceArray(slots: c1KS.slots, nkv: c1KS.nkv, seqLen: W)
+            engine.kFull1Out    = try ioSurfaceArray(slots: c1KF.slots, nkv: c1KF.nkv, seqLen: ctx)
+            engine.vFull1Out    = try ioSurfaceArray(slots: c1KF.slots, nkv: c1KF.nkv, seqLen: ctx)
+            engine.kSliding2Out = try ioSurfaceArray(slots: c2KS.slots, nkv: c2KS.nkv, seqLen: W)
+            engine.vSliding2Out = try ioSurfaceArray(slots: c2KS.slots, nkv: c2KS.nkv, seqLen: W)
+            engine.kFull2Out    = try ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx)
+            engine.vFull2Out    = try ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx)
             print("[KV] LLM_DOUBLE_BUFFER_KV=1 — outputBackings + swap enabled")
         }
 
