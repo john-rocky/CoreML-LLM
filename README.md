@@ -4,23 +4,24 @@
 
 CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a good fit for always-on, battery-friendly inference. [MLX Swift](https://github.com/ml-explore/mlx-swift) is the best choice when you want maximum throughput from the GPU; CoreML-LLM is the answer when you want the LLM to live on the ANE so the GPU stays free.
 
-> **v0.6.2** — Audio multimodal (Gemma 4 E2B speech understanding), library-side `ModelDownloader`, fixed 2K chunk download path. See [What's new](#whats-new).
+> **v0.7.0** — Video multimodal: native video vision encoder (64 tokens/frame), uniform frame sampling with per-frame thumbnails, `<|video|>` placeholder + bidirectional vision group attention. See [What's new](#whats-new).
 
-| Text | Image | Audio (v0.6) |
-|------|-------|--------------|
-| ![text](https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a) | ![multimodal](https://github.com/user-attachments/assets/2a869bf5-8315-422d-8b06-a4a7edecd173) | <video src="https://github.com/user-attachments/assets/e8deb6d0-d8b0-4210-885c-5d7a7ddc7ad3" controls></video> |
+| Text | Image | Audio (v0.6) | Video (v0.7) |
+|------|-------|--------------|--------------|
+| ![text](https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a) | ![multimodal](https://github.com/user-attachments/assets/2a869bf5-8315-422d-8b06-a4a7edecd173) | <video src="https://github.com/user-attachments/assets/e8deb6d0-d8b0-4210-885c-5d7a7ddc7ad3" controls></video> | ![video](https://github.com/user-attachments/assets/1d2a9ff3-2912-40e9-895d-fbaa3c73ee3a) |
 
 ## Performance (Gemma 4 E2B, iPhone 17 Pro)
 
-| | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | v0.5.0 | **v0.6.2** |
-|---|---:|---:|---:|---:|---:|---:|
-| Context length | 512 | 2048 | 2048 | 2048 | 2048 | **2048** |
-| Decode speed | ~11 tok/s | ~11 tok/s | ~28 tok/s | ~28 tok/s | ~31 tok/s | **~31 tok/s** |
-| Prefill | ~11 tok/s | ~175 tok/s | ~96 tok/s | ~96 tok/s | ~154 tok/s | **~154 tok/s** |
-| Multimodal (image) | — | — | broken | working | working | **working** |
-| Multimodal (audio) | — | — | — | — | — | **working** |
-| ANE placement | — | — | 99.78% | 99.78% | 99.78% | **99.78%** |
-| Memory (`phys_footprint`) | — | — | — | ~1 GB | ~1 GB | **~1 GB** |
+| | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | v0.5.0 | v0.6.2 | **v0.7.0** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Context length | 512 | 2048 | 2048 | 2048 | 2048 | 2048 | **2048** |
+| Decode speed | ~11 tok/s | ~11 tok/s | ~28 tok/s | ~28 tok/s | ~31 tok/s | ~31 tok/s | **~31 tok/s** |
+| Prefill | ~11 tok/s | ~175 tok/s | ~96 tok/s | ~96 tok/s | ~154 tok/s | ~154 tok/s | **~154 tok/s** |
+| Multimodal (image) | — | — | broken | working | working | working | **working** |
+| Multimodal (audio) | — | — | — | — | — | working | **working** |
+| Multimodal (video) | — | — | — | — | — | — | **working** |
+| ANE placement | — | — | 99.78% | 99.78% | 99.78% | 99.78% | **99.78%** |
+| Memory (`phys_footprint`) | — | — | — | ~1 GB | ~1 GB | ~1 GB | **~1 GB** |
 
 Context length is 2048. Extended context (8K) is under active development (see `docs/SPEED_8K.md` for the roadmap) but not yet stable for shipping: 8K chunk conversion and the inference path are still in flight. The shipped model on HuggingFace is ctx=2048.
 
@@ -32,7 +33,7 @@ Ground-truth ANE placement measured via `MLComputePlan` (7,294 / 7,310 dispatche
 
 | Model | Size | Multimodal | Download |
 |-------|------|------------|----------|
-| **Gemma 4 E2B** | 2.7 GB | Image + Text | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
+| **Gemma 4 E2B** | 3.1 GB | Image + Video + Audio + Text | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
 | Qwen2.5-0.5B | 302 MB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen2.5-0.5b-coreml) |
 
 The iOS sample app downloads models automatically. You can also convert your own.
@@ -98,6 +99,12 @@ let caption = try await llm.generate("Describe this image", image: cgImage)
 
 // Audio understanding (Gemma 4)
 let transcript = try await llm.generate("What did they say?", audio: pcmSamples)
+
+// Video understanding (Gemma 4)
+let analysis = try await llm.generate(
+    "Describe this video frame by frame.",
+    videoURL: URL(fileURLWithPath: "/path/to/clip.mp4"),
+    videoOptions: .init(fps: 1.0, maxFrames: 6))
 ```
 
 #### Model Download
@@ -137,7 +144,16 @@ python convert.py --list
 
 ## What's new
 
-Current release: **v0.6.2** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases/tag/v0.6.2)).
+Current release: **v0.7.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases/tag/v0.7.0)).
+
+### v0.7.0 — Video multimodal
+
+- **Native video vision encoder** — `vision_video.mlmodelc` traces the HF vision tower at video-grade resolution (384×384, 64 tokens/frame) and ships as part of the Gemma 4 E2B bundle (3.1 GB). Parity vs HF forward: cosine = 1.0000. Falls back to Swift-side 2×2 pooling of the still-image encoder when absent.
+- **Uniform frame sampling** — `maxFrames` are distributed evenly across the full clip duration instead of just the first N seconds. `fps` caps the sampling rate so short clips don't duplicate frames. Matches Gemma 4's `num_frames` semantic.
+- **Per-frame thumbnails** — the chat bubble shows the exact frames the encoder received, with `MM:SS` captions. Lets you see what the model sees.
+- **`<|video|>` placeholder (258884)** — uses the correct video-specific token id per HF's `Gemma4Processor`, with bidirectional attention within each frame's vision group during prefill.
+
+### v0.6.2 — Audio multimodal
 
 - **Audio multimodal** — Gemma 4 E2B can hear. Record on the phone, get an answer. 12-layer Conformer encoder, INT4-palettized, ANE-resident; features injected at `<|audio|>` placeholders via the same path as the vision encoder. See [docs/AUDIO.md](docs/AUDIO.md).
 - **`ModelDownloader` in the library** — `import CoreMLLLM` → `ModelDownloader.shared`. 404-tolerant on optional `mlmodelc` metadata.
@@ -203,6 +219,7 @@ See [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md) for a step-by-step guide and 
 | Step-by-step guide to adding a new architecture | [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md) |
 | `.mlpackage` vs `.mlmodelc`, byte-level format gotchas | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
 | Image pipeline (vision encoder, token injection, debug notes) | [docs/MULTIMODAL.md](docs/MULTIMODAL.md) |
+| Video pipeline (frame sampling, video encoder, prompt format) | [docs/VIDEO_PHASE2_CONTINUATION.md](docs/VIDEO_PHASE2_CONTINUATION.md) |
 | Audio pipeline (mel spec, Conformer, Swift-side projection) | [docs/AUDIO.md](docs/AUDIO.md) |
 | 8K context speed roadmap, ANE-compat matrix, reading list | [docs/SPEED_8K.md](docs/SPEED_8K.md) |
 | EAGLE-3 speculative decoding: trained ckpt → iPhone deployment contract | [docs/EAGLE3_DEPLOY.md](docs/EAGLE3_DEPLOY.md) |
@@ -219,7 +236,8 @@ CoreML-LLM/
 │   ├── CoreMLLLM.swift                  # Public API — load, generate, stream
 │   ├── ChunkedEngine.swift              # SWA 4-chunk decode + prefill engine
 │   ├── EmbeddingLookup.swift            # INT8 quantized embedding lookup
-│   ├── ImageProcessor.swift             # Vision encoder preprocessing
+│   ├── ImageProcessor.swift             # Vision encoder preprocessing (image + video)
+│   ├── VideoProcessor.swift             # Frame extraction + audio track decode
 │   ├── AudioProcessor.swift             # Mel spectrogram + audio encoder
 │   ├── ModelDownloader.swift            # Background download with pause/resume
 │   └── ModelConfig.swift
