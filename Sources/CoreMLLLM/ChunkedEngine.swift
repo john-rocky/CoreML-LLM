@@ -113,9 +113,31 @@ final class ChunkedEngine {
             print("[Load] GPU_PREFILL=1 — prefill chunks will use .cpuAndGPU")
         }
 
+        // Self-heal: remove any `prefill_chunk{i}.mlmodelc` directories that
+        // lack coremldata.bin. These leak onto disk when an older downloader
+        // build copied decode weights into prefill dirs whose metadata 404'd
+        // on the remote (e.g. E4B has no prefill on HF). Without cleanup they
+        // sit as ~2 GB of zombie weights and the loader's existence probe
+        // used to try (and fail) to open them as MLModels.
+        for i in 1...4 {
+            let prefillDir = directory.appendingPathComponent("prefill_chunk\(i).mlmodelc")
+            let coreML = prefillDir.appendingPathComponent("coremldata.bin")
+            let fm = FileManager.default
+            if fm.fileExists(atPath: prefillDir.path)
+                && !fm.fileExists(atPath: coreML.path) {
+                print("[Load] Removing stale prefill_chunk\(i).mlmodelc (missing coremldata.bin)")
+                try? fm.removeItem(at: prefillDir)
+            }
+        }
+
         func findModel(_ name: String) -> URL? {
+            // For .mlmodelc we require coremldata.bin alongside the directory
+            // — a half-populated directory (e.g. stray prefill_chunk with only
+            // weights from an older downloader build) must be treated as
+            // "not present" so it doesn't crash the loader.
             let compiled = directory.appendingPathComponent("\(name).mlmodelc")
-            if FileManager.default.fileExists(atPath: compiled.path) { return compiled }
+            let coreML = compiled.appendingPathComponent("coremldata.bin")
+            if FileManager.default.fileExists(atPath: coreML.path) { return compiled }
             let pkg = directory.appendingPathComponent("\(name).mlpackage")
             if FileManager.default.fileExists(atPath: pkg.path) { return pkg }
             return nil

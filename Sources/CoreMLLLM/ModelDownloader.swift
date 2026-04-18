@@ -491,14 +491,35 @@ public final class ModelDownloader: NSObject {
     private func finishDownload() {
         guard let model = currentModel, let dest = destDir else { return }
 
-        // Share decode weights with prefill chunks (saves ~1.1 GB)
+        // Share decode weights with prefill chunks ONLY if prefill metadata
+        // (coremldata.bin) was downloaded for that chunk. Models that don't
+        // ship prefill (e.g. gemma4-e4b) would otherwise get half-populated
+        // prefill_chunk{i}.mlmodelc directories — just weights, no
+        // coremldata.bin — which CoreML rejects at load time.
         for i in 1...4 {
             let src = dest.appendingPathComponent("chunk\(i).mlmodelc/weights/weight.bin")
-            let dst = dest.appendingPathComponent("prefill_chunk\(i).mlmodelc/weights/weight.bin")
-            if fileManager.fileExists(atPath: src.path) && !fileManager.fileExists(atPath: dst.path) {
-                try? fileManager.createDirectory(at: dst.deletingLastPathComponent(),
-                                                  withIntermediateDirectories: true)
-                try? fileManager.copyItem(at: src, to: dst)
+            let prefillDir = dest.appendingPathComponent("prefill_chunk\(i).mlmodelc")
+            let coreML = prefillDir.appendingPathComponent("coremldata.bin")
+            let dst = prefillDir.appendingPathComponent("weights/weight.bin")
+            guard fileManager.fileExists(atPath: coreML.path),
+                  fileManager.fileExists(atPath: src.path),
+                  !fileManager.fileExists(atPath: dst.path) else { continue }
+            try? fileManager.createDirectory(at: dst.deletingLastPathComponent(),
+                                              withIntermediateDirectories: true)
+            try? fileManager.copyItem(at: src, to: dst)
+        }
+
+        // Clean up any stray prefill directories that lack the required
+        // metadata. These happen when an older build of the app pulled prefill
+        // paths that 404'd on a prefill-less repo — the shared-weight copy
+        // above then seeded zero-metadata subdirectories, which CoreML can't
+        // open. Removing them here makes the device self-heal on next launch.
+        for i in 1...4 {
+            let prefillDir = dest.appendingPathComponent("prefill_chunk\(i).mlmodelc")
+            let coreML = prefillDir.appendingPathComponent("coremldata.bin")
+            if fileManager.fileExists(atPath: prefillDir.path)
+                && !fileManager.fileExists(atPath: coreML.path) {
+                try? fileManager.removeItem(at: prefillDir)
             }
         }
 
