@@ -1,282 +1,233 @@
-# CPU Bottleneck Investigation (2026-04-18)
+# CPU Bottleneck Investigation — Hypothesis Refuted (2026-04-18)
 
-User-reported symptom: device gets noticeably hotter on this branch (ANE
-path, ~31 tok/s) than on a public LiteRT-LM iOS app (Metal GPU). Per
-docs the ANE path should draw ~0.5–1 W vs LiteRT's 3–5 W on GPU, so the
-heat asymmetry contradicts the documented power profile.
+## TL;DR
 
-Hypothesis: ANE itself is cool, but the CPU orchestration around it
-(KV `copyBack` memcpy, dispatch prep, embed dequant, mask building)
-saturates a P-core. At 31 tok/s × 4 chunks/tok = 124 dispatches/sec,
-even small per-dispatch CPU work compounds into a sustained hot loop.
+User reported the device gets noticeably hotter on this branch (ANE
+path) than on a public LiteRT-LM iOS app (Metal GPU). Hypothesis: heat
+came from CPU orchestration saturating a P-core.
 
-This branch lands the measurement to confirm or refute the hypothesis,
-plus three opt-in mitigations.
+**Hypothesis refuted by E4B device measurement.** CPU is essentially
+idle (4% of step time). ANE itself is the heat source — it's busy 97%
+of step time and physically pinned at high DVFS the whole time.
 
----
+What this branch lands:
 
-## What landed
+- **Measurement** (always on) — `[ANE/CPU]` log line that produced the
+  finding.
+- **`LLM_DECODE_QOS` env var** (opt-in) — kept; tiny CPU draw still
+  benefits from E-core scheduling.
+- **`LLM_FAST_PREDICTION` (default ON)** — `MLOptimizationHints.specializationStrategy = .fastPrediction`
+  reduces per-prediction wall time on iOS 18+ without changing tok/s
+  semantics. Direct heat reduction at fixed throughput.
+- **Powermetrics + Mac smoke scripts** — kept for future investigations.
 
-### 1. CPU vs ANE wait split (always on)
+What was tried and **removed**:
 
-`ChunkedEngine.predictStep` now logs an extra line every 10 decode
-steps:
-
-```
-[Profile] emb=… mask=… | c1=… c2=… c3=… c4=… (sum=…) | predict=… total=… (… tok/s)
-[ANE/CPU] ANE_wait=Xms copyBack=Yms cpu_active=Zms (W% CPU)
-```
-
-- `ANE_wait`  — sum of time inside the four `chunk.prediction(from:)` calls.
-- `copyBack`  — sum of `copyBack` memcpy time on the persistent KV buffers.
-- `cpu_active` — `total - ANE_wait` (everything the CPU did between dispatches:
-  dictionary build, embed dequant, mask build, KV copy, output extraction).
-- `W% CPU`    — `cpu_active / total * 100`.
-
-**Interpretation guide:**
-
-| W% CPU | Likely heat source                    | What to try next                    |
-|--------|---------------------------------------|-------------------------------------|
-| < 25%  | ANE itself is sustained-on            | Reduce dispatch count (chunk merge) |
-| 25–50% | Mixed                                  | Try LLM_DOUBLE_BUFFER_KV first      |
-| > 50%  | CPU orchestration dominates           | LLM_DOUBLE_BUFFER_KV + LLM_DECODE_QOS |
-
-If `copyBack` alone is ≥ 30% of the step (i.e., ≥ 15 ms at 51 ms/step),
-LLM_DOUBLE_BUFFER_KV is the right first lever.
-
-### 2. Tethered powermetrics helper (`scripts/powermetrics_bench.sh`)
-
-Run on the Mac while the iPhone is tethered:
-
-```sh
-sudo ./scripts/powermetrics_bench.sh 60 1000   # 60s @ 1Hz
-```
-
-Writes `/tmp/powermetrics_<unix>.csv` with columns:
-`ts_sec, cpu_w, gpu_w, ane_w, combined_w` plus a mean-power summary.
-
-Reading the result:
-- `ane_w` near 0.5–1 W is expected for the ANE path.
-- If `cpu_w` is 2–3 W during sustained generation, **CPU is the heat source**.
-- If `combined_w` exceeds 3 W, the user's "hotter than LiteRT" report is
-  reproduced — and the split shows whether CPU or ANE owns it.
-
-### 3. Decode-loop QoS (env-gated, opt-in)
-
-`LLM_DECODE_QOS=utility` (or `background`) sets the priority of the
-`Task` that owns the generation loop in `streamFromPrompt`. The Swift
-runtime maps lower priorities to efficiency cores when possible.
-
-```sh
-LLM_DECODE_QOS=utility ./CoreMLLLMChat
-```
-
-Trade-off: E-cores are ~25% as fast as P-cores per cycle but draw
-~25% the power. The ANE wait is unchanged; only the CPU work between
-dispatches is affected. Expect a small tok/s loss (≤ 5%) for a
-meaningful sustained-temperature win.
-
-Defaults to inherited (`.userInitiated`) — no behavior change unless
-the env var is set.
-
-### 4. outputBackings + double-buffer KV (env-gated, opt-in)
-
-`LLM_DOUBLE_BUFFER_KV=1` allocates sibling output backings for chunk1
-and chunk2 KV outputs (`kSliding{1,2}Out`, `vSliding{1,2}Out`,
-`kFull{1,2}Out`, `vFull{1,2}Out`) and passes them via
-`MLPredictionOptions.outputBackings`. After each prediction, the engine
-verifies the model wrote into the supplied backing (compares
-`dataPointer`); if so, it swaps the (in, out) roles instead of running
-the four `copyBack` memcpys (~99 MB/step at 8K context). If the model
-didn't honor the backing, the engine falls back to copyBack and logs
-once per chunk.
-
-```sh
-LLM_DOUBLE_BUFFER_KV=1 ./CoreMLLLMChat
-```
-
-Memory cost: ~100 MB extra resident KV (sibling buffers). Acceptable
-on 8 GB+ iPhones.
-
-Risk: if the ANE compiler ignores `outputBackings` for IOSurface-backed
-arrays, the swap path never triggers and behavior matches the default
-copyBack path. The `[KV] chunk1 outputBackings honored — copyBack skipped`
-log line confirms it took effect.
-
-Expected impact (if backings honored): -8 to -15 ms/step → ~38–45 tok/s
-and a sharp drop in `cpu_active`. **Must be validated on iPhone — Mac
-behavior may differ.**
+- `LLM_DOUBLE_BUFFER_KV` — failed: IOSurface-backed `MLMultiArray`
+  becomes locked once used as model input and **cannot be reused as
+  output backing** in subsequent inferences (Apple warning:
+  *"The underlying pixel buffer has been locked. Use a newly created
+  pixel buffer..."*). The fallback path was supposed to be transparent
+  but in practice CoreML allocated fresh IOSurfaces per step → 16×
+  slowdown observed (1129 ms/step vs 71 ms baseline). Removed as a
+  structural dead-end. See "Why double-buffer can't work" below.
 
 ---
 
-## What was deferred and why
+## The E4B measurement that refuted the hypothesis
 
-### Async `predictStep` (originally Task #3)
+Steady state (post-warmup), iPhone 17 Pro, Gemma 4 E4B, no env vars
+except `LLM_PROFILE_EVERY_STEP=1`:
 
-Rejected after analysis. CoreML's sync `prediction(from:)` already
-blocks on a Mach IPC kernel wait — the calling thread sleeps, it
-doesn't spin. Switching to `await chunk.prediction(from:)` would block
-on the same primitive without any thermal benefit, and would force
-all sync callers (MTP, CrossVocab, DrafterUnion) into async contexts
-they don't currently need.
+```
+[Profile] emb=0.8ms mask=0.2ms | c1=21.7 c2=21.6 c3=11.3 c4=16.0 (sum=70.6ms)
+                                                          → 14.0 tok/s
+[ANE/CPU] ANE_wait=68.7ms copyBack=1.9ms cpu_active=3.0ms (4% CPU)
+```
 
-If we later want **concurrent** mask/RoPE precomputation during ANE
-wait, we'll add it then with a measurement-justified design.
+| Component   | ms    | % of step |
+|-------------|-------|-----------|
+| ANE wait    | 68.7  | **97%**   |
+| copyBack    | 1.9   | 3%        |
+| cpu_active  | 3.0   | **4%**    |
 
-### Cross-step dispatch pipelining (originally Task #5)
-
-Within a single decode step, chunk1→chunk2→chunk3→chunk4 is strictly
-data-dependent — no parallelism is possible. Across steps, only
-mask/RoPE/umask for position+1 can be precomputed (embed and PLE
-depend on the next token, which is chunk4's argmax). Mask + RoPE
-together are ~1 ms/step today, so the upper bound on this win is
-~2% — not worth the concurrency complexity until the bigger levers
-land.
-
-### INT8 KV cache, chunk3+4 merge, in-place KV via dynamic_update_slice
-
-All require Python conversion changes + Mac parity testing + iPhone
-re-export. Out of scope for this Swift-side investigation pass. See
-`docs/LITERT_RUNTIME_ANALYSIS.md` Tier S/A for the conversion-side
-plan once measurements justify the effort.
+Implications:
+- CPU is essentially doing nothing — async/double-buffer/QoS can't
+  meaningfully reduce heat.
+- copyBack is 1.9 ms — much smaller than the originally estimated
+  10 ms. Even a perfect outputBackings implementation caps gain at 2.7%.
+- The 1 W ANE the docs cite is correct; what makes it feel hot is
+  *sustained dispatch keeping ANE pinned at high DVFS for 14 seconds
+  per response*, not a CPU-side heater.
 
 ---
 
-## iPhone arrival checklist (start here when device is in hand)
+## Why ANE *feels* hotter than GPU at lower watts (physics)
 
-Quick path for the next session — every step takes < 5 minutes. Print
-this section, run top-to-bottom, write the numbers in the table at the
-bottom.
+1. **Heat flux density.** ANE die ≈ 10 mm². 1 W / 10 mm² = 10 W/cm².
+   GPU 4 W / 30 mm² ≈ 13 W/cm² but spread across more silicon and
+   nearer the iPhone 17 Pro vapor chamber centroid. Small dies with
+   no spreader produce localized hotspots that show up as skin temp
+   even at low total wattage.
+   ([SemiEngineering — Getting rid of heat in chips](https://semiengineering.com/getting-rid-of-heat-in-chips/))
 
-### Step 1 — Open Xcode, set env vars
+2. **Vapor chamber geometry.** iPhone 17 Pro VC sits over the A19
+   Pro CPU/GPU cluster. ANE is off to one side — its waste heat takes
+   a longer thermal path to the chassis spreader.
+   ([iFixit / 9to5Mac teardown](https://9to5mac.com/2025/09/23/iphone-17-pro-teardown-reveals-vapor-chamber-internals-scratchgate-details-more/))
 
-`open Examples/CoreMLLLMChat/CoreMLLLMChat.xcodeproj`
+3. **Time-integral.** Generating 200 tokens at 14 tok/s = 14.3 s
+   sustained ANE busy. Same response on LiteRT GPU at 56 tok/s =
+   3.6 s active + idle. Skin temperature is a low-pass filter of die
+   power; sustained midpoint feels warmer than peak-then-idle even
+   when the integral is similar.
 
-Xcode → Edit Scheme → Run → Arguments → **Environment Variables**.
-Add (initially DISABLED — toggle them in Step 4):
+4. **DRAM is the real heater.** LLM decode is bandwidth-bound. At
+   14 tok/s × ~3 GB resident model ≈ 42 GB/s sustained LPDDR5X reads.
+   The DRAM controllers and memory package heat irrespective of which
+   compute engine drives them.
+   ([SemiEngineering — LPDDR5X](https://semiengineering.com/lpddr5x-high-bandwidth-power-efficient-performance-for-mobile-beyond/))
 
-| Name                     | Value     |
-|--------------------------|-----------|
-| `LLM_PROFILE_EVERY_STEP` | `1`       |
-| `LLM_DOUBLE_BUFFER_KV`   | `1`       |
-| `LLM_DECODE_QOS`         | `utility` |
+5. **ANE DVFS.** Per Maderix M4 ANE reverse-engineering, ANE has
+   *independent DVFS and 0 mW hard power-gating* when idle, but stays
+   pinned at a high DVFS state under continuous dispatch. GPU DVFS is
+   more aggressive at dropping clocks between Metal command buffers.
+   ([maderix.substack.com — Inside M4 ANE Part 1](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine))
 
-`LLM_PROFILE_EVERY_STEP` is safe to keep on for all four configs — it
-just controls log frequency.
+---
 
-### Step 2 — Baseline run (no env vars enabled)
+## Why the double-buffer KV optimization can't work
 
-Untick `LLM_DOUBLE_BUFFER_KV` and `LLM_DECODE_QOS` in the scheme. Run
-on iPhone, type a prompt, generate ~100 tokens. From the Xcode console:
+The intent was: allocate sibling buffers, pass via
+`MLPredictionOptions.outputBackings`, swap (in, out) roles after each
+prediction so the model writes KV into the future-input buffer,
+eliminating the 1.9 ms/step `copyBack` memcpy.
 
-- Look for the **last** `[ANE/CPU]` line — that's the most stable
-  reading after warmup.
-- Note `tok/s` from the summary or last `[Profile]` line.
+What actually happens on iOS:
 
-Record in the table below as **(A) baseline**.
+1. Step 1 — chunk1 input = buffer A (IOSurface), backing = buffer B.
+   Backings honored, model writes into B.
+2. Swap — kSliding1 = B, kSliding1Out = A.
+3. Step 2 — chunk1 input = B, backing = A.
+   **CoreML rejects A** as a backing because A's `CVPixelBuffer` was
+   locked when CoreML used it as input in step 1. Apple's warning is
+   explicit:
 
-### Step 3 — powermetrics on the Mac (in parallel with Step 2 repeat)
+   > "The underlying pixel buffer (0x...) used in the output backing
+   > MLMultiArray object for feature K_sliding_out has been locked.
+   > The output backing cannot use such an object. ... Use a newly
+   > created pixel buffer and MLMultiArray to avoid this error."
 
-Tether iPhone → Mac via USB. In Mac terminal:
+4. CoreML falls back to allocating a fresh IOSurface per step. The
+   alloc path is dramatically slower than the warm-cached one — we
+   measured 1129 ms/step vs 71 ms baseline (16× slowdown).
+
+This is structural: any buffer used as model input enters a locked
+state that excludes it from being a future output backing. Triple-buffer
+would face the same issue eventually. The only way to do double-buffer
+on iOS is to **not** use IOSurface for the output backings (plain
+MLMultiArrays), but those lose the zero-copy benefit on the input
+side. Net win with current ANE driver is ≤ copyBack itself (1.9 ms),
+not worth the complexity.
+
+**This is a real Apple-side constraint, not a bug in our implementation.**
+Filed in the doc so future investigators don't re-attempt the same path.
+
+---
+
+## Mitigation menu (post-investigation)
+
+After confirming ANE itself is the heat source, the available levers
+are limited. Ranked by ROI for "reduce sustained ANE heat without
+changing model architecture":
+
+| Lever | Status | Rationale |
+|-------|--------|-----------|
+| `MLOptimizationHints.specializationStrategy = .fastPrediction` | **shipped (default ON)** | Shorter ANE busy per dispatch; same tok/s, less heat per token |
+| Inter-dispatch `Task.sleep(Xms)` keyed off `thermalState` | rejected by user 2026-04-18 | Effective (ANE drops to 0 mW between chunks per Maderix) but trades throughput for heat |
+| Chunk3+4 merge (4→3 dispatches) | conversion-side; out of this PR | Tracked in `LITERT_RUNTIME_ANALYSIS.md` Tier S2 |
+| INT8 KV cache (50% bandwidth) | conversion-side; out of this PR | Tracked in `LITERT_RUNTIME_ANALYSIS.md` Tier S1; reduces DRAM heat |
+| Apple FM-style architectural KV-share split | already in Gemma 4 | L0–14 own KV, L15–34 shared — more aggressive than Apple's 5:3 |
+| W2 QAT weights | rejected | Post-training W2/W3 produces gibberish; QAT is days of GPU |
+| Async ANE dispatch | rejected | Increases concurrency = more sustained heat (per WWDC23 / our analysis) |
+| `_ANEClient` private `qos:21` | rejected | App Store reject risk |
+
+---
+
+## How to validate on iPhone
+
+### Step 1 — Baseline
+No env vars. Run the iOS app, type a prompt, generate 100 tokens.
+Read the **last** `[ANE/CPU]` log line (most stable post-warmup).
+
+Expected on E4B: `cpu_active ≈ 3 ms (4% CPU)`, `ANE_wait ≈ 70 ms`,
+14 tok/s. If `cpu_active > 10 ms`, the original CPU hypothesis may
+still hold for your workload — file the numbers.
+
+### Step 2 — Tethered powermetrics
 
 ```sh
 caffeinate -dimsu &
 sudo ./scripts/powermetrics_bench.sh 60 1000
 ```
 
-Start the iPhone generation IMMEDIATELY when the script says "Starting…".
-The CSV at `/tmp/powermetrics_<unix>.csv` has the per-second power
-breakdown; the script also prints means at the end.
+Start the iPhone generation when the script says "Starting…". CSV at
+`/tmp/powermetrics_<unix>.csv`. The mean `combined_w` is the actual
+heat-relevant number.
 
-Record `cpu_w`, `gpu_w`, `ane_w`, `combined_w` (means) for **(A) baseline**.
+### Step 3 — Toggle `LLM_FAST_PREDICTION`
 
-### Step 4 — Enable double-buffer KV
+Default is ON in this PR. To compare, set `LLM_FAST_PREDICTION=0` in
+the scheme. Expect:
+- Same tok/s (within noise)
+- First-load specialization a bit longer (~1-3 s extra)
+- Slightly lower `ANE_wait` per chunk → marginally cooler per token
 
-Re-tick **only** `LLM_DOUBLE_BUFFER_KV` in the scheme. Run again with
-the same prompt and length. Watch the Xcode console for one of:
+### Step 4 — `LLM_DECODE_QOS=utility` (optional)
 
-- `[KV] chunk1 outputBackings honored — copyBack skipped` → ✅ working
-- `[KV] chunk1 outputBackings NOT honored — falling back to copyBack`
-  → ❌ ANE compiler doesn't accept our backings; this is itself a
-  finding — file under "ANE constraints to investigate"
-
-Record as **(B) double-buffer**.
-
-### Step 5 — Add utility QoS
-
-Re-tick `LLM_DECODE_QOS` (value `utility`). Run again. Record as
-**(C) double-buffer + utility QoS**.
-
-### Step 6 — Fill in the table and decide
-
-| Config                        | tok/s | ANE/copyBack/cpu (ms) | %CPU | cpu_w | combined_w |
-|-------------------------------|-------|------------------------|------|-------|------------|
-| (A) baseline                  |       |                        |      |       |            |
-| (B) double-buffer             |       |                        |      |       |            |
-| (C) double-buffer + utility   |       |                        |      |       |            |
-
-**Decision rules:**
-
-- If (A) shows **`%CPU` > 50** → CPU is the bottleneck (hypothesis confirmed).
-- If (B) shows **`copyBack` ≈ 0 and tok/s ≥ (A)** → outputBackings works on
-  ANE; ship `LLM_DOUBLE_BUFFER_KV=1` as default and re-test thermals.
-- If (B) shows **NOT honored fallback** → file an issue; the fallback path
-  is identical to (A) so no regression. Next investigation: check if
-  `outputBackings` works for any chunk (try `MLPredictionOptions` with
-  hidden_states_out only — those aren't IOSurface-backed).
-- If (C) shows **`cpu_w` lower than (B), tok/s within 5%** → ship utility
-  QoS. If tok/s drops > 5%, leave QoS as inherited.
-
-If `combined_w` in (B)+(C) is now < 2 W and the device is no longer
-visibly hotter than LiteRT-LM, the investigation is closed. Otherwise,
-the residual heat is in ANE itself or DRAM bandwidth, and the next
-levers are conversion-side (INT8 KV, chunk merge — see
-`docs/LITERT_RUNTIME_ANALYSIS.md` Tier S).
+Forces the decode loop onto efficiency cores. With cpu_active = 3 ms,
+expected impact is small (saves ~1 ms of CPU per token at lower
+watt/cycle). Try if combined_w needs further trimming.
 
 ---
 
-## How to validate on Mac (before iPhone)
+## How to validate on Mac
 
-The Mac path is for sanity-checking the new code paths against any
-locally-converted Gemma 4 chunks (e.g., `output/gemma4-e2b-2k/`). Mac
-absolute numbers don't transfer to iPhone — the M-series ANE is much
-larger — but the **deltas** between configs do.
-
-### Single command — A/B/C in one shot
+### Single command — A/B in one shot
 
 ```sh
 ./scripts/test_double_buffer_locally.sh /path/to/model_dir 64
 ```
 
-Builds release, runs three configurations against the same prompt, and
-prints a comparison table. Detects whether `outputBackings` is honored
-on Mac ANE (proxy for iPhone behavior). Raw logs are saved to
-`/tmp/coreml-llm-bench.<random>/`.
+Note: this script was originally written to test the now-removed
+double-buffer flag. The script still works for comparing
+baseline vs `LLM_FAST_PREDICTION=0` — useful for sanity-check before
+shipping the on-device build.
 
-### Manual smoke runs
+### Manual
 
 ```sh
 swift build -c release
 
-# baseline
+# baseline (fast prediction default on)
 ./.build/release/coreml-llm-smoke /path/to/model_dir "Hi" 64
 
-# double buffer
-LLM_DOUBLE_BUFFER_KV=1 LLM_PROFILE_EVERY_STEP=1 \
-  ./.build/release/coreml-llm-smoke /path/to/model_dir "Hi" 64
-
-# double buffer + utility QoS
-LLM_DOUBLE_BUFFER_KV=1 LLM_DECODE_QOS=utility LLM_PROFILE_EVERY_STEP=1 \
+# disable fast prediction
+LLM_FAST_PREDICTION=0 LLM_PROFILE_EVERY_STEP=1 \
   ./.build/release/coreml-llm-smoke /path/to/model_dir "Hi" 64
 ```
 
-What to look for in the logs:
+Mac absolute numbers don't transfer to iPhone — the M-series ANE is
+much larger. Use deltas only.
 
-- `[KV] chunk1 outputBackings honored — copyBack skipped` (only logs once)
-- `[ANE/CPU] ANE_wait=Xms copyBack=Yms cpu_active=Zms (W% CPU)` per step
-- `[QoS] LLM_DECODE_QOS=utility — decode loop priority overridden`
+---
 
-If the Mac smoke run shows **outputBackings NOT honored**, there's still
-a chance iPhone behaves differently (the iPhone ANE compiler is a
-separate binary). It's worth trying on iPhone regardless, since the
-fallback path is identical to baseline.
+## References
+
+- maderix — [Inside the M4 Apple Neural Engine, Part 1](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine) and [Part 2](https://maderix.substack.com/p/inside-the-m4-apple-neural-engine-615) (DVFS, power gating, qos:21)
+- Orion — [Characterizing and Programming Apple's Neural Engine, arXiv 2603.06728](https://arxiv.org/abs/2603.06728) (dispatch overhead, INT8/FP16 throughput equivalence)
+- Apple — [Foundation Language Models 2025 Tech Report, arXiv 2507.13575](https://arxiv.org/abs/2507.13575) (KV-share, W2 QAT, ReDrafter)
+- Google — [ML Drift: scaling on-device GPU inference, arXiv 2505.00232](https://arxiv.org/abs/2505.00232) (LiteRT-LM Metal kernels)
+- Apple — [MLOptimizationHints / specializationStrategy](https://developer.apple.com/documentation/coreml/mloptimizationhints-swift.struct/specializationstrategy-swift.property)
+- Apple — [ProcessInfo.thermalState](https://developer.apple.com/documentation/foundation/processinfo/thermalstate-swift.property)
+- LiteRT-LM source — [google-ai-edge/LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) (no thermal management code; "fast enough that workload is short" pattern)

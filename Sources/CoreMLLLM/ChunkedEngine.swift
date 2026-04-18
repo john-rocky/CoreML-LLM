@@ -57,29 +57,6 @@ final class ChunkedEngine {
     private var kFull2: MLMultiArray     // (2, 1, ctx, maxHd)
     private var vFull2: MLMultiArray
 
-    // Optional double-buffer KV outputs for `MLPredictionOptions.outputBackings`.
-    // When non-nil, chunk1/chunk2 KV outputs are written directly into these
-    // sibling buffers; we then swap the (in, out) roles instead of memcpy'ing
-    // ~99 MB/step back into the input buffers (`copyBack`). Falls back to
-    // copyBack if the model doesn't honor the supplied backings (Apple docs:
-    // "if a model output cannot use the backing you provide, the model will
-    // use a default one").
-    //
-    // Enable via env var: LLM_DOUBLE_BUFFER_KV=1
-    var kSliding1Out: MLMultiArray?
-    var vSliding1Out: MLMultiArray?
-    var kFull1Out: MLMultiArray?
-    var vFull1Out: MLMultiArray?
-    var kSliding2Out: MLMultiArray?
-    var vSliding2Out: MLMultiArray?
-    var kFull2Out: MLMultiArray?
-    var vFull2Out: MLMultiArray?
-    private var doubleBufferEnabled: Bool { kSliding1Out != nil }
-    // Tracks whether outputBackings was honored on the last attempt; if any
-    // chunk fell back, future steps still try (model may honor next time).
-    private var doubleBufferFallbackC1: Bool = false
-    private var doubleBufferFallbackC2: Bool = false
-    private var doubleBufferAnnounced: Bool = false
 
     // Phase 0e scratch pool: buffers rewritten each decode step instead of
     // freshly allocated. Holds the three largest per-step masks; smaller
@@ -125,16 +102,38 @@ final class ChunkedEngine {
 
     static func load(from directory: URL, config: ModelConfig,
                      computeUnits: MLComputeUnits) async throws -> ChunkedEngine {
+        // iOS 18+ MLOptimizationHints.specializationStrategy = .fastPrediction
+        // trades a longer first-load specialization for shorter per-prediction
+        // wall time. Enabled by default — the added load-time cost (~seconds)
+        // is amortized across the session, and a shorter ANE busy window per
+        // dispatch directly reduces sustained heat per token.
+        //
+        // Set LLM_FAST_PREDICTION=0 to disable (opt-out).
+        let fastPredictionEnabled = ProcessInfo.processInfo.environment["LLM_FAST_PREDICTION"] != "0"
+        func applyHints(_ cfg: MLModelConfiguration) {
+            guard fastPredictionEnabled else { return }
+            if #available(iOS 18.0, macOS 15.0, *) {
+                var hints = MLOptimizationHints()
+                hints.specializationStrategy = .fastPrediction
+                cfg.optimizationHints = hints
+            }
+        }
+
         let mlConfig = MLModelConfiguration()
         mlConfig.computeUnits = computeUnits
+        applyHints(mlConfig)
 
         // Prefill chunks use GPU for compute-bound batch processing (TTFT win).
         // Decode chunks stay on ANE for bandwidth-bound single-token inference.
         let prefillConfig = MLModelConfiguration()
         let useGPUPrefill = ProcessInfo.processInfo.environment["GPU_PREFILL"] == "1"
         prefillConfig.computeUnits = useGPUPrefill ? .cpuAndGPU : computeUnits
+        applyHints(prefillConfig)
         if useGPUPrefill {
             print("[Load] GPU_PREFILL=1 — prefill chunks will use .cpuAndGPU")
+        }
+        if fastPredictionEnabled {
+            print("[Load] MLOptimizationHints.specializationStrategy = .fastPrediction")
         }
 
         // Self-heal: remove any `prefill_chunk{i}.mlmodelc` directories that
@@ -221,6 +220,7 @@ final class ChunkedEngine {
             let verifyConfig = MLModelConfiguration()
             verifyConfig.computeUnits = computeUnits
             verifyConfig.functionName = "verify_qK"
+            applyHints(verifyConfig)
 
             let verifyT0 = CFAbsoluteTimeGetCurrent()
             try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
@@ -395,25 +395,6 @@ final class ChunkedEngine {
             vFull2:    ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx),
             config: config, prefillN: prefillN)
 
-        // Optional double-buffer KV: allocate sibling output backings so
-        // chunk1/chunk2 can write KV directly into pre-allocated buffers
-        // instead of paying ~10 ms/step in copyBack memcpy. Off by default;
-        // enable with LLM_DOUBLE_BUFFER_KV=1 to A/B test on iPhone.
-        if ProcessInfo.processInfo.environment["LLM_DOUBLE_BUFFER_KV"] == "1" {
-            // Mirror the (slots, nkv, seqLen) shape detected from each chunk's
-            // KV input so the sibling output backings match — required for the
-            // outputBackings dataPointer compare to succeed.
-            engine.kSliding1Out = try ioSurfaceArray(slots: c1KS.slots, nkv: c1KS.nkv, seqLen: W)
-            engine.vSliding1Out = try ioSurfaceArray(slots: c1KS.slots, nkv: c1KS.nkv, seqLen: W)
-            engine.kFull1Out    = try ioSurfaceArray(slots: c1KF.slots, nkv: c1KF.nkv, seqLen: ctx)
-            engine.vFull1Out    = try ioSurfaceArray(slots: c1KF.slots, nkv: c1KF.nkv, seqLen: ctx)
-            engine.kSliding2Out = try ioSurfaceArray(slots: c2KS.slots, nkv: c2KS.nkv, seqLen: W)
-            engine.vSliding2Out = try ioSurfaceArray(slots: c2KS.slots, nkv: c2KS.nkv, seqLen: W)
-            engine.kFull2Out    = try ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx)
-            engine.vFull2Out    = try ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx)
-            print("[KV] LLM_DOUBLE_BUFFER_KV=1 — outputBackings + swap enabled")
-        }
-
         // ANE pipeline prewarm (Phase 0b): four dummy decode steps at load
         // time force the ANE compiler to finalize dispatch schedules and
         // resident weight layouts before the first user token arrives —
@@ -465,17 +446,8 @@ final class ChunkedEngine {
     // MARK: - Reset
 
     func reset() {
-        var buffers: [MLMultiArray] = [
-            kSliding1, vSliding1, kFull1, vFull1,
-            kSliding2, vSliding2, kFull2, vFull2,
-        ]
-        // Also zero the double-buffer siblings so a swap after reset doesn't
-        // surface stale KV from the previous conversation.
-        for opt in [kSliding1Out, vSliding1Out, kFull1Out, vFull1Out,
-                    kSliding2Out, vSliding2Out, kFull2Out, vFull2Out] {
-            if let b = opt { buffers.append(b) }
-        }
-        for buf in buffers {
+        for buf in [kSliding1, vSliding1, kFull1, vFull1,
+                    kSliding2, vSliding2, kFull2, vFull2] {
             memset(buf.dataPointer, 0, buf.count * MemoryLayout<UInt16>.stride)
         }
         currentPosition = 0
@@ -562,50 +534,16 @@ final class ChunkedEngine {
             "V_full_in": MLFeatureValue(multiArray: vFull1),
         ])
         let tC1Wait0 = CFAbsoluteTimeGetCurrent()
-        let out1: MLFeatureProvider
-        if doubleBufferEnabled, let kSO = kSliding1Out, let vSO = vSliding1Out,
-           let kFO = kFull1Out, let vFO = vFull1Out {
-            let opts = MLPredictionOptions()
-            opts.outputBackings = [
-                "K_sliding_out": kSO, "V_sliding_out": vSO,
-                "K_full_out": kFO,    "V_full_out": vFO,
-            ]
-            out1 = try chunk1.prediction(from: in1, options: opts)
-        } else {
-            out1 = try chunk1.prediction(from: in1)
-        }
+        let out1 = try chunk1.prediction(from: in1)
         let tC1Wait1 = CFAbsoluteTimeGetCurrent()
         profileANEWait += (tC1Wait1 - tC1Wait0)
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
         let tC1Cb0 = CFAbsoluteTimeGetCurrent()
-        if doubleBufferEnabled,
-           let kSO = kSliding1Out, let vSO = vSliding1Out,
-           let kFO = kFull1Out, let vFO = vFull1Out,
-           let outKS = out1.featureValue(for: "K_sliding_out")?.multiArrayValue,
-           outKS.dataPointer == kSO.dataPointer {
-            // outputBackings honored: swap (in, out) roles — no memcpy needed.
-            // Explicit triple-assignment instead of `swap(&a, &b!)` which
-            // unwraps to a temporary in Swift and silently fails to write back.
-            let oldKS = kSliding1; kSliding1 = kSO; kSliding1Out = oldKS
-            let oldVS = vSliding1; vSliding1 = vSO; vSliding1Out = oldVS
-            let oldKF = kFull1;    kFull1    = kFO; kFull1Out    = oldKF
-            let oldVF = vFull1;    vFull1    = vFO; vFull1Out    = oldVF
-            if !doubleBufferAnnounced {
-                print("[KV] chunk1 outputBackings honored — copyBack skipped")
-                doubleBufferAnnounced = true
-            }
-            doubleBufferFallbackC1 = false
-        } else {
-            if doubleBufferEnabled && !doubleBufferFallbackC1 {
-                print("[KV] chunk1 outputBackings NOT honored — falling back to copyBack")
-                doubleBufferFallbackC1 = true
-            }
-            copyBack(out1, "K_sliding_out", into: kSliding1)
-            copyBack(out1, "V_sliding_out", into: vSliding1)
-            copyBack(out1, "K_full_out", into: kFull1)
-            copyBack(out1, "V_full_out", into: vFull1)
-        }
+        copyBack(out1, "K_sliding_out", into: kSliding1)
+        copyBack(out1, "V_sliding_out", into: vSliding1)
+        copyBack(out1, "K_full_out", into: kFull1)
+        copyBack(out1, "V_full_out", into: vFull1)
         let tC1End = CFAbsoluteTimeGetCurrent()
         profileCopyBack += (tC1End - tC1Cb0)
         profileC1 += (tC1End - tC1Start)
@@ -626,42 +564,15 @@ final class ChunkedEngine {
             "V_full_in": MLFeatureValue(multiArray: vFull2),
         ])
         let tC2Wait0 = CFAbsoluteTimeGetCurrent()
-        let out2: MLFeatureProvider
-        if doubleBufferEnabled, let kSO = kSliding2Out, let vSO = vSliding2Out,
-           let kFO = kFull2Out, let vFO = vFull2Out {
-            let opts = MLPredictionOptions()
-            opts.outputBackings = [
-                "K_sliding_out": kSO, "V_sliding_out": vSO,
-                "K_full_out": kFO,    "V_full_out": vFO,
-            ]
-            out2 = try chunk2.prediction(from: in2, options: opts)
-        } else {
-            out2 = try chunk2.prediction(from: in2)
-        }
+        let out2 = try chunk2.prediction(from: in2)
         let tC2Wait1 = CFAbsoluteTimeGetCurrent()
         profileANEWait += (tC2Wait1 - tC2Wait0)
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let tC2Cb0 = CFAbsoluteTimeGetCurrent()
-        if doubleBufferEnabled,
-           let kSO = kSliding2Out, let vSO = vSliding2Out,
-           let kFO = kFull2Out, let vFO = vFull2Out,
-           let outKS = out2.featureValue(for: "K_sliding_out")?.multiArrayValue,
-           outKS.dataPointer == kSO.dataPointer {
-            let oldKS = kSliding2; kSliding2 = kSO; kSliding2Out = oldKS
-            let oldVS = vSliding2; vSliding2 = vSO; vSliding2Out = oldVS
-            let oldKF = kFull2;    kFull2    = kFO; kFull2Out    = oldKF
-            let oldVF = vFull2;    vFull2    = vFO; vFull2Out    = oldVF
-            doubleBufferFallbackC2 = false
-        } else {
-            if doubleBufferEnabled && !doubleBufferFallbackC2 {
-                print("[KV] chunk2 outputBackings NOT honored — falling back to copyBack")
-                doubleBufferFallbackC2 = true
-            }
-            copyBack(out2, "K_sliding_out", into: kSliding2)
-            copyBack(out2, "V_sliding_out", into: vSliding2)
-            copyBack(out2, "K_full_out", into: kFull2)
-            copyBack(out2, "V_full_out", into: vFull2)
-        }
+        copyBack(out2, "K_sliding_out", into: kSliding2)
+        copyBack(out2, "V_sliding_out", into: vSliding2)
+        copyBack(out2, "K_full_out", into: kFull2)
+        copyBack(out2, "V_full_out", into: vFull2)
         let tC2Cb1 = CFAbsoluteTimeGetCurrent()
         profileCopyBack += (tC2Cb1 - tC2Cb0)
         let kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
