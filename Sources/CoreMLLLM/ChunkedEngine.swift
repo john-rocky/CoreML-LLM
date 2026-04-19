@@ -306,9 +306,20 @@ final class ChunkedEngine {
                         }
                     }
                     if v1 != nil && v2 != nil && v3 != nil && v4 != nil {
+                        // Standalone eagle3 verify chunks emit token_ids as (T,) 1D;
+                        // multi-function verify_qK emits (1, T). Handle both.
                         if let desc = v4!.modelDescription.outputDescriptionsByName["token_ids"],
-                           let c = desc.multiArrayConstraint, c.shape.count >= 2 {
-                            detectedK = c.shape[1].intValue
+                           let c = desc.multiArrayConstraint {
+                            if c.shape.count >= 2 {
+                                detectedK = c.shape[1].intValue
+                            } else if c.shape.count == 1 {
+                                detectedK = c.shape[0].intValue
+                            }
+                        }
+                        if detectedK == 0 {
+                            // Fallback: assume K=3 for EAGLE-3 build convention.
+                            detectedK = 3
+                            print("[Load] Could not infer K from verify_chunk4 token_ids shape; defaulting to 3")
                         }
                         let vDt = CFAbsoluteTimeGetCurrent() - verifyT0
                         print("[Load] Standalone verify chunks loaded (K=\(detectedK)) in \(String(format: "%.1f", vDt))s")
