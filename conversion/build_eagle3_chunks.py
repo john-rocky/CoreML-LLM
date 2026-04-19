@@ -201,11 +201,14 @@ class EagleChunk4(nn.Module):
                 config, per_layer_combined,
                 kv13_k, kv13_v, kv14_k, kv14_v,
             )
-        # post-L34 pre-norm hidden — matches test_eagle3_infer.py's
-        # out.hidden_states[fusion_layer + 1] semantics.
-        hidden_at_L34 = hidden_states
-
+        # post-final-norm hidden — matches `out.hidden_states[-1]` semantics
+        # from HF's Gemma4TextModel, which is what the training collector
+        # used as `h_high`. Earlier this captured the pre-norm hidden
+        # (norm ~40), whereas training saw the post-norm tensor (norm ~235):
+        # that 6× magnitude + distribution shift crushes the draft's
+        # accept rate to ~0% on device. Capture it AFTER `self.base.norm`.
         normed = self.base.norm(hidden_states)
+        hidden_at_L34 = normed
         x = normed.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
         logits = self.base.lm_head(x).squeeze(2).permute(0, 2, 1)
         if self.base.softcap > 0:
