@@ -794,6 +794,9 @@ public final class CoreMLLLM: @unchecked Sendable {
                             }
 
                             if useEagle, let sl = eagleSpec {
+                                if tokenCount < 5 {
+                                    print("[SpecDbg] ENTER EAGLE burst tokenCount=\(tokenCount) pos=\(engine.currentPosition) nid=\(nid)")
+                                }
                                 // EAGLE-3 speculative burst: yields 1..K+1 accepted tokens.
                                 let accepted: [Int32]
                                 do {
@@ -883,6 +886,9 @@ public final class CoreMLLLM: @unchecked Sendable {
                                     tokenCount += 1
                                 }
                             } else {
+                                if tokenCount < 5 {
+                                    print("[SpecDbg] ENTER T=1 tokenCount=\(tokenCount) pos=\(engine.currentPosition)")
+                                }
                                 mutableSelf.lastEmittedTokenIDs.append(nid)
                                 let text = mutableSelf.tokenizer.decode(tokens: [Int(nid)])
                                 continuation.yield(text)
