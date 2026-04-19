@@ -103,8 +103,8 @@ class EagleChunk2(nn.Module):
         V_full_outs = []
         hidden_at_L8 = hidden_states  # placeholder; overwritten below
 
-        for local_idx in range(self.base.END - self.base.START):
-            layer_idx = self.base.START + local_idx  # 8..14
+        for local_idx in range(self.base.end - self.base.start):
+            layer_idx = self.base.start + local_idx  # 8..14
             is_full = config.is_full_attention(layer_idx)
             if is_full:
                 fi = self.base.full_map[layer_idx]
@@ -161,8 +161,8 @@ class EagleChunk3(nn.Module):
         dummy_K = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
         dummy_V = dummy_K
         hidden_at_L17 = hidden_states
-        for local_idx in range(self.base.END - self.base.START):
-            layer_idx = self.base.START + local_idx  # 15..24
+        for local_idx in range(self.base.end - self.base.start):
+            layer_idx = self.base.start + local_idx  # 15..24
             hidden_states, *_ = _run_layer_swa(
                 self.base.layers[local_idx], layer_idx, hidden_states,
                 cos_s, sin_s, cos_f, sin_f,
@@ -191,8 +191,8 @@ class EagleChunk4(nn.Module):
         dummy_K = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
         dummy_V = dummy_K
 
-        for local_idx in range(self.base.END - self.base.START):
-            layer_idx = self.base.START + local_idx  # 25..34
+        for local_idx in range(self.base.end - self.base.start):
+            layer_idx = self.base.start + local_idx  # 25..34
             hidden_states, *_ = _run_layer_swa(
                 self.base.layers[local_idx], layer_idx, hidden_states,
                 cos_s, sin_s, cos_f, sin_f,
