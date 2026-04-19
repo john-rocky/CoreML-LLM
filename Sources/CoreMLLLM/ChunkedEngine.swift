@@ -709,8 +709,22 @@ final class ChunkedEngine {
                 aneMs, cbMs, cpuActiveMs, cpuPct))
         }
 
+        // Best-effort logit stash — zero-cost when chunk4 doesn't
+        // expose `token_logit` (the .featureValue call returns nil).
+        if let logitsFV = out4.featureValue(for: "token_logit"),
+           let arr = logitsFV.multiArrayValue, arr.count > 0 {
+            self.lastTokenLogit = Float(truncating: arr[0])
+        } else {
+            self.lastTokenLogit = nil
+        }
         return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
     }
+
+    /// Populated by the most recent `predictStep` call when the chunk4
+    /// build exposes `token_logit` (the max-logit for the argmax token,
+    /// fp16). `nil` when that output is absent. Read by the rich event
+    /// stream to surface per-token confidence without an extra dispatch.
+    public private(set) var lastTokenLogit: Float?
 
     // MARK: - Batched prefill (seq=N)
 
