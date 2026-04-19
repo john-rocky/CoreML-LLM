@@ -577,6 +577,231 @@ public final class CoreMLLLM: @unchecked Sendable {
                           maxTokens: maxTokens)
     }
 
+    // MARK: - Options-aware API (parity with LiteRT-LM / llama.cpp /
+    //         HF generate — adds sampling, stops, cancellation, events,
+    //         tool use, JSON mode, structured stats).
+
+    /// Rich stream. Emits `GenerationEvent.firstToken`, `.token`,
+    /// optionally `.toolCall`, and exactly one terminal `.finished`.
+    /// Honours `Task.cancel()` — the underlying decode task checks
+    /// cancellation between tokens.
+    public func streamEvents(_ messages: [Message],
+                              options: GenerationOptions = .default,
+                              tools: [ToolSpec] = [],
+                              image: CGImage? = nil,
+                              audio: [Float]? = nil
+    ) async throws -> AsyncStream<GenerationEvent> {
+        let template = ChatTemplate(family: config.architecture.hasPrefix("qwen")
+                                    ? .qwen : .gemma4)
+        let msgsWithTools = tools.isEmpty
+            ? messages
+            : template.injectTools(tools, into: messages)
+
+        // Media processing (kept sync with existing `stream(messages:)`).
+        var imageFeatures: MLMultiArray? = cachedImageFeatures
+        if let image {
+            imageFeatures = try processImage(image)
+            cachedImageFeatures = imageFeatures
+        }
+        var audioFeatures: MLMultiArray?
+        var actualAudioTokens = 0
+        if let audio {
+            let (features, tokenCount) = try processAudio(audio)
+            audioFeatures = features
+            actualAudioTokens = tokenCount
+        }
+        let hasImage = imageFeatures != nil
+        let hasAudioInput = audioFeatures != nil
+
+        let imageBlock = hasImage
+            ? "<|image>" + String(repeating: "<|image|>", count: 256) + "<image|>"
+            : ""
+        let audioBlock = hasAudioInput
+            ? "<|audio>" + String(repeating: "<|audio|>", count: actualAudioTokens) + "<audio|>"
+            : ""
+        let chatPrompt = template.render(messages: msgsWithTools,
+                                          imageBlock: imageBlock,
+                                          audioBlock: audioBlock)
+        return try streamEventsFromPrompt(
+            chatPrompt,
+            imageFeatures: imageFeatures,
+            imageNumTokens: hasImage ? 256 : 0,
+            audioFeatures: audioFeatures,
+            audioTokenCount: actualAudioTokens,
+            options: options,
+            tools: tools)
+    }
+
+    /// Convenience — single-prompt, rich events.
+    public func streamEvents(_ prompt: String,
+                              options: GenerationOptions = .default,
+                              tools: [ToolSpec] = [],
+                              image: CGImage? = nil,
+                              audio: [Float]? = nil
+    ) async throws -> AsyncStream<GenerationEvent> {
+        try await streamEvents([Message(role: .user, content: prompt)],
+                                options: options, tools: tools,
+                                image: image, audio: audio)
+    }
+
+    /// Run to completion, collecting the full response string + stats.
+    /// Honours `options.stopSequences`, `options.stopTokenIds`,
+    /// `options.jsonMode`, and `tools` (invokes tool handlers inline and
+    /// resumes generation with their results — one synchronous loop).
+    @discardableResult
+    public func generate(_ messages: [Message],
+                          options: GenerationOptions = .default,
+                          tools: [ToolSpec] = [],
+                          image: CGImage? = nil,
+                          audio: [Float]? = nil
+    ) async throws -> GenerationResult {
+        var text = ""
+        let finalStats = GenerationStats(promptTokens: 0, decodeTokens: 0,
+                                          ttft: 0, prefillTime: 0, decodeTime: 0)
+        var finalReason: FinishReason = .error
+        var turnMessages = messages
+        var remainingTokens = options.maxTokens
+        var totalStats = finalStats
+
+        // Up to 4 tool-loop iterations to prevent infinite back-and-forth.
+        for _ in 0..<max(1, tools.isEmpty ? 1 : 4) {
+            var thisTurnText = ""
+            var toolInvocation: ToolCallInvocation?
+            var stats = finalStats
+            var scopedOptions = options
+            scopedOptions.maxTokens = remainingTokens
+            let stream = try await streamEvents(turnMessages, options: scopedOptions,
+                                                 tools: tools, image: image, audio: audio)
+            for await event in stream {
+                switch event {
+                case .token(let t, _):
+                    thisTurnText += t
+                case .toolCall(let name, let args):
+                    toolInvocation = ToolCallInvocation(
+                        name: name, argumentsJSON: args,
+                        argumentsDict: (try? JSONSerialization.jsonObject(
+                            with: Data(args.utf8))) as? [String: Any] ?? [:])
+                case .finished(let reason, let s):
+                    finalReason = reason
+                    stats = s
+                case .firstToken:
+                    break
+                }
+            }
+            text += thisTurnText
+            totalStats = GenerationStats(
+                promptTokens: totalStats.promptTokens + stats.promptTokens,
+                decodeTokens: totalStats.decodeTokens + stats.decodeTokens,
+                ttft: totalStats.ttft == 0 ? stats.ttft : totalStats.ttft,
+                prefillTime: totalStats.prefillTime + stats.prefillTime,
+                decodeTime: totalStats.decodeTime + stats.decodeTime)
+            remainingTokens -= stats.decodeTokens
+
+            guard let inv = toolInvocation, finalReason == .toolCall else { break }
+            if let tool = tools.first(where: { $0.name == inv.name }) {
+                let resultText: String
+                do {
+                    resultText = try await tool.handler(inv.argumentsDict)
+                } catch {
+                    resultText = "ERROR: \(error.localizedDescription)"
+                }
+                // Append the assistant's partial turn + tool response, then
+                // re-prompt. We encode the exchange as a user-role message
+                // carrying `<tool_response>` so the template stays honest
+                // (Gemma 4 was not trained on a dedicated tool role).
+                turnMessages.append(Message(role: .assistant, content: thisTurnText))
+                turnMessages.append(Message(
+                    role: .user,
+                    content: "<tool_response>\(resultText)</tool_response>"))
+                if remainingTokens <= 0 { finalReason = .maxTokens; break }
+                continue
+            }
+            break
+        }
+        return GenerationResult(text: text, reason: finalReason, stats: totalStats)
+    }
+
+    @discardableResult
+    public func generate(_ prompt: String,
+                          options: GenerationOptions = .default,
+                          tools: [ToolSpec] = [],
+                          image: CGImage? = nil,
+                          audio: [Float]? = nil
+    ) async throws -> GenerationResult {
+        try await generate([Message(role: .user, content: prompt)],
+                            options: options, tools: tools,
+                            image: image, audio: audio)
+    }
+
+    public struct GenerationResult: Sendable {
+        public let text: String
+        public let reason: FinishReason
+        public let stats: GenerationStats
+    }
+
+    // MARK: - Session snapshot / clone (KV-cache save/restore)
+    //
+    // `Session` wraps the prefix-cache machinery so that callers can
+    // branch a conversation or resume it later without replaying the
+    // prompt through the model.
+
+    /// Immutable snapshot of the current KV state. Safe to hand off
+    /// across runs if the model directory is unchanged.
+    public struct SessionSnapshot: Sendable {
+        fileprivate let tokenIDs: [Int32]
+        fileprivate let position: Int
+        fileprivate let sourceModel: String
+        /// Number of tokens encoded in this snapshot (prompt + emitted).
+        public var tokenCount: Int { tokenIDs.count }
+        /// Logical decode position (`== tokenCount` under normal use).
+        public var decodePosition: Int { position }
+    }
+
+    /// Save the current KV state. Returns nil when the chunked engine
+    /// isn't loaded or when position=0 (no state to snapshot).
+    public func saveSession() -> SessionSnapshot? {
+        guard let engine = chunkedEngine, engine.currentPosition > 0 else { return nil }
+        let ids = Array(lastPromptTokenIDs) + Array(lastEmittedTokenIDs)
+        return SessionSnapshot(tokenIDs: ids,
+                                position: engine.currentPosition,
+                                sourceModel: config.modelName)
+    }
+
+    /// Restore a previously-saved session. The current in-memory KV is
+    /// replaced with the snapshot's; subsequent `stream`/`generate`
+    /// calls append to it.
+    public func restoreSession(_ snapshot: SessionSnapshot) throws {
+        guard snapshot.sourceModel == config.modelName else {
+            throw CoreMLLLMError.sessionModelMismatch
+        }
+        guard let engine = chunkedEngine else { throw CoreMLLLMError.prefillNotAvailable }
+        engine.reset()
+        // Replay via prefill when available, else step-wise.
+        let ids = snapshot.tokenIDs.map { Int($0) }
+        if engine.hasPrefill && ids.count > 1 {
+            let n = min(ids.count, engine.prefillN)
+            _ = try engine.runPrefill(tokenIDs: Array(ids.prefix(n)))
+            engine.currentPosition = n
+            for step in n..<ids.count {
+                _ = try engine.predictStep(tokenID: ids[step], position: step)
+                engine.currentPosition = step + 1
+            }
+        } else {
+            for (step, tid) in ids.enumerated() {
+                _ = try engine.predictStep(tokenID: tid, position: step)
+                engine.currentPosition = step + 1
+            }
+        }
+        lastPromptTokenIDs = snapshot.tokenIDs
+        lastEmittedTokenIDs = []
+    }
+
+    /// Clone the current session into a detached snapshot. Callers can
+    /// restore this later on the same model instance (we don't have
+    /// true multi-instance cloning because each `ChunkedEngine` owns a
+    /// single KV buffer).
+    public func cloneSession() -> SessionSnapshot? { saveSession() }
+
     // MARK: - Private core stream
 
     private func streamFromPrompt(
@@ -830,6 +1055,398 @@ public final class CoreMLLLM: @unchecked Sendable {
                 continuation.finish()
             }
         }
+    }
+
+    // MARK: - Private: rich event stream (sampling + stops + tools)
+
+    private static let DEFAULT_EOS_IDS: Set<Int> = [1, 106, 151645]
+
+    private static var samplingWarningEmitted = false
+
+    private func streamEventsFromPrompt(
+        _ chatPrompt: String,
+        imageFeatures: MLMultiArray?,
+        imageNumTokens: Int,
+        audioFeatures: MLMultiArray?,
+        audioTokenCount: Int,
+        options: GenerationOptions,
+        tools: [ToolSpec]
+    ) throws -> AsyncStream<GenerationEvent> {
+        let tokenIDs = tokenizer.encode(text: chatPrompt)
+        reset()
+
+        self.lastPromptTokenIDs = tokenIDs.map { Int32($0) }
+        self.lastEmittedTokenIDs = []
+
+        let mutableSelf = self
+        let imgFeats = imageFeatures
+        let imgTokenLimit = imageNumTokens
+        let audFeats = audioFeatures
+        let tokens = tokenIDs
+        let audTokenCount = audioTokenCount
+        let ctxLimit = config.contextLength
+        let toolsActive = !tools.isEmpty
+
+        if options.needsSampling && !Self.samplingWarningEmitted {
+            Self.samplingWarningEmitted = true
+            print("[Sampler] Warning: temperature/top-K/top-P requested but " +
+                  "the shipped chunk4 exposes only argmax — falling back to " +
+                  "greedy. Rebuild chunk4 with top-K output to enable.")
+        }
+
+        // QoS selection (mirror streamFromPrompt).
+        let qosEnv = ProcessInfo.processInfo.environment["LLM_DECODE_QOS"]?.lowercased()
+        let decodePriority: TaskPriority?
+        switch qosEnv {
+        case "background": decodePriority = .background
+        case "utility":    decodePriority = .utility
+        case "userinitiated", "user": decodePriority = .userInitiated
+        case "high":       decodePriority = .high
+        default:           decodePriority = nil
+        }
+
+        let eosSet: Set<Int> = Self.DEFAULT_EOS_IDS.union(options.stopTokenIds)
+        let stopMatcher = StopSequenceMatcher(options.stopSequences)
+
+        return AsyncStream { continuation in
+            let task = Task(priority: decodePriority) {
+                let IMAGE_TOKEN_ID = 258880
+                let AUDIO_TOKEN_ID = 258881
+                let VIDEO_TOKEN_ID = 258884
+                var imageIdx = 0
+                var audioIdx = 0
+                var nextID = 0
+                var stats = GenerationStats(promptTokens: tokens.count, decodeTokens: 0,
+                                             ttft: 0, prefillTime: 0, decodeTime: 0)
+                var firstTokenEmitted = false
+                var finishReason: FinishReason = .eos
+                var cumulativeText = ""
+                var pendingEmit = ""        // buffered chars held back during partial stop match
+                var jsonDetector = JSONCompletionDetector()
+
+                func multimodalEmbedding(for tid: Int) -> MLMultiArray? {
+                    if (tid == IMAGE_TOKEN_ID || tid == VIDEO_TOKEN_ID),
+                       let f = imgFeats, imageIdx < imgTokenLimit {
+                        let emb = mutableSelf.chunkedEngine?.sliceFeature(f, at: imageIdx)
+                            ?? ImageProcessor.sliceFeature(f, at: imageIdx,
+                                hiddenSize: mutableSelf.config.hiddenSize)
+                        imageIdx += 1
+                        return emb
+                    }
+                    if tid == AUDIO_TOKEN_ID, let f = audFeats, audioIdx < audTokenCount {
+                        let emb = mutableSelf.chunkedEngine?.sliceFeature(f, at: audioIdx)
+                            ?? AudioProcessor.sliceFeature(f, at: audioIdx,
+                                hiddenSize: mutableSelf.config.hiddenSize)
+                        audioIdx += 1
+                        return emb
+                    }
+                    return nil
+                }
+
+                do {
+                    let engine = mutableSelf.chunkedEngine
+                    let t0 = CFAbsoluteTimeGetCurrent()
+                    if let engine {
+                        // ---------------- prefill ----------------
+                        let prefillStart = CFAbsoluteTimeGetCurrent()
+                        let prefillLen = min(tokens.count, engine.prefillN)
+                        let useHybrid = engine.hasPrefill && prefillLen > 0
+                        if useHybrid {
+                            try autoreleasepool {
+                                let batch = Array(tokens[0..<prefillLen])
+                                nextID = try engine.runPrefill(
+                                    tokenIDs: batch,
+                                    imageFeatures: imgFeats,
+                                    imageNumTokens: imgTokenLimit,
+                                    audioFeatures: audFeats,
+                                    audioNumTokens: audTokenCount)
+                            }
+                            imageIdx = tokens[0..<prefillLen].filter {
+                                $0 == IMAGE_TOKEN_ID || $0 == VIDEO_TOKEN_ID
+                            }.count
+                            audioIdx = tokens[0..<prefillLen].filter {
+                                $0 == AUDIO_TOKEN_ID
+                            }.count
+                            engine.currentPosition = prefillLen
+                            for step in prefillLen..<tokens.count {
+                                if Task.isCancelled {
+                                    finishReason = .cancelled
+                                    throw CancellationError()
+                                }
+                                let tid = tokens[step]
+                                try autoreleasepool {
+                                    if let emb = multimodalEmbedding(for: tid) {
+                                        nextID = try engine.predictStep(tokenID: 0,
+                                            position: step, imageEmbedding: emb)
+                                    } else {
+                                        nextID = try engine.predictStep(tokenID: tid,
+                                            position: step)
+                                    }
+                                }
+                                engine.currentPosition = step + 1
+                            }
+                        } else {
+                            for (step, tid) in tokens.enumerated() {
+                                if Task.isCancelled {
+                                    finishReason = .cancelled
+                                    throw CancellationError()
+                                }
+                                try autoreleasepool {
+                                    if let emb = multimodalEmbedding(for: tid) {
+                                        nextID = try engine.predictStep(tokenID: 0,
+                                            position: step, imageEmbedding: emb)
+                                    } else {
+                                        nextID = try engine.predictStep(tokenID: tid,
+                                            position: step)
+                                    }
+                                }
+                                engine.currentPosition = step + 1
+                            }
+                        }
+                        stats = GenerationStats(
+                            promptTokens: tokens.count, decodeTokens: 0,
+                            ttft: 0,
+                            prefillTime: CFAbsoluteTimeGetCurrent() - prefillStart,
+                            decodeTime: 0)
+
+                        // ---------------- decode ----------------
+                        let decodeStart = CFAbsoluteTimeGetCurrent()
+                        var tokenCount = 0
+                        let maxDecode = min(ctxLimit - engine.currentPosition,
+                                             options.maxTokens)
+                        var nid = Int32(nextID)
+                        var sampler = Sampler(options: options)
+
+                        decodeLoop: while tokenCount < maxDecode {
+                            if Task.isCancelled {
+                                finishReason = .cancelled
+                                break decodeLoop
+                            }
+                            if eosSet.contains(Int(nid)) {
+                                finishReason = options.stopTokenIds.contains(Int(nid))
+                                    ? .stopTokenId : .eos
+                                break decodeLoop
+                            }
+                            if engine.currentPosition >= ctxLimit {
+                                finishReason = .contextFull
+                                break decodeLoop
+                            }
+
+                            // Apply sampler (greedy when no top-K source —
+                            // in that case forwards argmax unchanged).
+                            let candidates = [Sampler.Candidate(
+                                tokenId: nid, logit: 0)]
+                            let chosen = sampler.sample(from: candidates)
+                            nid = chosen
+
+                            mutableSelf.lastEmittedTokenIDs.append(nid)
+                            let text = mutableSelf.tokenizer.decode(tokens: [Int(nid)])
+                            cumulativeText += text
+
+                            if !firstTokenEmitted {
+                                let ttft = CFAbsoluteTimeGetCurrent() - t0
+                                stats = GenerationStats(
+                                    promptTokens: stats.promptTokens, decodeTokens: 0,
+                                    ttft: ttft,
+                                    prefillTime: stats.prefillTime, decodeTime: 0)
+                                continuation.yield(.firstToken(ttft: ttft))
+                                firstTokenEmitted = true
+                            }
+
+                            // Stop-sequence check on cumulative text.
+                            let (safe, hit) = stopMatcher.findStop(in: cumulativeText)
+                            if let h = hit {
+                                // Emit the safe prefix above what's already sent.
+                                let alreadySent = cumulativeText.count - pendingEmit.count
+                                    - (cumulativeText.count - pendingEmit.count - (cumulativeText.count - pendingEmit.count))
+                                let already = String(cumulativeText.prefix(
+                                    cumulativeText.count - (text.count + pendingEmit.count)))
+                                _ = alreadySent; _ = already  // (unused locals kept for clarity)
+                                // Simplification: re-derive safe-to-emit text as
+                                // (safe prefix minus what we've already emitted).
+                                let prevEmitted = String(cumulativeText.dropLast(
+                                    text.count + pendingEmit.count))
+                                let toEmit = String(safe.dropFirst(prevEmitted.count))
+                                if !toEmit.isEmpty {
+                                    continuation.yield(.token(text: toEmit, meta: nil))
+                                }
+                                finishReason = .stopSequence
+                                _ = h
+                                tokenCount += 1
+                                break decodeLoop
+                            }
+
+                            // Tool call detection — emit accumulated prefix
+                            // first, then surface the call and stop the turn.
+                            if toolsActive,
+                               let parsed = ToolCallDetector.tryParse(cumulativeText) {
+                                let emittedSoFar = String(cumulativeText.dropLast(
+                                    text.count + pendingEmit.count))
+                                let prefixText = String(parsed.prefix.dropFirst(
+                                    emittedSoFar.count))
+                                if !prefixText.isEmpty {
+                                    continuation.yield(.token(text: prefixText, meta: nil))
+                                }
+                                continuation.yield(.toolCall(
+                                    name: parsed.invocation.name,
+                                    arguments: parsed.invocation.argumentsJSON))
+                                finishReason = .toolCall
+                                tokenCount += 1
+                                break decodeLoop
+                            }
+
+                            // Honour partial-match suspension: if the tail
+                            // of cumulative could still extend into a stop
+                            // sequence or a tool-call open tag, buffer.
+                            let partialStop = stopMatcher.tailMightMatch(cumulativeText)
+                            let partialTool = toolsActive
+                                && cumulativeText.range(of: ToolCallDetector.open) == nil
+                                && isTailPrefixOf(ToolCallDetector.open, in: cumulativeText)
+                            if partialStop || partialTool {
+                                pendingEmit += text
+                            } else {
+                                let emit = pendingEmit + text
+                                pendingEmit = ""
+                                let meta: TokenMeta? = options.returnTokenMetadata
+                                    ? TokenMeta(position: engine.currentPosition,
+                                                 tokenId: Int(nid),
+                                                 maxLogit: engine.lastTokenLogit)
+                                    : nil
+                                continuation.yield(.token(text: emit, meta: meta))
+                            }
+                            tokenCount += 1
+
+                            // JSON mode: stop when a complete top-level JSON
+                            // value has been emitted.
+                            if options.jsonMode && jsonDetector.feed(text) {
+                                finishReason = .jsonComplete
+                                break decodeLoop
+                            }
+
+                            try autoreleasepool {
+                                let next = try engine.predictStep(
+                                    tokenID: Int(nid), position: engine.currentPosition)
+                                nid = Int32(next)
+                            }
+                            engine.currentPosition += 1
+
+                            let elapsed = CFAbsoluteTimeGetCurrent() - decodeStart
+                            if elapsed > 0 {
+                                mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed
+                            }
+                        }
+                        if tokenCount >= maxDecode && finishReason == .eos {
+                            finishReason = .maxTokens
+                        }
+                        // Flush any trailing pending text (partial match that
+                        // never completed).
+                        if !pendingEmit.isEmpty {
+                            continuation.yield(.token(text: pendingEmit, meta: nil))
+                        }
+                        stats = GenerationStats(
+                            promptTokens: stats.promptTokens,
+                            decodeTokens: tokenCount,
+                            ttft: stats.ttft,
+                            prefillTime: stats.prefillTime,
+                            decodeTime: CFAbsoluteTimeGetCurrent() - decodeStart)
+                        nextID = Int(nid)
+                    } else {
+                        // Monolithic path (simpler; inherits all options).
+                        let prefillStart = CFAbsoluteTimeGetCurrent()
+                        for (step, tid) in tokens.enumerated() {
+                            if Task.isCancelled {
+                                finishReason = .cancelled; throw CancellationError()
+                            }
+                            try autoreleasepool {
+                                if let emb = multimodalEmbedding(for: tid) {
+                                    nextID = try mutableSelf.predictMonolithic(
+                                        tokenID: 0, position: step, imageEmbedding: emb)
+                                } else {
+                                    nextID = try mutableSelf.predictMonolithic(
+                                        tokenID: tid, position: step)
+                                }
+                            }
+                        }
+                        let prefillTime = CFAbsoluteTimeGetCurrent() - prefillStart
+                        let decodeStart = CFAbsoluteTimeGetCurrent()
+                        var pos = tokens.count
+                        var tokenCount = 0
+                        var sampler = Sampler(options: options)
+                        while tokenCount < options.maxTokens {
+                            if Task.isCancelled { finishReason = .cancelled; break }
+                            if eosSet.contains(nextID) {
+                                finishReason = options.stopTokenIds.contains(nextID)
+                                    ? .stopTokenId : .eos
+                                break
+                            }
+                            if pos >= ctxLimit { finishReason = .contextFull; break }
+                            let chosen = sampler.sample(from: [Sampler.Candidate(
+                                tokenId: Int32(nextID), logit: 0)])
+                            nextID = Int(chosen)
+                            mutableSelf.lastEmittedTokenIDs.append(Int32(nextID))
+                            let text = mutableSelf.tokenizer.decode(tokens: [nextID])
+                            cumulativeText += text
+                            if !firstTokenEmitted {
+                                let ttft = CFAbsoluteTimeGetCurrent() - t0
+                                continuation.yield(.firstToken(ttft: ttft))
+                                firstTokenEmitted = true
+                            }
+                            let (safe, hit) = stopMatcher.findStop(in: cumulativeText)
+                            if let h = hit {
+                                _ = h
+                                let prev = String(cumulativeText.dropLast(text.count))
+                                let toEmit = String(safe.dropFirst(prev.count))
+                                if !toEmit.isEmpty {
+                                    continuation.yield(.token(text: toEmit, meta: nil))
+                                }
+                                finishReason = .stopSequence
+                                tokenCount += 1
+                                break
+                            }
+                            let meta: TokenMeta? = options.returnTokenMetadata
+                                ? TokenMeta(position: pos, tokenId: nextID, maxLogit: nil)
+                                : nil
+                            continuation.yield(.token(text: text, meta: meta))
+                            tokenCount += 1
+                            if options.jsonMode && jsonDetector.feed(text) {
+                                finishReason = .jsonComplete
+                                break
+                            }
+                            try autoreleasepool {
+                                nextID = try mutableSelf.predictMonolithic(
+                                    tokenID: nextID, position: pos)
+                            }
+                            pos += 1
+                        }
+                        stats = GenerationStats(
+                            promptTokens: tokens.count, decodeTokens: tokenCount,
+                            ttft: stats.ttft, prefillTime: prefillTime,
+                            decodeTime: CFAbsoluteTimeGetCurrent() - decodeStart)
+                    }
+                } catch is CancellationError {
+                    finishReason = .cancelled
+                } catch {
+                    print("[CoreMLLLM] streamEvents error: \(error)")
+                    finishReason = .error
+                }
+                continuation.yield(.finished(reason: finishReason, stats: stats))
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// Helper: returns true if the tail of `haystack` is a proper prefix
+    /// of `needle` (i.e. we might be in the middle of matching `needle`
+    /// but haven't yet completed it). Used to buffer emission while a
+    /// `<tool_call>` opener could still form.
+    private func isTailPrefixOf(_ needle: String, in haystack: String) -> Bool {
+        let maxN = min(needle.count, haystack.count)
+        for n in stride(from: maxN, through: 1, by: -1) {
+            let tail = haystack.suffix(n)
+            if needle.hasPrefix(String(tail)) { return true }
+        }
+        return false
     }
 
     /// Reset conversation state (clears KV cache and cached image features).
@@ -1243,6 +1860,7 @@ public enum CoreMLLLMError: LocalizedError {
     /// Returned by `benchVerifyTopK` / `verifyCandidatesWithLogits` until the
     /// Track B re-export (`feat/c0-verify-requant`) lands on `main`.
     case verifyLogitsNotExposed
+    case sessionModelMismatch
 
     public var errorDescription: String? {
         switch self {
@@ -1255,6 +1873,8 @@ public enum CoreMLLLMError: LocalizedError {
         case .videoDecodeFailed: return "Could not decode any frames from video"
         case .verifyLogitsNotExposed:
             return "verify chunk 4 does not expose `logits_fp16` (Track B re-export pending)"
+        case .sessionModelMismatch:
+            return "session snapshot was produced by a different model"
         }
     }
 }
