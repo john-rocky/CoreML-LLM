@@ -787,6 +787,11 @@ public final class CoreMLLLM: @unchecked Sendable {
                             let useEagle = (eagleSpec != nil) && didFirstDecode
                                 && engine.canSpeculate
                                 && (eagleSpec?.shouldSpeculate ?? false)
+                            // One-shot debug of the 4 gating conditions when
+                            // EAGLE-3 is loaded but not yet speculating.
+                            if eagleSpec != nil && !useEagle && tokenCount < 3 {
+                                print("[SpecDbg] useEagle=false  loaded=\(eagleSpec != nil)  firstDecode=\(didFirstDecode)  canSpec=\(engine.canSpeculate)  shouldSpec=\(eagleSpec?.shouldSpeculate ?? false)  hL8=\(engine.lastHiddenAtL8 != nil)  hL17=\(engine.lastHiddenAtL17 != nil)  hL34=\(engine.lastHiddenAtL34 != nil)  vchunk=\(engine.hasVerify)")
+                            }
 
                             if useEagle, let sl = eagleSpec {
                                 // EAGLE-3 speculative burst: yields 1..K+1 accepted tokens.
