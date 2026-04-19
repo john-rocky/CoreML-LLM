@@ -893,8 +893,15 @@ public final class CoreMLLLM: @unchecked Sendable {
                                     nid = Int32(next)
                                 }
                                 engine.currentPosition += 1
-                                didFirstDecode = true
                             }
+
+                            // Any branch (T=1, MTP, Union, CrossVocab) counts
+                            // as "first decode completed" — after which the
+                            // EAGLE-3 speculative path is eligible to take
+                            // over on subsequent steps. Without this, decode
+                            // loops that kick in MTP/Union/CrossVocab first
+                            // never let EAGLE-3 run (the flag stayed false).
+                            didFirstDecode = true
 
                             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                             if elapsed > 0 { mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed }
