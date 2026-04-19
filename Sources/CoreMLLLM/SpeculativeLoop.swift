@@ -237,8 +237,13 @@ public final class SpeculativeLoop {
 
         burstCount += 1
         if burstCount % 10 == 0 || burstCount <= 5 {
-            print(String(format: "[Spec] burst #%d accept=%d/%d emitted=%d rolling=%.1f%%",
-                         burstCount, matched, K, accepted.count, rollingAcceptance * 100))
+            let topNSize = useTolerance ? (targetTopN.first?.count ?? 1) : 1
+            let inTop: Bool = useTolerance && (0..<K).contains { k in
+                targetTopN[k].dropFirst().contains(proposals[k])
+            }
+            print(String(format: "[Spec] burst #%d accept=%d/%d emitted=%d rolling=%.1f%% tol=%d topNsize=%d lookAhead=%@",
+                         burstCount, matched, K, accepted.count, rollingAcceptance * 100,
+                         tolerance, topNSize, inTop ? "anyDraftInTopNexcArgmax" : "no"))
         }
         return accepted
     }
