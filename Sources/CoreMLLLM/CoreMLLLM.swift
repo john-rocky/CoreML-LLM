@@ -232,13 +232,15 @@ public final class CoreMLLLM: @unchecked Sendable {
                 if FileManager.default.fileExists(atPath: pkg.path) { return pkg }
                 return nil
             }
+            // EAGLE-3 speculative loop. Verify chunks are already loaded by
+            // ChunkedEngine.load() (either as multi-function verify_qK or as
+            // standalone verify_chunk*.mlmodelc). We just need draft + fusion
+            // mlpackages here to wire up the SpeculativeLoop orchestrator.
             if let fusionURL = findAsset("eagle3_fusion"),
                let draftURL = findAsset("eagle3_draft"),
-               findAsset("verify_chunk1") != nil {
+               (llm.chunkedEngine?.hasVerify ?? false) {
                 do {
-                    onProgress?("Loading EAGLE-3 speculative (fusion + draft + 4 verify chunks)...")
-                    try await llm.chunkedEngine?.loadVerifyChunks(
-                        from: directory, computeUnits: computeUnits)
+                    onProgress?("Loading EAGLE-3 speculative (fusion + draft)...")
                     llm.speculativeLoop = try SpeculativeLoop(
                         fusionURL: fusionURL, draftURL: draftURL,
                         K: 3, fusionLayers: [8, 17, 34],

@@ -86,13 +86,6 @@ final class ChunkedEngine {
     var lastHiddenAtL17: MLMultiArray?
     var lastHiddenAtL34: MLMultiArray?
 
-    // Verify chunks for batched T-position validation. Optional — speculative
-    // is disabled when any of the four is nil.
-    private(set) var verifyChunk1: MLModel?
-    private(set) var verifyChunk2: MLModel?
-    private(set) var verifyChunk3: MLModel?
-    private(set) var verifyChunk4: MLModel?
-
     /// Most recent token produced by `predictStep`. Used to hand the next
     /// `tTokNext` back to `SpeculativeLoop.drawBurst` after a commit burst.
     private(set) var lastArgmaxAfterDecode: Int = 0
@@ -283,6 +276,51 @@ final class ChunkedEngine {
             // Multi-function not available — verify chunks stay nil
             print("[Load] No verify_qK function found, speculative verification disabled")
             v1 = nil; v2 = nil; v3 = nil; v4 = nil
+        }
+
+        // EAGLE-3 fallback: if multi-function verify isn't present, try loading
+        // standalone verify_chunk{1..4}.mlmodelc files (produced by
+        // build_eagle3_verify.py). These have the same schema as the
+        // verify_qK function and work with the existing verifyCandidates()
+        // path. All four must be present to enable speculative.
+        if v1 == nil || v2 == nil || v3 == nil || v4 == nil {
+            if findModel("verify_chunk1") != nil {
+                do {
+                    let verifyConfig = MLModelConfiguration()
+                    verifyConfig.computeUnits = computeUnits
+                    applyHints(verifyConfig)
+                    let verifyT0 = CFAbsoluteTimeGetCurrent()
+                    try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
+                        for name in ["verify_chunk1", "verify_chunk2", "verify_chunk3", "verify_chunk4"] {
+                            guard let url = findModel(name) else { continue }
+                            group.addTask { (name, try MLModel(contentsOf: url, configuration: verifyConfig)) }
+                        }
+                        for try await (name, model) in group {
+                            switch name {
+                            case "verify_chunk1": v1 = model
+                            case "verify_chunk2": v2 = model
+                            case "verify_chunk3": v3 = model
+                            case "verify_chunk4": v4 = model
+                            default: break
+                            }
+                        }
+                    }
+                    if v1 != nil && v2 != nil && v3 != nil && v4 != nil {
+                        if let desc = v4!.modelDescription.outputDescriptionsByName["token_ids"],
+                           let c = desc.multiArrayConstraint, c.shape.count >= 2 {
+                            detectedK = c.shape[1].intValue
+                        }
+                        let vDt = CFAbsoluteTimeGetCurrent() - verifyT0
+                        print("[Load] Standalone verify chunks loaded (K=\(detectedK)) in \(String(format: "%.1f", vDt))s")
+                    } else {
+                        print("[Load] Partial verify_chunk*.mlmodelc set — speculative disabled")
+                        v1 = nil; v2 = nil; v3 = nil; v4 = nil
+                    }
+                } catch {
+                    print("[Load] verify_chunk*.mlmodelc load failed (\(error)) — speculative disabled")
+                    v1 = nil; v2 = nil; v3 = nil; v4 = nil
+                }
+            }
         }
 
         // Embeddings
@@ -1786,49 +1824,6 @@ final class ChunkedEngine {
 // MARK: - EAGLE-3 speculative decoding (Phase 2B)
 
 extension ChunkedEngine {
-    /// Load verify chunks from `directory` (expects verify_chunk{1..4}.mlmodelc
-    /// or .mlpackage). All four must be present; partial sets throw.
-    func loadVerifyChunks(from directory: URL, computeUnits: MLComputeUnits) async throws {
-        let mlConfig = MLModelConfiguration()
-        mlConfig.computeUnits = computeUnits
-
-        func findModel(_ name: String) -> URL? {
-            let compiled = directory.appendingPathComponent("\(name).mlmodelc")
-            if FileManager.default.fileExists(atPath: compiled.path) { return compiled }
-            let pkg = directory.appendingPathComponent("\(name).mlpackage")
-            if FileManager.default.fileExists(atPath: pkg.path) { return pkg }
-            return nil
-        }
-
-        var v1: MLModel!, v2: MLModel!, v3: MLModel!, v4: MLModel!
-        try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
-            for name in ["verify_chunk1", "verify_chunk2", "verify_chunk3", "verify_chunk4"] {
-                guard let url = findModel(name) else {
-                    throw CoreMLLLMError.modelNotFound(name)
-                }
-                group.addTask {
-                    let t0 = CFAbsoluteTimeGetCurrent()
-                    let m = try MLModel(contentsOf: url, configuration: mlConfig)
-                    print("[Load] \(name) done in \(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - t0))s")
-                    return (name, m)
-                }
-            }
-            for try await (name, model) in group {
-                switch name {
-                case "verify_chunk1": v1 = model
-                case "verify_chunk2": v2 = model
-                case "verify_chunk3": v3 = model
-                case "verify_chunk4": v4 = model
-                default: break
-                }
-            }
-        }
-        self.verifyChunk1 = v1
-        self.verifyChunk2 = v2
-        self.verifyChunk3 = v3
-        self.verifyChunk4 = v4
-    }
-
     /// True when all four verify chunks are loaded and the most recent decode
     /// step captured EAGLE-3 hidden taps (L8/L17/L34).
     var canSpeculate: Bool {
