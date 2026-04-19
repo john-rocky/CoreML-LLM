@@ -111,6 +111,13 @@ def build_chunk1(base, out_dir, T):
     outs = [
         ct.TensorType(name="hidden_states_out"),
         ct.TensorType(name="per_layer_combined_out"),
+        # Per-layer new K/V for the T verify positions, stacked across the
+        # own-KV layers in this chunk (7 sliding, 1 full in L0-7). Swift
+        # uses these in commitAccepted to skip the T=1 replay.
+        ct.TensorType(name="K_sliding_new"),   # (7, 1, T, 256)
+        ct.TensorType(name="V_sliding_new"),   # (7, 1, T, 256)
+        ct.TensorType(name="K_full_new"),      # (1, 1, T, 512)
+        ct.TensorType(name="V_full_new"),      # (1, 1, T, 512)
     ]
     do_convert(c1, s, ins, outs, f"{out_dir}/verify_chunk1.mlpackage")
 
@@ -156,6 +163,11 @@ def build_chunk2(base, out_dir, T):
         ct.TensorType(name="kv13_v_out"),
         ct.TensorType(name="kv14_k_out"),
         ct.TensorType(name="kv14_v_out"),
+        # Per-layer new K/V (5 sliding, 2 full in L8-14).
+        ct.TensorType(name="K_sliding_new"),   # (5, 1, T, 256)
+        ct.TensorType(name="V_sliding_new"),   # (5, 1, T, 256)
+        ct.TensorType(name="K_full_new"),      # (2, 1, T, 512)
+        ct.TensorType(name="V_full_new"),      # (2, 1, T, 512)
     ]
     do_convert(c2, s, ins, outs, f"{out_dir}/verify_chunk2.mlpackage")
 

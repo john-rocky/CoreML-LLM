@@ -65,6 +65,11 @@ def _run_layer_verify(
     kv_store_14_k, kv_store_14_v,     # (1, 1, ctx + T, 512) — shared by L15..34 full
     T: int,
 ):
+    """Returns (hidden_states, kv_store_13_k, kv_store_13_v, kv_store_14_k,
+    kv_store_14_v, k_new, v_new) where k_new/v_new are the per-layer new K/V
+    tensors (1, 1, T, hd) for owning-KV layers, or None for shared layers.
+    Swift side uses k_new/v_new to write the decode KV cache for the accepted
+    prefix, eliminating the T=1 replay that `commitAccepted` used to do."""
     num_heads = config.num_attention_heads
     num_kv_heads = config.num_key_value_heads
     n_rep = num_heads // num_kv_heads
@@ -180,7 +185,17 @@ def _run_layer_verify(
     hidden_states = residual_pl + hidden_states
     hidden_states = hidden_states * layer.layer_scalar.to(MODEL_DTYPE)
 
-    return hidden_states, kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v
+    # k_new / v_new are the per-layer new K/V for the T verify positions,
+    # only set for owning-KV layers. Shape (1, 1, T, hd) in natural head_dim
+    # (hd=256 for sliding, hd=512 for full). Shared layers (L15+) have None.
+    if is_kv_shared:
+        k_new_out = None
+        v_new_out = None
+    else:
+        k_new_out = k_new
+        v_new_out = v_new
+    return (hidden_states, kv_store_13_k, kv_store_13_v, kv_store_14_k,
+            kv_store_14_v, k_new_out, v_new_out)
 
 
 def _layer_kv_map(start: int, end: int, config):
@@ -245,6 +260,13 @@ class VerifyChunk1(nn.Module):
         dummy_14_k = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
         dummy_14_v = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
 
+        # Collect per-layer new K/V in sliding/full order (same order as the
+        # sliding_map / full_map produce), so Swift can index by si/fi.
+        k_sliding_new_list = []
+        v_sliding_new_list = []
+        k_full_new_list = []
+        v_full_new_list = []
+
         for local_idx in range(self.END - self.START):
             layer_idx = self.START + local_idx
             is_full = config.is_full_attention(layer_idx)
@@ -261,7 +283,7 @@ class VerifyChunk1(nn.Module):
                 K_full_slot = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
                 V_full_slot = K_full_slot
 
-            hidden_states, *_ = _run_layer_verify(
+            (hidden_states, _, _, _, _, k_new, v_new) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states,
                 cos_s, sin_s, cos_f, sin_f,
                 causal_mask_full, causal_mask_sliding,
@@ -270,7 +292,19 @@ class VerifyChunk1(nn.Module):
                 dummy_13_k, dummy_13_v, dummy_14_k, dummy_14_v,
                 T,
             )
-        return hidden_states, per_layer_combined
+            if is_full:
+                k_full_new_list.append(k_new.squeeze(0))  # (1, T, 512)
+                v_full_new_list.append(v_new.squeeze(0))
+            else:
+                k_sliding_new_list.append(k_new.squeeze(0))  # (1, T, 256)
+                v_sliding_new_list.append(v_new.squeeze(0))
+
+        K_sliding_new = torch.stack(k_sliding_new_list, dim=0)  # (7, 1, T, 256)
+        V_sliding_new = torch.stack(v_sliding_new_list, dim=0)
+        K_full_new = torch.stack(k_full_new_list, dim=0)        # (1, 1, T, 512)
+        V_full_new = torch.stack(v_full_new_list, dim=0)
+        return (hidden_states, per_layer_combined,
+                K_sliding_new, V_sliding_new, K_full_new, V_full_new)
 
 
 class VerifyChunk2(nn.Module):
@@ -296,6 +330,11 @@ class VerifyChunk2(nn.Module):
         kv14_k = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
         kv14_v = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
 
+        k_sliding_new_list = []
+        v_sliding_new_list = []
+        k_full_new_list = []
+        v_full_new_list = []
+
         for local_idx in range(self.END - self.START):
             layer_idx = self.START + local_idx
             is_full = config.is_full_attention(layer_idx)
@@ -312,17 +351,29 @@ class VerifyChunk2(nn.Module):
                 K_full_slot = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
                 V_full_slot = K_full_slot
 
-            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v) = _run_layer_verify(
-                self.layers[local_idx], layer_idx, hidden_states,
-                cos_s, sin_s, cos_f, sin_f,
-                causal_mask_full, causal_mask_sliding,
-                K_sliding_slot, V_sliding_slot, K_full_slot, V_full_slot,
-                config, per_layer_combined,
-                kv13_k, kv13_v, kv14_k, kv14_v,
-                T,
-            )
+            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v, k_new, v_new) = \
+                _run_layer_verify(
+                    self.layers[local_idx], layer_idx, hidden_states,
+                    cos_s, sin_s, cos_f, sin_f,
+                    causal_mask_full, causal_mask_sliding,
+                    K_sliding_slot, V_sliding_slot, K_full_slot, V_full_slot,
+                    config, per_layer_combined,
+                    kv13_k, kv13_v, kv14_k, kv14_v,
+                    T,
+                )
+            if is_full:
+                k_full_new_list.append(k_new.squeeze(0))  # (1, T, 512)
+                v_full_new_list.append(v_new.squeeze(0))
+            else:
+                k_sliding_new_list.append(k_new.squeeze(0))  # (1, T, 256)
+                v_sliding_new_list.append(v_new.squeeze(0))
 
-        return hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+        K_sliding_new = torch.stack(k_sliding_new_list, dim=0)  # (5, 1, T, 256)
+        V_sliding_new = torch.stack(v_sliding_new_list, dim=0)
+        K_full_new = torch.stack(k_full_new_list, dim=0)        # (2, 1, T, 512)
+        V_full_new = torch.stack(v_full_new_list, dim=0)
+        return (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v,
+                K_sliding_new, V_sliding_new, K_full_new, V_full_new)
 
 
 class VerifyChunk3(nn.Module):
@@ -344,7 +395,7 @@ class VerifyChunk3(nn.Module):
         dummy_V = dummy_K
         for local_idx in range(self.END - self.START):
             layer_idx = self.START + local_idx
-            hidden_states, *_ = _run_layer_verify(
+            hidden_states, *_rest = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states,
                 cos_s, sin_s, cos_f, sin_f,
                 causal_mask_full, causal_mask_sliding,
@@ -380,7 +431,7 @@ class VerifyChunk4(nn.Module):
         dummy_V = dummy_K
         for local_idx in range(self.END - self.START):
             layer_idx = self.START + local_idx
-            hidden_states, *_ = _run_layer_verify(
+            hidden_states, *_rest = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states,
                 cos_s, sin_s, cos_f, sin_f,
                 causal_mask_full, causal_mask_sliding,

@@ -110,6 +110,25 @@ final class ChunkedEngine {
     private(set) var lastKV14K: MLMultiArray?
     private(set) var lastKV14V: MLMultiArray?
 
+    // Per-verify-burst K/V scratch used by `commitAccepted` to skip T=1 replay.
+    // Populated by the new-schema verify path; stays nil if the chunk doesn't
+    // expose `{K,V}_{sliding,full}_new` (older models → fall back to T=1 replay).
+    private var lastVerifyBurstPos: Int?
+    private var lastVerifyKSlidingNew1: MLMultiArray?  // (7, 1, T, 256)
+    private var lastVerifyVSlidingNew1: MLMultiArray?
+    private var lastVerifyKFullNew1: MLMultiArray?     // (1, 1, T, 512)
+    private var lastVerifyVFullNew1: MLMultiArray?
+    private var lastVerifyKSlidingNew2: MLMultiArray?  // (5, 1, T, 256)
+    private var lastVerifyVSlidingNew2: MLMultiArray?
+    private var lastVerifyKFullNew2: MLMultiArray?     // (2, 1, T, 512)
+    private var lastVerifyVFullNew2: MLMultiArray?
+
+    /// Disable the write-through fast commit and fall back to the T=1 replay
+    /// path (old behaviour) by setting `LLM_EAGLE3_KV_WRITETHROUGH=0`.
+    private let kvWriteThroughEnabled: Bool = {
+        ProcessInfo.processInfo.environment["LLM_EAGLE3_KV_WRITETHROUGH"] != "0"
+    }()
+
     // MARK: - Loading
 
     static func load(from directory: URL, config: ModelConfig,
@@ -1984,13 +2003,123 @@ extension ChunkedEngine: SpeculativeTarget {
     }
 
     public func commitAccepted(_ tokens: [Int32]) throws {
-        // Simplest faithful commit: replay T=1 decode for each accepted token.
-        // Refreshes the lastHiddenAtL* ivars on the final iteration.
-        for tok in tokens {
-            _ = try predictStep(tokenID: Int(tok), position: currentPosition)
-            currentPosition += 1
+        // Fast commit path: the verify pass already computed the correct K/V
+        // for every accepted input token (verify ran the target model with
+        // those exact inputs at those exact positions). Rather than replaying
+        // each token through the T=1 decode chain (≈33ms/token), write the
+        // cached K/V directly into the decode-side KV cache (L0-14 own-KV
+        // layers; L15-34 share from L13/L14 at runtime so they need no
+        // separate write) and then run T=1 decode exactly ONCE at the final
+        // accepted position to refresh lastHiddenAtL{8,17,34} and
+        // lastArgmaxAfterDecode for the next burst.
+        //
+        // Fallback to the old per-token replay if the verify chunks don't
+        // expose K/V_new (older mlmodelc) or if LLM_EAGLE3_KV_WRITETHROUGH=0.
+        let canWriteThrough = kvWriteThroughEnabled
+            && lastVerifyBurstPos == currentPosition
+            && lastVerifyKSlidingNew1 != nil && lastVerifyVSlidingNew1 != nil
+            && lastVerifyKFullNew1    != nil && lastVerifyVFullNew1    != nil
+            && lastVerifyKSlidingNew2 != nil && lastVerifyVSlidingNew2 != nil
+            && lastVerifyKFullNew2    != nil && lastVerifyVFullNew2    != nil
+        guard canWriteThrough, tokens.count > 0 else {
+            for tok in tokens {
+                _ = try predictStep(tokenID: Int(tok), position: currentPosition)
+                currentPosition += 1
+            }
+            return
         }
+
+        let P = currentPosition
+        let M = tokens.count
+        // Write-through covers the first (M-1) positions from verify's K/V.
+        // The final accepted position is handled by exactly ONE T=1 decode
+        // below — that call also refreshes lastHiddenAtL* and
+        // lastArgmaxAfterDecode for the next burst. Doing write-through for
+        // all M positions would require predictStep's shift to be suppressed,
+        // which isn't straightforward; this split keeps predictStep's normal
+        // write-through path intact for the last position and collects the
+        // big win on the preceding M-1 positions.
+        let writeThruCount = M - 1
+        let W = config.slidingWindow
+        let ctx = config.contextLength
+
+        if writeThruCount > 0 {
+            func scatterFull(new: MLMultiArray, dst: MLMultiArray, layers: Int) {
+                let hd = 512
+                let srcT = new.shape[2].intValue  // T dim in new (full K from verify)
+                let src = new.dataPointer.bindMemory(
+                    to: UInt16.self, capacity: layers * 1 * srcT * hd)
+                let dstP = dst.dataPointer.bindMemory(
+                    to: UInt16.self, capacity: layers * 1 * ctx * hd)
+                for fi in 0..<layers {
+                    let srcLayerBase = fi * srcT * hd
+                    let dstLayerBase = fi * ctx * hd
+                    for k in 0..<writeThruCount {
+                        let absPos = P + k
+                        guard absPos < ctx else { continue }
+                        let srcRow = srcLayerBase + k * hd
+                        let dstRow = dstLayerBase + absPos * hd
+                        memcpy(dstP.advanced(by: dstRow),
+                               src.advanced(by: srcRow),
+                               hd * MemoryLayout<UInt16>.stride)
+                    }
+                }
+            }
+
+            func shiftSliding(new: MLMultiArray, dst: MLMultiArray, layers: Int) {
+                let maxHd = 512
+                let hd = 256
+                let srcT = new.shape[2].intValue
+                let src = new.dataPointer.bindMemory(
+                    to: UInt16.self, capacity: layers * 1 * srcT * hd)
+                let dstP = dst.dataPointer.bindMemory(
+                    to: UInt16.self, capacity: layers * 1 * W * maxHd)
+                let rowStride = maxHd
+                let rowBytes = maxHd * MemoryLayout<UInt16>.stride
+                let hdBytes = hd * MemoryLayout<UInt16>.stride
+                let shift = writeThruCount
+                for si in 0..<layers {
+                    let layerDstBase = si * W * rowStride
+                    let layerSrcBase = si * srcT * hd
+                    if shift < W {
+                        memmove(dstP.advanced(by: layerDstBase),
+                                dstP.advanced(by: layerDstBase + shift * rowStride),
+                                (W - shift) * rowBytes)
+                    }
+                    let nAppend = min(shift, W)
+                    for k in 0..<nAppend {
+                        let dstRow = layerDstBase + (W - nAppend + k) * rowStride
+                        let srcRow = layerSrcBase + k * hd
+                        memcpy(dstP.advanced(by: dstRow),
+                               src.advanced(by: srcRow), hdBytes)
+                        memset(dstP.advanced(by: dstRow + hd), 0,
+                               (maxHd - hd) * MemoryLayout<UInt16>.stride)
+                    }
+                }
+            }
+
+            scatterFull(new: lastVerifyKFullNew1!, dst: kFull1, layers: 1)
+            scatterFull(new: lastVerifyVFullNew1!, dst: vFull1, layers: 1)
+            scatterFull(new: lastVerifyKFullNew2!, dst: kFull2, layers: 2)
+            scatterFull(new: lastVerifyVFullNew2!, dst: vFull2, layers: 2)
+            shiftSliding(new: lastVerifyKSlidingNew1!, dst: kSliding1, layers: 7)
+            shiftSliding(new: lastVerifyVSlidingNew1!, dst: vSliding1, layers: 7)
+            shiftSliding(new: lastVerifyKSlidingNew2!, dst: kSliding2, layers: 5)
+            shiftSliding(new: lastVerifyVSlidingNew2!, dst: vSliding2, layers: 5)
+        }
+
+        currentPosition = P + writeThruCount   // = P + M - 1
+        _ = try predictStep(tokenID: Int(tokens[M - 1]), position: currentPosition)
+        currentPosition += 1
+
+        commitFastCount += 1
+        if commitFastCount <= 3 || commitFastCount % 20 == 0 {
+            print("[Spec] commit fast-path M=\(M) writeThru=\(writeThruCount) P=\(P)→\(currentPosition)")
+        }
+
+        lastVerifyBurstPos = nil
     }
+    private var commitFastCount: Int = 0
 
     public func verifyCandidates(_ candidates: [Int32], K: Int) throws -> [Int32] {
         guard let v1 = verifyChunk1, let v2 = verifyChunk2,
@@ -2026,6 +2155,11 @@ extension ChunkedEngine: SpeculativeTarget {
         ]))
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
+        // Optional K/V_new outputs (present only on KV-writethrough verify chunks).
+        lastVerifyKSlidingNew1 = out1.featureValue(for: "K_sliding_new")?.multiArrayValue
+        lastVerifyVSlidingNew1 = out1.featureValue(for: "V_sliding_new")?.multiArrayValue
+        lastVerifyKFullNew1    = out1.featureValue(for: "K_full_new")?.multiArrayValue
+        lastVerifyVFullNew1    = out1.featureValue(for: "V_full_new")?.multiArrayValue
 
         // Verify chunk 2 — produces extended kv13_k_out (1,1,W+T,256)
         // and kv14_k_out (1,1,ctx+T,512) for downstream chunks 3/4.
@@ -2046,6 +2180,14 @@ extension ChunkedEngine: SpeculativeTarget {
         let kv13v = out2.featureValue(for: "kv13_v_out")!.multiArrayValue!
         let kv14k = out2.featureValue(for: "kv14_k_out")!.multiArrayValue!
         let kv14v = out2.featureValue(for: "kv14_v_out")!.multiArrayValue!
+        // Optional K/V_new outputs for L8-14.
+        lastVerifyKSlidingNew2 = out2.featureValue(for: "K_sliding_new")?.multiArrayValue
+        lastVerifyVSlidingNew2 = out2.featureValue(for: "V_sliding_new")?.multiArrayValue
+        lastVerifyKFullNew2    = out2.featureValue(for: "K_full_new")?.multiArrayValue
+        lastVerifyVFullNew2    = out2.featureValue(for: "V_full_new")?.multiArrayValue
+        // Burst position stamped here — commitAccepted reads it to know where
+        // to write back. Only valid until the next verifyCandidates call.
+        lastVerifyBurstPos = P
 
         let shared: [String: MLFeatureValue] = [
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
