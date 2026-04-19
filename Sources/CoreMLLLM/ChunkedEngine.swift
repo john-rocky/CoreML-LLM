@@ -129,6 +129,10 @@ final class ChunkedEngine {
         ProcessInfo.processInfo.environment["LLM_EAGLE3_KV_WRITETHROUGH"] != "0"
     }()
 
+    /// Counts fast-path commits; printed to console for the first few bursts
+    /// plus every 20th one so you can confirm write-through is firing.
+    fileprivate var commitFastCount: Int = 0
+
     // MARK: - Loading
 
     static func load(from directory: URL, config: ModelConfig,
@@ -2119,7 +2123,6 @@ extension ChunkedEngine: SpeculativeTarget {
 
         lastVerifyBurstPos = nil
     }
-    private var commitFastCount: Int = 0
 
     public func verifyCandidates(_ candidates: [Int32], K: Int) throws -> [Int32] {
         guard let v1 = verifyChunk1, let v2 = verifyChunk2,
