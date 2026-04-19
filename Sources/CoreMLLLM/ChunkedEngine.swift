@@ -2072,15 +2072,11 @@ extension ChunkedEngine: SpeculativeTarget {
         return (0..<n).map { p[$0] }
     }
 
-    /// SpeculativeTarget override: run verify and return per-position top-N
-    /// tokenIDs alongside the argmax. Leverages `verifyCandidatesWithLogits`
-    /// which does the top-K extraction in a single pass.
-    public func verifyCandidatesTopN(_ candidates: [Int32], K: Int, topN: Int)
-        throws -> (argmax: [Int32], topN: [[Int32]])
-    {
-        let (argmax, topPairs) = try verifyCandidatesWithLogits(
-            tokens: candidates, startPosition: currentPosition, topK: max(1, topN))
-        let topTokens: [[Int32]] = topPairs.map { $0.map { $0.0 } }
-        return (argmax, topTokens)
-    }
+    // No `verifyCandidatesTopN` override — the standalone verify_chunk4
+    // exposes only `token_ids` + per-position `token_logits` (argmax logit
+    // value), not the full (T, vocab) logits needed to rank alternatives.
+    // Rebuilding chunk4 with a top-N output is required before tolerance>1
+    // can do anything useful. For now, fall through to the protocol default
+    // extension, which wraps argmax as a single-entry top list — so
+    // LLM_EAGLE3_TOLERANCE>1 degrades safely to strict argmax match.
 }
