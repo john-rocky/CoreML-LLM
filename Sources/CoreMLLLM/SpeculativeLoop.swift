@@ -135,12 +135,28 @@ public final class SpeculativeLoop {
         tokenEmbed: (Int32) throws -> MLMultiArray
     ) throws -> [Int32] {
 
+        // Verbose one-shot diagnostic of the very first burst only, to let us
+        // correlate on-device zero-accept with the actual values flowing
+        // through fusion → draft → verify.
+        let verbose = (burstCount < 2) || (ProcessInfo.processInfo
+            .environment["LLM_EAGLE3_VERBOSE_BURST"] != nil)
+
         // 1. Fetch multi-layer hidden states at fusionLayers from the target's
         //    last decode step.
         let hs = try target.lastHiddenMulti(at: fusionLayers)
         guard hs.count == fusionLayers.count else {
             throw SpeculativeError.verifyFailed(
                 "target returned \(hs.count) hiddens, expected \(fusionLayers.count)")
+        }
+
+        if verbose {
+            for (i, h) in hs.enumerated() {
+                let p = h.dataPointer.bindMemory(to: UInt16.self, capacity: 8)
+                let vals = (0..<8).map { fp16BitsToFloat(p[$0]) }
+                let norm = hiddenL2Norm(h)
+                print(String(format: "[Spec/dbg] h_fuse_in[%d] L%d  first8=%@  |h|=%.3f",
+                             i, fusionLayers[i], vals.description, norm))
+            }
         }
 
         // 2. Fuse them. Names must match eagle3_fusion.mlpackage I/O contract.
@@ -154,14 +170,26 @@ public final class SpeculativeLoop {
         guard let hFused = fusionOut.featureValue(for: "h_fused")?.multiArrayValue else {
             throw SpeculativeError.verifyFailed("fusion missing h_fused output")
         }
+        if verbose {
+            let p = hFused.dataPointer.bindMemory(to: UInt16.self, capacity: 8)
+            let vals = (0..<8).map { fp16BitsToFloat(p[$0]) }
+            print(String(format: "[Spec/dbg] h_fused     first8=%@  |h|=%.3f",
+                         vals.description, hiddenL2Norm(hFused)))
+        }
 
         // 3. Draft K tokens autoregressively.
         var hPrev: MLMultiArray = hFused
         var eNext: MLMultiArray = try tokenEmbed(tTokNext)
+        if verbose {
+            let p = eNext.dataPointer.bindMemory(to: UInt16.self, capacity: 8)
+            let vals = (0..<8).map { fp16BitsToFloat(p[$0]) }
+            print(String(format: "[Spec/dbg] embed(tTokNext=%d) first8=%@  |e|=%.3f",
+                         tTokNext, vals.description, hiddenL2Norm(eNext)))
+        }
         var proposals: [Int32] = []
         proposals.reserveCapacity(K)
 
-        for _ in 0..<K {
+        for k in 0..<K {
             let draftIn = try MLDictionaryFeatureProvider(dictionary: [
                 "h_prev": hPrev,
                 "e_next": eNext
@@ -177,6 +205,12 @@ public final class SpeculativeLoop {
                 .bindMemory(to: Int32.self, capacity: 1)
                 .pointee
             proposals.append(pred)
+            if verbose {
+                let p = hOut.dataPointer.bindMemory(to: UInt16.self, capacity: 8)
+                let vals = (0..<8).map { fp16BitsToFloat(p[$0]) }
+                print(String(format: "[Spec/dbg] draft step %d → token=%d h_out[0..8]=%@  |h|=%.3f",
+                             k, pred, vals.description, hiddenL2Norm(hOut)))
+            }
             hPrev = hOut
             eNext = try tokenEmbed(pred)
         }
@@ -199,6 +233,11 @@ public final class SpeculativeLoop {
         guard targetArgmax.count == K else {
             throw SpeculativeError.verifyFailed(
                 "verify returned \(targetArgmax.count), expected \(K)")
+        }
+        if verbose {
+            print("[Spec/dbg] verifyTokens = \(verifyTokens)")
+            print("[Spec/dbg] targetArgmax = \(targetArgmax)")
+            print("[Spec/dbg] proposals    = \(proposals)")
         }
 
         // 5. Accept prefix up to first disagreement. tTokNext is always accepted
@@ -252,4 +291,38 @@ public final class SpeculativeLoop {
 
     /// Whether to use speculative path for the next burst.
     public var shouldSpeculate: Bool { rollingAcceptance >= fallbackThreshold }
+}
+
+// MARK: - Debug helpers (fp16 scalar dump + L2 norm)
+
+private func fp16BitsToFloat(_ bits: UInt16) -> Float {
+    let sign = UInt32((bits >> 15) & 0x1) << 31
+    let exp  = (bits >> 10) & 0x1F
+    let mant = UInt32(bits & 0x3FF)
+    var e = UInt32(exp)
+    var m = mant
+    if exp == 0 {
+        if mant == 0 {
+            return Float(bitPattern: sign)
+        }
+        // Subnormal
+        while (m & 0x400) == 0 { m <<= 1; e -= 1 }
+        e += 1
+        m &= 0x3FF
+    } else if exp == 0x1F {
+        return Float(bitPattern: sign | 0x7F800000 | (mant << 13))
+    }
+    let f32 = sign | ((e + (127 - 15)) << 23) | (m << 13)
+    return Float(bitPattern: f32)
+}
+
+private func hiddenL2Norm(_ a: MLMultiArray) -> Float {
+    let n = a.count
+    let p = a.dataPointer.bindMemory(to: UInt16.self, capacity: n)
+    var sumSq: Float = 0
+    for i in 0..<n {
+        let v = fp16BitsToFloat(p[i])
+        sumSq += v * v
+    }
+    return sumSq.squareRoot()
 }
