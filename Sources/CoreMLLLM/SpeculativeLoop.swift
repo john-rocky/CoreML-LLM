@@ -187,8 +187,15 @@ public final class SpeculativeLoop {
         let rate = Double(matched) / Double(K)
         rollingAcceptance = rollingAlpha * rate + (1 - rollingAlpha) * rollingAcceptance
 
+        burstCount += 1
+        if burstCount % 10 == 0 || burstCount <= 5 {
+            print(String(format: "[Spec] burst #%d accept=%d/%d emitted=%d rolling=%.1f%%",
+                         burstCount, matched, K, accepted.count, rollingAcceptance * 100))
+        }
         return accepted
     }
+
+    private var burstCount: Int = 0
 
     /// Whether to use speculative path for the next burst.
     public var shouldSpeculate: Bool { rollingAcceptance >= fallbackThreshold }
