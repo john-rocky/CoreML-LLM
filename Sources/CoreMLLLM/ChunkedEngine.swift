@@ -2071,4 +2071,16 @@ extension ChunkedEngine: SpeculativeTarget {
         let p = tokenIdsArr.dataPointer.bindMemory(to: Int32.self, capacity: n)
         return (0..<n).map { p[$0] }
     }
+
+    /// SpeculativeTarget override: run verify and return per-position top-N
+    /// tokenIDs alongside the argmax. Leverages `verifyCandidatesWithLogits`
+    /// which does the top-K extraction in a single pass.
+    public func verifyCandidatesTopN(_ candidates: [Int32], K: Int, topN: Int)
+        throws -> (argmax: [Int32], topN: [[Int32]])
+    {
+        let (argmax, topPairs) = try verifyCandidatesWithLogits(
+            tokens: candidates, startPosition: currentPosition, topK: max(1, topN))
+        let topTokens: [[Int32]] = topPairs.map { $0.map { $0.0 } }
+        return (argmax, topTokens)
+    }
 }

@@ -35,9 +35,26 @@ public protocol SpeculativeTarget: AnyObject {
     /// Returns the target's argmax at each of the K positions.
     func verifyCandidates(_ candidates: [Int32], K: Int) throws -> [Int32]
 
+    /// Variant that also returns top-N (tokenID, logit) per verified position.
+    /// Used by tolerance-based acceptance. Default implementation just calls
+    /// `verifyCandidates` and wraps each argmax in a single-entry top list —
+    /// conforming types that have cheap access to full logits should override
+    /// with the true top-N extraction.
+    func verifyCandidatesTopN(_ candidates: [Int32], K: Int, topN: Int)
+        throws -> (argmax: [Int32], topN: [[Int32]])
+
     /// Commit `tokens` to the running KV cache. After this call, subsequent
     /// decode steps MUST see position advanced by `tokens.count`.
     func commitAccepted(_ tokens: [Int32]) throws
+}
+
+extension SpeculativeTarget {
+    public func verifyCandidatesTopN(_ candidates: [Int32], K: Int, topN: Int)
+        throws -> (argmax: [Int32], topN: [[Int32]])
+    {
+        let ax = try verifyCandidates(candidates, K: K)
+        return (ax, ax.map { [$0] })
+    }
 }
 
 public final class SpeculativeLoop {
@@ -64,6 +81,16 @@ public final class SpeculativeLoop {
 
     /// Disable speculative path when rolling acceptance drops below this.
     public var fallbackThreshold: Double = 0.30
+
+    /// Tolerance for accepting a draft proposal: accept if it appears in the
+    /// target's top-`tolerance` predictions at that position (1 = strict
+    /// argmax match). Higher values relax matching to salvage bursts when
+    /// fp16 on-device numerics flip argmax on tight-margin positions but the
+    /// intended token is still near the top. Set via env var
+    /// LLM_EAGLE3_TOLERANCE (default 1).
+    public var tolerance: Int = {
+        Int(ProcessInfo.processInfo.environment["LLM_EAGLE3_TOLERANCE"] ?? "") ?? 1
+    }()
 
     // MARK: - Init
 
@@ -155,10 +182,20 @@ public final class SpeculativeLoop {
         }
 
         // 4. Run target verify on [tTokNext, proposals[0..K-2]]. Target's argmax
-        //    at each of those K positions is what it "would" emit next.
+        //    (and top-N for tolerance) at each of those K positions is what it
+        //    "would" emit next.
         var verifyTokens = [tTokNext]
         verifyTokens.append(contentsOf: proposals.dropLast())
-        let targetArgmax = try target.verifyCandidates(verifyTokens, K: K)
+        let useTolerance = tolerance > 1
+        let (targetArgmax, targetTopN): ([Int32], [[Int32]])
+        if useTolerance {
+            let r = try target.verifyCandidatesTopN(verifyTokens, K: K, topN: tolerance)
+            targetArgmax = r.argmax
+            targetTopN = r.topN
+        } else {
+            targetArgmax = try target.verifyCandidates(verifyTokens, K: K)
+            targetTopN = targetArgmax.map { [$0] }
+        }
         guard targetArgmax.count == K else {
             throw SpeculativeError.verifyFailed(
                 "verify returned \(targetArgmax.count), expected \(K)")
@@ -166,10 +203,21 @@ public final class SpeculativeLoop {
 
         // 5. Accept prefix up to first disagreement. tTokNext is always accepted
         //    (it is target's own pick from the previous step's argmax).
+        //    Tolerance: treat proposal as matching if it appears anywhere in
+        //    target's top-N at that position.
         var accepted: [Int32] = [tTokNext]
         var matched = 0
         for k in 0..<K {
-            if proposals[k] == targetArgmax[k] {
+            let isMatch: Bool
+            if useTolerance {
+                isMatch = targetTopN[k].contains(proposals[k])
+            } else {
+                isMatch = proposals[k] == targetArgmax[k]
+            }
+            if isMatch {
+                // Commit the draft proposal (which target also ranks highly)
+                // rather than target's argmax — keeps output closer to draft's
+                // distribution when tolerance > 1 is used as a relaxation.
                 accepted.append(proposals[k])
                 matched += 1
             } else {
