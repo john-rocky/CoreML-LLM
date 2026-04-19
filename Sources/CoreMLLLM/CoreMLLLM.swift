@@ -901,6 +901,9 @@ public final class CoreMLLLM: @unchecked Sendable {
                             // over on subsequent steps. Without this, decode
                             // loops that kick in MTP/Union/CrossVocab first
                             // never let EAGLE-3 run (the flag stayed false).
+                            if !didFirstDecode && tokenCount < 3 {
+                                print("[SpecDbg] didFirstDecode set true (tokenCount=\(tokenCount))")
+                            }
                             didFirstDecode = true
 
                             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
