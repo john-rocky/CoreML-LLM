@@ -1783,27 +1783,6 @@ final class ChunkedEngine {
     }
 }
 
-// MARK: - SpeculativeTarget conformance
-
-extension ChunkedEngine: SpeculativeTarget {
-    public func lastHiddenMulti(at layerIndices: [Int]) throws -> [MLMultiArray] {
-        // Placeholder: requires chunk modifications to expose per-layer hidden states.
-        // For now, return empty arrays; EAGLE-3 integration will fill this in.
-        throw CoreMLLLMError.predictionFailed
-    }
-
-    public func verifyCandidates(_ candidates: [Int32], K: Int) throws -> [Int32] {
-        return try verifyCandidates(tokens: candidates, startPosition: currentPosition)
-    }
-
-    public func commitAccepted(_ tokens: [Int32]) throws {
-        // Write-through: verify already wrote KV for all K positions.
-        // Rejected entries are masked out by causal mask in future steps.
-        // Just advance the position counter.
-        currentPosition += tokens.count
-    }
-}
-
 // MARK: - EAGLE-3 speculative decoding (Phase 2B)
 
 extension ChunkedEngine {
