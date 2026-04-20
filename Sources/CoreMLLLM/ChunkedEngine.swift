@@ -160,6 +160,22 @@ final class ChunkedEngine {
             }
         }
 
+        // Phase D1b spike: optionally move chunk3 to .cpuAndGPU while other
+        // chunks stay on the inherited compute unit (usually ANE via .all).
+        // Hypothesis: distinct-compute-unit chunks go through distinct drivers
+        // and can overlap, where pure-ANE chunks serialise (see PR #75).
+        // Gated by COMPUTE_UNIT_SPLIT=1. Default-off, zero behaviour change.
+        let splitEnabled = ProcessInfo.processInfo.environment["COMPUTE_UNIT_SPLIT"] == "1"
+        let splitTarget = ProcessInfo.processInfo.environment["COMPUTE_UNIT_SPLIT_CHUNK"] ?? "chunk3"
+        let splitConfig: MLModelConfiguration = {
+            let c = MLModelConfiguration()
+            c.computeUnits = .cpuAndGPU
+            return c
+        }()
+        if splitEnabled {
+            print("[Spike] COMPUTE_UNIT_SPLIT=1 — \(splitTarget) will load on .cpuAndGPU")
+        }
+
         func findModel(_ name: String) -> URL? {
             // For .mlmodelc we require coremldata.bin alongside the directory
             // — a half-populated directory (e.g. stray prefill_chunk with only
@@ -178,9 +194,11 @@ final class ChunkedEngine {
                 throw CoreMLLLMError.modelNotFound(name)
             }
             let t0 = CFAbsoluteTimeGetCurrent()
-            let m = try MLModel(contentsOf: url, configuration: cfg)
+            let effectiveCfg = (splitEnabled && name == splitTarget) ? splitConfig : cfg
+            let m = try MLModel(contentsOf: url, configuration: effectiveCfg)
             let dt = CFAbsoluteTimeGetCurrent() - t0
-            print("[Load] \(name) done in \(String(format: "%.1f", dt))s")
+            print("[Load] \(name) done in \(String(format: "%.1f", dt))s" +
+                  (splitEnabled && name == splitTarget ? " (.cpuAndGPU)" : ""))
             return m
         }
 
@@ -413,6 +431,14 @@ final class ChunkedEngine {
         }
         engine.reset()
         print("[Load] ANE prewarm (4 steps) done in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - warmT0))s")
+
+        // Phase D1b spike: one-shot c2/c3 cross-compute-unit overlap probe.
+        // Only runs when COMPUTE_UNIT_SPLIT=1 (so chunk3 is on .cpuAndGPU).
+        // Mirrors PR #75's probe pattern but measures c2 (ANE) vs c3 (GPU).
+        if splitEnabled {
+            try engine.runComputeUnitSplitProbe()
+            engine.reset()
+        }
 
         return engine
     }
@@ -1743,6 +1769,75 @@ final class ChunkedEngine {
     }
     func makeDrafterFullMask(position: Int) throws -> MLMultiArray {
         try makeCausalMask(position: position, length: config.contextLength)
+    }
+
+    // MARK: - Phase D1b spike: compute-unit-split concurrency probe
+
+    /// One-shot probe: can c2 (ANE) and c3 (.cpuAndGPU) predictions overlap
+    /// on separate DispatchQueues when they go through distinct drivers?
+    /// Mirrors PR #75's pattern but pairs c2/c3 for the split experiment.
+    func runComputeUnitSplitProbe() throws {
+        print("[Spike] Running compute-unit-split probe (c2 ANE vs c3 .cpuAndGPU)")
+        let p = 1
+        let fv: (MLMultiArray) -> MLFeatureValue = { MLFeatureValue(multiArray: $0) }
+        let rope: [String: MLFeatureValue] = [
+            "causal_mask_full": fv(try makeCausalMask(position: p, length: config.contextLength)),
+            "causal_mask_sliding": fv(try makeSlidingCausalMask(position: p, W: config.slidingWindow)),
+            "update_mask": fv(try makeUpdateMask(position: p, length: config.contextLength)),
+            "cos_s": fv(try lookupRoPE(table: cosSlidingTable, position: p, dim: 256)),
+            "sin_s": fv(try lookupRoPE(table: sinSlidingTable, position: p, dim: 256)),
+            "cos_f": fv(try lookupRoPE(table: cosFullTable, position: p, dim: 512)),
+            "sin_f": fv(try lookupRoPE(table: sinFullTable, position: p, dim: 512))]
+        var d1 = rope
+        d1["hidden_states"] = fv(try embedTokens.lookup(0, shape: [1, 1, NSNumber(value: config.hiddenSize)]))
+        d1["per_layer_raw"] = fv(try lookupPerLayerRaw(tokenID: 0))
+        d1["K_sliding_in"] = fv(kSliding1); d1["V_sliding_in"] = fv(vSliding1)
+        d1["K_full_in"] = fv(kFull1); d1["V_full_in"] = fv(vFull1)
+        let o1 = try chunk1.prediction(from: try MLDictionaryFeatureProvider(dictionary: d1))
+        let plc = o1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
+        var d2 = rope
+        d2["hidden_states"] = fv(o1.featureValue(for: "hidden_states_out")!.multiArrayValue!)
+        d2["per_layer_combined"] = fv(plc)
+        d2["K_sliding_in"] = fv(kSliding2); d2["V_sliding_in"] = fv(vSliding2)
+        d2["K_full_in"] = fv(kFull2); d2["V_full_in"] = fv(vFull2)
+        let c2Inputs = try MLDictionaryFeatureProvider(dictionary: d2)
+        let o2 = try chunk2.prediction(from: c2Inputs)
+        var d3 = rope
+        d3["hidden_states"] = fv(o2.featureValue(for: "hidden_states_out")!.multiArrayValue!)
+        d3["per_layer_combined"] = fv(plc)
+        for k in ["kv13_k", "kv13_v", "kv14_k", "kv14_v"] { d3[k] = fv(o2.featureValue(for: k)!.multiArrayValue!) }
+        let c3Inputs = try MLDictionaryFeatureProvider(dictionary: d3)
+        _ = try chunk2.prediction(from: c2Inputs); _ = try chunk3.prediction(from: c3Inputs)  // warm
+        let trials = 10
+        func time(_ block: () throws -> Void) rethrows -> Double {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            for _ in 0..<trials { try block() }
+            return (CFAbsoluteTimeGetCurrent() - t0) / Double(trials)
+        }
+        let sC2 = try time { _ = try self.chunk2.prediction(from: c2Inputs) }
+        let sC3 = try time { _ = try self.chunk3.prediction(from: c3Inputs) }
+        let seq = try time {
+            _ = try self.chunk2.prediction(from: c2Inputs); _ = try self.chunk3.prediction(from: c3Inputs)
+        }
+        let q2 = DispatchQueue(label: "spike.c2", qos: .userInitiated)
+        let q3 = DispatchQueue(label: "spike.c3", qos: .userInitiated)
+        let par = try time {
+            let g = DispatchGroup(); var e2: Error?; var e3: Error?
+            g.enter(); q2.async { do { _ = try self.chunk2.prediction(from: c2Inputs) } catch { e2 = error }; g.leave() }
+            g.enter(); q3.async { do { _ = try self.chunk3.prediction(from: c3Inputs) } catch { e3 = error }; g.leave() }
+            g.wait(); if let e = e2 ?? e3 { throw e }
+        }
+        let ideal = max(sC2, sC3), sum = sC2 + sC3
+        let overlap = (sum - par) / max(sum - ideal, 1e-6)
+        print(String(format: "[Spike] c2_serial=%.2fms c3_serial=%.2fms seq_both=%.2fms parallel=%.2fms",
+                     sC2 * 1000, sC3 * 1000, seq * 1000, par * 1000))
+        print(String(format: "[Spike] ideal_parallel=%.2fms sum=%.2fms overlap_factor=%.2f (1.0=full, 0.0=serial)",
+                     ideal * 1000, sum * 1000, overlap))
+        let verdict = overlap > 0.5 ? "strong overlap — pursue full compute-unit-split implementation"
+                    : overlap > 0.30 ? "meaningful overlap — evaluate full 4-way assignment"
+                    : overlap > 0.15 ? "partial overlap — marginal, likely net-neutral after GPU deficit"
+                    : "no overlap — cross-compute-unit also serializes at system level"
+        print("[Spike] VERDICT: \(verdict).")
     }
 }
 

@@ -5,9 +5,26 @@ struct ModelPickerView: View {
     let downloader = ModelDownloader.shared
     let onModelReady: (URL) -> Void
 
+    // Picked value is read by `LLMRunner.loadModel` at the next load
+    // via UserDefaults (same key as `ComputeMode.storageKey`). Applies
+    // to both `Load` on a downloaded model and fresh `Download` flows.
+    @AppStorage(ComputeMode.storageKey) private var computeMode: ComputeMode = .aneOnly
+
     var body: some View {
         NavigationStack {
             List {
+                Section("Compute Units") {
+                    Picker("Units", selection: $computeMode) {
+                        ForEach(ComputeMode.allCases) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    Text("Applied at Load time. Changing this without reloading has no effect.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("Available Models") {
                     ForEach(downloader.availableModels) { model in
                         let _ = downloader.refreshTrigger
