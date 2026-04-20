@@ -83,10 +83,19 @@ class QuantEmbed:
 
 
 class PerLayerRawEmbed:
-    """Per-layer-input raw embedding (int8 × fp16-scale) — matches EmbeddingLookup
-    with a different input file that was dumped at conversion time."""
+    """Per-layer-input raw embedding (int8 × fp16-scale × per_layer_embed_scale)
+    — must match Swift's `EmbeddingLookup(..., scale: perLayerEmbedScale)`
+    at `ChunkedEngine.swift:395` and `ModelConfig.swift:42` (default 16.0).
+
+    The earlier version omitted the ×16 scale, producing training data whose
+    `per_layer_raw` input was 16× smaller in magnitude than the value the
+    on-device chunks receive at inference. The resulting `per_layer_combined`
+    and every downstream hidden was therefore OOD vs deployment — the single
+    largest contributor to the 0% accept rate observed on iPhone.
+    """
     def __init__(self, data_path: Path, scales_path: Path,
-                 vocab: int, per_layer_dim: int, num_layers: int):
+                 vocab: int, per_layer_dim: int, num_layers: int,
+                 per_layer_embed_scale: float | None = None):
         dim = per_layer_dim * num_layers
         self.data = np.memmap(data_path, dtype=np.int8,
                               shape=(vocab, dim), mode="r")
@@ -94,10 +103,16 @@ class PerLayerRawEmbed:
                                      shape=(vocab,), mode="r")
         self.vocab = vocab
         self.dim = dim
+        # Default: sqrt(per_layer_dim) matches Gemma's standard embed scale
+        # convention and the runtime default in Swift (16.0 for per_layer_dim=256).
+        self.per_layer_embed_scale = (
+            float(per_layer_embed_scale) if per_layer_embed_scale is not None
+            else float(per_layer_dim) ** 0.5)
 
     def lookup(self, tok: int) -> np.ndarray:
         row = self.data[tok].astype(np.float32)
-        s = np.float32(self.scales_fp16[tok]) / np.float32(127.0)
+        s = (np.float32(self.scales_fp16[tok]) / np.float32(127.0)
+             * np.float32(self.per_layer_embed_scale))
         return (row * s).astype(np.float16)
 
 
