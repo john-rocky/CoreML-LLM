@@ -7,9 +7,19 @@ CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a 
 > **v0.8.0** — **Gemma 4 E4B** (42 layers, hidden=2560, ~14 tok/s on iPhone 17 Pro, 100% ANE). Second model option alongside E2B; swap in the Models picker. See [What's new](#whats-new).
 > **v0.7.0** — Video multimodal: native video vision encoder (64 tokens/frame), uniform frame sampling with per-frame thumbnails, `<|video|>` placeholder + bidirectional vision group attention.
 
-| Text (E2B) | Image | Audio (v0.6) | Video (v0.7) | Text (E4B, v0.8) |
-|------------|-------|--------------|--------------|-------------------|
-| ![text](https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a) | ![multimodal](https://github.com/user-attachments/assets/2a869bf5-8315-422d-8b06-a4a7edecd173) | <video src="https://github.com/user-attachments/assets/e8deb6d0-d8b0-4210-885c-5d7a7ddc7ad3" controls></video> | ![video](https://github.com/user-attachments/assets/1d2a9ff3-2912-40e9-895d-fbaa3c73ee3a) | ![e4b](https://github.com/user-attachments/assets/5d514739-8538-4048-bfce-78605de64e83) |
+<table>
+  <tr>
+    <td align="center" width="50%"><b>Text (E2B)</b><br><img src="https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a" width="100%"></td>
+    <td align="center" width="50%"><b>Text (E4B, v0.8)</b><br><img src="https://github.com/user-attachments/assets/5d514739-8538-4048-bfce-78605de64e83" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Image</b><br><img src="https://github.com/user-attachments/assets/2a869bf5-8315-422d-8b06-a4a7edecd173" width="100%"></td>
+    <td align="center"><b>Video (v0.7)</b><br><img src="https://github.com/user-attachments/assets/1d2a9ff3-2912-40e9-895d-fbaa3c73ee3a" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2"><b>Audio (v0.6)</b><br><video src="https://github.com/user-attachments/assets/e8deb6d0-d8b0-4210-885c-5d7a7ddc7ad3" controls></video></td>
+  </tr>
+</table>
 
 ## Performance (iPhone 17 Pro)
 
