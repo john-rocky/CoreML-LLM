@@ -37,11 +37,62 @@ public final class DrafterUnion {
 
     private static let priority: [Source: Int] = [.crossVocab: 0, .pldN3: 1, .pldN2: 2]
 
-    /// Per-source rolling-accept gates. Cross-vocab uses a higher floor
-    /// because its drafter cost is non-trivial (Qwen forward); prompt-lookup
-    /// is a CPU n-gram scan so the floor is near zero.
-    public var crossVocabThreshold: Double = 0.20
-    public var pldThreshold: Double = 0.05
+    /// Hysteresis gate for a draft source. A source toggles ON when its
+    /// rolling EMA rises above `enableThreshold`, and OFF when it falls
+    /// below `disableThreshold`. The gap prevents oscillation around a
+    /// single point when acceptance noise straddles the bound. Disabled
+    /// sources are re-probed every `probeEvery` bursts so a workload
+    /// shift can flip them back on.
+    ///
+    /// Background: `docs/DRAFTER_DEAD_FOR_E2B.md` shows that on Gemma 4
+    /// E2B every separate-architecture drafter falls under the
+    /// break-even bar. In that steady state every missed CV draft is
+    /// ANE energy with no payoff (`docs/LITERT_PERF_ADOPTIONS.md` §T5).
+    /// Defaults below keep CV OFF until live evidence justifies it.
+    public struct Gate {
+        public var enableThreshold: Double
+        public var disableThreshold: Double
+        public var initiallyEnabled: Bool
+        public var probeEvery: Int
+
+        public static let crossVocabDefault = Gate(
+            enableThreshold: 0.50,
+            disableThreshold: 0.30,
+            initiallyEnabled: false,
+            probeEvery: 64
+        )
+        public static let pldDefault = Gate(
+            enableThreshold: 0.20,
+            disableThreshold: 0.08,
+            initiallyEnabled: true,
+            probeEvery: 32
+        )
+    }
+
+    public var crossVocabGate: Gate = .crossVocabDefault {
+        didSet { resyncEnabledFromGates() }
+    }
+    public var pldGate: Gate = .pldDefault {
+        didSet { resyncEnabledFromGates() }
+    }
+
+    /// Compatibility shims: setting the legacy per-burst threshold widens
+    /// it into a hysteresis pair (disable = value, enable = value + margin).
+    /// Existing callers (and benchmarks) that twist these knobs still work.
+    public var crossVocabThreshold: Double {
+        get { crossVocabGate.disableThreshold }
+        set {
+            crossVocabGate.disableThreshold = newValue
+            crossVocabGate.enableThreshold = max(newValue + 0.10, newValue * 1.5)
+        }
+    }
+    public var pldThreshold: Double {
+        get { pldGate.disableThreshold }
+        set {
+            pldGate.disableThreshold = newValue
+            pldGate.enableThreshold = max(newValue + 0.05, newValue * 2.0)
+        }
+    }
 
     /// Hard-disable the cross-vocab source even when it's loaded. Skips
     /// both the bootstrap replay through Qwen and the per-burst draftBurst.
@@ -53,6 +104,33 @@ public final class DrafterUnion {
     private(set) public var rollingPL3: Double = 1.0
     private(set) public var rollingPL2: Double = 1.0
     private let rollingAlpha: Double = 0.10
+
+    // Hysteresis state. enabledX = "this source is currently allowed to
+    // propose without being a probe." Each disabled source still gets a
+    // probe burst every gate.probeEvery cycles so it can re-enable on a
+    // workload shift.
+    private var enabledCV: Bool = Gate.crossVocabDefault.initiallyEnabled
+    private var enabledPL3: Bool = Gate.pldDefault.initiallyEnabled
+    private var enabledPL2: Bool = Gate.pldDefault.initiallyEnabled
+    private var burstsSinceCVProbe: Int = 0
+    private var burstsSincePL3Probe: Int = 0
+    private var burstsSincePL2Probe: Int = 0
+
+    /// Snapshot of which sources are currently enabled. Useful for
+    /// benchmark output and the ANE thermal audit (we want to see how
+    /// often CV actually fires in a chat workload).
+    public var gateState: (cv: Bool, pl3: Bool, pl2: Bool) {
+        (enabledCV, enabledPL3, enabledPL2)
+    }
+
+    /// Counters for how often each source's gate let it run vs blocked it.
+    /// "Probe" runs are counted as allowed.
+    private(set) public var gateAllowedCV: Int = 0
+    private(set) public var gateBlockedCV: Int = 0
+    private(set) public var gateAllowedPL3: Int = 0
+    private(set) public var gateBlockedPL3: Int = 0
+    private(set) public var gateAllowedPL2: Int = 0
+    private(set) public var gateBlockedPL2: Int = 0
 
     private var isBootstrapped = false
     private var prefillHistory: [Int32] = []
@@ -83,6 +161,7 @@ public final class DrafterUnion {
         self.crossVocab = crossVocab
         self.K = K
         for s: Source in [.crossVocab, .pldN3, .pldN2, .fallback] { picks[s] = 0 }
+        resyncEnabledFromGates()
     }
 
     public func reset() {
@@ -93,6 +172,19 @@ public final class DrafterUnion {
         rollingCV = 1.0; rollingPL3 = 1.0; rollingPL2 = 1.0
         totalCycles = 0; totalEmitted = 0; totalAcceptedDraftSlots = 0
         for k in picks.keys { picks[k] = 0 }
+        resyncEnabledFromGates()
+        burstsSinceCVProbe = 0
+        burstsSincePL3Probe = 0
+        burstsSincePL2Probe = 0
+        gateAllowedCV = 0; gateBlockedCV = 0
+        gateAllowedPL3 = 0; gateBlockedPL3 = 0
+        gateAllowedPL2 = 0; gateBlockedPL2 = 0
+    }
+
+    private func resyncEnabledFromGates() {
+        enabledCV  = crossVocabGate.initiallyEnabled
+        enabledPL3 = pldGate.initiallyEnabled
+        enabledPL2 = pldGate.initiallyEnabled
     }
 
     public func setPrefillHistory(_ tokens: [Int32]) {
@@ -112,26 +204,41 @@ public final class DrafterUnion {
         let rCVSnapshot = rollingCV
         let rPL3Snapshot = rollingPL3
         let rPL2Snapshot = rollingPL2
-        let cvGatePassed = (rollingCV >= crossVocabThreshold)
+
+        // Hysteresis-aware per-source decisions for *this* burst. A
+        // disabled source still gets a probe burst every gate.probeEvery
+        // cycles so a workload shift can flip it back on. PLD propose() is
+        // a CPU n-gram scan (microseconds) so its gate only filters
+        // whether to USE the proposal, not whether to compute it.
+        let cvProbeDue = !enabledCV && (burstsSinceCVProbe >= crossVocabGate.probeEvery)
+        let cvAllowed = enabledCV || cvProbeDue
+        let pl3ProbeDue = !enabledPL3 && (burstsSincePL3Probe >= pldGate.probeEvery)
+        let pl3Allowed = enabledPL3 || pl3ProbeDue
+        let pl2ProbeDue = !enabledPL2 && (burstsSincePL2Probe >= pldGate.probeEvery)
+        let pl2Allowed = enabledPL2 || pl2ProbeDue
+
+        if cvAllowed { gateAllowedCV += 1 } else { gateBlockedCV += 1; burstsSinceCVProbe += 1 }
+        if pl3Allowed { gateAllowedPL3 += 1 } else { gateBlockedPL3 += 1; burstsSincePL3Probe += 1 }
+        if pl2Allowed { gateAllowedPL2 += 1 } else { gateBlockedPL2 += 1; burstsSincePL2Probe += 1 }
 
         // 1. Collect per-source proposals.
         var lookupHist = history
         lookupHist.append(nextID)
 
         let (plProps3, pl3Ms): ([Int32], Double) = SpecProfile.time {
-            (rollingPL3 >= pldThreshold)
+            pl3Allowed
                 ? PromptLookupDraft.propose(history: lookupHist, ngramSize: 3, maxDraftLen: K - 1)
                 : []
         }
         let (plProps2, pl2Ms): ([Int32], Double) = SpecProfile.time {
-            (rollingPL2 >= pldThreshold)
+            pl2Allowed
                 ? PromptLookupDraft.propose(history: lookupHist, ngramSize: 2, maxDraftLen: K - 1)
                 : []
         }
 
         var cvBurst: DraftBurst? = nil
         var cvMs: Double = 0
-        if let cv = crossVocab, !crossVocabDisabled, cvGatePassed {
+        if let cv = crossVocab, !crossVocabDisabled, cvAllowed {
             // Side-effect: writes K Qwen KV slots speculatively. If CV is
             // not picked, we rewind below.
             (cvBurst, cvMs) = try SpecProfile.time { try cv.draftBurst(seed: nextID) }
@@ -263,9 +370,33 @@ public final class DrafterUnion {
         let denom = max(compareLen, 1)
         let rate = Double(matchCount) / Double(denom)
         switch source {
-        case .crossVocab: rollingCV  = rollingAlpha * rate + (1 - rollingAlpha) * rollingCV
-        case .pldN3:      rollingPL3 = rollingAlpha * rate + (1 - rollingAlpha) * rollingPL3
-        case .pldN2:      rollingPL2 = rollingAlpha * rate + (1 - rollingAlpha) * rollingPL2
+        case .crossVocab:
+            rollingCV  = rollingAlpha * rate + (1 - rollingAlpha) * rollingCV
+            // Hysteresis transition for CV. We only update enabledCV when
+            // CV actually ran; otherwise rollingCV is stale and a flip
+            // would be based on old data.
+            if cvProbeDue { burstsSinceCVProbe = 0 }
+            if !enabledCV && rollingCV >= crossVocabGate.enableThreshold {
+                enabledCV = true
+            } else if enabledCV && rollingCV <= crossVocabGate.disableThreshold {
+                enabledCV = false
+            }
+        case .pldN3:
+            rollingPL3 = rollingAlpha * rate + (1 - rollingAlpha) * rollingPL3
+            if pl3ProbeDue { burstsSincePL3Probe = 0 }
+            if !enabledPL3 && rollingPL3 >= pldGate.enableThreshold {
+                enabledPL3 = true
+            } else if enabledPL3 && rollingPL3 <= pldGate.disableThreshold {
+                enabledPL3 = false
+            }
+        case .pldN2:
+            rollingPL2 = rollingAlpha * rate + (1 - rollingAlpha) * rollingPL2
+            if pl2ProbeDue { burstsSincePL2Probe = 0 }
+            if !enabledPL2 && rollingPL2 >= pldGate.enableThreshold {
+                enabledPL2 = true
+            } else if enabledPL2 && rollingPL2 <= pldGate.disableThreshold {
+                enabledPL2 = false
+            }
         case .fallback:   break
         }
 

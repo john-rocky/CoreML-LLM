@@ -44,3 +44,6 @@ output/
 *.gif
 Examples/CoreMLLLMChat/gemma4-e2b/
 .claude/
+
+# Third-party source clones (reference only, not vendored)
+/mlx/

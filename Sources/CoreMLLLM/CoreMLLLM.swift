@@ -575,7 +575,29 @@ public final class CoreMLLLM: @unchecked Sendable {
         let ctxLimit = config.contextLength
 
         return AsyncStream { continuation in
-            Task {
+            // T3 NOTE (2026-04-19): we initially pinned this Task to
+            // `.utility` to prefer E-core for the CPU prep between ANE
+            // dispatches (thermal hypothesis). On Mac that was harmless
+            // (~33 tok/s either way), but the first iPhone 17 Pro run
+            // measured ~25 tok/s — a ~20% regression vs the documented
+            // baseline of 31 tok/s. iPhone's E/P scheduler is much more
+            // strict than Mac's: a `.utility` Task that submits ANE
+            // requests from an E-core lengthens every per-chunk dispatch
+            // round-trip enough to dominate the savings. Switched to
+            // `.userInitiated` (the Apple-recommended class for "user
+            // initiated this, show progress") which keeps the dispatch
+            // thread on P-core. The thermal-leaning version is an opt-in
+            // env var instead of the default. See LITERT_PERF_ADOPTIONS.md §T3.
+            //
+            // T4: cancellation. AsyncStream does NOT auto-cancel the
+            // producer task when the consumer breaks out of `for await`.
+            // We bind onTermination so a user-initiated cancel (or
+            // deinit) stops generation at the next checkCancellation
+            // point — a chunk boundary in prefill, the top of the
+            // decode loop. Without this hook, cancelled generations
+            // keep burning ANE energy until maxDecode tokens.
+            let useUtilityQoS = ProcessInfo.processInfo.environment["DECODE_UTILITY_QOS"] == "1"
+            let genTask = Task(priority: useUtilityQoS ? .utility : .userInitiated) {
                 do {
                     let IMAGE_TOKEN_ID = 258880
                     let AUDIO_TOKEN_ID = 258881
@@ -632,6 +654,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                             engine.currentPosition = prefillLen
 
                             for step in prefillLen..<tokens.count {
+                                try Task.checkCancellation()
                                 let tid = tokens[step]
                                 try autoreleasepool {
                                     if let emb = multimodalEmbedding(for: tid) {
@@ -645,6 +668,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                             }
                         } else {
                             for (step, tid) in tokens.enumerated() {
+                                try Task.checkCancellation()
                                 try autoreleasepool {
                                     if let emb = multimodalEmbedding(for: tid) {
                                         nextID = try engine.predictStep(tokenID: 0, position: step,
@@ -685,6 +709,10 @@ public final class CoreMLLLM: @unchecked Sendable {
                         while tokenCount < maxDecode {
                             if eosIDs.contains(Int(nid)) { break }
                             if engine.currentPosition >= ctxLimit { break }
+                            // T4: stop the loop the moment the consumer
+                            // unsubscribes. AsyncStream wires this via
+                            // continuation.onTermination → genTask.cancel().
+                            try Task.checkCancellation()
 
                             if let se = mtpSpec, se.shouldSpeculate {
                                 let emitted = try autoreleasepool {
@@ -777,10 +805,15 @@ public final class CoreMLLLM: @unchecked Sendable {
                             pos += 1
                         }
                     }
+                } catch is CancellationError {
+                    // User-cancelled. No log spam — this is expected.
                 } catch {
                     print("[CoreMLLLM] Error: \(error)")
                 }
                 continuation.finish()
+            }
+            continuation.onTermination = { @Sendable _ in
+                genTask.cancel()
             }
         }
     }
