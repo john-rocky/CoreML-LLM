@@ -47,6 +47,10 @@ HF_DIR = os.environ.get(
 CTX = 2048
 W = 512
 FUSION_LAYERS = (8, 17, 34)
+# Top-K logits exposed by chunk4 for HASS-style soft-KL training. iPhone
+# decode ignores the extra outputs; the Mac collector reads them and
+# stores them in the EAGLE-3 retrain memmap.
+CHUNK4_TOPK = int(os.environ.get("EAGLE3_CHUNK4_TOPK", "20"))
 fp16 = ct.converters.mil.mil.types.fp16
 
 
@@ -180,9 +184,10 @@ class EagleChunk3(nn.Module):
 # EagleChunk4: SWAChunk4 emits pre-norm post-L34 hidden instead of post-norm
 # ============================================================
 class EagleChunk4(nn.Module):
-    def __init__(self, base: SWAChunk4):
+    def __init__(self, base: SWAChunk4, top_k: int = CHUNK4_TOPK):
         super().__init__()
         self.base = base
+        self.top_k = int(top_k)
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding, update_mask,
                 per_layer_combined, cos_s, sin_s, cos_f, sin_f,
@@ -212,11 +217,16 @@ class EagleChunk4(nn.Module):
 
         normed = self.base.norm(hidden_states)
         x = normed.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
-        logits = self.base.lm_head(x).squeeze(2).permute(0, 2, 1)
+        logits = self.base.lm_head(x).squeeze(2).permute(0, 2, 1)  # (1, 1, V)
         if self.base.softcap > 0:
             logits = torch.tanh(logits / self.base.softcap) * self.base.softcap
         token_id, token_logit = self.base.argmax(logits.squeeze(0))
-        return token_id, token_logit, hidden_at_L34
+        # Top-K over vocab from the same softcapped logits. Shape (1, 1, K).
+        # Int64 indices cast to int32 for Core ML friendliness + smaller memmap.
+        top_k_values, top_k_idx_i64 = torch.topk(logits, k=self.top_k, dim=-1)
+        top_k_ids = top_k_idx_i64.to(torch.int32)
+        top_k_logits = top_k_values.to(MODEL_DTYPE)
+        return token_id, token_logit, hidden_at_L34, top_k_ids, top_k_logits
 
 
 def build_chunk1(base, out_dir):
@@ -380,7 +390,8 @@ def build_chunk4(base, out_dir):
         ct.TensorType(name="kv14_k",              shape=s[11].shape, dtype=fp16),
         ct.TensorType(name="kv14_v",              shape=s[12].shape, dtype=fp16),
     ]
-    outs = ["token_id", "token_logit", "hidden_at_L34"]
+    outs = ["token_id", "token_logit", "hidden_at_L34",
+            "top_k_ids", "top_k_logits"]
     do_convert(c4, s, ins, outs, f"{out_dir}/chunk4.mlpackage")
 
 

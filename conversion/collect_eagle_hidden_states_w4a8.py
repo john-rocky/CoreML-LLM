@@ -215,8 +215,10 @@ class ChunkRunner:
              cos_s: np.ndarray, sin_s: np.ndarray,
              cos_f: np.ndarray, sin_f: np.ndarray) -> tuple:
         """Run one T=1 decode step. KV buffers are updated in place.
-        Returns (h_L8, h_L17, h_L34, token_id) as numpy arrays of shape (hidden,)
-        fp16 except token_id which is scalar int32."""
+        Returns (h_L8, h_L17, h_L34, token_id, top_k_ids, top_k_logits).
+        Hiddens are fp16 (hidden,). `token_id` is scalar int32. top_k_ids
+        is int32 (K,) and top_k_logits is fp16 (K,) — both empty-shaped
+        None if the loaded chunk4 predates the top-K output additions."""
         ctx = self.ctx
         W = self.W
         mask_full = make_causal_mask(position, ctx)
@@ -280,7 +282,12 @@ class ChunkRunner:
         h3 = out3["hidden_states_out"]
         h_L17 = out3["hidden_at_L17"]
 
-        # chunk4 — emits (token_id, token_logit, hidden_at_L34).
+        # chunk4 — emits (token_id, token_logit, hidden_at_L34, top_k_ids,
+        # top_k_logits). The top-K outputs are added by the HASS-retrain
+        # rebuild of chunk4 (build_eagle3_chunks.py with EAGLE3_CHUNK4_TOPK).
+        # Older chunk4 builds only emit the first three; we fall back to
+        # None so the caller can detect and either skip the top-K memmap
+        # columns or error out.
         out4 = self.c4.predict({
             "hidden_states": h3,
             **shared_shared,
@@ -288,11 +295,17 @@ class ChunkRunner:
         token_id = int(np.array(out4["token_id"]).reshape(-1)[0])
         h_L34 = out4["hidden_at_L34"]
 
-        # Squeeze to (hidden,)
+        top_k_ids = out4.get("top_k_ids")
+        top_k_logits = out4.get("top_k_logits")
+        if top_k_ids is not None:
+            top_k_ids = np.asarray(top_k_ids).reshape(-1).astype(np.int32)
+        if top_k_logits is not None:
+            top_k_logits = np.asarray(top_k_logits).reshape(-1).astype(np.float16)
+
         return (np.asarray(h_L8).reshape(-1).astype(np.float16),
                 np.asarray(h_L17).reshape(-1).astype(np.float16),
                 np.asarray(h_L34).reshape(-1).astype(np.float16),
-                token_id)
+                token_id, top_k_ids, top_k_logits)
 
 
 def main():
@@ -318,6 +331,11 @@ def main():
                     help="Skip sequences shorter than this many tokens.")
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--W", type=int, default=512)
+    ap.add_argument("--top-k", type=int, default=20,
+                    help="Top-K size expected from chunk4 (must match the K "
+                         "baked into chunk4.mlpackage via EAGLE3_CHUNK4_TOPK). "
+                         "Set 0 to skip the top-K columns and stay compatible "
+                         "with pre-HASS chunk4 builds that only emit argmax.")
     args = ap.parse_args()
 
     assets_dir = args.assets if args.assets is not None else args.chunks
@@ -345,16 +363,22 @@ def main():
 
     # Output memmap with a structured row dtype — one record per collected
     # position. Trainer side can mmap the same dtype and slice freely.
+    # format_version 2 adds top_k columns for HASS-style soft-KL training.
     out_bin = Path(str(args.output) + ".bin")
     out_manifest = Path(str(args.output) + ".manifest.json")
     out_bin.parent.mkdir(parents=True, exist_ok=True)
-    row_dtype = np.dtype([
+    K_top = int(args.top_k)
+    row_fields: list[tuple] = [
         ("h_low",      np.float16, (HIDDEN,)),
         ("h_mid",      np.float16, (HIDDEN,)),
         ("h_high",     np.float16, (HIDDEN,)),
         ("tok_input",  np.int32),
         ("tok_argmax", np.int32),
-    ])
+    ]
+    if K_top > 0:
+        row_fields.append(("top_k_ids",    np.int32,   (K_top,)))
+        row_fields.append(("top_k_logits", np.float16, (K_top,)))
+    row_dtype = np.dtype(row_fields)
     row_bytes = row_dtype.itemsize
     buf = np.memmap(out_bin, dtype=row_dtype,
                     shape=(args.max_tokens,), mode="w+")
@@ -401,7 +425,8 @@ def main():
             cos_f = rope_row(cos_f_table, pos, dim=512)
             sin_f = rope_row(sin_f_table, pos, dim=512)
 
-            h_L8, h_L17, h_L34, argmax_tok = runner.step(
+            (h_L8, h_L17, h_L34, argmax_tok,
+             top_k_ids, top_k_logits) = runner.step(
                 hidden_states=hid, per_layer_raw=plr, position=pos,
                 cos_s=cos_s, sin_s=sin_s, cos_f=cos_f, sin_f=sin_f,
             )
@@ -411,6 +436,20 @@ def main():
             buf[collected]["h_high"] = h_L34
             buf[collected]["tok_input"] = np.int32(tok)
             buf[collected]["tok_argmax"] = np.int32(argmax_tok)
+            if K_top > 0:
+                if top_k_ids is None or top_k_logits is None:
+                    raise RuntimeError(
+                        "chunk4 did not return top_k_ids/top_k_logits — rebuild "
+                        "chunk4.mlpackage with build_eagle3_chunks.py (2026-04-20+) "
+                        "or rerun with --top-k 0 to collect argmax-only data.")
+                if top_k_ids.shape[0] != K_top or top_k_logits.shape[0] != K_top:
+                    raise RuntimeError(
+                        f"chunk4 top-K mismatch: got {top_k_ids.shape[0]} ids / "
+                        f"{top_k_logits.shape[0]} logits, expected K={K_top}. "
+                        f"Either rebuild chunk4 with EAGLE3_CHUNK4_TOPK={K_top} "
+                        f"or pass --top-k matching the baked value.")
+                buf[collected]["top_k_ids"] = top_k_ids
+                buf[collected]["top_k_logits"] = top_k_logits
             collected += 1
 
             if collected % 500 == 0:
@@ -438,26 +477,39 @@ def main():
         pass  # memmap already flushed; truncate via os.truncate below
     os.truncate(out_bin, actual_bytes)
 
+    # Build row layout dynamically so format_version 2 (with top-K) and
+    # legacy (argmax-only) runs both emit accurate offsets.
+    row_layout = [
+        {"name": "h_low",      "dtype": "float16", "dim": HIDDEN},
+        {"name": "h_mid",      "dtype": "float16", "dim": HIDDEN},
+        {"name": "h_high",     "dtype": "float16", "dim": HIDDEN},
+        {"name": "tok_input",  "dtype": "int32",   "dim": 1},
+        {"name": "tok_argmax", "dtype": "int32",   "dim": 1},
+    ]
+    if K_top > 0:
+        row_layout.append({"name": "top_k_ids",    "dtype": "int32",   "dim": K_top})
+        row_layout.append({"name": "top_k_logits", "dtype": "float16", "dim": K_top})
+    _DTYPE_BYTES = {"float16": 2, "int32": 4}
+    offset = 0
+    for f in row_layout:
+        n = f["dim"] * _DTYPE_BYTES[f["dtype"]]
+        f["offset"] = offset
+        f["nbytes"] = n
+        offset += n
+    assert offset == row_bytes, f"row_layout offset drift: {offset} vs {row_bytes}"
+
     manifest = {
-        "format_version": 1,
+        "format_version": 2 if K_top > 0 else 1,
         "hidden": HIDDEN,
         "row_bytes": row_bytes,
-        "row_layout": [
-            {"name": "h_low", "dtype": "float16", "dim": HIDDEN,
-             "offset": 0, "nbytes": HIDDEN * 2},
-            {"name": "h_mid", "dtype": "float16", "dim": HIDDEN,
-             "offset": HIDDEN * 2, "nbytes": HIDDEN * 2},
-            {"name": "h_high", "dtype": "float16", "dim": HIDDEN,
-             "offset": 2 * HIDDEN * 2, "nbytes": HIDDEN * 2},
-            {"name": "tok_input", "dtype": "int32", "dim": 1,
-             "offset": 3 * HIDDEN * 2, "nbytes": 4},
-            {"name": "tok_argmax", "dtype": "int32", "dim": 1,
-             "offset": 3 * HIDDEN * 2 + 4, "nbytes": 4},
-        ],
+        "row_layout": row_layout,
         "num_rows": collected,
         "seq_starts": seq_starts,
         "embed_scale": float(EMBED_SCALE),
+        "per_layer_embed_scale": float(ple.per_layer_embed_scale),
         "fusion_layers": [8, 17, 34],
+        "top_k": K_top,
+        "softcap": 30.0,
         "source": "W4A8 deployed chunks via coremltools (cpuAndNeuralEngine)",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
