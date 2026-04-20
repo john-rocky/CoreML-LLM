@@ -296,24 +296,9 @@ public final class SpeculativeLoop {
 // MARK: - Debug helpers (fp16 scalar dump + L2 norm)
 
 private func fp16BitsToFloat(_ bits: UInt16) -> Float {
-    let sign = UInt32((bits >> 15) & 0x1) << 31
-    let exp  = (bits >> 10) & 0x1F
-    let mant = UInt32(bits & 0x3FF)
-    var e = UInt32(exp)
-    var m = mant
-    if exp == 0 {
-        if mant == 0 {
-            return Float(bitPattern: sign)
-        }
-        // Subnormal
-        while (m & 0x400) == 0 { m <<= 1; e -= 1 }
-        e += 1
-        m &= 0x3FF
-    } else if exp == 0x1F {
-        return Float(bitPattern: sign | 0x7F800000 | (mant << 13))
-    }
-    let f32 = sign | ((e + (127 - 15)) << 23) | (m << 13)
-    return Float(bitPattern: f32)
+    // Use Swift's built-in Float16. Avoids the manual subnormal shift loop
+    // that underflowed UInt32 `e` on subnormals (e.g., 0x8212 → e=0, mant≠0).
+    Float(Float16(bitPattern: bits))
 }
 
 private func hiddenL2Norm(_ a: MLMultiArray) -> Float {
