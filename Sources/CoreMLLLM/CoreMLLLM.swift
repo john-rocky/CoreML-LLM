@@ -765,7 +765,13 @@ public final class CoreMLLLM: @unchecked Sendable {
                         // Only the selected engine resets — the union and the
                         // CV-alone engine share an underlying CrossVocabDraft,
                         // so simultaneous use would corrupt Qwen state.
-                        let eagleSpec = mutableSelf.speculativeLoop
+                        //
+                        // LLM_EAGLE3_DISABLE=1 skips EAGLE-3 so DrafterUnion/CV
+                        // can be benched standalone (e.g. while the EAGLE-3
+                        // draft is a known-broken pre-retrain checkpoint).
+                        let eagleDisabled = ProcessInfo.processInfo
+                            .environment["LLM_EAGLE3_DISABLE"] == "1"
+                        let eagleSpec = eagleDisabled ? nil : mutableSelf.speculativeLoop
                         let mtpSpec = (eagleSpec == nil && mutableSelf.mtpEnabled)
                             ? mutableSelf.mtpEngine : nil
                         let unionSpec = (eagleSpec == nil && mtpSpec == nil
