@@ -220,12 +220,21 @@ class EagleChunk4(nn.Module):
         logits = self.base.lm_head(x).squeeze(2).permute(0, 2, 1)  # (1, 1, V)
         if self.base.softcap > 0:
             logits = torch.tanh(logits / self.base.softcap) * self.base.softcap
-        token_id, token_logit = self.base.argmax(logits.squeeze(0))
-        # Top-K over vocab from the same softcapped logits. Shape (1, 1, K).
-        # Int64 indices cast to int32 for Core ML friendliness + smaller memmap.
+        # Single top-K over vocab produces BOTH the argmax (slot 0) and the
+        # K-way teacher distribution. Running a separate `argmax` op alongside
+        # `topk` on the same logical tensor lets coremltools place them on
+        # different compute units (ANE vs CPU) which produces byte-different
+        # logit copies at palettization boundaries — observed as token_id
+        # disagreeing with top_k_ids[0] on ~40% of the collector rows with
+        # an exact +196608 offset (3 × 65536 vocab-partition offset). Using
+        # topk's first slot guarantees numeric consistency between the hard
+        # label used for CE and the soft target used for KL.
         top_k_values, top_k_idx_i64 = torch.topk(logits, k=self.top_k, dim=-1)
         top_k_ids = top_k_idx_i64.to(torch.int32)
         top_k_logits = top_k_values.to(MODEL_DTYPE)
+        # token_id is batch-preserving int32 of shape (1,), token_logit fp16 (1,).
+        token_id = top_k_ids.squeeze(1)[..., 0]
+        token_logit = top_k_logits.squeeze(1)[..., 0]
         return token_id, token_logit, hidden_at_L34, top_k_ids, top_k_logits
 
 
