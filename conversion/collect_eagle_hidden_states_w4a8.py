@@ -122,13 +122,18 @@ def make_causal_mask(position: int, length: int) -> np.ndarray:
 
 
 def make_sliding_mask(position: int, W: int) -> np.ndarray:
-    """(1, 1, 1, W) fp16. Tail-aligned: slots [W-validCache .. W-1] are 0."""
+    """(1, 1, 1, W) fp16. Slot valid for any `i >= W - min(position+1, W)`.
+
+    Matches Swift's `makeSlidingCausalMask` — the chunk shifts the cache
+    left by 1 on every step and writes the current token's K at slot W-1,
+    so after the shift-and-write, slots [W - (position+1) .. W-1] hold
+    real K/V (tail-aligned). Using `position` (not position+1) here misses
+    slot W-2 on every step, zeroing attention except for the current token.
+    """
     m = np.full((1, 1, 1, W), np.float16(-65504.0), dtype=np.float16)
-    valid_cache = min(position, W)  # slots currently holding real K/V
-    cache_start = W - valid_cache
-    m[0, 0, 0, cache_start:W] = np.float16(0.0)
-    # The current token's own slot is W-1 (after the shift-in the chunk does).
-    m[0, 0, 0, W - 1] = np.float16(0.0)
+    valid = min(position + 1, W)
+    start = W - valid
+    m[0, 0, 0, start:W] = np.float16(0.0)
     return m
 
 

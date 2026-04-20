@@ -201,14 +201,16 @@ class EagleChunk4(nn.Module):
                 config, per_layer_combined,
                 kv13_k, kv13_v, kv14_k, kv14_v,
             )
-        # post-final-norm hidden — matches `out.hidden_states[-1]` semantics
-        # from HF's Gemma4TextModel, which is what the training collector
-        # used as `h_high`. Earlier this captured the pre-norm hidden
-        # (norm ~40), whereas training saw the post-norm tensor (norm ~235):
-        # that 6× magnitude + distribution shift crushes the draft's
-        # accept rate to ~0% on device. Capture it AFTER `self.base.norm`.
+        # post-L34 pre-norm hidden — matches the collector's forward_batch
+        # semantics (fusion_hiddens[34] captured inside the loop, BEFORE
+        # `self.norm`). An earlier "fix" that tried to post-norm this was
+        # misdiagnosed: the custom collector used pre-norm, so the old ckpt
+        # learned against pre-norm L34. Keep pre-norm to stay consistent
+        # with the repo's training convention (and with the new W4A8
+        # retrain, which collects via the same chunk4 → same pre-norm).
+        hidden_at_L34 = hidden_states
+
         normed = self.base.norm(hidden_states)
-        hidden_at_L34 = normed
         x = normed.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
         logits = self.base.lm_head(x).squeeze(2).permute(0, 2, 1)
         if self.base.softcap > 0:
