@@ -135,6 +135,11 @@ def main():
                         help="Context length (default: registry entry's default)")
     parser.add_argument("--no-quantize", action="store_true",
                         help="Skip int4 palettization")
+    parser.add_argument("--keep-tmp", action="store_true",
+                        help="Keep the _tmp/chunkN_{decode,verify}.mlpackage "
+                             "intermediates so standalone verify-only chunks "
+                             "can be pushed to iPhone without the multi-function "
+                             "mlpackage (some iOS CoreML builds reject multi-function).")
     args = parser.parse_args()
 
     if args.output is None:
@@ -533,9 +538,15 @@ def main():
         f"{args.output}/chunk4.mlpackage")
 
     # ================================================================
-    # Cleanup temp files
+    # Cleanup temp files (unless --keep-tmp). Retained intermediates are
+    # usable as standalone chunk{N}_{decode,verify}.mlpackage which match
+    # Swift's "standalone verify chunks" fallback when multi-function
+    # loading is unsupported on the target OS.
     # ================================================================
-    shutil.rmtree(tmp, ignore_errors=True)
+    if not args.keep_tmp:
+        shutil.rmtree(tmp, ignore_errors=True)
+    else:
+        print(f"\n  [keep-tmp] intermediates preserved under {tmp}/")
 
     print(f"\n{'='*60}")
     print(f"Multi-function chunks saved to {args.output}/")

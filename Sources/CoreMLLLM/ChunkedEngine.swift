@@ -2183,8 +2183,25 @@ extension ChunkedEngine: SpeculativeTarget {
 
         let hiddenIn = try buildVerifyHidden(tokenIDs: candidates)
         let plRaw = try buildVerifyPLR(tokenIDs: candidates)
-        let maskFull = try makeVerifyCausalMaskFull(position: P, T: K, ctx: ctx)
-        let maskSliding = try makeVerifyCausalMaskSliding(position: P, T: K, W: W)
+        // 11c verify chunks use (1,1,K,ctx) for full and (1,1,K,W) for sliding
+        // (the cache IS W — new K rows are appended by torch.cat(slot[K:], k_new)
+        // inside the Python verify graph, so the query-side mask is just the
+        // cache mask). Old (W+K) / (ctx+K) shapes rejected on iPhone.
+        let maskFull = try makeVerifyCausalMask(startPos: P, K: K, length: ctx)
+        let maskSliding = try makeVerifySlidingMask(startPos: P, K: K, W: W)
+        // update_indicator: (1, 1, ctx, K) — one-hot column k at abs pos P+k.
+        // Required by the 11c verify chunks for in-graph full-attn K scatter.
+        let updateIndicator = try MLMultiArray(
+            shape: [1, 1, NSNumber(value: ctx), NSNumber(value: K)],
+            dataType: .float16)
+        let indPtr = updateIndicator.dataPointer.bindMemory(to: UInt16.self, capacity: ctx * K)
+        memset(indPtr, 0, ctx * K * MemoryLayout<UInt16>.stride)
+        for k in 0..<K {
+            let pos = P + k
+            if pos < ctx {
+                indPtr[pos * K + k] = 0x3C00  // fp16 1.0
+            }
+        }
         let cosS = try buildVerifyRoPE(table: cosSlidingTable, position: P, T: K, dim: 256)
         let sinS = try buildVerifyRoPE(table: sinSlidingTable, position: P, T: K, dim: 256)
         let cosF = try buildVerifyRoPE(table: cosFullTable, position: P, T: K, dim: 512)
@@ -2195,6 +2212,7 @@ extension ChunkedEngine: SpeculativeTarget {
             "hidden_states": MLFeatureValue(multiArray: hiddenIn),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
             "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+            "update_indicator": MLFeatureValue(multiArray: updateIndicator),
             "per_layer_raw": MLFeatureValue(multiArray: plRaw),
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
@@ -2213,12 +2231,14 @@ extension ChunkedEngine: SpeculativeTarget {
         lastNewKFull1    = out1.featureValue(for: "new_K_full")?.multiArrayValue
         lastNewVFull1    = out1.featureValue(for: "new_V_full")?.multiArrayValue
 
-        // Verify chunk 2 — produces extended kv13_k_out (1,1,W+T,256)
-        // and kv14_k_out (1,1,ctx+T,512) for downstream chunks 3/4.
+        // Verify chunk 2 — emits within-verify kv13/kv14 used by chunks 3/4
+        // in this verify call. Under 11c these are NOT persisted to the
+        // device KV cache — commitAccepted writes per-T slices instead.
         let out2 = try v2.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h1),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
             "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+            "update_indicator": MLFeatureValue(multiArray: updateIndicator),
             "per_layer_combined": MLFeatureValue(multiArray: plc),
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
@@ -2228,10 +2248,11 @@ extension ChunkedEngine: SpeculativeTarget {
             "V_full_in": MLFeatureValue(multiArray: vFull2),
         ]))
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
-        let kv13k = out2.featureValue(for: "kv13_k_out")!.multiArrayValue!
-        let kv13v = out2.featureValue(for: "kv13_v_out")!.multiArrayValue!
-        let kv14k = out2.featureValue(for: "kv14_k_out")!.multiArrayValue!
-        let kv14v = out2.featureValue(for: "kv14_v_out")!.multiArrayValue!
+        // 11c verify chunks emit kv13_k / kv14_k (no `_out` suffix).
+        let kv13k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
+        let kv13v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
+        let kv14k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
+        let kv14v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
         // 11c per-T K/V slices for L8-14 (persistent cache update happens in
         // commitAccepted, not here).
         lastNewKSliding2 = out2.featureValue(for: "new_K_sliding")?.multiArrayValue
