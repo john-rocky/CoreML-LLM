@@ -355,8 +355,23 @@ def train(args: argparse.Namespace) -> None:
                 d_h = fused
                 loss = 0.0
                 match = torch.zeros(args.K, device=device)
+                # TTT semantics (matches commit b844850's original trainer and
+                # Swift SpeculativeLoop.drawBurst at inference):
+                #   step 0: e_next = embed(tok_inputs[0])  (teacher-forced,
+                #           simulates `tTokNext` from target's previous argmax)
+                #   step k ≥ 1: e_next = embed(draft's own argmax at step k-1)
+                #           (autoregressive — trains the draft to handle its
+                #           own mistakes, which is what it does at inference).
+                # The earlier version used teacher-forced e_next at EVERY step,
+                # inflating val (easy task) but not transferring to free-gen
+                # (hard autoregressive task). That bug is fixed here.
+                prev_argmax: torch.Tensor | None = None
                 for k in range(args.K):
-                    e_next = (embed_table[tok_in[:, k]].unsqueeze(1).float()
+                    if k == 0:
+                        tok_for_e = tok_in[:, 0]
+                    else:
+                        tok_for_e = prev_argmax  # draft's own prediction
+                    e_next = (embed_table[tok_for_e].unsqueeze(1).float()
                               * float(cfg["embed_scale"]))
                     d_h, d_logits = draft.step(d_h, e_next, cos_r, sin_r,
                                                is_sequence=False)
@@ -365,7 +380,8 @@ def train(args: argparse.Namespace) -> None:
                     loss_k = F.cross_entropy(logits_k, tok_tg[:, k])
                     loss = loss + loss_k
                     with torch.no_grad():
-                        match[k] = (logits_k.argmax(-1) == tok_tg[:, k]).float().mean()
+                        prev_argmax = logits_k.argmax(-1)   # feeds step k+1
+                        match[k] = (prev_argmax == tok_tg[:, k]).float().mean()
 
                 loss = loss / args.K
                 if training:
