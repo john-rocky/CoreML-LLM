@@ -167,14 +167,18 @@ def main():
     ap.add_argument("--K", type=int, default=3)
     args = ap.parse_args()
 
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(str(args.assets / "hf_model"))
+    # Use the low-level tokenizers library directly — transformers' fast
+    # tokenizer path for Gemma currently crashes in recent builds (dict/list
+    # confusion in _set_model_specific_special_tokens). The raw tokenizer.json
+    # works fine and produces the same IDs.
+    from tokenizers import Tokenizer
+    tokenizer = Tokenizer.from_file(str(args.assets / "hf_model" / "tokenizer.json"))
     if args.corpus is not None:
         with open(args.corpus) as f:
             prompt_text = json.loads(f.readline())["text"]
     else:
         prompt_text = args.prompt or "Tell me about the history of Japan briefly."
-    prompt_ids = tokenizer.encode(prompt_text)
+    prompt_ids = tokenizer.encode(prompt_text).ids
     # Keep prompt modest so we stay in context.
     prompt_ids = prompt_ids[:96]
     print(f"[Prompt] {len(prompt_ids)} tokens")
