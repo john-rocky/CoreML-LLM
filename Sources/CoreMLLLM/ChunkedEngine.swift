@@ -161,15 +161,38 @@ final class ChunkedEngine {
             }
         }
 
+        // Env override: LLM_COMPUTE_UNITS=cpu|cpuGpu|cpuAne|all — for
+        // diagnosing ANE-vs-other-device numerical differences. When a per-
+        // device ANE gives very different numerics (e.g., 4-bit palettized
+        // weights decoded differently on A-series vs M-series), routing the
+        // same .mlmodelc through CPU eliminates the hardware variance at the
+        // cost of speed.
+        var effectiveUnits = computeUnits
+        if let raw = ProcessInfo.processInfo.environment["LLM_COMPUTE_UNITS"]?.lowercased() {
+            switch raw {
+            case "cpu", "cpuonly":
+                effectiveUnits = .cpuOnly
+            case "cpugpu", "cpuandgpu":
+                effectiveUnits = .cpuAndGPU
+            case "cpuane", "cpuandneuralengine":
+                effectiveUnits = .cpuAndNeuralEngine
+            case "all":
+                effectiveUnits = .all
+            default:
+                break
+            }
+            print("[Load] LLM_COMPUTE_UNITS=\(raw) → computeUnits=\(effectiveUnits)")
+        }
+
         let mlConfig = MLModelConfiguration()
-        mlConfig.computeUnits = computeUnits
+        mlConfig.computeUnits = effectiveUnits
         applyHints(mlConfig)
 
         // Prefill chunks use GPU for compute-bound batch processing (TTFT win).
         // Decode chunks stay on ANE for bandwidth-bound single-token inference.
         let prefillConfig = MLModelConfiguration()
         let useGPUPrefill = ProcessInfo.processInfo.environment["GPU_PREFILL"] == "1"
-        prefillConfig.computeUnits = useGPUPrefill ? .cpuAndGPU : computeUnits
+        prefillConfig.computeUnits = useGPUPrefill ? .cpuAndGPU : effectiveUnits
         applyHints(prefillConfig)
         if useGPUPrefill {
             print("[Load] GPU_PREFILL=1 — prefill chunks will use .cpuAndGPU")
@@ -260,7 +283,7 @@ final class ChunkedEngine {
         var detectedK = 0
         do {
             let verifyConfig = MLModelConfiguration()
-            verifyConfig.computeUnits = computeUnits
+            verifyConfig.computeUnits = effectiveUnits
             verifyConfig.functionName = "verify_qK"
             applyHints(verifyConfig)
 
@@ -310,7 +333,7 @@ final class ChunkedEngine {
             if findModel("verify_chunk1") != nil {
                 do {
                     let verifyConfig = MLModelConfiguration()
-                    verifyConfig.computeUnits = computeUnits
+                    verifyConfig.computeUnits = effectiveUnits
                     applyHints(verifyConfig)
                     let verifyT0 = CFAbsoluteTimeGetCurrent()
                     try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
