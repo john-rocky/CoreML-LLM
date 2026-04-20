@@ -20,6 +20,12 @@ final class LLMRunner {
     var hasAudio = false
     var maxAudioDuration: TimeInterval = 10.0
 
+    /// Active compute unit selection. Applied on the next `loadModel` call —
+    /// changing this on a loaded model does NOT migrate weights between ANE
+    /// and GPU; you must reload. Vision/audio submodels are intentionally
+    /// pinned to `.cpuAndGPU` upstream and ignore this setting.
+    var computeUnits: MLComputeUnits = .cpuAndNeuralEngine
+
     // MTP speculation metrics
     var mtpAcceptanceRate: Double = 0
     var mtpTokensPerRound: Double = 0
@@ -30,11 +36,25 @@ final class LLMRunner {
     var crossVocabTokensPerCycle: Double = 0
 
     private var llm: CoreMLLLM?
-    private var modelFolderURL: URL?
+    /// Folder of the most recently loaded model. Exposed (read-only) so the
+    /// app can re-issue `loadModel` with a different compute unit (A/B
+    /// benchmark, picker change) without re-prompting the user.
+    private(set) var modelFolderURL: URL?
+
+    static func computeUnitsString(_ cu: MLComputeUnits) -> String {
+        switch cu {
+        case .cpuOnly:             return "CPU"
+        case .cpuAndGPU:           return "CPU+GPU"
+        case .all:                 return "All (CPU+GPU+ANE)"
+        case .cpuAndNeuralEngine:  return "CPU+ANE"
+        @unknown default:          return "?"
+        }
+    }
 
     // MARK: - Loading
 
-    func loadModel(from url: URL) async throws {
+    func loadModel(from url: URL, computeUnits: MLComputeUnits? = nil) async throws {
+        if let cu = computeUnits { self.computeUnits = cu }
         let folder = url.deletingLastPathComponent()
 
         // Release the previous model BEFORE allocating the new one — otherwise
@@ -62,11 +82,13 @@ final class LLMRunner {
         modelFolderURL = folder
         loadingStatus = "Loading..."
 
-        llm = try await CoreMLLLM.load(from: folder) { [weak self] status in
+        let cu = self.computeUnits
+        llm = try await CoreMLLLM.load(from: folder, computeUnits: cu) { [weak self] status in
             Task { @MainActor in
                 self?.loadingStatus = status
             }
         }
+        print("[LLMRunner] computeUnits=\(Self.computeUnitsString(cu))")
 
         modelName = llm!.modelName
         hasVision = llm!.supportsVision
@@ -243,6 +265,77 @@ final class LLMRunner {
     }
     #endif
 
+    // MARK: - A/B compute-unit comparison
+
+    struct ABBenchmarkResult {
+        var perSideDuration: TimeInterval
+        var entries: [(units: MLComputeUnits, result: BenchmarkResult?, error: String?)]
+    }
+
+    /// Reload the current model under each requested compute unit and run
+    /// `runBenchmark` on each. The same prompt, same duration, sequential.
+    /// Restores the original compute unit at the end (best-effort).
+    ///
+    /// Caveats baked in:
+    /// - Reloading is slow (first-run ANE compile ≈ 1–2 min). The phase
+    ///   callback distinguishes load vs run.
+    /// - Vision/audio submodels are pinned to `.cpuAndGPU` upstream and are
+    ///   not affected by the side under test.
+    /// - The model must already have been loaded once so we know its folder.
+    #if os(iOS)
+    @MainActor
+    func runABBenchmark(
+        durationPerSide: TimeInterval,
+        units: [MLComputeUnits] = [.cpuAndNeuralEngine, .cpuAndGPU],
+        onPhase: @escaping (String) -> Void,
+        onProgress: @escaping (BenchmarkProgress) -> Void
+    ) async throws -> ABBenchmarkResult {
+        guard let folder = modelFolderURL else {
+            throw NSError(domain: "LLMRunner", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Load a model first"])
+        }
+        let modelURL = folder.appendingPathComponent("model.mlpackage")
+        let originalCU = self.computeUnits
+
+        var entries: [(MLComputeUnits, BenchmarkResult?, String?)] = []
+        for cu in units {
+            let label = Self.computeUnitsString(cu)
+            onPhase("[\(label)] reloading model…")
+            do {
+                try await loadModel(from: modelURL, computeUnits: cu)
+            } catch {
+                entries.append((cu, nil, "load failed: \(error.localizedDescription)"))
+                continue
+            }
+            onPhase("[\(label)] benchmarking \(Int(durationPerSide))s…")
+            do {
+                let r = try await runBenchmark(duration: durationPerSide,
+                                               onProgress: onProgress)
+                entries.append((cu, r, nil))
+            } catch {
+                entries.append((cu, nil, "bench failed: \(error.localizedDescription)"))
+            }
+            // Cool-down between sides so thermal state from side A doesn't
+            // bleed into side B's measurements. 60s is a compromise — not
+            // enough to hit nominal from .serious, but enough to drop
+            // surface temperature noticeably on most devices.
+            if cu != units.last {
+                onPhase("Cooling down 60s before next side…")
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+            }
+        }
+
+        // Restore original compute units (best-effort — caller may want a
+        // specific side left loaded; they can reload after if needed).
+        if originalCU != units.last {
+            onPhase("Restoring original compute units (\(Self.computeUnitsString(originalCU)))…")
+            try? await loadModel(from: modelURL, computeUnits: originalCU)
+        }
+
+        return ABBenchmarkResult(perSideDuration: durationPerSide, entries: entries)
+    }
+    #endif
+
     static func thermalString(_ s: ProcessInfo.ThermalState) -> String {
         switch s {
         case .nominal:  return "nominal"
@@ -253,8 +346,12 @@ final class LLMRunner {
         }
     }
 
-    // MARK: - ANE placement verification
+    // MARK: - Compute placement verification
 
+    /// Reports MLComputePlan placement for the currently-loaded model, using
+    /// the runner's active `computeUnits` for the LLM chunks (so the audit
+    /// matches reality, not a hardcoded ANE config). Vision stays on
+    /// `.cpuAndGPU` because that is what the package always uses for it.
     @available(iOS 17.0, macOS 14.0, *)
     func verifyANEPlacement() async -> String {
         guard let folder = modelFolderURL else {
@@ -262,17 +359,29 @@ final class LLMRunner {
         }
 
         let cfg = MLModelConfiguration()
-        cfg.computeUnits = .cpuAndNeuralEngine
+        cfg.computeUnits = self.computeUnits
         let visionCfg = MLModelConfiguration()
         visionCfg.computeUnits = .cpuAndGPU
 
+        // Prefill chunks may have been forced to GPU via the GPU_PREFILL
+        // env var — see ChunkedEngine.swift. Mirror that here so the audit
+        // matches what was actually loaded.
+        let useGPUPrefill = ProcessInfo.processInfo.environment["GPU_PREFILL"] == "1"
+        let prefillCfg = MLModelConfiguration()
+        prefillCfg.computeUnits = useGPUPrefill ? .cpuAndGPU : self.computeUnits
+
         struct Entry { let label: String; let url: URL; let cfg: MLModelConfiguration }
         var entries: [Entry] = []
-        let names = ["chunk1", "chunk2", "chunk3", "chunk4",
-                     "prefill_chunk1", "prefill_chunk2", "prefill_chunk3", "prefill_chunk4"]
-        for name in names {
+        let decodeNames = ["chunk1", "chunk2", "chunk3", "chunk4"]
+        let prefillNames = ["prefill_chunk1", "prefill_chunk2", "prefill_chunk3", "prefill_chunk4"]
+        for name in decodeNames {
             if let u = findModel(in: folder, name: name) {
                 entries.append(Entry(label: name, url: u, cfg: cfg))
+            }
+        }
+        for name in prefillNames {
+            if let u = findModel(in: folder, name: name) {
+                entries.append(Entry(label: name, url: u, cfg: prefillCfg))
             }
         }
         if let u = findModel(in: folder, name: "vision") {
@@ -280,7 +389,7 @@ final class LLMRunner {
         }
         if entries.isEmpty { return "No chunks found." }
 
-        var lines: [String] = ["MLComputePlan placement:"]
+        var lines: [String] = ["MLComputePlan placement (cfg=\(Self.computeUnitsString(self.computeUnits))):"]
         var tAll = 0, aAll = 0, gAll = 0, cAll = 0
         for e in entries {
             do {

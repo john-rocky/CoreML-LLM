@@ -1,9 +1,25 @@
 import SwiftUI
 import PhotosUI
+import CoreML
 import CoreMLLLM
+
+enum ComputeChoice: String, CaseIterable, Identifiable {
+    case ane = "ANE"
+    case gpu = "GPU"
+    case all = "All"
+    var id: String { rawValue }
+    var mlValue: MLComputeUnits {
+        switch self {
+        case .ane: return .cpuAndNeuralEngine
+        case .gpu: return .cpuAndGPU
+        case .all: return .all
+        }
+    }
+}
 
 struct ChatView: View {
     @State private var runner = LLMRunner()
+    @State private var computeChoice: ComputeChoice = .ane
     @State private var messages: [ChatMessage] = []
     @State private var inputText = ""
     @State private var showModelPicker = false
@@ -210,8 +226,31 @@ struct ChatView: View {
                             Button("5 min")  { startBenchmark(minutes: 5) }
                             Button("10 min") { startBenchmark(minutes: 10) }
                             Button("30 min") { startBenchmark(minutes: 30) }
+                            Divider()
+                            Section("Compare ANE vs GPU") {
+                                Button("2 min each")  { startABBenchmark(minutesPerSide: 2) }
+                                Button("5 min each")  { startABBenchmark(minutesPerSide: 5) }
+                                Button("10 min each") { startABBenchmark(minutesPerSide: 10) }
+                            }
                         }
                         .disabled(runner.isGenerating || benchmarkRunning)
+                    }
+                }
+                if runner.isLoaded {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Menu {
+                            Picker("Compute", selection: $computeChoice) {
+                                ForEach(ComputeChoice.allCases) { c in
+                                    Text(c.rawValue).tag(c)
+                                }
+                            }
+                        } label: {
+                            Text(computeChoice.rawValue)
+                        }
+                        .disabled(runner.isGenerating || benchmarkRunning)
+                        .onChange(of: computeChoice) { _, new in
+                            reloadWithCompute(new)
+                        }
                     }
                 }
                 if runner.hasAudio {
@@ -552,6 +591,115 @@ struct ChatView: View {
                 benchmarkRunning = false
                 benchmarkStatus = ""
                 messages.append(ChatMessage(role: .system, content: "[Benchmark] Failed: \(error.localizedDescription)"))
+            }
+        }
+    }
+
+    private func reloadWithCompute(_ choice: ComputeChoice) {
+        guard let folder = runner.modelFolderURL else { return }
+        let modelURL = folder.appendingPathComponent("model.mlpackage")
+        messages.append(ChatMessage(role: .system,
+            content: "Reloading model on \(LLMRunner.computeUnitsString(choice.mlValue))…"))
+        Task.detached(priority: .userInitiated) {
+            do {
+                try await runner.loadModel(from: modelURL, computeUnits: choice.mlValue)
+                await MainActor.run {
+                    messages.append(ChatMessage(role: .system,
+                        content: "Loaded on \(LLMRunner.computeUnitsString(choice.mlValue))."))
+                }
+            } catch {
+                await MainActor.run {
+                    messages.append(ChatMessage(role: .system,
+                        content: "Reload failed: \(error.localizedDescription)"))
+                }
+            }
+        }
+    }
+
+    private func startABBenchmark(minutesPerSide: Int) {
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        let state = UIDevice.current.batteryState
+        if state == .charging || state == .full {
+            messages.append(ChatMessage(role: .system, content: "[A/B] Device is charging — unplug for accurate SoC drain measurement."))
+        }
+        benchmarkRunning = true
+        benchmarkStatus = "A/B starting… (\(minutesPerSide) min per side)"
+        messages.append(ChatMessage(role: .system,
+            content: "[A/B] Running ANE then GPU for \(minutesPerSide) min each. Reload between sides takes ~1 min; 60s cool-down in between."))
+        UIApplication.shared.isIdleTimerDisabled = true
+
+        Task {
+            defer { UIApplication.shared.isIdleTimerDisabled = false }
+            do {
+                let ab = try await runner.runABBenchmark(
+                    durationPerSide: TimeInterval(minutesPerSide * 60),
+                    onPhase: { phase in
+                        benchmarkStatus = phase
+                    },
+                    onProgress: { prog in
+                        let batNow = prog.batteryNow >= 0 ? Int(prog.batteryNow * 100) : -1
+                        benchmarkStatus = String(
+                            format: "[A/B] %ds  %d tok  avg %.1f tok/s  SoC %d%%  %@",
+                            Int(prog.elapsed), prog.totalTokens, prog.avgTokPerSec,
+                            batNow,
+                            LLMRunner.thermalString(prog.thermal) as NSString)
+                    }
+                )
+                benchmarkRunning = false
+                benchmarkStatus = "A/B done. See chat for result."
+
+                var out = ["[A/B RESULT] \(minutesPerSide) min per side"]
+                for e in ab.entries {
+                    let label = LLMRunner.computeUnitsString(e.units)
+                    if let err = e.error {
+                        out.append("\(label): \(err)")
+                        continue
+                    }
+                    guard let r = e.result else { continue }
+                    let bs = r.batteryStart >= 0 ? Int(r.batteryStart * 100) : -1
+                    let be = r.batteryEnd   >= 0 ? Int(r.batteryEnd   * 100) : -1
+                    out.append("""
+                    \(label):
+                      tok/s avg   : \(String(format: "%.2f", r.avgTokPerSec))
+                      tokens      : \(r.totalTokens)  (rounds \(r.rounds))
+                      battery     : \(bs)% → \(be)%  (Δ \(String(format: "%.2f", r.drainedPercent))%)
+                      drain/min   : \(String(format: "%.3f", r.drainedPerMinute))%/min
+                      tokens/%SoC : \(String(format: "%.0f", r.tokensPerPercent))
+                      thermal     : \(LLMRunner.thermalString(r.thermalStart)) → \(LLMRunner.thermalString(r.thermalEnd))\(r.abortedThermal ? "  (aborted .serious)" : "")
+                    """)
+                }
+                // Head-to-head delta on tok/s and drain if both sides finished.
+                let done = ab.entries.compactMap { e -> (MLComputeUnits, LLMRunner.BenchmarkResult)? in
+                    if let r = e.result { return (e.units, r) } else { return nil }
+                }
+                if done.count >= 2 {
+                    let (u0, r0) = done[0]
+                    let (u1, r1) = done[1]
+                    let fasterLabel = r0.avgTokPerSec >= r1.avgTokPerSec
+                        ? LLMRunner.computeUnitsString(u0)
+                        : LLMRunner.computeUnitsString(u1)
+                    let speedRatio = r0.avgTokPerSec > 0 && r1.avgTokPerSec > 0
+                        ? max(r0.avgTokPerSec, r1.avgTokPerSec) / min(r0.avgTokPerSec, r1.avgTokPerSec)
+                        : 1.0
+                    let coolerLabel: String
+                    if r0.drainedPerMinute > 0 && r1.drainedPerMinute > 0 {
+                        coolerLabel = r0.drainedPerMinute <= r1.drainedPerMinute
+                            ? LLMRunner.computeUnitsString(u0)
+                            : LLMRunner.computeUnitsString(u1)
+                    } else {
+                        coolerLabel = "n/a (charging or unmeasured)"
+                    }
+                    out.append("""
+                    Summary:
+                      faster       : \(fasterLabel)  (×\(String(format: "%.2f", speedRatio)))
+                      lower drain  : \(coolerLabel)
+                    """)
+                }
+                messages.append(ChatMessage(role: .system, content: out.joined(separator: "\n\n")))
+            } catch {
+                benchmarkRunning = false
+                benchmarkStatus = ""
+                messages.append(ChatMessage(role: .system, content: "[A/B] Failed: \(error.localizedDescription)"))
             }
         }
     }
