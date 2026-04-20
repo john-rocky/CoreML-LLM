@@ -246,10 +246,12 @@ public final class DrafterUnion {
             carry = targetArgmax[K - 1]
         }
 
-        // 6. Commit on target. Verify wrote KV at [pos, pos+matchCount];
-        //    rejected slots stay masked-out by the causal mask.
+        // 6. Commit on target. Under the 11c protocol, verify does NOT write
+        //    KV to the persistent cache; commitAccepted is what writes the
+        //    accepted-prefix slices. Bumping currentPosition directly (as the
+        //    pre-11c code did) leaves the cache stale and corrupts decode.
         let committed = matchCount + 1
-        engine.currentPosition = pos + committed
+        let committedTokens = Array(emitted.prefix(committed))
 
         // 7. Sync history (committed tokens only).
         for k in 0..<committed { history.append(emitted[k]) }
@@ -263,12 +265,15 @@ public final class DrafterUnion {
             sfx.applyCommit(tokens: delta)
         }
 
-        // 8. Sync cross-vocab Qwen state. If CV was the source, applyCommit
+        // 8. Commit KV via the engine (11c protocol — verify no longer writes
+        //    persistent KV, so we must call commitAccepted here), plus sync
+        //    cross-vocab Qwen state. If CV was the source, applyCommit
         //    rewinds/extends correctly. If CV ran but wasn't picked, its
         //    speculative writes don't match the committed prefix — rewind
         //    and replay the actual committed tokens through Qwen.
         var cvPosAfterRewind: Int = cvActive?.committedPosition ?? -1
         let (_, commitMs) = try SpecProfile.time {
+            try engine.commitAccepted(committedTokens)
             if let cv = cvActive, let burst = cvBurst {
                 if source == .crossVocab {
                     try cv.applyCommit(matchCount: matchCount, burst: burst)

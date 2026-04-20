@@ -75,6 +75,28 @@ final class LLMRunner {
         isLoaded = true
         loadingStatus = "Ready"
         print("[LLMRunner] loaded: vision=\(hasVision) audio=\(hasAudio) model=\(modelName)")
+
+        // 11c iPhone bench (Task #9): when SPECULATIVE_PROFILE is set, switch
+        // off the (incompatible-ctx) MTP drafter and route through the cross-vocab /
+        // PLD union instead so the verify path is actually exercised. Without
+        // this, the default mtpEnabled=true silently falls through to no-spec
+        // when the MTP drafter mlmodel is incompatible with the engine config.
+        if ProcessInfo.processInfo.environment["SPECULATIVE_PROFILE"] != nil {
+            llm!.mtpEnabled = false
+            llm!.drafterUnionEnabled = true
+            llm!.crossVocabEnabled = true
+            print("[LLMRunner] SPECULATIVE_PROFILE=1 — mtp=off union=on cv=on")
+        }
+
+        // 11c iPhone diagnostic: SPEC_OFF=1 disables ALL speculative paths so
+        // we can measure pure serial decode speed (isolates ANE compile / chunk
+        // perf from spec-engine overhead). Overrides SPECULATIVE_PROFILE.
+        if ProcessInfo.processInfo.environment["SPEC_OFF"] != nil {
+            llm!.mtpEnabled = false
+            llm!.drafterUnionEnabled = false
+            llm!.crossVocabEnabled = false
+            print("[LLMRunner] SPEC_OFF=1 — pure serial decode")
+        }
     }
 
     // MARK: - Generation
