@@ -1,6 +1,6 @@
 # Next-session handoff
 
-**Last updated:** 2026-04-16 (full docs audit + coremltools 9 findings).
+**Last updated:** 2026-04-17 (GPU read-only verify strategy + 2-chunk priority + PR-1/2 closed).
 
 ---
 
@@ -37,6 +37,50 @@ better drafters (60 %+ acc) so contamination rarely triggers. Our best
 drafter hits 38 %. Google's works because their MTP is 60-80 % against
 their own quantized target.
 
+### Unexplored: GPU read-only verify — potential spec decode revival
+
+The common blocker above exists because **ANE verify chunks have KV
+write baked into the compiled forward path** — it cannot be separated.
+GPU does not have this constraint. A GPU verify path could:
+
+1. Read existing KV cache via IOSurface (zero-copy, Apple UMA)
+2. Compute attention for K draft positions against existing KV in
+   scratch buffers — **never write to the persistent KV cache**
+3. Return top-K logits per position
+4. Only accepted tokens get their KV committed via the normal ANE
+   decode path (`predictStep`)
+
+This eliminates the semantic contamination entirely — the verify never
+sees KV from unconfirmed proposals. Accept rates should recover to
+oracle-bench levels (E[tok/burst] 2.3–3.2, per Phase A5 data).
+
+**Why this is different from previous GPU attempts:**
+- D1b pipelining failed because it moved **decode** to GPU (data
+  dependency between chunks killed overlap). This moves only **verify**.
+- PR #17 / SDPA fusion failed because they changed the ANE forward
+  path. This leaves ANE decode untouched.
+- GPU thermal concern is minimal: verify is a short burst (K=3 tokens,
+  ~5–10 ms), not sustained generation.
+
+**Implementation paths (ordered by effort):**
+
+| Path | Effort | What it tests |
+|---|---|---|
+| A. Reload existing verify chunks with `computeUnits=.cpuAndGPU` | 1 day | GPU precision helps accept rate? (KV still written, but fp32 accumulation may reduce drift) |
+| B. Build read-only verify model (no KV write, scratch attention) | 1–2 weeks | Full contamination fix. New `VerifyReadOnly` PyTorch module + CoreML export targeting GPU. |
+| C. llama.cpp Metal verify | 2–4 weeks | Native FlashAttention for verify. Merges with Metal-LLM track. |
+
+**Composition with other levers:**
+- 2-chunk consolidated decode (31→45 tok/s) + GPU read-only verify
+  (×1.5–2.0) = 67–90 tok/s
+- ANE decode and GPU verify run in parallel (Mirror SD pattern) —
+  verify cost approaches zero
+- Drafter runs on CPU (Prompt Lookup) or ANE (if small enough)
+
+**Status:** Not started. Recommended after 2-chunk iPhone measurement
+confirms the dispatch-reduction baseline. This is the highest-potential
+path to reviving speculative decoding on CoreML.
+
 ### Decode-side non-speculative — all dead
 
 | Approach | Result | Why |
@@ -57,11 +101,13 @@ The bottleneck is **4 serial ANE dispatches per token** at ~13 ms each
 are not the constraint. Dispatch count is. The only ways past this are:
 
 1. Fewer chunks (2-chunk variant prototyped but ANE compiler stability
-   concerns; being explored in a separate session)
-2. Speculative decoding (all paths blocked, see above)
+   concerns; 2K build pending on `device-bench` branch, iPhone
+   measurement is the next priority action — predicted ~45 tok/s)
+2. GPU read-only verify + speculative decoding (see new section above)
 3. A future Apple OS/API change
 
-None of these are on the current critical path.
+Item 1 is the immediate next action. Item 2 is the highest-potential
+path if 2-chunk alone doesn't reach 56 tok/s.
 
 ---
 
@@ -131,9 +177,9 @@ Remaining headroom is **conversion-side only**:
 
 | PR | Status | Action |
 |---|---|---|
-| #83 | OPEN | PR-1 safe baseline — **close** (coremltools 9 renders it moot) |
+| #83 | CLOSED | PR-1 safe baseline — closed (iPhone quality OK but +1.7% only, not worth the diff) |
 | #84 | OPEN | Video placeholder token fix — review and merge if correct |
-| #85 | OPEN | PR-2 softmax swap — **close** (coremltools 9 renders it moot) |
+| #85 | CLOSED | PR-2 softmax swap — closed (iPhone quality regression; fused softmax is ANE-hostile, 3rd failure after SDPA bb2ecfe + PR #17 exp2) |
 | #79 | OPEN | D1b pipelining negative result — keep as documentation |
 | #76 | OPEN | Track A tolerance — blocked; no longer on critical path |
 | #33 | DRAFT | 0d prefill bypass — 6× regression, unresolved |
@@ -146,7 +192,9 @@ Remaining headroom is **conversion-side only**:
 - Per-chunk decode: c1=5.9 c2=6.8 c3=8.1 c4=10.4 ms
 - ANE placement: 99.78 % (7,294/7,310 ops)
 - Memory: ~1 GB `phys_footprint`
-- LiteRT-LM iOS: 56 tok/s (Metal GPU, 3–5 W) — different axis, not a target
+- LiteRT-LM iOS: 56 tok/s (Metal GPU, 3–5 W) — target for 2-chunk + spec decode path
+- 2-chunk predicted: ~45 tok/s @ 2K (dispatch halving, CHUNK_CONSOLIDATION_BENCH.md)
+- 2-chunk + GPU verify spec decode: 67–90 tok/s theoretical
 
 ---
 
