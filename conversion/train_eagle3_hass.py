@@ -21,15 +21,25 @@ Deltas from vanilla EAGLE-3 TTT (as in `train_eagle3_ttt.py`):
    official EAGLE-3 t2d (target-to-draft) vocab pruning pass. Vanilla
    TTT used hard CE only, losing the teacher's shoulder distribution.
 
-2. HASS "context harmonisation" Q-override, `--q-override step0`:
+2. HASS "context harmonisation" Q-override, `--q-override step0`
+   (OPTIONAL, default off):
    At TTT step k=0 the draft's own attention-input hidden is replaced
    by the teacher's L34 pre-norm (`h_high`). The rest of the rollout
    (k ≥ 1) is driven by the draft's own prev_argmax, same as vanilla
-   TTT. This matches HASS §3.2: at the first drafting step, the
-   target's feature is inserted in place of the draft's cached query
-   so the draft's attention is anchored to the teacher's context; the
-   gradient then trains the draft to stay close to the teacher when it
-   is autoregressing from its own outputs.
+   TTT. This attempts to match HASS §3.2: at the first drafting step,
+   the target's feature is inserted in place of the draft's cached
+   query so the draft's attention is anchored to the teacher's context.
+
+   NOTE: the HASS paper's Q-override is defined for multi-layer drafts
+   with a KV cache (override cached K/V with target's). Our EAGLE-3
+   draft is single-layer with no persistent cache, so the adaptation
+   is "use h_high as step-0 input hidden". This creates a deliberate
+   train/inference mismatch because SpeculativeLoop.drawBurst feeds
+   `h_fused` (the fusion model's output) to the draft at step 0, not
+   `h_high`. For exact train/inference parity, use `--q-override none`
+   (vanilla EAGLE-3 TTT, default). Only enable `step0` as an ablation
+   if you want to probe whether anchoring on h_high ex-fusion helps
+   despite the mismatch.
 
    Derivation (the HASS paper's pseudo-code uses a KV cache which this
    draft does not have at train time): since our single-layer draft has
@@ -632,9 +642,16 @@ def main() -> None:
                     help="Weight on RMSE(draft_h_final, h_high). Off by "
                          "default (matches EAGLE-3 paper).")
     ap.add_argument("--q-override", type=str,
-                    choices=["none", "step0", "all"], default="step0",
-                    help="HASS context-harmonisation Q-override. "
-                         "'step0' (default) anchors k=0 on teacher h_high.")
+                    choices=["none", "step0", "all"], default="none",
+                    help="Q-override at TTT step 0. 'none' (default) is the "
+                         "vanilla EAGLE-3 TTT convention: k=0 input = fused "
+                         "target hiddens, exactly matching what SpeculativeLoop "
+                         "feeds the draft at inference (hPrev=hFused). 'step0' "
+                         "is a HASS-adapted variant that overrides k=0 input "
+                         "with teacher's pre-norm L34 (h_high) — anchors the "
+                         "draft's Q on target's unfused feature. It's a "
+                         "deliberate train/inference mismatch; use only for "
+                         "ablation. 'all' replaces d_h at every k (debug).")
     ap.add_argument("--device", type=str,
                     default=("mps" if torch.backends.mps.is_available()
                              else ("cuda" if torch.cuda.is_available() else "cpu")))
