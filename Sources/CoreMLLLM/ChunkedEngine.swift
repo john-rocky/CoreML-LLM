@@ -251,22 +251,56 @@ final class ChunkedEngine {
         }
 
         // Load all chunks in parallel (MLModel(contentsOf:) is thread-safe,
-        // ANE compiler can pipeline compilation across chunks)
+        // ANE compiler can pipeline compilation across chunks).
+        //
+        // Concurrency cap: 8 simultaneous MIL/ANE compilations pin the
+        // P-cores and ANECompilerService daemon at the same moment,
+        // producing a load-time heat spike that is empirically larger
+        // than sustained decode. Opt-in via LLM_LOAD_MAX_PARALLEL=<N>;
+        // unset or 0 preserves the original all-at-once behavior.
+        // Runtime decode/prefill throughput is unaffected — only the
+        // load-window duty cycle changes.
         let hasPrefillFiles = findModel("prefill_chunk1") != nil
         var c1: MLModel!, c2: MLModel!, c3: MLModel!, c4: MLModel!
         var p1: MLModel?, p2: MLModel?, p3: MLModel?, p4: MLModel?
 
+        let loadMaxParallel: Int = {
+            guard let s = ProcessInfo.processInfo.environment["LLM_LOAD_MAX_PARALLEL"],
+                  let n = Int(s), n > 0 else { return 0 }
+            return n
+        }()
+        if loadMaxParallel > 0 {
+            print("[Load] LLM_LOAD_MAX_PARALLEL=\(loadMaxParallel) " +
+                  "(cap concurrent MIL/ANE compilations)")
+        }
+
+        var chunkWork: [(String, MLModelConfiguration)] = [
+            ("chunk1", mlConfig), ("chunk2", mlConfig),
+            ("chunk3", mlConfig), ("chunk4", mlConfig),
+        ]
+        if hasPrefillFiles {
+            for name in ["prefill_chunk1", "prefill_chunk2",
+                         "prefill_chunk3", "prefill_chunk4"] {
+                chunkWork.append((name, prefillConfig))
+            }
+        }
+
         let loadT0 = CFAbsoluteTimeGetCurrent()
         try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
-            for name in ["chunk1", "chunk2", "chunk3", "chunk4"] {
-                group.addTask { (name, try loadOne(name, config: mlConfig)) }
+            let cap = loadMaxParallel > 0
+                ? min(loadMaxParallel, chunkWork.count)
+                : chunkWork.count
+            var idx = 0
+            // Seed the initial wave of up to `cap` compilations.
+            while idx < cap {
+                let (name, cfg) = chunkWork[idx]
+                group.addTask { (name, try loadOne(name, config: cfg)) }
+                idx += 1
             }
-            if hasPrefillFiles {
-                for name in ["prefill_chunk1", "prefill_chunk2", "prefill_chunk3", "prefill_chunk4"] {
-                    group.addTask { (name, try loadOne(name, config: prefillConfig)) }
-                }
-            }
-            for try await (name, model) in group {
+            // Drain completed tasks and refill one-for-one. When
+            // cap == chunkWork.count this is equivalent to the original
+            // all-at-once launch (all tasks seeded, none refilled).
+            while let (name, model) = try await group.next() {
                 switch name {
                 case "chunk1": c1 = model
                 case "chunk2": c2 = model
@@ -278,10 +312,19 @@ final class ChunkedEngine {
                 case "prefill_chunk4": p4 = model
                 default: break
                 }
+                if idx < chunkWork.count {
+                    let (nextName, nextCfg) = chunkWork[idx]
+                    group.addTask {
+                        (nextName, try loadOne(nextName, config: nextCfg))
+                    }
+                    idx += 1
+                }
             }
         }
         let loadDt = CFAbsoluteTimeGetCurrent() - loadT0
-        print("[Load] All \(hasPrefillFiles ? 8 : 4) chunks loaded in \(String(format: "%.1f", loadDt))s (parallel)")
+        let loadMode = loadMaxParallel > 0 ? "cap=\(loadMaxParallel)" : "parallel"
+        print("[Load] All \(hasPrefillFiles ? 8 : 4) chunks loaded in " +
+              "\(String(format: "%.1f", loadDt))s (\(loadMode))")
 
         // Load verify functions from multi-function chunks (if available).
         // Multi-function chunks have a "verify_qK" function alongside the
