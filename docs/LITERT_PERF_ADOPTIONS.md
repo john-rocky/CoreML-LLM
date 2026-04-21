@@ -15,6 +15,18 @@ machine with the HF checkpoint and coremltools). S3 (dual-bank KV) and the
 in-graph embedding dequant variant of T1 are deferred — both require a
 non-trivial converter pass.
 
+**On-device bench update (2026-04-21):** side-by-side on iPhone 17 Pro
+with identical 2K bundle showed **no measurable tok/s delta** between
+this PR and `main`. Root cause: S1 is dormant (no b-variants on disk),
+T3/T4/T5 are either no-ops vs `main`'s inherited behaviour or gated
+behind a manually-enabled drafter, and the two knobs that actually flip
+behaviour on — S2 prefetch and T1 embedding LRU — produced zero lift on
+this workload. S2 and T1 are therefore now **opt-in**
+(`ENABLE_PREFETCH=1`, `ENABLE_EMBED_LRU=1`); the default path behaves
+like `main`. The T2 ANE-residency CLI and the `ComputePlanAudit`
+`ios18.*` namespace fix stay on as they are tooling / a correctness bug
+fix, not runtime perf.
+
 ---
 
 ## What this doc is

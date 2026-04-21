@@ -303,10 +303,11 @@ final class ChunkedEngine {
         let hidden = config.hiddenSize
         let nlayers = config.numLayers
         let pld = config.perLayerDim
-        // Bench knob: DISABLE_EMBED_LRU=1 forces capacity=0 so every
-        // lookup re-runs the vDSP/vImage dequant. Used for A/B perf
-        // comparisons against the T1 LRU.
-        let embedCacheCap = ProcessInfo.processInfo.environment["DISABLE_EMBED_LRU"] == "1" ? 0 : 256
+        // Opt-in: ENABLE_EMBED_LRU=1 turns on the 256-entry FP16 LRU.
+        // Default off — the 2026-04-20 iPhone 17 Pro bench showed zero
+        // measurable tok/s change with it on, so keeping it out of the
+        // default path avoids paying the cache bookkeeping for no gain.
+        let embedCacheCap = ProcessInfo.processInfo.environment["ENABLE_EMBED_LRU"] == "1" ? 256 : 0
         let embedTokens = try EmbeddingLookup(
             dataURL: directory.appendingPathComponent("embed_tokens_q8.bin"),
             scalesURL: directory.appendingPathComponent("embed_tokens_scales.bin"),
@@ -1340,9 +1341,11 @@ final class ChunkedEngine {
     /// and RoPE rows. Idempotent — replaces any older pending prefetch.
     /// Skipped when `pos` exceeds context length.
     private func schedulePrefetch(forPosition pos: Int) {
-        // Bench knob: DISABLE_PREFETCH=1 forces synchronous mask/RoPE
-        // build inside predictStep. Used for A/B perf comparisons.
-        if ProcessInfo.processInfo.environment["DISABLE_PREFETCH"] == "1" { return }
+        // Opt-in: ENABLE_PREFETCH=1 turns on async mask/RoPE prep on a
+        // background utility queue. Default off — the 2026-04-20 iPhone
+        // bench showed no tok/s lift, so the extra dispatch / NSLock
+        // cost isn't worth paying in the default path.
+        if ProcessInfo.processInfo.environment["ENABLE_PREFETCH"] != "1" { return }
         let ctx = config.contextLength
         let W = config.slidingWindow
         guard pos < ctx else { return }
