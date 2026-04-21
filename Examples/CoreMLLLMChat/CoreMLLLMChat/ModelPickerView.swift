@@ -73,6 +73,11 @@ struct ModelPickerView: View {
                     } label: {
                         Label("Qwen3.5-0.8B decode benchmark", systemImage: "speedometer")
                     }
+                    NavigationLink {
+                        Qwen35GeneratorView()
+                    } label: {
+                        Label("Qwen3.5-0.8B end-to-end generate", systemImage: "text.bubble")
+                    }
                 }
 
                 Section("Troubleshooting") {

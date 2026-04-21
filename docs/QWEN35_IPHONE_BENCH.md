@@ -130,6 +130,56 @@ runtime predict, zero-init states, HF recurrent oracle):
 - If both fall short → consider INT4 weight-only (with relaxed kmeans
   settings) to shrink memory and cache-miss overhead.
 
+## End-to-end generation (Phase 4e-2 + 4e-4)
+
+A third screen **Qwen3.5-0.8B end-to-end generate** runs the full
+prefill → decode pipeline with state passing. This produces generated
+token IDs (detokenization is deliberately excluded — paste IDs in,
+get IDs out).
+
+### Additional setup
+
+1. Build the **stateful prefill** mlpackage (emits initial states for decode):
+
+   ```bash
+   cd conversion
+   /Users/$(whoami)/.pyenv/versions/3.10.13/envs/lama-cml/bin/python \
+       test_qwen3_5_full_prefill_stateful.py \
+       --seq-len 64 --out-dir /tmp/qwen35_build_prefill_stateful
+   ```
+
+   Output: `/tmp/qwen35_build_prefill_stateful/qwen3_5_0_8b_prefill_stateful_fp16_seq64.mlpackage`
+   (≈ 1.5 GB, ANE placement ≈ 97.9%).
+
+2. The decode mlpackage is the same one used by the decode benchmark
+   (`qwen3_5_0_8b_decode_fp16_mseq128.mlpackage`, built earlier).
+
+3. Drag both mlpackages into the Xcode project (if not already). The
+   generator expects:
+   - `qwen3_5_0_8b_prefill_stateful_fp16_seq64.mlmodelc`
+   - `qwen3_5_0_8b_decode_fp16_mseq128.mlmodelc`
+
+### Usage
+
+1. Encode your prompt to Qwen token IDs elsewhere (e.g. in Python with
+   `AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")`).
+2. Paste the comma-separated IDs into the input box.
+3. Pick max new tokens (default 16).
+4. Tap **Generate**. The app reports prefill latency, decode per-token
+   latency, and end-to-end tok/s, and lists the generated token IDs.
+5. Decode the IDs back to text externally (same tokenizer).
+
+### What this measures
+
+- **prefill** ms: 1 call with full 64-token input
+- **decode avg** ms/tok: sequential single-token decode, state-threaded
+- **tokens/s**: end-to-end throughput including prefill
+
+Expected on iPhone A18 Pro CPU fp16 (extrapolating from M4 Studio
+decode ~50 tok/s): likely 50-70 tok/s on decode alone. Prefill is a
+one-shot cost so end-to-end tok/s on short outputs is dominated by
+prefill; on long outputs it approaches decode rate.
+
 ## Known limitations of this harness
 
 - Measures **prefill only** (seq=64 fixed). Generation requires the decode
