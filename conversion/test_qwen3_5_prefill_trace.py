@@ -82,13 +82,14 @@ class PrefillLinearAttnLayer(nn.Module):
         return x * torch.rsqrt(x.pow(2).sum(dim=-1, keepdim=True) + eps)
 
     def _rmsnorm_gated(self, x, z):
-        in_dtype = x.dtype
-        x = x.float()
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        x = self.norm_w * x.to(in_dtype)
-        x = x * F.silu(z.float())
-        return x.to(in_dtype)
+        # ANE-friendly RMSNorm via [x, -x] concat + LayerNorm identity, then
+        # apply z-gate. See conversion/ane_ops.py.
+        Dv = self.Dv
+        doubled = torch.cat([x, -x], dim=-1)
+        normed = F.layer_norm(doubled, normalized_shape=(2 * Dv,),
+                               weight=None, bias=None, eps=float(self.eps))
+        normed, _ = torch.chunk(normed, 2, dim=-1)
+        return normed * self.norm_w * F.silu(z)
 
     def _chunk_gated_delta_rule(self, q, k, v, g, beta):
         """Trace-friendly rewrite of HF torch_chunk_gated_delta_rule.

@@ -63,13 +63,13 @@ class FullAttentionLayer(nn.Module):
         self.register_buffer("causal_mask", causal, persistent=False)
 
     def _rmsnorm(self, x, w):
-        # x: (..., head_dim). Qwen3_5RMSNorm uses (1 + w).
-        in_dtype = x.dtype
-        x = x.float()
-        var = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        x = x * (1.0 + w.float())
-        return x.to(in_dtype)
+        # ANE-friendly via [x,-x] concat + LayerNorm; Qwen3.5 applies (1 + w).
+        D = self.head_dim
+        doubled = torch.cat([x, -x], dim=-1)
+        normed = F.layer_norm(doubled, normalized_shape=(2 * D,),
+                               weight=None, bias=None, eps=float(self.eps))
+        normed, _ = torch.chunk(normed, 2, dim=-1)
+        return normed * (1.0 + w)
 
     @staticmethod
     def _rotate_half(x):
