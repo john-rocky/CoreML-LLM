@@ -91,6 +91,45 @@ Device-side data points to collect:
 - **If A18 ANE top-1 < 70%**: A18 ANE has stricter fp16 behavior than M4;
   same options as above, tipped toward option (b).
 
+## Decode benchmark (Phase 4e-1)
+
+A second benchmark screen measures the **stateful decode** path — the
+per-token auto-regressive step used during text generation. This is
+the component whose throughput determines tok/s during real generation.
+
+**Mac M4 Studio reference numbers** (from `test_qwen3_5_full_decode_trace.py`
+runtime predict, zero-init states, HF recurrent oracle):
+
+| runtime | mean cos | worst cos | top-1 | tok/s |
+|---|---|---|---|---|
+| CPU fp16 | 0.99992 | 0.99985 | 100% | ~50 |
+| CPU+ANE fp16 | 0.99 | 0.977 | 40% | ~40 |
+
+**Setup:**
+
+1. Build the decode mlpackage:
+   ```bash
+   /Users/$(whoami)/.pyenv/versions/3.10.13/envs/lama-cml/bin/python \
+       conversion/test_qwen3_5_full_decode_trace.py \
+       --out-dir /tmp/qwen35_build_decode
+   ```
+   Output: `/tmp/qwen35_build_decode/qwen3_5_0_8b_decode_fp16_mseq128.mlpackage` (≈ 1.5 GB).
+
+2. Drag into the Xcode project alongside the prefill mlpackage.
+   The decode benchmark loads both `qwen3_5_0_8b_decode_fp16_mseq128.mlmodelc`
+   and the shared `qwen3_5_oracle_ios.json`.
+
+3. In the app: **Models → Research → Qwen3.5-0.8B decode benchmark**.
+
+**Decision rule** for the decode benchmark:
+- If CPU-only tok/s on A18 Pro >= 56.5 → **shipping path found** (CPU fp16
+  clears LiteRT without needing ANE). Proceed to Phase 4e-2 (prefill
+  state export) + 4e-4 (Swift generation loop).
+- If CPU-only < 56.5 but CPU+ANE top-1 recovers on A18 → invest in ANE
+  drift investigation (a win doubles as speed + accuracy).
+- If both fall short → consider INT4 weight-only (with relaxed kmeans
+  settings) to shrink memory and cache-miss overhead.
+
 ## Known limitations of this harness
 
 - Measures **prefill only** (seq=64 fixed). Generation requires the decode

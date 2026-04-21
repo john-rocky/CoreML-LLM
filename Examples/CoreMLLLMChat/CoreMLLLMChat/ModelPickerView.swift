@@ -68,6 +68,11 @@ struct ModelPickerView: View {
                     } label: {
                         Label("Qwen3.5-0.8B prefill benchmark", systemImage: "stopwatch")
                     }
+                    NavigationLink {
+                        Qwen35DecodeBenchmarkView()
+                    } label: {
+                        Label("Qwen3.5-0.8B decode benchmark", systemImage: "speedometer")
+                    }
                 }
 
                 Section("Troubleshooting") {
