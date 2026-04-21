@@ -183,6 +183,34 @@ public final class CoreMLLLM: @unchecked Sendable {
 
         let llm = CoreMLLLM(config: config, tokenizer: tokenizer)
 
+        // Opt-in gates for the speculative stack. Every component adds
+        // resident ANE memory; the baseline (no env set) loads only the
+        // T=1 decode chunks so footprint matches pre-EAGLE-3 builds.
+        //
+        //   LLM_EAGLE3_ENABLE=1     — load eagle3_draft + eagle3_fusion
+        //                              (234 MB ANE-resident) AND verify
+        //                              chunks (600 MB); speculative burst
+        //                              path active.
+        //   SPECULATIVE_PROFILE=1   — load cross-vocab Qwen drafter
+        //                              (301 MB) + verify chunks (600 MB).
+        //                              Validated 11c cv bench path.
+        //   (neither)                 — pure T=1 decode, no aux models.
+        //
+        // EAGLE-3 measurement (Gemma 4 E2B, 500k training positions):
+        // val accept 22%, iPhone throughput +5-8% over T=1. Default
+        // opt-out keeps users who don't need speculation from paying
+        // the memory cost.
+        let eagle3Enabled =
+            ProcessInfo.processInfo.environment["LLM_EAGLE3_ENABLE"] == "1"
+        let specProfile =
+            ProcessInfo.processInfo.environment["SPECULATIVE_PROFILE"] != nil
+        let loadVerify = eagle3Enabled || specProfile
+        let loadCV = specProfile
+        if eagle3Enabled || specProfile {
+            print("[Load] speculative gates: "
+                  + "eagle3=\(eagle3Enabled) cv=\(loadCV) verify=\(loadVerify)")
+        }
+
         // Auto-detect: chunked or monolithic
         let isChunked = FileManager.default.fileExists(
             atPath: directory.appendingPathComponent("chunk1.mlmodelc").path)
@@ -241,7 +269,14 @@ public final class CoreMLLLM: @unchecked Sendable {
             // ChunkedEngine.load() (either as multi-function verify_qK or as
             // standalone verify_chunk*.mlmodelc). We just need draft + fusion
             // mlpackages here to wire up the SpeculativeLoop orchestrator.
-            if let fusionURL = findAsset("eagle3_fusion"),
+            //
+            // Opt-in: gated by LLM_EAGLE3_ENABLE=1. On iPhone 17 Pro with
+            // Gemma 4 E2B the draft/fusion add ~234 MB ANE-resident and
+            // yield only ~+5-8% throughput at current draft quality (val
+            // 22.4% per-step, per-token compounded ~14%). Not worth the
+            // memory by default.
+            if eagle3Enabled,
+               let fusionURL = findAsset("eagle3_fusion"),
                let draftURL = findAsset("eagle3_draft"),
                (llm.chunkedEngine?.hasVerify ?? false) {
                 do {
@@ -293,14 +328,17 @@ public final class CoreMLLLM: @unchecked Sendable {
         // Cross-vocabulary drafter (Route B): Qwen 2.5 0.5B monolithic +
         // vocab map. Looks for `cross_vocab/qwen_drafter.mlmodelc` (or
         // `.mlpackage`) plus `cross_vocab/qwen_gemma_vocab.bin` under the
-        // model directory. Silently skipped if absent.
+        // model directory. Skipped if absent OR if SPECULATIVE_PROFILE
+        // is not set (gate prevents paying 301 MB ANE-resident cost
+        // when speculation is off).
         let cvDir = directory.appendingPathComponent("cross_vocab")
         let cvCompiled = cvDir.appendingPathComponent("qwen_drafter.mlmodelc")
         let cvPkg = cvDir.appendingPathComponent("qwen_drafter.mlpackage")
         let cvMapURL = cvDir.appendingPathComponent("qwen_gemma_vocab.bin")
         let cvModelURL: URL? = FileManager.default.fileExists(atPath: cvCompiled.path) ? cvCompiled
             : FileManager.default.fileExists(atPath: cvPkg.path) ? cvPkg : nil
-        if let cvModelURL,
+        if loadCV,
+           let cvModelURL,
            FileManager.default.fileExists(atPath: cvMapURL.path),
            let engine = llm.chunkedEngine,
            engine.hasVerify {

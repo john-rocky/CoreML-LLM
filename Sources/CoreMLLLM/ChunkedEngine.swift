@@ -287,8 +287,18 @@ final class ChunkedEngine {
         // Multi-function chunks have a "verify_qK" function alongside the
         // default "decode_q1". We detect this by checking if the chunk has
         // the verify function and load it with a separate configuration.
+        //
+        // Opt-in: verify chunks add ~600 MB ANE-resident. Only load if
+        // the caller has enabled a speculative path (LLM_EAGLE3_ENABLE=1
+        // for the trained EAGLE-3 draft, or SPECULATIVE_PROFILE=1 for
+        // the cross-vocab Qwen drafter). Default mode (no env set) skips
+        // verify entirely so baseline memory footprint matches pre-spec.
+        let specRequested =
+            ProcessInfo.processInfo.environment["LLM_EAGLE3_ENABLE"] == "1"
+            || ProcessInfo.processInfo.environment["SPECULATIVE_PROFILE"] != nil
         var v1: MLModel?, v2: MLModel?, v3: MLModel?, v4: MLModel?
         var detectedK = 0
+        if specRequested {
         do {
             let verifyConfig = MLModelConfiguration()
             verifyConfig.computeUnits = effectiveUnits
@@ -386,6 +396,10 @@ final class ChunkedEngine {
                     v1 = nil; v2 = nil; v3 = nil; v4 = nil
                 }
             }
+        }
+        }  // end if specRequested
+        if !specRequested {
+            print("[Load] speculative disabled by default — set LLM_EAGLE3_ENABLE=1 or SPECULATIVE_PROFILE=1 to load verify chunks")
         }
 
         // Embeddings
