@@ -15,7 +15,12 @@ let package = Package(
         .executable(name: "union-bitexact", targets: ["UnionBitExact"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.0"),
+        // Range widened to 1.0.x: mlx-swift-examples caps swift-transformers at
+        // <1.1.0, so any consumer that also pulls MLX deadlocks if we require
+        // 1.1+ here. 1.0.x already exposes the `Tokenizers` product with the
+        // `Tokenizer` protocol + `AutoTokenizer.from(modelFolder:)` API that
+        // CoreMLLLM uses, so 1.0.x is source-compatible with 1.1.x here.
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
     ],
     targets: [
         .target(
