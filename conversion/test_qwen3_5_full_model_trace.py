@@ -84,10 +84,7 @@ class FullModel(nn.Module):
         for layer in self.layers:
             hidden = layer(hidden, self.cos, self.sin)
         hidden = self.final_norm(hidden)
-        # lm_head is the largest matmul (1024 -> 248320 vocab). Conv2d 1x1
-        # path picks up the biggest ANE precision improvement here.
-        from test_qwen3_5_prefill_trace import _linear_as_conv2d
-        logits = _linear_as_conv2d(hidden, self.lm_head_w)
+        logits = F.linear(hidden, self.lm_head_w)
         return logits
 
 
@@ -147,11 +144,11 @@ def parity_vs_oracle(model: FullModel, oracle: dict, seq_len: int):
     return overall_min, overall_mean, top1_rate
 
 
-# Op types that accumulate over long reduction dims on ANE and lose precision
-# in fp16. Keeping these in fp32 makes ANE compile them as fp32 kernels
-# (which it supports on A18 for linear/matmul), at the cost of some
-# throughput. Elementwise ops stay fp16 and run hot on ANE.
-FP32_KEEP_OP_TYPES = {"matmul", "linear"}
+SSM_FP32_PREFIXES = (
+    "attn3", "L3", "decay_mask", "k_decay", "k_cumdecay",
+    "k_beta", "v_beta", "core", "v_prime", "v_new",
+    "attn_inter", "last_state", "k3", "k_beta3", "v_beta3",
+)
 
 
 _SEL_STATS = {"kept_fp32": 0, "cast_fp16": 0,
@@ -160,18 +157,21 @@ _SEL_STATS = {"kept_fp32": 0, "cast_fp16": 0,
 
 def _ssm_op_selector(op):
     """FP16ComputePrecision selector. Return True → fp16, False → keep fp32.
-    Keep long-accumulation ops (matmul / linear) fp32; cast the rest to fp16.
-    """
-    if op.op_type in FP32_KEEP_OP_TYPES:
-        _SEL_STATS["kept_fp32"] += 1
-        if len(_SEL_STATS["samples_fp32"]) < 5:
-            name = op.outputs[0].name if getattr(op, "outputs", None) else "<none>"
-            _SEL_STATS["samples_fp32"].append(f"{op.op_type}:{name}")
-        return False
+    Any op whose output names start with a Gated-DeltaNet chunk-algorithm
+    variable prefix is held at fp32 to preserve the 64-step Neumann iteration
+    and associated WY-product numerics."""
+    first_name = op.outputs[0].name if getattr(op, "outputs", None) else "<none>"
+    for out in op.outputs:
+        name = out.name
+        for p in SSM_FP32_PREFIXES:
+            if name == p or name.startswith(p + "_"):
+                _SEL_STATS["kept_fp32"] += 1
+                if len(_SEL_STATS["samples_fp32"]) < 10:
+                    _SEL_STATS["samples_fp32"].append(f"{op.op_type}:{name}")
+                return False
     _SEL_STATS["cast_fp16"] += 1
-    if len(_SEL_STATS["samples_fp16"]) < 5:
-        name = op.outputs[0].name if getattr(op, "outputs", None) else "<none>"
-        _SEL_STATS["samples_fp16"].append(f"{op.op_type}:{name}")
+    if len(_SEL_STATS["samples_fp16"]) < 10:
+        _SEL_STATS["samples_fp16"].append(f"{op.op_type}:{first_name}")
     return True
 
 

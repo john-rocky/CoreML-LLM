@@ -29,56 +29,6 @@ MODEL_ID = "Qwen/Qwen3.5-0.8B"
 CHUNK_SIZE = 64
 
 
-def _linear_as_conv2d(x, weight, bias=None):
-    """ANE-friendly Linear equivalent. Apple's ml-ane-transformers layout
-    (as used in conversion/ane_ops.py Conv2dLinear): reshape to
-    (B, C, 1, T) with sequence on the last dim so the ANE conv kernel
-    can process the full tensor efficiently, with fp16 accumulation that
-    is more precise than the matmul-backed nn.Linear path.
-
-    x      : (B, T, in)
-    weight : (out, in)       — same layout as nn.Linear.weight
-    bias   : (out,) or None
-    returns: (B, T, out)
-    """
-    # (B, T, C) -> (B, C, 1, T)
-    x4 = x.permute(0, 2, 1).unsqueeze(2)
-    # (out, in) -> (out, in, 1, 1)
-    w4 = weight.unsqueeze(-1).unsqueeze(-1)
-    y4 = F.conv2d(x4, w4, bias=bias)
-    # (B, out, 1, T) -> (B, T, out)
-    return y4.squeeze(2).permute(0, 2, 1)
-
-
-def _ane_rmsnorm(x, weight, eps: float):
-    """ANE-friendly RMSNorm. Uses the [x, -x] concat + LayerNorm identity
-    (cat has zero mean, so LayerNorm ≡ RMSNorm). ANE has a highly-optimized
-    LayerNorm kernel; it has no rsqrt kernel. Same trick Gemma 4 uses.
-
-    x      : (..., hidden)
-    weight : (hidden,)  — multiplied after the norm
-    eps    : RMSNorm epsilon
-    """
-    hidden = weight.shape[0]
-    doubled = torch.cat([x, -x], dim=-1)
-    normed = F.layer_norm(
-        doubled, normalized_shape=(2 * hidden,),
-        weight=None, bias=None, eps=float(eps),
-    )
-    normed, _ = torch.chunk(normed, 2, dim=-1)
-    return normed * weight
-
-
-def _ane_softmax(x, dim: int = -1):
-    """Numerically-stable softmax using only ANE-friendly primitives, with
-    explicit fp16 casts to prevent torch.exp auto-upcasting to fp32."""
-    dt = x.dtype
-    x = x.to(dt)
-    x_max = x.max(dim=dim, keepdim=True).values.to(dt)
-    exp_x = (x - x_max).exp().to(dt)
-    return (exp_x / exp_x.sum(dim=dim, keepdim=True)).to(dt)
-
-
 class PrefillLinearAttnLayer(nn.Module):
     """One linear_attention layer forward for a fixed seq_len divisible by 64.
 
@@ -132,11 +82,13 @@ class PrefillLinearAttnLayer(nn.Module):
         return x * torch.rsqrt(x.pow(2).sum(dim=-1, keepdim=True) + eps)
 
     def _rmsnorm_gated(self, x, z):
-        # ANE-friendly RMSNorm with z-gate post-multiply. The learned norm_w
-        # is NOT a (1 + w) like the decoder-layer norms — it's a plain scale
-        # (Qwen3_5RMSNormGated.weight initialised at 1), so pass it straight.
-        x = _ane_rmsnorm(x, self.norm_w, self.eps)
-        return x * F.silu(z)
+        in_dtype = x.dtype
+        x = x.float()
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.eps)
+        x = self.norm_w * x.to(in_dtype)
+        x = x * F.silu(z.float())
+        return x.to(in_dtype)
 
     def _chunk_gated_delta_rule(self, q, k, v, g, beta):
         """Trace-friendly rewrite of HF torch_chunk_gated_delta_rule.
@@ -261,11 +213,11 @@ class PrefillLinearAttnLayer(nn.Module):
 
     def forward(self, hidden_in):
         """hidden_in: (1, S, H)  →  hidden_out: (1, S, H)."""
-        # 1. Four projections — Conv2d 1x1 for ANE fp16-accumulation precision
-        mixed_qkv = _linear_as_conv2d(hidden_in, self.in_proj_qkv_w)
-        z = _linear_as_conv2d(hidden_in, self.in_proj_z_w)
-        b = _linear_as_conv2d(hidden_in, self.in_proj_b_w)
-        a = _linear_as_conv2d(hidden_in, self.in_proj_a_w)
+        # 1. Four projections
+        mixed_qkv = F.linear(hidden_in, self.in_proj_qkv_w)          # (1,S,C)
+        z = F.linear(hidden_in, self.in_proj_z_w)                    # (1,S,V)
+        b = F.linear(hidden_in, self.in_proj_b_w)                    # (1,S,num_v)
+        a = F.linear(hidden_in, self.in_proj_a_w)                    # (1,S,num_v)
 
         # 2. depthwise conv1d on (B, C, S) with causal left-padding.
         mixed_qkv_t = mixed_qkv.transpose(1, 2)                      # (1,C,S)
@@ -304,7 +256,7 @@ class PrefillLinearAttnLayer(nn.Module):
         z_flat = z.reshape(-1, self.Dv)
         out_flat = self._rmsnorm_gated(core_flat, z_flat)
         out = out_flat.reshape(1, self.S, self.value_dim)             # (1,S,V)
-        hidden_out = _linear_as_conv2d(out, self.out_proj_w)           # (1,S,H)
+        hidden_out = F.linear(out, self.out_proj_w)                   # (1,S,H)
         return hidden_out
 
 
