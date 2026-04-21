@@ -15,13 +15,13 @@ let package = Package(
         .executable(name: "union-bitexact", targets: ["UnionBitExact"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "0.1.12"),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.0"),
     ],
     targets: [
         .target(
             name: "CoreMLLLM",
             dependencies: [
-                .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
