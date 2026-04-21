@@ -22,11 +22,26 @@ final class ChunkedEngine {
     private let chunk3: MLModel
     private let chunk4: MLModel
 
-    // Prefill chunks (optional; falls back to per-token decode if nil)
+    // Prefill chunks (optional; falls back to per-token decode if nil).
+    // The "default" set sizes a single batch up to `prefillN` tokens.
     private let prefillChunk1: MLModel?
     private let prefillChunk2: MLModel?
     private let prefillChunk3: MLModel?
     private let prefillChunk4: MLModel?
+
+    /// One precompiled prefill variant. The runtime picks the smallest
+    /// variant whose `size` is ≥ the real prompt length, falling back to
+    /// the default set if none fits. See docs/LITERT_PERF_ADOPTIONS.md §S1.
+    private struct PrefillSet {
+        let size: Int
+        let c1: MLModel
+        let c2: MLModel
+        let c3: MLModel
+        let c4: MLModel
+    }
+
+    /// Sorted ascending by size. Empty when only the default set is built.
+    private let prefillVariants: [PrefillSet]
 
     // Verify chunks (optional; loaded from multi-function mlpackages via functionName)
     private let verifyChunk1: MLModel?
@@ -74,6 +89,33 @@ final class ChunkedEngine {
         try! MLMultiArray(shape: [1, 1, NSNumber(value: config.contextLength), 1], dataType: .float16)
     }()
 
+    // S2: async prep pipeline. While chunks 1-4 run on ANE for step N,
+    // mask + RoPE builds for step N+1 happen on a background queue. The
+    // next predictStep consumes them via consumePrefetched(); on miss
+    // (e.g. speculative jump), it rebuilds synchronously.
+    //
+    // Buffers in PrefetchedInputs are FRESH MLMultiArray allocations,
+    // not the scratch* pool, so the background writer never races the
+    // foreground reader on the same memory. See docs/LITERT_PERF_ADOPTIONS.md
+    // §S2.
+    private struct PrefetchedInputs {
+        let position: Int
+        let maskFull: MLMultiArray
+        let maskSliding: MLMultiArray
+        let updateMask: MLMultiArray
+        let cosS: MLMultiArray
+        let sinS: MLMultiArray
+        let cosF: MLMultiArray
+        let sinF: MLMultiArray
+    }
+    private let prepQueue = DispatchQueue(label: "CoreMLLLM.ChunkedEngine.prep",
+                                          qos: .utility)
+    private let prefetchLock = NSLock()
+    private var pendingPrefetch: DispatchWorkItem? = nil
+    private var prefetched: PrefetchedInputs? = nil
+    private(set) var prefetchHits: Int = 0
+    private(set) var prefetchMisses: Int = 0
+
     let config: ModelConfig
     let prefillN: Int
     var currentPosition: Int = 0
@@ -91,8 +133,17 @@ final class ChunkedEngine {
     private(set) var lastArgmaxAfterDecode: Int = 0
 
     var hasPrefill: Bool {
-        prefillChunk1 != nil && prefillChunk2 != nil
-            && prefillChunk3 != nil && prefillChunk4 != nil
+        !prefillVariants.isEmpty
+            || (prefillChunk1 != nil && prefillChunk2 != nil
+                && prefillChunk3 != nil && prefillChunk4 != nil)
+    }
+
+    /// Pick the smallest precompiled prefill variant whose static batch
+    /// size fits `realLen` tokens. Returns `nil` if nothing fits — the
+    /// caller falls back to the default `prefillChunk*` set (or per-token
+    /// decode if even that is missing).
+    private func pickPrefillSet(realLen: Int) -> PrefillSet? {
+        return prefillVariants.first(where: { $0.size >= realLen })
     }
 
     var hasVerify: Bool {
@@ -283,6 +334,40 @@ final class ChunkedEngine {
         let loadDt = CFAbsoluteTimeGetCurrent() - loadT0
         print("[Load] All \(hasPrefillFiles ? 8 : 4) chunks loaded in \(String(format: "%.1f", loadDt))s (parallel)")
 
+        // S1: discover precompiled prefill batch-size variants.
+        // Naming: prefill_chunk{1..4}_b{N}.{mlmodelc,mlpackage} for each
+        // size N. A variant only counts if all four chunks exist for that
+        // size. Smaller-than-default variants let short prompts skip the
+        // wasted compute of padding to the default static shape (e.g. a
+        // 50-token chat turn through a b512 prefill).
+        let candidateSizes = [32, 64, 128, 256]
+        var discoveredVariants: [(Int, MLModel, MLModel, MLModel, MLModel)] = []
+        for size in candidateSizes {
+            let names = (1...4).map { "prefill_chunk\($0)_b\(size)" }
+            guard names.allSatisfy({ findModel($0) != nil }) else { continue }
+            do {
+                var v1: MLModel!, v2: MLModel!, v3: MLModel!, v4: MLModel!
+                let vT0 = CFAbsoluteTimeGetCurrent()
+                try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
+                    for n in names {
+                        group.addTask { (n, try loadOne(n, config: prefillConfig)) }
+                    }
+                    for try await (n, m) in group {
+                        if n.hasSuffix("\(1)_b\(size)")      { v1 = m }
+                        else if n.hasSuffix("\(2)_b\(size)") { v2 = m }
+                        else if n.hasSuffix("\(3)_b\(size)") { v3 = m }
+                        else if n.hasSuffix("\(4)_b\(size)") { v4 = m }
+                    }
+                }
+                discoveredVariants.append((size, v1, v2, v3, v4))
+                print("[Load] prefill variant b\(size) loaded in " +
+                      "\(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - vT0))s")
+            } catch {
+                print("[Load] prefill variant b\(size) load failed: \(error)")
+            }
+        }
+        discoveredVariants.sort { $0.0 < $1.0 }
+
         // Load verify functions from multi-function chunks (if available).
         // Multi-function chunks have a "verify_qK" function alongside the
         // default "decode_q1". We detect this by checking if the chunk has
@@ -407,14 +492,21 @@ final class ChunkedEngine {
         let hidden = config.hiddenSize
         let nlayers = config.numLayers
         let pld = config.perLayerDim
+        // Opt-in: ENABLE_EMBED_LRU=1 turns on the 256-entry FP16 LRU.
+        // Default off — the 2026-04-20 iPhone 17 Pro bench showed zero
+        // measurable tok/s change with it on, so keeping it out of the
+        // default path avoids paying the cache bookkeeping for no gain.
+        let embedCacheCap = ProcessInfo.processInfo.environment["ENABLE_EMBED_LRU"] == "1" ? 256 : 0
         let embedTokens = try EmbeddingLookup(
             dataURL: directory.appendingPathComponent("embed_tokens_q8.bin"),
             scalesURL: directory.appendingPathComponent("embed_tokens_scales.bin"),
-            vocabSize: vocabSize, dim: hidden, scale: config.embedScale)
+            vocabSize: vocabSize, dim: hidden, scale: config.embedScale,
+            cacheCapacity: embedCacheCap)
         let embedPerLayer = try EmbeddingLookup(
             dataURL: directory.appendingPathComponent("embed_tokens_per_layer_q8.bin"),
             scalesURL: directory.appendingPathComponent("embed_tokens_per_layer_scales.bin"),
-            vocabSize: vocabSize, dim: nlayers * pld, scale: config.perLayerEmbedScale)
+            vocabSize: vocabSize, dim: nlayers * pld, scale: config.perLayerEmbedScale,
+            cacheCapacity: embedCacheCap)
 
         // Per-layer projection: convert fp16 → fp32 for Accelerate BLAS
         let projData = try Data(contentsOf: directory.appendingPathComponent("per_layer_projection.bin"),
@@ -522,6 +614,7 @@ final class ChunkedEngine {
         let engine = try ChunkedEngine(
             chunk1: c1, chunk2: c2, chunk3: c3, chunk4: c4,
             prefillChunk1: p1, prefillChunk2: p2, prefillChunk3: p3, prefillChunk4: p4,
+            prefillVariantTuples: discoveredVariants,
             verifyChunk1: v1, verifyChunk2: v2, verifyChunk3: v3, verifyChunk4: v4,
             verifyK: detectedK,
             embedTokens: embedTokens, embedPerLayer: embedPerLayer,
@@ -584,6 +677,7 @@ final class ChunkedEngine {
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
                  prefillChunk1: MLModel?, prefillChunk2: MLModel?,
                  prefillChunk3: MLModel?, prefillChunk4: MLModel?,
+                 prefillVariantTuples: [(Int, MLModel, MLModel, MLModel, MLModel)],
                  verifyChunk1: MLModel?, verifyChunk2: MLModel?,
                  verifyChunk3: MLModel?, verifyChunk4: MLModel?,
                  verifyK: Int,
@@ -600,6 +694,9 @@ final class ChunkedEngine {
         self.chunk3 = chunk3; self.chunk4 = chunk4
         self.prefillChunk1 = prefillChunk1; self.prefillChunk2 = prefillChunk2
         self.prefillChunk3 = prefillChunk3; self.prefillChunk4 = prefillChunk4
+        self.prefillVariants = prefillVariantTuples.map {
+            PrefillSet(size: $0.0, c1: $0.1, c2: $0.2, c3: $0.3, c4: $0.4)
+        }
         self.verifyChunk1 = verifyChunk1; self.verifyChunk2 = verifyChunk2
         self.verifyChunk3 = verifyChunk3; self.verifyChunk4 = verifyChunk4
         self.verifyK = verifyK
@@ -678,6 +775,14 @@ final class ChunkedEngine {
         profileMask = 0
         profileC1 = 0; profileC2 = 0; profileC3 = 0; profileC4 = 0
         profileANEWait = 0; profileCopyBack = 0
+        // S2: any in-flight prefetch is now stale; cancel and drop.
+        prefetchLock.lock()
+        pendingPrefetch?.cancel()
+        pendingPrefetch = nil
+        prefetched = nil
+        prefetchHits = 0
+        prefetchMisses = 0
+        prefetchLock.unlock()
     }
 
     // MARK: - Single-token decode step
@@ -729,13 +834,31 @@ final class ChunkedEngine {
         let t1 = CFAbsoluteTimeGetCurrent()
         profileEmbed += (t1 - t0)
 
-        let maskFull = try makeCausalMask(position: position, length: ctx)
-        let maskSliding = try makeSlidingCausalMask(position: position, W: W)
-        let umask = try makeUpdateMask(position: position, length: ctx)
-        let cosS = try lookupRoPE(table: cosSlidingTable, position: position, dim: 256)
-        let sinS = try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
-        let cosF = try lookupRoPE(table: cosFullTable, position: position, dim: 512)
-        let sinF = try lookupRoPE(table: sinFullTable, position: position, dim: 512)
+        // S2: prefer prefetched masks/RoPE built during the previous
+        // step's chunks 1-4. Falls back to synchronous build on a miss
+        // (first call, speculative jump, position out of range).
+        let maskFull: MLMultiArray
+        let maskSliding: MLMultiArray
+        let umask: MLMultiArray
+        let cosS: MLMultiArray
+        let sinS: MLMultiArray
+        let cosF: MLMultiArray
+        let sinF: MLMultiArray
+        if let p = consumePrefetched(position: position) {
+            maskFull = p.maskFull; maskSliding = p.maskSliding; umask = p.updateMask
+            cosS = p.cosS; sinS = p.sinS; cosF = p.cosF; sinF = p.sinF
+        } else {
+            maskFull = try makeCausalMask(position: position, length: ctx)
+            maskSliding = try makeSlidingCausalMask(position: position, W: W)
+            umask = try makeUpdateMask(position: position, length: ctx)
+            cosS = try lookupRoPE(table: cosSlidingTable, position: position, dim: 256)
+            sinS = try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
+            cosF = try lookupRoPE(table: cosFullTable, position: position, dim: 512)
+            sinF = try lookupRoPE(table: sinFullTable, position: position, dim: 512)
+        }
+        // S2: kick off prefetch for the next step's inputs. Runs on the
+        // CPU in parallel with chunks 1-4 ANE inference below.
+        schedulePrefetch(forPosition: position + 1)
         let tMask = CFAbsoluteTimeGetCurrent()
         profileMask += (tMask - t1)
 
@@ -894,12 +1017,23 @@ final class ChunkedEngine {
     func runPrefill(tokenIDs: [Int], imageFeatures: MLMultiArray? = nil,
                     imageNumTokens: Int = 256,
                     audioFeatures: MLMultiArray? = nil, audioNumTokens: Int = 50) throws -> Int {
-        guard let p1 = prefillChunk1, let p2 = prefillChunk2,
-              let p3 = prefillChunk3, let p4 = prefillChunk4 else {
+        let realLen = tokenIDs.count
+        // S1: pick the smallest precompiled prefill variant whose static
+        // batch size is ≥ realLen. Falls back to the default set when
+        // either no variant fits or no variants were shipped. Padding
+        // overhead drops linearly with how tightly the chosen N hugs
+        // realLen — a 50-token chat turn through b64 spends ~8× less ANE
+        // time than through b512.
+        let p1: MLModel, p2: MLModel, p3: MLModel, p4: MLModel
+        let N: Int
+        if let v = pickPrefillSet(realLen: realLen) {
+            p1 = v.c1; p2 = v.c2; p3 = v.c3; p4 = v.c4; N = v.size
+        } else if let d1 = prefillChunk1, let d2 = prefillChunk2,
+                  let d3 = prefillChunk3, let d4 = prefillChunk4 {
+            p1 = d1; p2 = d2; p3 = d3; p4 = d4; N = prefillN
+        } else {
             throw CoreMLLLMError.prefillNotAvailable
         }
-        let N = prefillN
-        let realLen = tokenIDs.count
         precondition(realLen > 0 && realLen <= N)
 
         // ---- Prefix cache lookup (text-only) -----------------------------
@@ -991,6 +1125,14 @@ final class ChunkedEngine {
 
         let prepDt = CFAbsoluteTimeGetCurrent() - prefillT0
 
+        // T4: Cancellation checkpoints between prefill chunks. Each chunk
+        // is a single ANE dispatch we can't interrupt, so cancellation
+        // grain = one chunk (~25-100ms on iPhone 17 Pro). A cancelled
+        // generation drops the remaining chunks instead of burning ANE
+        // cycles on output the user no longer wants.
+        // See docs/LITERT_PERF_ADOPTIONS.md §T4.
+        try Task.checkCancellation()
+
         // Prefill chunk 1
         let pc1T0 = CFAbsoluteTimeGetCurrent()
         let out1 = try p1.prediction(from: MLDictionaryFeatureProvider(dictionary: [
@@ -1013,6 +1155,8 @@ final class ChunkedEngine {
             try writeFullFromPrefill(src: out1, name: name, cache: kv, slot: slot,
                                      realLen: prefillLen, hd: hd)
         }
+
+        try Task.checkCancellation()
 
         // Prefill chunk 2
         let pc2T0 = CFAbsoluteTimeGetCurrent()
@@ -1097,15 +1241,19 @@ final class ChunkedEngine {
         let bypass = ProcessInfo.processInfo.environment["PREFILL_BYPASS"] == "1"
         if bypass {
             let totalPrefill = CFAbsoluteTimeGetCurrent() - prefillT0
-            print("[Prefill] BYPASS prep=\(String(format: "%.1f", prepDt*1000))ms " +
+            print("[Prefill] BYPASS N=\(N) prep=\(String(format: "%.1f", prepDt*1000))ms " +
                   "c1=\(String(format: "%.1f", pc1Dt*1000))ms " +
                   "c2=\(String(format: "%.1f", pc2Dt*1000))ms " +
                   "c3/4=skipped " +
                   "total=\(String(format: "%.1f", totalPrefill*1000))ms " +
                   "(\(realLen) tokens, \(String(format: "%.0f", Double(realLen)/totalPrefill)) tok/s)")
             let lastTokenID = tokenIDs[realLen - 1]
+            // The inner predictStep will schedulePrefetch(realLen) itself
+            // (its position+1), so we don't double-schedule here.
             return try predictStep(tokenID: lastTokenID, position: realLen - 1)
         }
+
+        try Task.checkCancellation()
 
         // Prefill chunk 3
         let pc3T0 = CFAbsoluteTimeGetCurrent()
@@ -1119,6 +1267,8 @@ final class ChunkedEngine {
         let h3 = try p3.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
             .featureValue(for: "hidden_states_out")!.multiArrayValue!
         let pc3Dt = CFAbsoluteTimeGetCurrent() - pc3T0
+
+        try Task.checkCancellation()
 
         // Prefill chunk 4
         let pc4T0 = CFAbsoluteTimeGetCurrent()
@@ -1134,7 +1284,7 @@ final class ChunkedEngine {
         let pc4Dt = CFAbsoluteTimeGetCurrent() - pc4T0
 
         let totalPrefill = CFAbsoluteTimeGetCurrent() - prefillT0
-        print("[Prefill] prep=\(String(format: "%.1f", prepDt*1000))ms " +
+        print("[Prefill] N=\(N) prep=\(String(format: "%.1f", prepDt*1000))ms " +
               "c1=\(String(format: "%.1f", pc1Dt*1000))ms " +
               "c2=\(String(format: "%.1f", pc2Dt*1000))ms " +
               "c3=\(String(format: "%.1f", pc3Dt*1000))ms " +
@@ -1156,6 +1306,10 @@ final class ChunkedEngine {
             }
         }
 
+        // S2: pre-build inputs for the first decode position so it lands
+        // as a hit instead of paying the build cost in the critical
+        // first-token path. No-op unless ENABLE_PREFETCH=1.
+        schedulePrefetch(forPosition: realLen)
         return nextToken
     }
 
@@ -1617,6 +1771,90 @@ final class ChunkedEngine {
         let dst = result.dataPointer.bindMemory(to: UInt16.self, capacity: totalDim)
         memcpy(dst, raw, totalDim * MemoryLayout<UInt16>.stride)
         return result
+    }
+
+    /// S2: take any prefetched input set whose `position` matches; nil
+    /// otherwise. Blocks (briefly) only if the background prefetch task
+    /// has not yet completed — typically zero wait because chunk1-4 ran
+    /// for tens of milliseconds while the prep took ~1 ms.
+    private func consumePrefetched(position: Int) -> PrefetchedInputs? {
+        let inflight: DispatchWorkItem?
+        prefetchLock.lock()
+        inflight = pendingPrefetch
+        prefetchLock.unlock()
+        inflight?.wait()
+
+        prefetchLock.lock()
+        let p = prefetched
+        prefetched = nil
+        pendingPrefetch = nil
+        prefetchLock.unlock()
+        if let p, p.position == position {
+            prefetchHits += 1
+            return p
+        }
+        if p != nil { prefetchMisses += 1 }
+        return nil
+    }
+
+    /// S2: kick off a background build of the next decode step's masks
+    /// and RoPE rows. Idempotent — replaces any older pending prefetch.
+    /// Skipped when `pos` exceeds context length.
+    private func schedulePrefetch(forPosition pos: Int) {
+        // Opt-in: ENABLE_PREFETCH=1 turns on async mask/RoPE prep on a
+        // background utility queue. Default off — the 2026-04-20 iPhone
+        // bench showed no tok/s lift, so the extra dispatch / NSLock
+        // cost isn't worth paying in the default path.
+        if ProcessInfo.processInfo.environment["ENABLE_PREFETCH"] != "1" { return }
+        let ctx = config.contextLength
+        let W = config.slidingWindow
+        guard pos < ctx else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            do {
+                let mf = try self.buildFreshFullMask(position: pos, length: ctx)
+                let ms = try self.buildFreshSlidingMask(position: pos, W: W)
+                let um = try self.buildFreshUpdateMask(position: pos, length: ctx)
+                let cs = try self.lookupRoPE(table: self.cosSlidingTable, position: pos, dim: 256)
+                let ss = try self.lookupRoPE(table: self.sinSlidingTable, position: pos, dim: 256)
+                let cf = try self.lookupRoPE(table: self.cosFullTable, position: pos, dim: 512)
+                let sf = try self.lookupRoPE(table: self.sinFullTable, position: pos, dim: 512)
+                let pre = PrefetchedInputs(position: pos, maskFull: mf,
+                                           maskSliding: ms, updateMask: um,
+                                           cosS: cs, sinS: ss, cosF: cf, sinF: sf)
+                self.prefetchLock.lock()
+                self.prefetched = pre
+                self.prefetchLock.unlock()
+            } catch {
+                // Silent: foreground rebuilds sync if it doesn't find a hit.
+            }
+        }
+        prefetchLock.lock()
+        pendingPrefetch = work
+        prefetchLock.unlock()
+        prepQueue.async(execute: work)
+    }
+
+    private func buildFreshFullMask(position: Int, length: Int) throws -> MLMultiArray {
+        let mask = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: length)], dataType: .float16)
+        let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: length)
+        for i in 0..<length { mp[i] = i <= position ? 0 : 0xFC00 }
+        return mask
+    }
+    private func buildFreshSlidingMask(position: Int, W: Int) throws -> MLMultiArray {
+        let mask = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: W)], dataType: .float16)
+        let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: W)
+        let valid = min(position + 1, W)
+        let start = W - valid
+        for i in 0..<W { mp[i] = i >= start ? 0 : 0xFC00 }
+        return mask
+    }
+    private func buildFreshUpdateMask(position: Int, length: Int) throws -> MLMultiArray {
+        let umask = try MLMultiArray(shape: [1, 1, NSNumber(value: length), 1], dataType: .float16)
+        let up = umask.dataPointer.bindMemory(to: UInt16.self, capacity: length)
+        memset(up, 0, length * MemoryLayout<UInt16>.stride)
+        up[min(position, length - 1)] = 0x3C00
+        return umask
     }
 
     /// Fill the decode-step full causal mask. Reuses scratchMaskFull when

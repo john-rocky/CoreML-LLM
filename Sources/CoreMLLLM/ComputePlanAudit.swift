@@ -13,12 +13,62 @@ import Foundation
 /// // Set env var COMPUTE_PLAN_AUDIT=1 or UserDefaults bool "COMPUTE_PLAN_AUDIT"
 /// await ComputePlanAudit.run(modelDirectory: url, computeUnits: .cpuAndNeuralEngine)
 /// ```
-enum ComputePlanAudit {
+public enum ComputePlanAudit {
 
     /// Returns true when the audit should run.
     static var isEnabled: Bool {
         if ProcessInfo.processInfo.environment["COMPUTE_PLAN_AUDIT"] != nil { return true }
         return UserDefaults.standard.bool(forKey: "COMPUTE_PLAN_AUDIT")
+    }
+
+    /// Structured result of one chunk's residency check. `aneOps + nonANE
+    /// = totalOps`. Constant-loading ops are excluded from the totals.
+    public struct ChunkResult: Codable, Sendable {
+        public let chunkName: String
+        public let totalOps: Int
+        public let aneOps: Int
+        public let nonANE: Int
+        public var aneFraction: Double {
+            totalOps == 0 ? 1.0 : Double(aneOps) / Double(totalOps)
+        }
+    }
+
+    /// Programmatic audit for the T2 CI gate. Returns one entry per chunk
+    /// that was successfully loaded. Skips missing chunks silently — the
+    /// caller decides whether absence is a failure.
+    public static func audit(modelDirectory: URL,
+                             chunkNames: [String] = ["chunk1", "chunk2", "chunk3", "chunk4"],
+                             computeUnits: MLComputeUnits = .cpuAndNeuralEngine) async -> [ChunkResult] {
+        var results: [ChunkResult] = []
+        for name in chunkNames {
+            let url: URL
+            let compiled = modelDirectory.appendingPathComponent("\(name).mlmodelc")
+            let pkg = modelDirectory.appendingPathComponent("\(name).mlpackage")
+            if FileManager.default.fileExists(atPath: compiled.path) {
+                url = compiled
+            } else if FileManager.default.fileExists(atPath: pkg.path) {
+                url = pkg
+            } else {
+                continue
+            }
+            let config = MLModelConfiguration()
+            config.computeUnits = computeUnits
+            do {
+                let plan = try await MLComputePlan.load(contentsOf: url, configuration: config)
+                let (total, fallbacks) = silentAuditPlan(plan)
+                results.append(ChunkResult(
+                    chunkName: name,
+                    totalOps: total,
+                    aneOps: total - fallbacks,
+                    nonANE: fallbacks))
+            } catch {
+                // Surface load failure as zero-op result so the gate can
+                // detect it.
+                results.append(ChunkResult(chunkName: name, totalOps: 0,
+                                           aneOps: 0, nonANE: 0))
+            }
+        }
+        return results
     }
 
     /// Run the audit for all decode chunks found in `modelDirectory`.
@@ -101,6 +151,48 @@ enum ComputePlanAudit {
 
     // MARK: - Private
 
+    /// Silent variant: walk a plan and return (totalOps, fallbackCount)
+    /// without printing per-op detail. Used by `audit(...)` for the T2
+    /// CI gate where we only need the rolled-up numbers.
+    private static func silentAuditPlan(_ plan: MLComputePlan) -> (Int, Int) {
+        guard case .program(let program) = plan.modelStructure else {
+            return (0, 0)
+        }
+        var totalOps = 0
+        var fallbackOps = 0
+        func walk(_ block: MLModelStructure.Program.Block) {
+            for op in block.operations {
+                let isConstOp = isConstantOp(op.operatorName)
+                if !isConstOp { totalOps += 1 }
+                let usage = plan.deviceUsage(for: op)
+                let isANE: Bool
+                if let preferred = usage?.preferred {
+                    isANE = (deviceLabel(preferred) == "ANE")
+                } else {
+                    isANE = isConstOp
+                }
+                if !isANE && !isConstOp { fallbackOps += 1 }
+                for nested in op.blocks { walk(nested) }
+            }
+        }
+        for (_, function) in program.functions { walk(function.block) }
+        return (totalOps, fallbackOps)
+    }
+
+    /// Match constant / weight-loading ops, allowing for namespaced
+    /// variants like `ios18.constexpr_lut_to_dense`. These run once at
+    /// model-load, never per inference step, so they belong outside the
+    /// per-step ANE residency calculation.
+    private static func isConstantOp(_ rawName: String) -> Bool {
+        let bareName = rawName.split(separator: ".").last.map(String.init) ?? rawName
+        let constOps: Set<String> = [
+            "const", "constexpr_lut_to_dense", "constexpr_affine_dequantize",
+            "constexpr_blockwise_shift_scale", "constexpr_sparse_to_dense",
+            "constexpr_cast",
+        ]
+        return constOps.contains(bareName)
+    }
+
     /// Walk a single compute plan, log non-ANE ops, return (totalOps, fallbackCount).
     private static func auditPlan(_ plan: MLComputePlan,
                                   chunkName: String) -> (Int, Int) {
@@ -130,15 +222,8 @@ enum ComputePlanAudit {
                                   plan: MLComputePlan,
                                   totalOps: inout Int,
                                   fallbackOps: inout Int) {
-        // Skip constant/weight-loading ops — they run once at load, not per-step
-        let constOps: Set<String> = [
-            "const", "constexpr_lut_to_dense", "constexpr_affine_dequantize",
-            "constexpr_blockwise_shift_scale", "constexpr_sparse_to_dense",
-            "constexpr_cast",
-        ]
-
         for op in block.operations {
-            let isConstOp = constOps.contains(op.operatorName)
+            let isConstOp = isConstantOp(op.operatorName)
             if !isConstOp { totalOps += 1 }
 
             let usage = plan.deviceUsage(for: op)
@@ -196,17 +281,11 @@ enum ComputePlanAudit {
             print("[ComputePlan] \(name): model structure is not a program")
             return (0, 0)
         }
-        let constOps: Set<String> = [
-            "const", "constexpr_lut_to_dense", "constexpr_affine_dequantize",
-            "constexpr_blockwise_shift_scale", "constexpr_sparse_to_dense",
-            "constexpr_cast",
-        ]
         var totalOps = 0
         var fallbackOps = 0
         for (fnName, function) in program.functions {
             walkDrafterBlock(function.block, path: "\(name)/\(fnName)",
                              plan: plan, expectedDevice: expectedDevice,
-                             constOps: constOps,
                              totalOps: &totalOps, fallbackOps: &fallbackOps)
         }
         return (totalOps, fallbackOps)
@@ -216,11 +295,10 @@ enum ComputePlanAudit {
                                          path: String,
                                          plan: MLComputePlan,
                                          expectedDevice: String,
-                                         constOps: Set<String>,
                                          totalOps: inout Int,
                                          fallbackOps: inout Int) {
         for op in block.operations {
-            let isConstOp = constOps.contains(op.operatorName)
+            let isConstOp = isConstantOp(op.operatorName)
             if !isConstOp { totalOps += 1 }
             let usage = plan.deviceUsage(for: op)
             let cost = plan.estimatedCost(of: op)
@@ -241,7 +319,6 @@ enum ComputePlanAudit {
             for nested in op.blocks {
                 walkDrafterBlock(nested, path: "\(path)/\(op.operatorName)",
                                  plan: plan, expectedDevice: expectedDevice,
-                                 constOps: constOps,
                                  totalOps: &totalOps, fallbackOps: &fallbackOps)
             }
         }

@@ -737,7 +737,20 @@ public final class CoreMLLLM: @unchecked Sendable {
         }
 
         return AsyncStream { continuation in
-            Task(priority: decodePriority) {
+            // T4: cancellation. AsyncStream does NOT auto-cancel the
+            // producer task when the consumer breaks out of `for await`.
+            // We bind onTermination so a user-initiated cancel (or
+            // deinit) stops generation at the next checkCancellation
+            // point — a chunk boundary in prefill, the top of the
+            // decode loop. Without this hook, cancelled generations
+            // keep burning ANE energy until maxDecode tokens.
+            //
+            // QoS: `decodePriority` is driven by `LLM_DECODE_QOS`
+            // (utility / userinitiated / high, default inherit). T3 in
+            // `LITERT_PERF_ADOPTIONS.md` originally added a
+            // `DECODE_UTILITY_QOS` flag; that's been superseded by the
+            // richer `LLM_DECODE_QOS` knob landed later on main.
+            let genTask = Task(priority: decodePriority) {
                 do {
                     let IMAGE_TOKEN_ID = 258880
                     let AUDIO_TOKEN_ID = 258881
@@ -794,6 +807,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                             engine.currentPosition = prefillLen
 
                             for step in prefillLen..<tokens.count {
+                                try Task.checkCancellation()
                                 let tid = tokens[step]
                                 try autoreleasepool {
                                     if let emb = multimodalEmbedding(for: tid) {
@@ -807,6 +821,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                             }
                         } else {
                             for (step, tid) in tokens.enumerated() {
+                                try Task.checkCancellation()
                                 try autoreleasepool {
                                     if let emb = multimodalEmbedding(for: tid) {
                                         nextID = try engine.predictStep(tokenID: 0, position: step,
@@ -861,6 +876,10 @@ public final class CoreMLLLM: @unchecked Sendable {
                         decodeLoop: while tokenCount < maxDecode {
                             if eosIDs.contains(Int(nid)) { break }
                             if engine.currentPosition >= ctxLimit { break }
+                            // T4: stop the loop the moment the consumer
+                            // unsubscribes. AsyncStream wires this via
+                            // continuation.onTermination → genTask.cancel().
+                            try Task.checkCancellation()
 
                             let useEagle = (eagleSpec != nil) && didFirstDecode
                                 && engine.canSpeculate
@@ -1027,10 +1046,15 @@ public final class CoreMLLLM: @unchecked Sendable {
                             pos += 1
                         }
                     }
+                } catch is CancellationError {
+                    // User-cancelled. No log spam — this is expected.
                 } catch {
                     print("[CoreMLLLM] Error: \(error)")
                 }
                 continuation.finish()
+            }
+            continuation.onTermination = { @Sendable _ in
+                genTask.cancel()
             }
         }
     }

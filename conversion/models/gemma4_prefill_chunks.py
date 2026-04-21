@@ -26,7 +26,7 @@ from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax
 
 from .gemma4 import Gemma4Model
 
-PREFILL_N = 512
+PREFILL_N = 512  # default static batch size; overridable per chunk instance for S1 variants
 
 
 def v_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -52,7 +52,10 @@ def _run_layer_prefill(
     is_full = config.is_full_attention(layer_idx)
     hd = config.get_head_dim(layer_idx)
     is_kv_shared = config.is_kv_shared(layer_idx)
-    N = PREFILL_N
+    # N is the static batch size baked into the trace. PyTorch view() needs
+    # the literal so we read it from hidden_states. CoreML traces this as
+    # a constant; per-variant exports just trace with a different example.
+    N = hidden_states.shape[1]
 
     residual = hidden_states
     h = layer.input_layernorm(hidden_states)  # (1, N, hidden)
@@ -210,7 +213,7 @@ class PrefillChunk1(nn.Module):
     def _compute_ple_batch(self, hidden_states, per_layer_raw):
         """Compute per_layer_combined for batched input (1, N, hidden).
         Original loop version (one ANERMSNorm per layer slice)."""
-        N = PREFILL_N
+        N = hidden_states.shape[1]
         h_conv = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
         proj = self.per_layer_model_projection(h_conv) * self.per_layer_model_projection_scale
         proj = proj.squeeze(2).permute(0, 2, 1)  # (1, N, total_pld)

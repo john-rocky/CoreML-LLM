@@ -13,6 +13,7 @@ let package = Package(
         .executable(name: "accept-rate-bench", targets: ["AcceptRateBench"]),
         .executable(name: "coreml-llm-smoke", targets: ["CoreMLLLMSmoke"]),
         .executable(name: "union-bitexact", targets: ["UnionBitExact"]),
+        .executable(name: "ane-residency-gate", targets: ["AneResidencyGate"]),
     ],
     dependencies: [
         .package(url: "https://github.com/huggingface/swift-transformers", from: "0.1.12"),
@@ -56,6 +57,17 @@ let package = Package(
             name: "UnionBitExact",
             dependencies: ["CoreMLLLM"],
             path: "Sources/union-bitexact",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // T2: ANE residency CI gate. Loads each chunk{1..4}.mlpackage in
+        // a model directory, queries MLComputePlan, and exits non-zero if
+        // any chunk's ANE op fraction drops below the threshold (default
+        // 99.5%). Also writes a JSON baseline so PRs can be diffed.
+        // See docs/LITERT_PERF_ADOPTIONS.md §T2.
+        .executableTarget(
+            name: "AneResidencyGate",
+            dependencies: ["CoreMLLLM"],
+            path: "Sources/ane-residency-gate",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
