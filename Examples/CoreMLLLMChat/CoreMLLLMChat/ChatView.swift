@@ -49,22 +49,41 @@ struct ChatView: View {
                     .padding(.top, 12)
                 }
 
-                // `.defaultScrollAnchor(.bottom)` keeps the viewport pinned
-                // to the bottom as content grows, without a per-token
-                // `withAnimation { scrollTo }`. Each generated token used
-                // to open a Core Animation transaction; at 31 tok/s those
-                // overlapped and kept the CPU busy building implicit
-                // animations no one asked for.
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 12) {
-                        ForEach(messages) { message in
-                            MessageBubble(message: message)
+                // Scroll strategy:
+                // - ScrollViewReader + scrollTo (no `withAnimation`) keeps
+                //   Core Animation transactions out of the per-token path.
+                //   The old `withAnimation { scrollTo }` opened overlapping
+                //   CA transactions at 31 tok/s; plain scrollTo just sets
+                //   the content offset, which is cheap.
+                // - `.defaultScrollAnchor(.bottom)` was tried but bottom-
+                //   aligns short content (empty chat → first bubble appears
+                //   at the bottom) and leaves dead space when content
+                //   shrinks (streaming ends). Explicit scrollTo to a
+                //   sentinel avoids both.
+                // - Per-token scrollTo is triggered from *inside*
+                //   StreamingBubble, so the onChange observation stays
+                //   scoped to that subtree. ChatView's body is still not
+                //   re-evaluated per token.
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 12) {
+                            ForEach(messages) { message in
+                                MessageBubble(message: message)
+                            }
+                            StreamingBubble(buffer: streaming, scrollProxy: proxy)
+                            // Zero-height sentinel that is always present so
+                            // scrollTo has a stable target whether or not
+                            // the streaming bubble is currently visible.
+                            Color.clear
+                                .frame(height: 1)
+                                .id("bottom-anchor")
                         }
-                        StreamingBubble(buffer: streaming)
+                        .padding()
                     }
-                    .padding()
+                    .onChange(of: messages.count) { _, _ in
+                        proxy.scrollTo("bottom-anchor", anchor: .bottom)
+                    }
                 }
-                .defaultScrollAnchor(.bottom)
 
                 // The HUD reads `runner.tokensPerSecond` etc., which change
                 // every token. Keeping it in a nested view scopes those
@@ -624,8 +643,14 @@ final class StreamingBuffer {
 /// The assistant-side bubble shown while tokens are streaming in. Isolated
 /// into its own view so that per-token mutations of `buffer.text` only
 /// invalidate this subtree, not the parent ChatView.
+///
+/// The per-token `onChange` → `scrollTo` lives here (not in ChatView) so
+/// that observing `buffer.text` does not pull ChatView into the per-token
+/// invalidation set. `scrollTo` without `withAnimation` is a plain content-
+/// offset set — no CA transaction is created per token.
 private struct StreamingBubble: View {
     let buffer: StreamingBuffer
+    let scrollProxy: ScrollViewProxy
 
     var body: some View {
         if !buffer.text.isEmpty {
@@ -633,6 +658,9 @@ private struct StreamingBubble: View {
                 message: ChatMessage(role: .assistant, content: buffer.text)
             )
             .id("streaming")
+            .onChange(of: buffer.text) { _, _ in
+                scrollProxy.scrollTo("bottom-anchor", anchor: .bottom)
+            }
         }
     }
 }
