@@ -63,13 +63,10 @@ class FullAttentionLayer(nn.Module):
         self.register_buffer("causal_mask", causal, persistent=False)
 
     def _rmsnorm(self, x, w):
-        # x: (..., head_dim). Qwen3_5RMSNorm uses (1 + w).
-        in_dtype = x.dtype
-        x = x.float()
-        var = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        x = x * (1.0 + w.float())
-        return x.to(in_dtype)
+        # ANE-friendly RMSNorm ([x,-x] concat → LayerNorm). Qwen3.5 applies
+        # (1 + w) scale, which we pre-fold.
+        from test_qwen3_5_prefill_trace import _ane_rmsnorm
+        return _ane_rmsnorm(x, 1.0 + w, self.eps)
 
     @staticmethod
     def _rotate_half(x):
@@ -95,9 +92,10 @@ class FullAttentionLayer(nn.Module):
         S = self.S
 
         # 1. Projections
-        qg = F.linear(hidden_in, self.q_proj_w)              # (1, S, num_heads*head_dim*2)
-        k = F.linear(hidden_in, self.k_proj_w)                # (1, S, num_kv_heads*head_dim)
-        v = F.linear(hidden_in, self.v_proj_w)                # (1, S, num_kv_heads*head_dim)
+        from test_qwen3_5_prefill_trace import _linear_as_conv2d
+        qg = _linear_as_conv2d(hidden_in, self.q_proj_w)       # Conv2d 1x1 for ANE
+        k  = _linear_as_conv2d(hidden_in, self.k_proj_w)
+        v  = _linear_as_conv2d(hidden_in, self.v_proj_w)
 
         # 2. Split q from gate (second half of each head's doubled output)
         qg = qg.reshape(1, S, self.num_heads, self.head_dim * 2)
@@ -118,18 +116,22 @@ class FullAttentionLayer(nn.Module):
             k = k.repeat_interleave(self.num_kv_groups, dim=1)
             v = v.repeat_interleave(self.num_kv_groups, dim=1)
 
-        # 6. Softmax attention (eager). Uses a precomputed additive causal mask.
-        # Avoid tensor.dtype / to(dtype) reads during trace — causal_mask is
-        # already stored in the model dtype (float at trace time).
-        attn_scores = q @ k.transpose(-1, -2) * self.scale                    # (B, num_heads, S, S)
-        attn_scores = attn_scores + self.causal_mask
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_out = attn_weights @ v                                            # (B, num_heads, S, head_dim)
+        # 6. Softmax attention. Gemma 4's `stable_attention` pattern: the
+        # softmax-matmul chain is the biggest precision loss point on ANE
+        # fp16 (kv_len * head_dim accumulation per head per query). Force
+        # fp32 inside the attention, let the surrounding ops stay fp16.
+        q_f = q.float()
+        k_f = k.float()
+        v_f = v.float()
+        attn_scores = (q_f @ k_f.transpose(-1, -2)) * self.scale               # fp32
+        attn_scores = attn_scores + self.causal_mask.float()
+        attn_weights = F.softmax(attn_scores, dim=-1)                           # fp32
+        attn_out = (attn_weights @ v_f).to(q.dtype)                             # back to input dtype
 
         # 7. Reshape, output gate, o_proj
         attn_out = attn_out.transpose(1, 2).contiguous().reshape(1, S, self.num_heads * self.head_dim)
         attn_out = attn_out * torch.sigmoid(gate)
-        hidden_out = F.linear(attn_out, self.o_proj_w)                         # (1, S, hidden)
+        hidden_out = _linear_as_conv2d(attn_out, self.o_proj_w)                 # Conv2d 1x1
         return hidden_out
 
 

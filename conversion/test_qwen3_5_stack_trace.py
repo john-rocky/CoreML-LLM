@@ -31,19 +31,28 @@ SEQ_LEN = 64
 
 
 class RMSNorm(nn.Module):
-    """Qwen3_5RMSNorm: (x * rsqrt(mean(x²) + eps)) * (1 + w). Weights initialized at ~0."""
+    """Qwen3_5RMSNorm: (x * rsqrt(mean(x²) + eps)) * (1 + w).
+
+    Uses the ANE-friendly `[x, -x] concat → LayerNorm` identity (cat has zero
+    mean so LayerNorm ≡ RMSNorm). ANE has a fast LayerNorm kernel and no
+    rsqrt kernel; this is the Apple-blessed pattern also used by Gemma 4
+    (see conversion/ane_ops.py ANERMSNorm)."""
     def __init__(self, hidden_size, eps, weight):
         super().__init__()
-        self.eps = eps
-        self.w = nn.Parameter(weight.detach().clone(), requires_grad=False)
+        self.eps = float(eps)
+        self.hidden = hidden_size
+        # Qwen3_5's learned scale is applied as (1 + w). Pre-fold into a
+        # single scale parameter so the forward has one multiply.
+        self.w = nn.Parameter((1.0 + weight.detach().clone()), requires_grad=False)
 
     def forward(self, x):
-        in_dtype = x.dtype
-        x = x.float()
-        var = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        x = x * (1.0 + self.w.float())
-        return x.to(in_dtype)
+        doubled = torch.cat([x, -x], dim=-1)
+        normed = F.layer_norm(
+            doubled, normalized_shape=(2 * self.hidden,),
+            weight=None, bias=None, eps=self.eps,
+        )
+        normed, _ = torch.chunk(normed, 2, dim=-1)
+        return normed * self.w
 
 
 class MLP(nn.Module):
@@ -55,9 +64,13 @@ class MLP(nn.Module):
         self.down_w = nn.Parameter(down_w.detach().clone(), requires_grad=False)
 
     def forward(self, x):
-        g = F.silu(F.linear(x, self.gate_w))
-        u = F.linear(x, self.up_w)
-        return F.linear(g * u, self.down_w)
+        # Conv2d 1x1 path: Apple's ANE-transformers recipe. Gives better
+        # fp16 accumulation precision on Neural Engine than the nn.Linear
+        # matmul kernel.
+        from test_qwen3_5_prefill_trace import _linear_as_conv2d
+        g = F.silu(_linear_as_conv2d(x, self.gate_w))
+        u = _linear_as_conv2d(x, self.up_w)
+        return _linear_as_conv2d(g * u, self.down_w)
 
 
 class DecoderLayer(nn.Module):
