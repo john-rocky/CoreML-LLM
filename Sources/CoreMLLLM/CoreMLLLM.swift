@@ -37,6 +37,15 @@ public final class CoreMLLLM: @unchecked Sendable {
     private var monolithicModel: MLModel?
     private var monolithicState: MLState?
 
+    // EAGLE-3 speculative decoding (optional — nil if the fusion/draft/verify
+    // assets aren't in the model directory).
+    private var speculativeLoop: SpeculativeLoop?
+
+    /// Test-only accessor for the chunked engine. `internal` so tests in the
+    /// same module (via @testable import) can exercise low-level paths like
+    /// commitAccepted / KV snapshot. Do NOT use from production code.
+    internal var _testChunkedEngine: ChunkedEngine? { chunkedEngine }
+
     // Vision (lazy loaded to save memory)
     private var visionModel: MLModel?
     private var visionModelURL: URL?
@@ -174,6 +183,34 @@ public final class CoreMLLLM: @unchecked Sendable {
 
         let llm = CoreMLLLM(config: config, tokenizer: tokenizer)
 
+        // Opt-in gates for the speculative stack. Every component adds
+        // resident ANE memory; the baseline (no env set) loads only the
+        // T=1 decode chunks so footprint matches pre-EAGLE-3 builds.
+        //
+        //   LLM_EAGLE3_ENABLE=1     — load eagle3_draft + eagle3_fusion
+        //                              (234 MB ANE-resident) AND verify
+        //                              chunks (600 MB); speculative burst
+        //                              path active.
+        //   SPECULATIVE_PROFILE=1   — load cross-vocab Qwen drafter
+        //                              (301 MB) + verify chunks (600 MB).
+        //                              Validated 11c cv bench path.
+        //   (neither)                 — pure T=1 decode, no aux models.
+        //
+        // EAGLE-3 measurement (Gemma 4 E2B, 500k training positions):
+        // val accept 22%, iPhone throughput +5-8% over T=1. Default
+        // opt-out keeps users who don't need speculation from paying
+        // the memory cost.
+        let eagle3Enabled =
+            ProcessInfo.processInfo.environment["LLM_EAGLE3_ENABLE"] == "1"
+        let specProfile =
+            ProcessInfo.processInfo.environment["SPECULATIVE_PROFILE"] != nil
+        let loadVerify = eagle3Enabled || specProfile
+        let loadCV = specProfile
+        if eagle3Enabled || specProfile {
+            print("[Load] speculative gates: "
+                  + "eagle3=\(eagle3Enabled) cv=\(loadCV) verify=\(loadVerify)")
+        }
+
         // Auto-detect: chunked or monolithic
         let isChunked = FileManager.default.fileExists(
             atPath: directory.appendingPathComponent("chunk1.mlmodelc").path)
@@ -217,6 +254,43 @@ public final class CoreMLLLM: @unchecked Sendable {
                     print("[PrefixCache] init failed: \(error)")
                 }
             }
+
+            // EAGLE-3 assets are optional. All three must be present or
+            // speculative decoding stays off. Gemma 4 fusion layers are
+            // [8, 17, 34] per eagle3_config.json.
+            func findAsset(_ name: String) -> URL? {
+                let compiled = directory.appendingPathComponent("\(name).mlmodelc")
+                if FileManager.default.fileExists(atPath: compiled.path) { return compiled }
+                let pkg = directory.appendingPathComponent("\(name).mlpackage")
+                if FileManager.default.fileExists(atPath: pkg.path) { return pkg }
+                return nil
+            }
+            // EAGLE-3 speculative loop. Verify chunks are already loaded by
+            // ChunkedEngine.load() (either as multi-function verify_qK or as
+            // standalone verify_chunk*.mlmodelc). We just need draft + fusion
+            // mlpackages here to wire up the SpeculativeLoop orchestrator.
+            //
+            // Opt-in: gated by LLM_EAGLE3_ENABLE=1. On iPhone 17 Pro with
+            // Gemma 4 E2B the draft/fusion add ~234 MB ANE-resident and
+            // yield only ~+5-8% throughput at current draft quality (val
+            // 22.4% per-step, per-token compounded ~14%). Not worth the
+            // memory by default.
+            if eagle3Enabled,
+               let fusionURL = findAsset("eagle3_fusion"),
+               let draftURL = findAsset("eagle3_draft"),
+               (llm.chunkedEngine?.hasVerify ?? false) {
+                do {
+                    onProgress?("Loading EAGLE-3 speculative (fusion + draft)...")
+                    llm.speculativeLoop = try SpeculativeLoop(
+                        fusionURL: fusionURL, draftURL: draftURL,
+                        K: 3, fusionLayers: [8, 17, 34],
+                        embedScale: config.embedScale)
+                    print("[Load] EAGLE-3 speculative ready (K=3)")
+                } catch {
+                    print("[Load] EAGLE-3 unavailable: \(error). Falling back to T=1 decode.")
+                    llm.speculativeLoop = nil
+                }
+            }
         } else {
             let mlConfig = MLModelConfiguration()
             mlConfig.computeUnits = computeUnits
@@ -254,14 +328,17 @@ public final class CoreMLLLM: @unchecked Sendable {
         // Cross-vocabulary drafter (Route B): Qwen 2.5 0.5B monolithic +
         // vocab map. Looks for `cross_vocab/qwen_drafter.mlmodelc` (or
         // `.mlpackage`) plus `cross_vocab/qwen_gemma_vocab.bin` under the
-        // model directory. Silently skipped if absent.
+        // model directory. Skipped if absent OR if SPECULATIVE_PROFILE
+        // is not set (gate prevents paying 301 MB ANE-resident cost
+        // when speculation is off).
         let cvDir = directory.appendingPathComponent("cross_vocab")
         let cvCompiled = cvDir.appendingPathComponent("qwen_drafter.mlmodelc")
         let cvPkg = cvDir.appendingPathComponent("qwen_drafter.mlpackage")
         let cvMapURL = cvDir.appendingPathComponent("qwen_gemma_vocab.bin")
         let cvModelURL: URL? = FileManager.default.fileExists(atPath: cvCompiled.path) ? cvCompiled
             : FileManager.default.fileExists(atPath: cvPkg.path) ? cvPkg : nil
-        if let cvModelURL,
+        if loadCV,
+           let cvModelURL,
            FileManager.default.fileExists(atPath: cvMapURL.path),
            let engine = llm.chunkedEngine,
            engine.hasVerify {
@@ -373,6 +450,35 @@ public final class CoreMLLLM: @unchecked Sendable {
             }
         }
 
+        // Final prewarm — re-warm decode + verify paths after all auxiliary
+        // models (EAGLE-3 draft/fusion, cross-vocab Qwen, etc.) have loaded.
+        // Those loads can evict the early ANE cache set up during
+        // ChunkedEngine.load, leaving the first user decode ~50ms slower
+        // per step and the first spec burst ~100ms slower.
+        if let engine = llm.chunkedEngine {
+            do {
+                try engine.finalPrewarm()
+            } catch {
+                print("[Load] final prewarm skipped: \(error)")
+            }
+        }
+
+        // Also warm the EAGLE-3 draft + fusion mlpackages if loaded —
+        // one dry forward through each so the first user burst doesn't
+        // eat the ANE compile cost for these two graphs.
+        if let sl = llm.speculativeLoop, let engine = llm.chunkedEngine {
+            do {
+                _ = try sl.drawBurst(
+                    target: engine,
+                    tTokNext: 0,
+                    tokenEmbed: { try engine.embedToken($0) })
+                engine.reset()
+                print("[Load] EAGLE-3 draft+fusion prewarm done")
+            } catch {
+                print("[Load] EAGLE-3 prewarm skipped: \(error)")
+            }
+        }
+
         onProgress?("Ready")
         return llm
     }
@@ -400,6 +506,15 @@ public final class CoreMLLLM: @unchecked Sendable {
         let directory = modelURL.deletingLastPathComponent()
         return try await load(from: directory, computeUnits: computeUnits,
                                onProgress: onProgress)
+    }
+
+    /// Whether EAGLE-3 speculative decoding is loaded and active for this model.
+    public var supportsSpeculative: Bool { speculativeLoop != nil }
+
+    /// Rolling acceptance rate observed on recent speculative bursts. 1.0 before
+    /// any burst has run; decays toward 0 if the draft consistently mispredicts.
+    public var speculativeAcceptance: Double {
+        speculativeLoop?.rollingAcceptance ?? 0
     }
 
     /// Whether this model supports image input.
@@ -725,16 +840,26 @@ public final class CoreMLLLM: @unchecked Sendable {
                         var tokenCount = 0
                         let maxDecode = min(ctxLimit - engine.currentPosition, maxTokens)
                         // Drafter selection priority (highest first):
-                        //   1. MTP (trained drafter, best when present)
-                        //   2. DrafterUnion (Phase B; cv + pld-n2 + pld-n3)
-                        //   3. CrossVocab alone (legacy, kept as opt-out fallback)
+                        //   1. EAGLE-3 SpeculativeLoop (trained eagle drafter, best when present)
+                        //   2. MTP (trained drafter, best when present)
+                        //   3. DrafterUnion (Phase B; cv + pld-n2 + pld-n3)
+                        //   4. CrossVocab alone (legacy, kept as opt-out fallback)
                         // Only the selected engine resets — the union and the
                         // CV-alone engine share an underlying CrossVocabDraft,
                         // so simultaneous use would corrupt Qwen state.
-                        let mtpSpec = mutableSelf.mtpEnabled ? mutableSelf.mtpEngine : nil
-                        let unionSpec = (mtpSpec == nil && mutableSelf.drafterUnionEnabled)
+                        //
+                        // LLM_EAGLE3_DISABLE=1 skips EAGLE-3 so DrafterUnion/CV
+                        // can be benched standalone (e.g. while the EAGLE-3
+                        // draft is a known-broken pre-retrain checkpoint).
+                        let eagleDisabled = ProcessInfo.processInfo
+                            .environment["LLM_EAGLE3_DISABLE"] == "1"
+                        let eagleSpec = eagleDisabled ? nil : mutableSelf.speculativeLoop
+                        let mtpSpec = (eagleSpec == nil && mutableSelf.mtpEnabled)
+                            ? mutableSelf.mtpEngine : nil
+                        let unionSpec = (eagleSpec == nil && mtpSpec == nil
+                                         && mutableSelf.drafterUnionEnabled)
                             ? mutableSelf.drafterUnion : nil
-                        let cvSpec = (mtpSpec == nil && unionSpec == nil
+                        let cvSpec = (eagleSpec == nil && mtpSpec == nil && unionSpec == nil
                                       && mutableSelf.crossVocabEnabled)
                             ? mutableSelf.crossVocabEngine : nil
                         mtpSpec?.reset()
@@ -743,8 +868,12 @@ public final class CoreMLLLM: @unchecked Sendable {
                         cvSpec?.reset()
                         cvSpec?.setPrefillHistory(tokens.map { Int32($0) })
 
+                        // First iteration is always plain T=1 decode so hidden_at_L*
+                        // taps get populated before EAGLE-3 speculative can read them.
+                        var didFirstDecode = false
+
                         var nid = Int32(nextID)
-                        while tokenCount < maxDecode {
+                        decodeLoop: while tokenCount < maxDecode {
                             if eosIDs.contains(Int(nid)) { break }
                             if engine.currentPosition >= ctxLimit { break }
                             // T4: stop the loop the moment the consumer
@@ -752,7 +881,67 @@ public final class CoreMLLLM: @unchecked Sendable {
                             // continuation.onTermination → genTask.cancel().
                             try Task.checkCancellation()
 
-                            if let se = mtpSpec, se.shouldSpeculate {
+                            let useEagle = (eagleSpec != nil) && didFirstDecode
+                                && engine.canSpeculate
+                                && (eagleSpec?.shouldSpeculate ?? false)
+                            // One-shot debug of the 4 gating conditions when
+                            // EAGLE-3 is loaded but not yet speculating.
+                            if eagleSpec != nil && !useEagle && tokenCount < 3 {
+                                print("[SpecDbg] useEagle=false  loaded=\(eagleSpec != nil)  firstDecode=\(didFirstDecode)  canSpec=\(engine.canSpeculate)  shouldSpec=\(eagleSpec?.shouldSpeculate ?? false)  hL8=\(engine.lastHiddenAtL8 != nil)  hL17=\(engine.lastHiddenAtL17 != nil)  hL34=\(engine.lastHiddenAtL34 != nil)  vchunk=\(engine.hasVerify)")
+                            }
+
+                            if useEagle, let sl = eagleSpec {
+                                if tokenCount < 5 {
+                                    print("[SpecDbg] ENTER EAGLE burst tokenCount=\(tokenCount) pos=\(engine.currentPosition) nid=\(nid)")
+                                }
+                                // EAGLE-3 speculative burst: yields 1..K+1 accepted tokens.
+                                let accepted: [Int32]
+                                do {
+                                    accepted = try sl.drawBurst(
+                                        target: engine,
+                                        tTokNext: nid,
+                                        tokenEmbed: { try engine.embedToken($0) })
+                                } catch {
+                                    // On any speculative failure, fall back to T=1 this step.
+                                    print("[Spec] burst failed: \(error) — falling back to T=1")
+                                    mutableSelf.lastEmittedTokenIDs.append(nid)
+                                    let text = mutableSelf.tokenizer.decode(tokens: [Int(nid)])
+                                    continuation.yield(text)
+                                    tokenCount += 1
+                                    let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                                    if elapsed > 0 {
+                                        mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed
+                                    }
+                                    try autoreleasepool {
+                                        let next = try engine.predictStep(
+                                            tokenID: Int(nid), position: engine.currentPosition)
+                                        nid = Int32(next)
+                                    }
+                                    engine.currentPosition += 1
+                                    continue decodeLoop
+                                }
+
+                                // `accepted` always starts with the tTokNext we passed in.
+                                // commitAccepted has already advanced currentPosition by
+                                // accepted.count and refreshed hidden taps.
+                                for tok in accepted {
+                                    let t = Int(tok)
+                                    if eosIDs.contains(t) {
+                                        mutableSelf.lastEmittedTokenIDs.append(tok)
+                                        let text = mutableSelf.tokenizer.decode(tokens: [t])
+                                        continuation.yield(text)
+                                        tokenCount += 1
+                                        nid = tok
+                                        break decodeLoop
+                                    }
+                                    mutableSelf.lastEmittedTokenIDs.append(tok)
+                                    let text = mutableSelf.tokenizer.decode(tokens: [t])
+                                    continuation.yield(text)
+                                    tokenCount += 1
+                                    if tokenCount >= maxDecode { break decodeLoop }
+                                }
+                                nid = Int32(engine.lastArgmaxAfterDecode)
+                            } else if let se = mtpSpec, se.shouldSpeculate {
                                 let emitted = try autoreleasepool {
                                     try se.speculateStep(nextID: &nid)
                                 }
@@ -794,6 +983,9 @@ public final class CoreMLLLM: @unchecked Sendable {
                                     tokenCount += 1
                                 }
                             } else {
+                                if tokenCount < 5 {
+                                    print("[SpecDbg] ENTER T=1 tokenCount=\(tokenCount) pos=\(engine.currentPosition)")
+                                }
                                 mutableSelf.lastEmittedTokenIDs.append(nid)
                                 let text = mutableSelf.tokenizer.decode(tokens: [Int(nid)])
                                 continuation.yield(text)
@@ -805,6 +997,17 @@ public final class CoreMLLLM: @unchecked Sendable {
                                 }
                                 engine.currentPosition += 1
                             }
+
+                            // Any branch (T=1, MTP, Union, CrossVocab) counts
+                            // as "first decode completed" — after which the
+                            // EAGLE-3 speculative path is eligible to take
+                            // over on subsequent steps. Without this, decode
+                            // loops that kick in MTP/Union/CrossVocab first
+                            // never let EAGLE-3 run (the flag stayed false).
+                            if !didFirstDecode && tokenCount < 3 {
+                                print("[SpecDbg] didFirstDecode set true (tokenCount=\(tokenCount))")
+                            }
+                            didFirstDecode = true
 
                             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                             if elapsed > 0 { mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed }

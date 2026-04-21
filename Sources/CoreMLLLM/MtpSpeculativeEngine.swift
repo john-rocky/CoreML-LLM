@@ -172,9 +172,12 @@ public final class MtpSpeculativeEngine {
             carry = targetArgmax[K - 1]  // defensive; unreachable given K-1 cap
         }
 
-        // Commit: advance position by the verified prefix only.
+        // Commit: under the 11c protocol, verify does NOT write KV to the
+        // persistent cache. commitAccepted is what writes the accepted-prefix
+        // slices. Bumping currentPosition directly leaves the cache stale.
         let committed = matchCount + 1
-        engine.currentPosition = pos + committed
+        let committedTokens = Array(emitted.prefix(committed))
+        try engine.commitAccepted(committedTokens)
 
         // Extract carry state from verify hidden states.
         // lastVerifyHiddenStates: (1, K, hidden) — matchCount indexes the

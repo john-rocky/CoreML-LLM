@@ -28,14 +28,24 @@ public final class DrafterUnion {
         case crossVocab = "cv"
         case pldN3      = "pl3"
         case pldN2      = "pl2"
+        case suffix     = "sfx"
         case fallback   = "single"
     }
 
     let engine: ChunkedEngine
     let crossVocab: CrossVocabDraft?
+    /// Optional SuffixDecoding drafter — zero-model-cost drafter backed by
+    /// a cross-session suffix trie (arXiv 2411.04975). Purely additive:
+    /// when nil, the union behaves exactly as before. When set, the
+    /// engine participates as a per-burst proposal source.
+    public var suffix: SuffixSpeculativeEngine?
     let K: Int
 
-    private static let priority: [Source: Int] = [.crossVocab: 0, .pldN3: 1, .pldN2: 2]
+    // Priority: CV first (trained drafter → highest quality), PLD n=3 next
+    // (most-specific n-gram), Suffix next (cross-session), PLD n=2 last.
+    private static let priority: [Source: Int] = [
+        .crossVocab: 0, .pldN3: 1, .suffix: 2, .pldN2: 3,
+    ]
 
     /// Hysteresis gate for a draft source. A source toggles ON when its
     /// rolling EMA rises above `enableThreshold`, and OFF when it falls
@@ -93,6 +103,11 @@ public final class DrafterUnion {
             pldGate.enableThreshold = max(newValue + 0.05, newValue * 2.0)
         }
     }
+    /// Suffix drafter gate. Zero-cost tree lookup; only disabled when
+    /// rolling acceptance collapses to near-zero for several dozen bursts.
+    /// Kept as a single scalar (no hysteresis) since the drafter cost is
+    /// negligible and the EMA floor is already near zero.
+    public var suffixThreshold: Double = 0.05
 
     /// Hard-disable the cross-vocab source even when it's loaded. Skips
     /// both the bootstrap replay through Qwen and the per-burst draftBurst.
@@ -103,6 +118,7 @@ public final class DrafterUnion {
     private(set) public var rollingCV: Double  = 1.0
     private(set) public var rollingPL3: Double = 1.0
     private(set) public var rollingPL2: Double = 1.0
+    private(set) public var rollingSfx: Double = 1.0
     private let rollingAlpha: Double = 0.10
 
     // Hysteresis state. enabledX = "this source is currently allowed to
@@ -160,7 +176,7 @@ public final class DrafterUnion {
         self.engine = engine
         self.crossVocab = crossVocab
         self.K = K
-        for s: Source in [.crossVocab, .pldN3, .pldN2, .fallback] { picks[s] = 0 }
+        for s: Source in [.crossVocab, .pldN3, .pldN2, .suffix, .fallback] { picks[s] = 0 }
         resyncEnabledFromGates()
     }
 
@@ -169,7 +185,8 @@ public final class DrafterUnion {
         prefillHistory.removeAll()
         history.removeAll()
         crossVocab?.reset()
-        rollingCV = 1.0; rollingPL3 = 1.0; rollingPL2 = 1.0
+        suffix?.reset()
+        rollingCV = 1.0; rollingPL3 = 1.0; rollingPL2 = 1.0; rollingSfx = 1.0
         totalCycles = 0; totalEmitted = 0; totalAcceptedDraftSlots = 0
         for k in picks.keys { picks[k] = 0 }
         resyncEnabledFromGates()
@@ -190,6 +207,7 @@ public final class DrafterUnion {
     public func setPrefillHistory(_ tokens: [Int32]) {
         prefillHistory = tokens
         history = tokens
+        suffix?.setPrefillHistory(tokens)
     }
 
     public func speculateStep(nextID: inout Int32) throws -> [Int32] {
@@ -235,6 +253,11 @@ public final class DrafterUnion {
                 ? PromptLookupDraft.propose(history: lookupHist, ngramSize: 2, maxDraftLen: K - 1)
                 : []
         }
+        // SuffixDecoding: cross-session trie lookup, zero model cost.
+        let (sfxProps, sfxMs): ([Int32], Double) = SpecProfile.time {
+            guard let sfx = suffix, rollingSfx >= suffixThreshold else { return [] }
+            return sfx.drawBurst(context: lookupHist, K: K - 1)
+        }
 
         var cvBurst: DraftBurst? = nil
         var cvMs: Double = 0
@@ -246,10 +269,11 @@ public final class DrafterUnion {
         let cvProps: [Int32] = cvBurst?.drafts ?? []
         let cvPosAfterPropose: Int = cvActive?.committedPosition ?? -1
 
-        // 2. Selection: longest first, then priority cv > pl-n3 > pl-n2.
+        // 2. Selection: longest first, then priority cv > pl-n3 > suffix > pl-n2.
         var candidates: [(Source, [Int32])] = []
         if !cvProps.isEmpty  { candidates.append((.crossVocab, cvProps)) }
         if !plProps3.isEmpty { candidates.append((.pldN3, plProps3)) }
+        if !sfxProps.isEmpty { candidates.append((.suffix, sfxProps)) }
         if !plProps2.isEmpty { candidates.append((.pldN2, plProps2)) }
 
         guard !candidates.isEmpty else {
@@ -331,20 +355,34 @@ public final class DrafterUnion {
             carry = targetArgmax[K - 1]
         }
 
-        // 6. Commit on target. Verify wrote KV at [pos, pos+matchCount];
-        //    rejected slots stay masked-out by the causal mask.
+        // 6. Commit on target. Under the 11c protocol, verify does NOT write
+        //    KV to the persistent cache; commitAccepted is what writes the
+        //    accepted-prefix slices. Bumping currentPosition directly (as the
+        //    pre-11c code did) leaves the cache stale and corrupts decode.
         let committed = matchCount + 1
-        engine.currentPosition = pos + committed
+        let committedTokens = Array(emitted.prefix(committed))
 
         // 7. Sync history (committed tokens only).
         for k in 0..<committed { history.append(emitted[k]) }
 
-        // 8. Sync cross-vocab Qwen state. If CV was the source, applyCommit
+        // 7b. Feed committed tokens to the suffix trie (cross-session
+        //     knowledge base). Runs whether or not SuffixDecoding was
+        //     the picked source — the tree should learn from every
+        //     trajectory.
+        if let sfx = suffix {
+            let delta = Array(emitted.prefix(committed))
+            sfx.applyCommit(tokens: delta)
+        }
+
+        // 8. Commit KV via the engine (11c protocol — verify no longer writes
+        //    persistent KV, so we must call commitAccepted here), plus sync
+        //    cross-vocab Qwen state. If CV was the source, applyCommit
         //    rewinds/extends correctly. If CV ran but wasn't picked, its
         //    speculative writes don't match the committed prefix — rewind
         //    and replay the actual committed tokens through Qwen.
         var cvPosAfterRewind: Int = cvActive?.committedPosition ?? -1
         let (_, commitMs) = try SpecProfile.time {
+            try engine.commitAccepted(committedTokens)
             if let cv = cvActive, let burst = cvBurst {
                 if source == .crossVocab {
                     try cv.applyCommit(matchCount: matchCount, burst: burst)
@@ -397,6 +435,8 @@ public final class DrafterUnion {
             } else if enabledPL2 && rollingPL2 <= pldGate.disableThreshold {
                 enabledPL2 = false
             }
+        case .suffix:
+            rollingSfx = rollingAlpha * rate + (1 - rollingAlpha) * rollingSfx
         case .fallback:   break
         }
 
@@ -407,7 +447,7 @@ public final class DrafterUnion {
 
         SpecProfile.logUnionBurst(
             cycle: totalCycles, source: source.rawValue,
-            perSourceMs: ["cv": cvMs, "pl3": pl3Ms, "pl2": pl2Ms],
+            perSourceMs: ["cv": cvMs, "pl3": pl3Ms, "pl2": pl2Ms, "sfx": sfxMs],
             verifyMs: verifyMs, commitMs: commitMs,
             accepted: matchCount, compareLen: compareLen,
             emitted: emitted.count, matches: matches)
@@ -466,6 +506,7 @@ public final class DrafterUnion {
         if let cv = cvActive {
             _ = try cv.consume(gemmaToken: nextID)
         }
+        suffix?.applyCommit(tokens: [emittedTok])
         nextID = Int32(newNext)
         SpecProfile.logBootstrap(
             engine: "union", replayCount: replayCount,
@@ -494,6 +535,7 @@ public final class DrafterUnion {
                 cv.committedPosition += 1
             }
         }
+        suffix?.applyCommit(tokens: [emittedTok])
         nextID = Int32(newNext)
         SpecProfile.logFallback(
             engine: "union", cycle: totalCycles, targetStepMs: targetStepMs)

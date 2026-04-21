@@ -47,6 +47,10 @@ HF_DIR = os.environ.get(
 CTX = 2048
 W = 512
 FUSION_LAYERS = (8, 17, 34)
+# Top-K logits exposed by chunk4 for HASS-style soft-KL training. iPhone
+# decode ignores the extra outputs; the Mac collector reads them and
+# stores them in the EAGLE-3 retrain memmap.
+CHUNK4_TOPK = int(os.environ.get("EAGLE3_CHUNK4_TOPK", "20"))
 fp16 = ct.converters.mil.mil.types.fp16
 
 
@@ -103,8 +107,8 @@ class EagleChunk2(nn.Module):
         V_full_outs = []
         hidden_at_L8 = hidden_states  # placeholder; overwritten below
 
-        for local_idx in range(self.base.END - self.base.START):
-            layer_idx = self.base.START + local_idx  # 8..14
+        for local_idx in range(self.base.end - self.base.start):
+            layer_idx = self.base.start + local_idx  # 8..14
             is_full = config.is_full_attention(layer_idx)
             if is_full:
                 fi = self.base.full_map[layer_idx]
@@ -161,8 +165,8 @@ class EagleChunk3(nn.Module):
         dummy_K = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
         dummy_V = dummy_K
         hidden_at_L17 = hidden_states
-        for local_idx in range(self.base.END - self.base.START):
-            layer_idx = self.base.START + local_idx  # 15..24
+        for local_idx in range(self.base.end - self.base.start):
+            layer_idx = self.base.start + local_idx  # 15..24
             hidden_states, *_ = _run_layer_swa(
                 self.base.layers[local_idx], layer_idx, hidden_states,
                 cos_s, sin_s, cos_f, sin_f,
@@ -180,9 +184,10 @@ class EagleChunk3(nn.Module):
 # EagleChunk4: SWAChunk4 emits pre-norm post-L34 hidden instead of post-norm
 # ============================================================
 class EagleChunk4(nn.Module):
-    def __init__(self, base: SWAChunk4):
+    def __init__(self, base: SWAChunk4, top_k: int = CHUNK4_TOPK):
         super().__init__()
         self.base = base
+        self.top_k = int(top_k)
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding, update_mask,
                 per_layer_combined, cos_s, sin_s, cos_f, sin_f,
@@ -191,8 +196,8 @@ class EagleChunk4(nn.Module):
         dummy_K = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
         dummy_V = dummy_K
 
-        for local_idx in range(self.base.END - self.base.START):
-            layer_idx = self.base.START + local_idx  # 25..34
+        for local_idx in range(self.base.end - self.base.start):
+            layer_idx = self.base.start + local_idx  # 25..34
             hidden_states, *_ = _run_layer_swa(
                 self.base.layers[local_idx], layer_idx, hidden_states,
                 cos_s, sin_s, cos_f, sin_f,
@@ -201,17 +206,36 @@ class EagleChunk4(nn.Module):
                 config, per_layer_combined,
                 kv13_k, kv13_v, kv14_k, kv14_v,
             )
-        # post-L34 pre-norm hidden — matches test_eagle3_infer.py's
-        # out.hidden_states[fusion_layer + 1] semantics.
+        # post-L34 pre-norm hidden — matches the collector's forward_batch
+        # semantics (fusion_hiddens[34] captured inside the loop, BEFORE
+        # `self.norm`). An earlier "fix" that tried to post-norm this was
+        # misdiagnosed: the custom collector used pre-norm, so the old ckpt
+        # learned against pre-norm L34. Keep pre-norm to stay consistent
+        # with the repo's training convention (and with the new W4A8
+        # retrain, which collects via the same chunk4 → same pre-norm).
         hidden_at_L34 = hidden_states
 
         normed = self.base.norm(hidden_states)
         x = normed.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
-        logits = self.base.lm_head(x).squeeze(2).permute(0, 2, 1)
+        logits = self.base.lm_head(x).squeeze(2).permute(0, 2, 1)  # (1, 1, V)
         if self.base.softcap > 0:
             logits = torch.tanh(logits / self.base.softcap) * self.base.softcap
-        token_id, token_logit = self.base.argmax(logits.squeeze(0))
-        return token_id, token_logit, hidden_at_L34
+        # Single top-K over vocab produces BOTH the argmax (slot 0) and the
+        # K-way teacher distribution. Running a separate `argmax` op alongside
+        # `topk` on the same logical tensor lets coremltools place them on
+        # different compute units (ANE vs CPU) which produces byte-different
+        # logit copies at palettization boundaries — observed as token_id
+        # disagreeing with top_k_ids[0] on ~40% of the collector rows with
+        # an exact +196608 offset (3 × 65536 vocab-partition offset). Using
+        # topk's first slot guarantees numeric consistency between the hard
+        # label used for CE and the soft target used for KL.
+        top_k_values, top_k_idx_i64 = torch.topk(logits, k=self.top_k, dim=-1)
+        top_k_ids = top_k_idx_i64.to(torch.int32)
+        top_k_logits = top_k_values.to(MODEL_DTYPE)
+        # token_id is batch-preserving int32 of shape (1,), token_logit fp16 (1,).
+        token_id = top_k_ids.squeeze(1)[..., 0]
+        token_logit = top_k_logits.squeeze(1)[..., 0]
+        return token_id, token_logit, hidden_at_L34, top_k_ids, top_k_logits
 
 
 def build_chunk1(base, out_dir):
@@ -375,7 +399,8 @@ def build_chunk4(base, out_dir):
         ct.TensorType(name="kv14_k",              shape=s[11].shape, dtype=fp16),
         ct.TensorType(name="kv14_v",              shape=s[12].shape, dtype=fp16),
     ]
-    outs = ["token_id", "token_logit", "hidden_at_L34"]
+    outs = ["token_id", "token_logit", "hidden_at_L34",
+            "top_k_ids", "top_k_logits"]
     do_convert(c4, s, ins, outs, f"{out_dir}/chunk4.mlpackage")
 
 

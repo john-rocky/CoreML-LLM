@@ -163,10 +163,12 @@ public final class CrossVocabSpeculativeEngine {
             carry = targetArgmax[K - 1]  // defensive; unreachable given K-1 cap
         }
 
-        // 5. Advance target position and re-anchor drafter.
+        // 5. Commit KV via the engine (11c: verify no longer writes KV; the
+        //    accepted-prefix slices are committed here), then re-anchor drafter.
         let committed = matchCount + 1
-        engine.currentPosition = pos + committed
+        let committedTokens = Array(emitted.prefix(committed))
         let (_, commitMs) = try SpecProfile.time {
+            try engine.commitAccepted(committedTokens)
             try drafter.applyCommit(matchCount: matchCount, burst: burst)
         }
 

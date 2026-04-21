@@ -35,9 +35,26 @@ public protocol SpeculativeTarget: AnyObject {
     /// Returns the target's argmax at each of the K positions.
     func verifyCandidates(_ candidates: [Int32], K: Int) throws -> [Int32]
 
+    /// Variant that also returns top-N (tokenID, logit) per verified position.
+    /// Used by tolerance-based acceptance. Default implementation just calls
+    /// `verifyCandidates` and wraps each argmax in a single-entry top list —
+    /// conforming types that have cheap access to full logits should override
+    /// with the true top-N extraction.
+    func verifyCandidatesTopN(_ candidates: [Int32], K: Int, topN: Int)
+        throws -> (argmax: [Int32], topN: [[Int32]])
+
     /// Commit `tokens` to the running KV cache. After this call, subsequent
     /// decode steps MUST see position advanced by `tokens.count`.
     func commitAccepted(_ tokens: [Int32]) throws
+}
+
+extension SpeculativeTarget {
+    public func verifyCandidatesTopN(_ candidates: [Int32], K: Int, topN: Int)
+        throws -> (argmax: [Int32], topN: [[Int32]])
+    {
+        let ax = try verifyCandidates(candidates, K: K)
+        return (ax, ax.map { [$0] })
+    }
 }
 
 public final class SpeculativeLoop {
@@ -64,6 +81,16 @@ public final class SpeculativeLoop {
 
     /// Disable speculative path when rolling acceptance drops below this.
     public var fallbackThreshold: Double = 0.30
+
+    /// Tolerance for accepting a draft proposal: accept if it appears in the
+    /// target's top-`tolerance` predictions at that position (1 = strict
+    /// argmax match). Higher values relax matching to salvage bursts when
+    /// fp16 on-device numerics flip argmax on tight-margin positions but the
+    /// intended token is still near the top. Set via env var
+    /// LLM_EAGLE3_TOLERANCE (default 1).
+    public var tolerance: Int = {
+        Int(ProcessInfo.processInfo.environment["LLM_EAGLE3_TOLERANCE"] ?? "") ?? 1
+    }()
 
     // MARK: - Init
 
@@ -108,12 +135,28 @@ public final class SpeculativeLoop {
         tokenEmbed: (Int32) throws -> MLMultiArray
     ) throws -> [Int32] {
 
+        // Verbose one-shot diagnostic of the very first burst only, to let us
+        // correlate on-device zero-accept with the actual values flowing
+        // through fusion → draft → verify.
+        let verbose = (burstCount < 2) || (ProcessInfo.processInfo
+            .environment["LLM_EAGLE3_VERBOSE_BURST"] != nil)
+
         // 1. Fetch multi-layer hidden states at fusionLayers from the target's
         //    last decode step.
         let hs = try target.lastHiddenMulti(at: fusionLayers)
         guard hs.count == fusionLayers.count else {
             throw SpeculativeError.verifyFailed(
                 "target returned \(hs.count) hiddens, expected \(fusionLayers.count)")
+        }
+
+        if verbose {
+            for (i, h) in hs.enumerated() {
+                let p = h.dataPointer.bindMemory(to: UInt16.self, capacity: 8)
+                let vals = (0..<8).map { fp16BitsToFloat(p[$0]) }
+                let norm = hiddenL2Norm(h)
+                print(String(format: "[Spec/dbg] h_fuse_in[%d] L%d  first8=%@  |h|=%.3f",
+                             i, fusionLayers[i], vals.description, norm))
+            }
         }
 
         // 2. Fuse them. Names must match eagle3_fusion.mlpackage I/O contract.
@@ -127,14 +170,26 @@ public final class SpeculativeLoop {
         guard let hFused = fusionOut.featureValue(for: "h_fused")?.multiArrayValue else {
             throw SpeculativeError.verifyFailed("fusion missing h_fused output")
         }
+        if verbose {
+            let p = hFused.dataPointer.bindMemory(to: UInt16.self, capacity: 8)
+            let vals = (0..<8).map { fp16BitsToFloat(p[$0]) }
+            print(String(format: "[Spec/dbg] h_fused     first8=%@  |h|=%.3f",
+                         vals.description, hiddenL2Norm(hFused)))
+        }
 
         // 3. Draft K tokens autoregressively.
         var hPrev: MLMultiArray = hFused
         var eNext: MLMultiArray = try tokenEmbed(tTokNext)
+        if verbose {
+            let p = eNext.dataPointer.bindMemory(to: UInt16.self, capacity: 8)
+            let vals = (0..<8).map { fp16BitsToFloat(p[$0]) }
+            print(String(format: "[Spec/dbg] embed(tTokNext=%d) first8=%@  |e|=%.3f",
+                         tTokNext, vals.description, hiddenL2Norm(eNext)))
+        }
         var proposals: [Int32] = []
         proposals.reserveCapacity(K)
 
-        for _ in 0..<K {
+        for k in 0..<K {
             let draftIn = try MLDictionaryFeatureProvider(dictionary: [
                 "h_prev": hPrev,
                 "e_next": eNext
@@ -150,26 +205,58 @@ public final class SpeculativeLoop {
                 .bindMemory(to: Int32.self, capacity: 1)
                 .pointee
             proposals.append(pred)
+            if verbose {
+                let p = hOut.dataPointer.bindMemory(to: UInt16.self, capacity: 8)
+                let vals = (0..<8).map { fp16BitsToFloat(p[$0]) }
+                print(String(format: "[Spec/dbg] draft step %d → token=%d h_out[0..8]=%@  |h|=%.3f",
+                             k, pred, vals.description, hiddenL2Norm(hOut)))
+            }
             hPrev = hOut
             eNext = try tokenEmbed(pred)
         }
 
         // 4. Run target verify on [tTokNext, proposals[0..K-2]]. Target's argmax
-        //    at each of those K positions is what it "would" emit next.
+        //    (and top-N for tolerance) at each of those K positions is what it
+        //    "would" emit next.
         var verifyTokens = [tTokNext]
         verifyTokens.append(contentsOf: proposals.dropLast())
-        let targetArgmax = try target.verifyCandidates(verifyTokens, K: K)
+        let useTolerance = tolerance > 1
+        let (targetArgmax, targetTopN): ([Int32], [[Int32]])
+        if useTolerance {
+            let r = try target.verifyCandidatesTopN(verifyTokens, K: K, topN: tolerance)
+            targetArgmax = r.argmax
+            targetTopN = r.topN
+        } else {
+            targetArgmax = try target.verifyCandidates(verifyTokens, K: K)
+            targetTopN = targetArgmax.map { [$0] }
+        }
         guard targetArgmax.count == K else {
             throw SpeculativeError.verifyFailed(
                 "verify returned \(targetArgmax.count), expected \(K)")
         }
+        if verbose {
+            print("[Spec/dbg] verifyTokens = \(verifyTokens)")
+            print("[Spec/dbg] targetArgmax = \(targetArgmax)")
+            print("[Spec/dbg] proposals    = \(proposals)")
+        }
 
         // 5. Accept prefix up to first disagreement. tTokNext is always accepted
         //    (it is target's own pick from the previous step's argmax).
+        //    Tolerance: treat proposal as matching if it appears anywhere in
+        //    target's top-N at that position.
         var accepted: [Int32] = [tTokNext]
         var matched = 0
         for k in 0..<K {
-            if proposals[k] == targetArgmax[k] {
+            let isMatch: Bool
+            if useTolerance {
+                isMatch = targetTopN[k].contains(proposals[k])
+            } else {
+                isMatch = proposals[k] == targetArgmax[k]
+            }
+            if isMatch {
+                // Commit the draft proposal (which target also ranks highly)
+                // rather than target's argmax — keeps output closer to draft's
+                // distribution when tolerance > 1 is used as a relaxation.
                 accepted.append(proposals[k])
                 matched += 1
             } else {
@@ -187,9 +274,40 @@ public final class SpeculativeLoop {
         let rate = Double(matched) / Double(K)
         rollingAcceptance = rollingAlpha * rate + (1 - rollingAlpha) * rollingAcceptance
 
+        burstCount += 1
+        if burstCount % 10 == 0 || burstCount <= 5 {
+            let topNSize = useTolerance ? (targetTopN.first?.count ?? 1) : 1
+            let inTop: Bool = useTolerance && (0..<K).contains { k in
+                targetTopN[k].dropFirst().contains(proposals[k])
+            }
+            print(String(format: "[Spec] burst #%d accept=%d/%d emitted=%d rolling=%.1f%% tol=%d topNsize=%d lookAhead=%@",
+                         burstCount, matched, K, accepted.count, rollingAcceptance * 100,
+                         tolerance, topNSize, inTop ? "anyDraftInTopNexcArgmax" : "no"))
+        }
         return accepted
     }
 
+    private var burstCount: Int = 0
+
     /// Whether to use speculative path for the next burst.
     public var shouldSpeculate: Bool { rollingAcceptance >= fallbackThreshold }
+}
+
+// MARK: - Debug helpers (fp16 scalar dump + L2 norm)
+
+private func fp16BitsToFloat(_ bits: UInt16) -> Float {
+    // Use Swift's built-in Float16. Avoids the manual subnormal shift loop
+    // that underflowed UInt32 `e` on subnormals (e.g., 0x8212 → e=0, mant≠0).
+    Float(Float16(bitPattern: bits))
+}
+
+private func hiddenL2Norm(_ a: MLMultiArray) -> Float {
+    let n = a.count
+    let p = a.dataPointer.bindMemory(to: UInt16.self, capacity: n)
+    var sumSq: Float = 0
+    for i in 0..<n {
+        let v = fp16BitsToFloat(p[i])
+        sumSq += v * v
+    }
+    return sumSq.squareRoot()
 }

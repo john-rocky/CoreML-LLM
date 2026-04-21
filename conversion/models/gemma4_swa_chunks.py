@@ -492,19 +492,23 @@ def _run_layer_verify(
     kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v,
     sliding_map, full_map,
 ):
-    """Run one layer in verify mode (Q=seq_len) WITH KV write-through.
+    """Run one layer in verify mode (Q=seq_len) under the 11c protocol.
 
-    For non-shared layers (L0-14): computes K/V projections and writes
-    to the cache. Sliding layers shift by K; full layers scatter via
-    update_indicator. For shared layers (L15-34): reads kv13/kv14 only.
+    KV cache buffers (K_sliding_slot/K_full_slot) are updated LOCALLY only —
+    used to derive K_for_attn within this verify call, and to produce the
+    extended kv13/kv14 outputs for shared layers in chunks 3/4. They are
+    NOT returned from the chunk forward, so persistent storage is untouched.
 
-    After verification, rejected tokens' KV entries remain in the cache
-    but are masked out by the causal mask in future decode steps — matching
-    Google's LiteRT approach (see docs/LITERT_RUNTIME_ANALYSIS.md §B1.3).
+    Per-position raw new K/V slices (`new_k_slice`, `new_v_slice`) are
+    additionally returned so Swift can selectively commit only the accepted
+    prefix into persistent storage after acceptance is decided.
 
     Returns:
         hidden_states, K_sliding_slot, V_sliding_slot, K_full_slot, V_full_slot,
-        kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v
+        kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v,
+        new_k_slice, new_v_slice
+        - new_k_slice / new_v_slice: (1, num_kv_heads=1, seq_len, hd) for non-shared layers,
+          None for shared layers (L15-34).
     """
     num_heads = config.num_attention_heads
     num_kv_heads = config.num_key_value_heads
@@ -537,6 +541,8 @@ def _run_layer_verify(
     V_sliding_out = V_sliding_slot
     K_full_out = K_full_slot
     V_full_out = V_full_slot
+    new_k_slice = None  # (1, num_kv_heads=1, seq_len, hd) for non-shared layers
+    new_v_slice = None
 
     if not is_kv_shared:
         # Compute K/V for all K tokens
@@ -556,6 +562,10 @@ def _run_layer_verify(
             _, k = apply_rotary_pos_emb(k, k, cos_f, sin_f)
         else:
             _, k = apply_rotary_pos_emb(k, k, cos_s, sin_s)
+
+        # 11c: raw per-T slice output (at hd, not max_hd) — Swift commits to persistent cache
+        new_k_slice = k  # (1, 1, seq_len, hd)
+        new_v_slice = v
 
         # Pad to max_hd if needed: (1, kv, K, hd) -> (1, kv, K, max_hd)
         if hd < max_hd:
@@ -585,7 +595,7 @@ def _run_layer_verify(
             V_for_attn = V_full_out[fi:fi+1][..., :hd]
         else:
             si = sliding_map[layer_idx]
-            # Shift by K and append K new entries
+            # Shift by K and append K new entries (LOCAL only — not returned by chunk)
             slot_k = K_sliding_slot[si:si+1]
             slot_v = V_sliding_slot[si:si+1]
             new_k = torch.cat([slot_k[:, :, seq_len:, :], k_padded], dim=2)
@@ -596,6 +606,8 @@ def _run_layer_verify(
             V_for_attn = V_sliding_out[si:si+1][..., :hd]
 
         # Store producer-layer KV for sharing (same alias convention as decode path).
+        # Extended within-verify form consumed by chunks 3/4 in this verify call —
+        # NOT written to persistent storage by Swift under the 11c protocol.
         if layer_idx == config.kv_sliding_producer:
             kv_store_13_k = K_sliding_out[si:si+1][..., :config.head_dim]
             kv_store_13_v = V_sliding_out[si:si+1][..., :config.head_dim]
@@ -659,15 +671,16 @@ def _run_layer_verify(
     hidden_states = hidden_states * layer.layer_scalar.to(MODEL_DTYPE)
 
     return (hidden_states, K_sliding_out, V_sliding_out, K_full_out, V_full_out,
-            kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v)
+            kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v,
+            new_k_slice, new_v_slice)
 
 
 class SWAVerifyChunk1(nn.Module):
-    """Verify version of chunk1: Q=K with KV write-through.
+    """Verify version of chunk1 (L0-7) under the 11c protocol.
 
-    Computes K/V projections and writes them to the cache (shift for sliding,
-    scatter for full-attn). Rejected entries are masked by causal mask later.
-    Outputs hidden_states, updated KV caches, and per_layer_combined.
+    Computes attention with full K/V context (input cache + new K/V at K positions)
+    but does NOT return the updated cache. Instead returns per-T raw new K/V slices
+    so Swift can selectively commit only accepted positions to persistent storage.
     """
 
     def __init__(self, model: Gemma4Model, seq_len: int, start: int = 0, end: int = 8):
@@ -678,6 +691,12 @@ class SWAVerifyChunk1(nn.Module):
         self.end = end
         self.layers = nn.ModuleList([model.layers[i] for i in range(start, end)])
         self.sliding_map, self.full_map = _layer_kv_map(start, end, model.config)
+        # Precompute (sliding_layer_idx -> stack_position) and same for full
+        # so chunk output ordering matches the persistent cache slot ordering.
+        self.sliding_layer_indices = sorted(self.sliding_map.keys(),
+                                            key=lambda k: self.sliding_map[k])
+        self.full_layer_indices = sorted(self.full_map.keys(),
+                                         key=lambda k: self.full_map[k])
         # PLE modules (same weights as decode chunk1)
         self.per_layer_model_projection = model.per_layer_model_projection
         self.per_layer_projection_norm = model.per_layer_projection_norm
@@ -717,11 +736,16 @@ class SWAVerifyChunk1(nn.Module):
         per_layer_combined = self._compute_ple(hidden_states, per_layer_raw)
 
         kv13_k = kv13_v = kv14_k = kv14_v = None
+        sliding_slices_k = [None] * len(self.sliding_layer_indices)
+        sliding_slices_v = [None] * len(self.sliding_layer_indices)
+        full_slices_k = [None] * len(self.full_layer_indices)
+        full_slices_v = [None] * len(self.full_layer_indices)
 
         for local_idx in range(self.end - self.start):
             layer_idx = self.start + local_idx
             (hidden_states, K_sliding_in, V_sliding_in, K_full_in, V_full_in,
-             kv13_k, kv13_v, kv14_k, kv14_v) = _run_layer_verify(
+             kv13_k, kv13_v, kv14_k, kv14_v,
+             new_k_slice, new_v_slice) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states, K,
                 cos_s, sin_s, cos_f, sin_f,
                 causal_mask_full, causal_mask_sliding,
@@ -731,15 +755,29 @@ class SWAVerifyChunk1(nn.Module):
                 kv13_k, kv13_v, kv14_k, kv14_v,
                 self.sliding_map, self.full_map,
             )
+            if layer_idx in self.sliding_map:
+                sliding_slices_k[self.sliding_map[layer_idx]] = new_k_slice
+                sliding_slices_v[self.sliding_map[layer_idx]] = new_v_slice
+            elif layer_idx in self.full_map:
+                full_slices_k[self.full_map[layer_idx]] = new_k_slice
+                full_slices_v[self.full_map[layer_idx]] = new_v_slice
 
-        return (hidden_states, K_sliding_in, V_sliding_in,
-                K_full_in, V_full_in, per_layer_combined)
+        # Stack slices in slot order: (num_slots, 1, K, hd)
+        new_K_sliding = torch.cat(sliding_slices_k, dim=0)
+        new_V_sliding = torch.cat(sliding_slices_v, dim=0)
+        new_K_full = torch.cat(full_slices_k, dim=0)
+        new_V_full = torch.cat(full_slices_v, dim=0)
+
+        return (hidden_states, per_layer_combined,
+                new_K_sliding, new_V_sliding, new_K_full, new_V_full)
 
 
 class SWAVerifyChunk2(nn.Module):
-    """Verify version of chunk2: Q=K with KV write-through.
+    """Verify version of chunk2 (L8-14) under the 11c protocol.
 
-    Writes K/V for all K positions. Emits updated kv13/kv14 for chunks 3-4.
+    Same write-after-accept pattern as chunk1: returns per-T raw K/V slices
+    for selective Swift commit. Also emits the extended within-verify kv13/kv14
+    for chunks 3/4 to consume during this verify call (these are NOT persisted).
     """
 
     def __init__(self, model: Gemma4Model, seq_len: int, start: int = 8, end: int = 15):
@@ -750,6 +788,10 @@ class SWAVerifyChunk2(nn.Module):
         self.end = end
         self.layers = nn.ModuleList([model.layers[i] for i in range(start, end)])
         self.sliding_map, self.full_map = _layer_kv_map(start, end, model.config)
+        self.sliding_layer_indices = sorted(self.sliding_map.keys(),
+                                            key=lambda k: self.sliding_map[k])
+        self.full_layer_indices = sorted(self.full_map.keys(),
+                                         key=lambda k: self.full_map[k])
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
                 update_indicator, per_layer_combined, cos_s, sin_s, cos_f, sin_f,
@@ -758,11 +800,16 @@ class SWAVerifyChunk2(nn.Module):
         K = self.seq_len
 
         kv13_k = kv13_v = kv14_k = kv14_v = None
+        sliding_slices_k = [None] * len(self.sliding_layer_indices)
+        sliding_slices_v = [None] * len(self.sliding_layer_indices)
+        full_slices_k = [None] * len(self.full_layer_indices)
+        full_slices_v = [None] * len(self.full_layer_indices)
 
         for local_idx in range(self.end - self.start):
             layer_idx = self.start + local_idx
             (hidden_states, K_sliding_in, V_sliding_in, K_full_in, V_full_in,
-             kv13_k, kv13_v, kv14_k, kv14_v) = _run_layer_verify(
+             kv13_k, kv13_v, kv14_k, kv14_v,
+             new_k_slice, new_v_slice) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states, K,
                 cos_s, sin_s, cos_f, sin_f,
                 causal_mask_full, causal_mask_sliding,
@@ -772,9 +819,20 @@ class SWAVerifyChunk2(nn.Module):
                 kv13_k, kv13_v, kv14_k, kv14_v,
                 self.sliding_map, self.full_map,
             )
+            if layer_idx in self.sliding_map:
+                sliding_slices_k[self.sliding_map[layer_idx]] = new_k_slice
+                sliding_slices_v[self.sliding_map[layer_idx]] = new_v_slice
+            elif layer_idx in self.full_map:
+                full_slices_k[self.full_map[layer_idx]] = new_k_slice
+                full_slices_v[self.full_map[layer_idx]] = new_v_slice
 
-        return (hidden_states, K_sliding_in, V_sliding_in,
-                K_full_in, V_full_in,
+        new_K_sliding = torch.cat(sliding_slices_k, dim=0)
+        new_V_sliding = torch.cat(sliding_slices_v, dim=0)
+        new_K_full = torch.cat(full_slices_k, dim=0)
+        new_V_full = torch.cat(full_slices_v, dim=0)
+
+        return (hidden_states,
+                new_K_sliding, new_V_sliding, new_K_full, new_V_full,
                 kv13_k, kv13_v, kv14_k, kv14_v)
 
 
@@ -801,7 +859,7 @@ class SWAVerifyChunk3(nn.Module):
         for local_idx in range(self.end - self.start):
             layer_idx = self.start + local_idx
             (hidden_states, _, _, _, _,
-             _, _, _, _) = _run_layer_verify(
+             _, _, _, _, _, _) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states, K,
                 cos_s, sin_s, cos_f, sin_f,
                 causal_mask_full, causal_mask_sliding,
@@ -843,7 +901,7 @@ class SWAVerifyChunk4(nn.Module):
         for local_idx in range(self.end - self.start):
             layer_idx = self.start + local_idx
             (hidden_states, _, _, _, _,
-             _, _, _, _) = _run_layer_verify(
+             _, _, _, _, _, _) = _run_layer_verify(
                 self.layers[local_idx], layer_idx, hidden_states, K,
                 cos_s, sin_s, cos_f, sin_f,
                 causal_mask_full, causal_mask_sliding,
