@@ -144,6 +144,37 @@ def parity_vs_oracle(model: FullModel, oracle: dict, seq_len: int):
     return overall_min, overall_mean, top1_rate
 
 
+SSM_FP32_PREFIXES = (
+    "attn3", "L3", "decay_mask", "k_decay", "k_cumdecay",
+    "k_beta", "v_beta", "core", "v_prime", "v_new",
+    "attn_inter", "last_state", "k3", "k_beta3", "v_beta3",
+)
+
+
+_SEL_STATS = {"kept_fp32": 0, "cast_fp16": 0,
+              "samples_fp32": [], "samples_fp16": []}
+
+
+def _ssm_op_selector(op):
+    """FP16ComputePrecision selector. Return True → fp16, False → keep fp32.
+    Any op whose output names start with a Gated-DeltaNet chunk-algorithm
+    variable prefix is held at fp32 to preserve the 64-step Neumann iteration
+    and associated WY-product numerics."""
+    first_name = op.outputs[0].name if getattr(op, "outputs", None) else "<none>"
+    for out in op.outputs:
+        name = out.name
+        for p in SSM_FP32_PREFIXES:
+            if name == p or name.startswith(p + "_"):
+                _SEL_STATS["kept_fp32"] += 1
+                if len(_SEL_STATS["samples_fp32"]) < 10:
+                    _SEL_STATS["samples_fp32"].append(f"{op.op_type}:{name}")
+                return False
+    _SEL_STATS["cast_fp16"] += 1
+    if len(_SEL_STATS["samples_fp16"]) < 10:
+        _SEL_STATS["samples_fp16"].append(f"{op.op_type}:{first_name}")
+    return True
+
+
 def convert_to_coreml(model: FullModel, seq_len: int, out_path: Path,
                       precision: str = "fp16"):
     print(f"\n=== CoreML conversion (seq={seq_len}, precision={precision}) ===")
@@ -151,7 +182,20 @@ def convert_to_coreml(model: FullModel, seq_len: int, out_path: Path,
     traced = torch.jit.trace(model, example, strict=False)
     print("  trace OK")
 
-    ct_precision = ct.precision.FLOAT32 if precision == "fp32" else ct.precision.FLOAT16
+    if precision == "fp32":
+        ct_precision = ct.precision.FLOAT32
+    elif precision == "mixed":
+        from coremltools.converters.mil.mil.passes.defs.quantization import (
+            FP16ComputePrecision,
+        )
+        # Reset per-run counters
+        _SEL_STATS["kept_fp32"] = 0
+        _SEL_STATS["cast_fp16"] = 0
+        _SEL_STATS["samples_fp32"].clear()
+        _SEL_STATS["samples_fp16"].clear()
+        ct_precision = FP16ComputePrecision(op_selector=_ssm_op_selector)
+    else:
+        ct_precision = ct.precision.FLOAT16
     ct_model = ct.convert(
         traced,
         convert_to="mlprogram",
@@ -172,6 +216,12 @@ def convert_to_coreml(model: FullModel, seq_len: int, out_path: Path,
     ct_model.save(str(out_path))
     size_mb = sum(f.stat().st_size for f in out_path.rglob('*') if f.is_file()) / 1e6
     print(f"  saved {out_path} ({size_mb:.1f} MB)")
+
+    if precision == "mixed":
+        print(f"  op_selector: kept_fp32={_SEL_STATS['kept_fp32']}  "
+              f"cast_fp16={_SEL_STATS['cast_fp16']}")
+        print(f"    fp32 samples: {_SEL_STATS['samples_fp32'][:5]}")
+        print(f"    fp16 samples: {_SEL_STATS['samples_fp16'][:5]}")
     return out_path, size_mb
 
 
@@ -233,8 +283,10 @@ def main():
                     help="parity only, skip CoreML conversion")
     ap.add_argument("--out-dir", type=str, default=None,
                     help="if set, save mlpackage here; else use a tempdir")
-    ap.add_argument("--precision", choices=["fp16", "fp32"], default="fp16",
-                    help="compute precision inside the mlprogram")
+    ap.add_argument("--precision", choices=["fp16", "fp32", "mixed"], default="fp16",
+                    help="compute precision inside the mlprogram. "
+                         "mixed = fp16 everywhere except the Gated DeltaNet "
+                         "SSM region (Neumann iter + chunked WY), which stays fp32.")
     args = ap.parse_args()
 
     print("loading HF model fp32...")
@@ -281,7 +333,8 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
     else:
         out_dir = Path(tempfile.mkdtemp(prefix="qwen35_full_"))
-    out_path = out_dir / f"qwen3_5_0_8b_{args.precision}_seq{args.seq_len}.mlpackage"
+    tag = {"fp16": "fp16", "fp32": "fp32", "mixed": "mixed"}[args.precision]
+    out_path = out_dir / f"qwen3_5_0_8b_{tag}_seq{args.seq_len}.mlpackage"
     convert_to_coreml(model, args.seq_len, out_path, precision=args.precision)
     ane_pct, dev_counts = audit_placement(out_path)
 
