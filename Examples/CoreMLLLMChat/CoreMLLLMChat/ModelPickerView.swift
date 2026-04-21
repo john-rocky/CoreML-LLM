@@ -62,6 +62,14 @@ struct ModelPickerView: View {
                     }
                 }
 
+                Section("Research") {
+                    NavigationLink {
+                        Qwen35BenchmarkView()
+                    } label: {
+                        Label("Qwen3.5-0.8B prefill benchmark", systemImage: "stopwatch")
+                    }
+                }
+
                 Section("Troubleshooting") {
                     Button(role: .destructive) {
                         do {
