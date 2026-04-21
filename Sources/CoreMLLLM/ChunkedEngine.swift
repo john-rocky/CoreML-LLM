@@ -146,12 +146,18 @@ final class ChunkedEngine {
     static func load(from directory: URL, config: ModelConfig,
                      computeUnits: MLComputeUnits) async throws -> ChunkedEngine {
         // iOS 18+ MLOptimizationHints.specializationStrategy = .fastPrediction
-        // trades a longer first-load specialization for shorter per-prediction
-        // wall time. Enabled by default — the added load-time cost (~seconds)
-        // is amortized across the session, and a shorter ANE busy window per
-        // dispatch directly reduces sustained heat per token.
+        // trades a longer first-load ANE specialization for (nominally)
+        // shorter per-prediction wall time.
         //
-        // Set LLM_FAST_PREDICTION=0 to disable (opt-out).
+        // As of 2026-04-21 device bench on iPhone 17 Pro / A19 Pro / iOS 26,
+        // the runtime decode tok/s delta between .fastPrediction on and off
+        // was below measurement noise, while the load-time cost was large
+        // (multi-second ANECompilerService + P-core burn per chunk × 8
+        // chunks, showing up as the hottest moment of the session).
+        //
+        // Default is now **off**. Set LLM_FAST_PREDICTION=1 to opt back in
+        // on hardware/OS combinations where the specialization is worth the
+        // load-time heat (older A-series / beta OS builds may differ).
         //
         // Removed: .reshapeFrequency = .infrequent. Worked stand-alone but
         // combined with LLM_PREFIX_CACHE=1 reproducibly triggered
@@ -159,7 +165,7 @@ final class ChunkedEngine {
         // on iPhone 17 Pro (A19 Pro, iOS 26). 1-3% gain not worth the
         // instability; removed entirely rather than left as opt-in to
         // prevent accidental enable.
-        let fastPredictionEnabled = ProcessInfo.processInfo.environment["LLM_FAST_PREDICTION"] != "0"
+        let fastPredictionEnabled = ProcessInfo.processInfo.environment["LLM_FAST_PREDICTION"] == "1"
         func applyHints(_ cfg: MLModelConfiguration) {
             guard fastPredictionEnabled else { return }
             if #available(iOS 18.0, macOS 15.0, *) {
@@ -250,23 +256,69 @@ final class ChunkedEngine {
             return m
         }
 
-        // Load all chunks in parallel (MLModel(contentsOf:) is thread-safe,
-        // ANE compiler can pipeline compilation across chunks)
+        // Chunk load strategy.
+        //
+        // Device bench on 2026-04-21 (iPhone 17 Pro / A19 Pro / iOS 26,
+        // Gemma 4 E2B, 8 chunks = decode×4 + prefill×4):
+        //   all-parallel (8 concurrent):  97.3 s
+        //   sequential  (cap = 1):        71.3 s
+        //
+        // Parallel load is **slower and hotter**. Most likely
+        // ANECompilerService serializes compile work internally; naive
+        // 8-way TaskGroup seeding just adds scheduling pressure and makes
+        // the ANE compile daemon + P-cores all burn at once.
+        //
+        // Default is now sequential (cap = 1). The original unlimited
+        // parallel behavior is preserved as an explicit opt-in via
+        // LLM_LOAD_MAX_PARALLEL=0 for hardware/OS combinations where the
+        // daemon can actually exploit concurrency.
+        //
+        // LLM_LOAD_MAX_PARALLEL semantics:
+        //   unset   → cap = 1 (sequential, default)
+        //   = 0     → unlimited concurrency (legacy fast-burn behavior)
+        //   = N > 0 → cap = N concurrent MIL/ANE compilations
         let hasPrefillFiles = findModel("prefill_chunk1") != nil
         var c1: MLModel!, c2: MLModel!, c3: MLModel!, c4: MLModel!
         var p1: MLModel?, p2: MLModel?, p3: MLModel?, p4: MLModel?
 
+        let loadMaxParallel: Int = {
+            guard let s = ProcessInfo.processInfo.environment["LLM_LOAD_MAX_PARALLEL"] else {
+                return 1   // default: sequential
+            }
+            return Int(s) ?? 1
+        }()
+        if ProcessInfo.processInfo.environment["LLM_LOAD_MAX_PARALLEL"] != nil {
+            print("[Load] LLM_LOAD_MAX_PARALLEL=\(loadMaxParallel) " +
+                  "(override default sequential load)")
+        }
+
+        var chunkWork: [(String, MLModelConfiguration)] = [
+            ("chunk1", mlConfig), ("chunk2", mlConfig),
+            ("chunk3", mlConfig), ("chunk4", mlConfig),
+        ]
+        if hasPrefillFiles {
+            for name in ["prefill_chunk1", "prefill_chunk2",
+                         "prefill_chunk3", "prefill_chunk4"] {
+                chunkWork.append((name, prefillConfig))
+            }
+        }
+
         let loadT0 = CFAbsoluteTimeGetCurrent()
         try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
-            for name in ["chunk1", "chunk2", "chunk3", "chunk4"] {
-                group.addTask { (name, try loadOne(name, config: mlConfig)) }
+            let cap = loadMaxParallel > 0
+                ? min(loadMaxParallel, chunkWork.count)
+                : chunkWork.count
+            var idx = 0
+            // Seed the initial wave of up to `cap` compilations.
+            while idx < cap {
+                let (name, cfg) = chunkWork[idx]
+                group.addTask { (name, try loadOne(name, config: cfg)) }
+                idx += 1
             }
-            if hasPrefillFiles {
-                for name in ["prefill_chunk1", "prefill_chunk2", "prefill_chunk3", "prefill_chunk4"] {
-                    group.addTask { (name, try loadOne(name, config: prefillConfig)) }
-                }
-            }
-            for try await (name, model) in group {
+            // Drain completed tasks and refill one-for-one. When
+            // cap == chunkWork.count this is equivalent to the original
+            // all-at-once launch (all tasks seeded, none refilled).
+            while let (name, model) = try await group.next() {
                 switch name {
                 case "chunk1": c1 = model
                 case "chunk2": c2 = model
@@ -278,10 +330,24 @@ final class ChunkedEngine {
                 case "prefill_chunk4": p4 = model
                 default: break
                 }
+                if idx < chunkWork.count {
+                    let (nextName, nextCfg) = chunkWork[idx]
+                    group.addTask {
+                        (nextName, try loadOne(nextName, config: nextCfg))
+                    }
+                    idx += 1
+                }
             }
         }
         let loadDt = CFAbsoluteTimeGetCurrent() - loadT0
-        print("[Load] All \(hasPrefillFiles ? 8 : 4) chunks loaded in \(String(format: "%.1f", loadDt))s (parallel)")
+        let loadMode: String
+        switch loadMaxParallel {
+        case 0:  loadMode = "parallel"
+        case 1:  loadMode = "sequential"
+        default: loadMode = "cap=\(loadMaxParallel)"
+        }
+        print("[Load] All \(hasPrefillFiles ? 8 : 4) chunks loaded in " +
+              "\(String(format: "%.1f", loadDt))s (\(loadMode))")
 
         // Load verify functions from multi-function chunks (if available).
         // Multi-function chunks have a "verify_qK" function alongside the
