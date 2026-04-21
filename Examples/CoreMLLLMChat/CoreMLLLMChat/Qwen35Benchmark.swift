@@ -182,7 +182,7 @@ final class Qwen35Benchmark {
         let loadMs = Date().timeIntervalSince(loadStart) * 1000
         print("[Qwen35Bench] model loaded in \(String(format: "%.0f", loadMs))ms")
 
-        guard oracle != nil else { return }
+        guard let oracle else { return }
 
         status = units == .cpuAndNE
             ? "Warming up (ANE compile, may take 30-90s)..."
