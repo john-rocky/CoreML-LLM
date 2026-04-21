@@ -145,16 +145,13 @@ class StatefulPrefillLinearAttn(nn.Module):
         L3 = -torch.bmm(k_beta3, k3.transpose(-1, -2)) * decay_mask.reshape(BN, CS, CS)
         L3 = torch.where(upper, torch.zeros_like(L3), L3)
 
-        # Forward substitution (see Phase 4b notes)
+        # Clamped Neumann: see the prefill_trace module's comment. Avoids the
+        # cumulative-concat chain that breaks iPhone Core ML CPU runtime.
         eye = self.chunk_eye
-        rows = [eye[0, :].unsqueeze(0).unsqueeze(0).expand(BN, 1, CS)]
-        for i in range(1, CS):
-            prev = torch.cat(rows, dim=1)
-            L_row = L3[:, i:i+1, :i]
-            delta = torch.bmm(L_row, prev)
-            row_i = eye[i, :].unsqueeze(0).unsqueeze(0).expand(BN, 1, CS) + delta
-            rows.append(row_i)
-        attn3 = torch.cat(rows, dim=1)
+        attn3 = eye.expand(BN, CS, CS).contiguous()
+        for _ in range(CS):
+            attn3 = eye + torch.bmm(L3, attn3)
+            attn3 = attn3.clamp(-1e3, 1e3)
 
         value = torch.bmm(attn3, v_beta3).reshape(B, H, NC, CS, Dv)
         k_decay = (k_beta * g.exp().unsqueeze(-1)).reshape(BN, CS, Dk)
