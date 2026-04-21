@@ -113,17 +113,28 @@ final class Qwen35Benchmark {
         meanCos = 0; worstCos = 1.0; top1Rate = 0
         meanPrefillMs = 0; tokensPerSecond = 0
 
+        status = units == .cpuAndNE
+            ? "Loading & compiling ANE graph (first run can take 30-90s for 1.5GB model)..."
+            : "Loading model..."
+        let loadStart = Date()
         do {
             try loadArtifacts()
         } catch {
             status = "Load failed: \(error.localizedDescription)"
             return
         }
+        let loadMs = Date().timeIntervalSince(loadStart) * 1000
+        print("[Qwen35Bench] model loaded in \(String(format: "%.0f", loadMs))ms")
 
         guard let model, let oracle else { return }
 
-        // Warm-up: one dummy predict so first-call overhead doesn't skew timing
-        status = "Warming up..."
+        // Warm-up: one dummy predict so first-call overhead doesn't skew timing.
+        // On ANE, this triggers the graph compile + weight upload; can take
+        // tens of seconds on first launch.
+        status = units == .cpuAndNE
+            ? "Warming up (ANE compile, may take 30-90s)..."
+            : "Warming up..."
+        let warmStart = Date()
         do {
             let warm = try MLMultiArray(shape: [1, NSNumber(value: seqLen)], dataType: .int32)
             for i in 0..<seqLen { warm[[0, NSNumber(value: i)] as [NSNumber]] = 0 }
@@ -133,6 +144,9 @@ final class Qwen35Benchmark {
             status = "Warmup failed: \(error.localizedDescription)"
             return
         }
+        let warmMs = Date().timeIntervalSince(warmStart) * 1000
+        print("[Qwen35Bench] warmup took \(String(format: "%.0f", warmMs))ms")
+        status = "Warmup done (\(Int(warmMs))ms). Starting benchmark..."
 
         var collected: [PromptResult] = []
         var totalMs = 0.0
