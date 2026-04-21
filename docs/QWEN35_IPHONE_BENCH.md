@@ -58,6 +58,31 @@ into the `CoreMLLLMChat` target's file list. Make sure:
   inside the app bundle at build time.
 - For the JSON, it's copied verbatim as a bundle resource.
 
+### Known iOS build blocker (Xcode 17.x)
+
+The CoreMLLLMChat project depends transitively on `Jinja` (via
+`swift-transformers`) which hits a **Swift-compiler explicit-module
+resolution bug** under Xcode 17.2 + iOS SDK 26.1:
+
+```
+Jinja/Sources/Ast.swift:9:8: error: Unable to find module dependency: 'OrderedCollections'
+```
+
+This fails identically whether swift-collections is pinned to 1.4.1 or
+1.1.4, with `xcodebuild` CLI. Workarounds to try, in order:
+
+1. **Open the project in Xcode GUI and build from there** (Product → Run).
+   The GUI sometimes resolves module graphs that the CLI doesn't.
+2. If GUI also fails: temporarily remove the `swift-transformers`
+   dependency from CoreMLLLMChat. The Qwen3.5 benchmark / decode /
+   generator screens do **not** need swift-transformers (they go
+   directly to `CoreML.framework`). Only the Gemma tokenizer uses it.
+3. Or downgrade Xcode to 15.x where this SPM bug does not trigger.
+
+The CLI is not a blocker for this harness — once the issue resolves, the
+three Qwen3.5 screens appear under **Models → Research** and can be
+launched by plugging in the iPhone and pressing ⌘R in Xcode.
+
 ### 4. Build + run on device
 
 1. Connect iPhone 17 Pro via USB (or wireless debugging if paired).
