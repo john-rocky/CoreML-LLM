@@ -156,23 +156,28 @@ class PrefillLinearAttnLayer(nn.Module):
         L3 = -torch.bmm(k_beta3, k3.transpose(-1, -2)) * decay_mask.reshape(BN, CS, CS)
         L3 = torch.where(upper_incl_diag, torch.zeros_like(L3), L3)
 
-        # Solve (I - L) X = I for X = (I - L)^{-1} via row-by-row forward
-        # substitution. X[i,:] = I[i,:] + L[i,:i] @ X[:i,:]. Because L is
-        # strictly lower triangular, each row depends only on earlier rows,
-        # so the iteration is exact (no Neumann truncation) and intermediate
-        # values stay in the same magnitude as the final (I-L)^{-1} entries —
-        # bounded, fp16-safe. Earlier Neumann form produced T_k peaks of
-        # 10^10-10^16 before collapsing back to <20, overflowing fp16 and
-        # poisoning downstream ops with NaN on CPU / silent drift on ANE.
+        # Neumann iteration with fp16-safe clamp: T_{k+1} = clamp(I + L @ T_k).
+        # L is strictly lower triangular so L^CS = 0 and the series terminates
+        # at k=CS-1 with the exact (I - L)^{-1}. Raw Neumann has intermediate
+        # T_k peaks of 10^10-10^16 before collapsing back to <20 (the entries
+        # of the true inverse), overflowing fp16 and poisoning downstream ops
+        # with NaN on CPU / silent drift on ANE. Clamp to ±1e3 bounds the
+        # transient excursion to fp16-safe magnitudes; the math converges
+        # because the final value is well within the clamp range.
+        #
+        # Earlier we used row-by-row forward substitution here, which is also
+        # mathematically safe, but it produces a cumulative-concat chain of
+        # 64 rows × 18 linear_attention layers (~1150 concat ops plus ~2400
+        # slice ops). iPhone A18 Pro Core ML CPU runtime mis-handles this
+        # pattern on iOS 26.1 and returns garbage logits (cos≈0.3, top-1 0%)
+        # even though Mac Core ML on the same mlmodelc gives cos≈1.0. The
+        # clamp-Neumann form stays at ~9900 total ops with no cumulative
+        # concat and works on both platforms.
         eye = self.chunk_eye                                        # (CS, CS)
-        rows = [eye[0, :].unsqueeze(0).unsqueeze(0).expand(BN, 1, CS)]
-        for i in range(1, CS):
-            prev = torch.cat(rows, dim=1)                           # (BN, i, CS)
-            L_row = L3[:, i:i+1, :i]                                # (BN, 1, i)
-            delta = torch.bmm(L_row, prev)                          # (BN, 1, CS)
-            row_i = eye[i, :].unsqueeze(0).unsqueeze(0).expand(BN, 1, CS) + delta
-            rows.append(row_i)
-        attn3 = torch.cat(rows, dim=1)                              # (BN, CS, CS)
+        attn3 = eye.expand(BN, CS, CS).contiguous()
+        for _ in range(CS):
+            attn3 = eye + torch.bmm(L3, attn3)
+            attn3 = attn3.clamp(-1e3, 1e3)
         attn = attn3.reshape(B, H, NC, CS, CS)
 
         # WY products (kept as 3D bmm to stay on ANE)
