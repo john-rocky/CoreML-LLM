@@ -148,19 +148,43 @@ final class Qwen35Benchmark {
         print("[Qwen35Bench] warmup took \(String(format: "%.0f", warmMs))ms")
         status = "Warmup done (\(Int(warmMs))ms). Starting benchmark..."
 
-        // Diagnostic: dump the shape/strides/dtype of the warmup logits so
-        // we can tell whether the runtime is handing us the layout our
-        // slicer assumes.
-        do {
-            let warm = try MLMultiArray(shape: [1, NSNumber(value: seqLen)], dataType: .int32)
-            for i in 0..<seqLen { warm[[0, NSNumber(value: i)] as [NSNumber]] = 0 }
-            let feat = try MLDictionaryFeatureProvider(dictionary: ["input_ids": MLFeatureValue(multiArray: warm)])
-            let w = try await model.prediction(from: feat)
-            if let arr = w.featureValue(for: "logits")?.multiArrayValue {
-                print("[Qwen35Bench] logits shape=\(arr.shape) strides=\(arr.strides) dtype=\(arr.dataType.rawValue) count=\(arr.count)")
+        // Diagnostic: feed the first oracle prompt's real input_ids (not zeros)
+        // so we exercise the exact path the main loop uses, then dump:
+        //   - logits tensor shape / strides / dtype
+        //   - first 5 output logits at last real position
+        //   - first 5 reference logits from oracle
+        //   - argmax of output  vs  oracle top-1
+        // This pinpoints whether the bug is in model output layout, reference
+        // decode, or math.
+        if let rec = oracle.records.first {
+            do {
+                let ids = try MLMultiArray(shape: [1, NSNumber(value: seqLen)], dataType: .int32)
+                let p = ids.dataPointer.assumingMemoryBound(to: Int32.self)
+                for i in 0..<seqLen { p[i] = i < rec.S_real ? rec.input_ids[i] : 0 }
+                let feat = try MLDictionaryFeatureProvider(dictionary: ["input_ids": MLFeatureValue(multiArray: ids)])
+                let w = try await model.prediction(from: feat)
+                if let arr = w.featureValue(for: "logits")?.multiArrayValue {
+                    let dtypeStr = arr.dataType == .float32 ? "f32"
+                                 : arr.dataType == .float16 ? "f16"
+                                 : arr.dataType == .int32   ? "i32" : "?\(arr.dataType.rawValue)"
+                    print("[Qwen35Bench] logits shape=\(arr.shape) strides=\(arr.strides) dtype=\(dtypeStr) count=\(arr.count) S_real=\(rec.S_real)")
+                    let lastPos = rec.S_real - 1
+                    let out = sliceLastPositionLogits(arr, seqLen: seqLen, position: lastPos, vocab: vocabSize)
+                    let refBytes = Data(base64Encoded: rec.last_logits_fp16_b64)!
+                    let ref = fp16ToFloat32(refBytes, count: vocabSize)
+                    let outFirst = (0..<5).map { String(format: "%.4f", out[$0]) }.joined(separator: ",")
+                    let refFirst = (0..<5).map { String(format: "%.4f", ref[$0]) }.joined(separator: ",")
+                    let outMax = out.indices.max(by: { out[$0] < out[$1] }) ?? 0
+                    let refMax = ref.indices.max(by: { ref[$0] < ref[$1] }) ?? 0
+                    print("[Qwen35Bench] out[0..5]=\(outFirst)  argmax=\(outMax) val=\(out[outMax])")
+                    print("[Qwen35Bench] ref[0..5]=\(refFirst)  argmax=\(refMax) val=\(ref[refMax])  oracle_top1=\(rec.top1_id)")
+                    let outMin = out.min() ?? 0, outMaxV = out.max() ?? 0
+                    let refMin = ref.min() ?? 0, refMaxV = ref.max() ?? 0
+                    print("[Qwen35Bench] out range=[\(outMin),\(outMaxV)]  ref range=[\(refMin),\(refMaxV)]")
+                }
+            } catch {
+                print("[Qwen35Bench] diagnostic predict failed: \(error)")
             }
-        } catch {
-            // non-fatal
         }
 
         var collected: [PromptResult] = []
