@@ -87,37 +87,48 @@ final class Qwen35Benchmark {
     // route ANE/All to the chunks (only path that compiles).
     private var usingChunks: Bool { units != .cpuOnly }
 
-    // MARK: - Bundle loading
+    // MARK: - Resource lookup (Documents > Bundle)
+
+    /// Find a model resource. Prefer `<Documents>/<name>.mlmodelc` (hot-swap
+    /// via Finder file sharing, no app reinstall needed), else fall back to
+    /// `<Documents>/<name>.mlpackage` (compile on-device, once), else to the
+    /// bundled resource. Xcode's app-bundle caching makes same-named
+    /// mlpackages sticky across reinstalls; Documents dir avoids that.
+    private func resolveModelURL(_ base: String) throws -> URL {
+        let docs = try FileManager.default.url(
+            for: .documentDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true
+        )
+        let docMLC = docs.appendingPathComponent("\(base).mlmodelc")
+        if FileManager.default.fileExists(atPath: docMLC.path) {
+            print("[Qwen35Bench] loading \(base) from Documents/ (mlmodelc)")
+            return docMLC
+        }
+        let docPkg = docs.appendingPathComponent("\(base).mlpackage")
+        if FileManager.default.fileExists(atPath: docPkg.path) {
+            print("[Qwen35Bench] compiling \(base) from Documents/ (mlpackage)")
+            return try MLModel.compileModel(at: docPkg)
+        }
+        if let bundled = Bundle.main.url(forResource: base, withExtension: "mlmodelc") {
+            print("[Qwen35Bench] loading \(base) from app bundle (mlmodelc)")
+            return bundled
+        }
+        throw NSError(domain: "Qwen35Benchmark", code: 10,
+                      userInfo: [NSLocalizedDescriptionKey:
+                          "\(base) not found in Documents/ or app bundle"])
+    }
 
     func loadArtifacts() throws {
         let cfg = MLModelConfiguration()
         cfg.computeUnits = units.mlComputeUnits
         if usingChunks {
-            guard let aURL = Bundle.main.url(
-                forResource: "qwen3_5_chunk_a", withExtension: "mlmodelc"
-            ) else {
-                throw NSError(domain: "Qwen35Benchmark", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey:
-                                  "qwen3_5_chunk_a.mlmodelc not found"])
-            }
-            guard let bURL = Bundle.main.url(
-                forResource: "qwen3_5_chunk_b", withExtension: "mlmodelc"
-            ) else {
-                throw NSError(domain: "Qwen35Benchmark", code: 2,
-                              userInfo: [NSLocalizedDescriptionKey:
-                                  "qwen3_5_chunk_b.mlmodelc not found"])
-            }
+            let aURL = try resolveModelURL("qwen3_5_chunk_a")
+            let bURL = try resolveModelURL("qwen3_5_chunk_b")
             chunkA = try MLModel(contentsOf: aURL, configuration: cfg)
             chunkB = try MLModel(contentsOf: bURL, configuration: cfg)
             monolith = nil
         } else {
-            guard let mlcURL = Bundle.main.url(
-                forResource: "qwen3_5_0_8b_fp16_seq64", withExtension: "mlmodelc"
-            ) else {
-                throw NSError(domain: "Qwen35Benchmark", code: 6,
-                              userInfo: [NSLocalizedDescriptionKey:
-                                  "qwen3_5_0_8b_fp16_seq64.mlmodelc not found"])
-            }
+            let mlcURL = try resolveModelURL("qwen3_5_0_8b_fp16_seq64")
             monolith = try MLModel(contentsOf: mlcURL, configuration: cfg)
             chunkA = nil; chunkB = nil
         }
