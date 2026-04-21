@@ -412,6 +412,35 @@ public final class CoreMLLLM: @unchecked Sendable {
             }
         }
 
+        // Final prewarm — re-warm decode + verify paths after all auxiliary
+        // models (EAGLE-3 draft/fusion, cross-vocab Qwen, etc.) have loaded.
+        // Those loads can evict the early ANE cache set up during
+        // ChunkedEngine.load, leaving the first user decode ~50ms slower
+        // per step and the first spec burst ~100ms slower.
+        if let engine = llm.chunkedEngine {
+            do {
+                try engine.finalPrewarm()
+            } catch {
+                print("[Load] final prewarm skipped: \(error)")
+            }
+        }
+
+        // Also warm the EAGLE-3 draft + fusion mlpackages if loaded —
+        // one dry forward through each so the first user burst doesn't
+        // eat the ANE compile cost for these two graphs.
+        if let sl = llm.speculativeLoop, let engine = llm.chunkedEngine {
+            do {
+                _ = try sl.drawBurst(
+                    target: engine,
+                    tTokNext: 0,
+                    tokenEmbed: { try engine.embedToken($0) })
+                engine.reset()
+                print("[Load] EAGLE-3 draft+fusion prewarm done")
+            } catch {
+                print("[Load] EAGLE-3 prewarm skipped: \(error)")
+            }
+        }
+
         onProgress?("Ready")
         return llm
     }

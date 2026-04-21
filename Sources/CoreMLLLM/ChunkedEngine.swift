@@ -524,11 +524,15 @@ final class ChunkedEngine {
             vFull2:    ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx),
             config: config, prefillN: prefillN)
 
-        // ANE pipeline prewarm (Phase 0b): four dummy decode steps at load
-        // time force the ANE compiler to finalize dispatch schedules and
-        // resident weight layouts before the first user token arrives —
-        // eliminating the ~0.5-1.5s first-token stall. KV cache is reset
-        // afterwards so the dummy tokens leave no state behind.
+        // ANE pipeline prewarm (Phase 0b): dummy decode steps at load time
+        // force the ANE compiler to finalize dispatch schedules and resident
+        // weight layouts before the first user token arrives. KV cache is
+        // reset afterwards so the dummy tokens leave no state behind.
+        //
+        // NOTE: this is the EARLY prewarm. After this returns, CoreMLLLM.load
+        // may load additional models (EAGLE-3 draft/fusion, cross-vocab Qwen,
+        // etc.) which can evict this ANE cache — call engine.finalPrewarm()
+        // at end of full load to re-warm decode + verify paths.
         let warmT0 = CFAbsoluteTimeGetCurrent()
         for i in 0..<4 {
             _ = try engine.predictStep(tokenID: 0, position: i)
@@ -537,6 +541,30 @@ final class ChunkedEngine {
         print("[Load] ANE prewarm (4 steps) done in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - warmT0))s")
 
         return engine
+    }
+
+    /// Final prewarm after ALL auxiliary models (EAGLE-3 draft/fusion,
+    /// cross-vocab Qwen, etc.) have loaded — those loads can evict the
+    /// decode chunks' ANE cache, causing the first user prompt to see
+    /// ~50ms extra per decode step (observed on iPhone 17 Pro).
+    /// Call once from CoreMLLLM.load after everything is loaded.
+    public func finalPrewarm() throws {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        // 8 T=1 decode steps (double the early prewarm) so ANE has more
+        // dispatch samples to stabilize.
+        for i in 0..<8 {
+            _ = try predictStep(tokenID: 0, position: i)
+        }
+        // Warm verify path too — verify_qK is a separate compiled graph
+        // that predictStep never touches, so first verifyCandidates is
+        // otherwise a cold ANE hit (~100ms extra on first spec burst).
+        if hasVerify {
+            let dummy: [Int32] = Array(repeating: 0, count: verifyK)
+            _ = try? verifyCandidates(tokens: dummy, startPosition: 0)
+        }
+        reset()
+        let dt = CFAbsoluteTimeGetCurrent() - t0
+        print("[Load] Final prewarm (8 decode + verify) done in \(String(format: "%.2f", dt))s")
     }
 
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
