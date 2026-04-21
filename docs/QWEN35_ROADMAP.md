@@ -95,6 +95,42 @@ Parity cos ≥ 0.999999 vs HF reference at seq=64/128/256.
 
 Implication: **the SSM-on-ANE question is fully answered. Both hot paths (decode + prefill) run ≥99% on ANE.**
 
+## Phase 3a result (2026-04-21) — full_attention layer
+
+`conversion/test_qwen3_5_full_attention_trace.py` converts a single
+`Qwen3_5Attention` (output gate + q_norm/k_norm + partial RoPE on first 64 of
+256 head dims, rope_theta=10M, text-only position_ids collapsing MRoPE to
+plain RoPE). Parity cos = 1.000 vs HF at seq=64/128/256. MLComputePlan audit
+at seq=64/256/2048: **64/64 compute ops on ANE (100%)** — softmax, sigmoid,
+linear, matmul, RMSNorm (pow/rsqrt/mean), reshape, transpose, slice, concat,
+split, expand_dims — every one resident.
+
+Trace gotchas resolved:
+- Replace shape-unpacking `B, S, H = x.shape` with fixed `self.S` to avoid
+  coremltools' aten::Int cast trap.
+- Causal mask is a precomputed buffer, not `torch.triu` inside forward.
+- Drop `tensor.dtype` reads and `.to(dtype)` calls inside forward.
+
+## Phase 3b result (2026-04-21) — 4-layer integration
+
+`conversion/test_qwen3_5_stack_trace.py` stacks 3 linear_attention + 1
+full_attention decoder layers (matching the Qwen3.5-0.8B pattern for layers
+0..3), each wrapped with `Qwen3_5RMSNorm`, residuals, and a SwiGLU MLP.
+
+- Parity cos = 1.000003 vs HF end-to-end (layer0 input → layer3 output)
+- CoreML conversion: 167.6 MB mlpackage at seq=64
+- MLComputePlan: **800/803 compute ops on ANE = 99.63%**
+- Only CPU ops: 3 × `cumsum` (one per linear_attention layer, as expected)
+
+Op mix on ANE: 225 add, 215 matmul, 74 mul, 63 reshape, 33 transpose,
+31 linear, 19 pow, 19 rsqrt, 13 reduce_mean, 10 silu, 9 exp, 6 reduce_sum,
+6 sub, 4 sigmoid, 4 concat, 3 conv, 3 softplus, 1 softmax — the full
+Qwen3.5 op inventory runs ANE-native.
+
+**Implication:** scaling to 24 layers + embed + final norm + lm_head is
+applied engineering — no further research unknowns. INT4 palettization, HF
+upload, and Swift/iOS wire-up are Phase 4.
+
 ## Phased plan
 
 ### Phase 0 — ANE primitive probe (blocked on eagle3 freeing ANE)
