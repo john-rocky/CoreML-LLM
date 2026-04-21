@@ -31,27 +31,19 @@ SEQ_LEN = 64
 
 
 class RMSNorm(nn.Module):
-    """Qwen3_5RMSNorm using the ANE-friendly [x, -x] concat + LayerNorm identity.
-    The concat has zero mean, so LayerNorm over 2H equals RMSNorm over H. ANE
-    has no rsqrt kernel but a highly-optimized LayerNorm kernel, so this
-    swap is pure upside on ANE with no op-count bloat (pow+rsqrt → concat+
-    layer_norm+chunk is the same graph depth). See conversion/ane_ops.py for
-    the Gemma 4 precedent."""
+    """Qwen3_5RMSNorm: (x * rsqrt(mean(x²) + eps)) * (1 + w). Weights initialized at ~0."""
     def __init__(self, hidden_size, eps, weight):
         super().__init__()
-        self.eps = float(eps)
-        self.hidden = hidden_size
-        # Pre-fold Qwen3_5's (1 + w) scale so the forward has a single multiply.
-        self.w = nn.Parameter((1.0 + weight.detach().clone()), requires_grad=False)
+        self.eps = eps
+        self.w = nn.Parameter(weight.detach().clone(), requires_grad=False)
 
     def forward(self, x):
-        doubled = torch.cat([x, -x], dim=-1)
-        normed = F.layer_norm(
-            doubled, normalized_shape=(2 * self.hidden,),
-            weight=None, bias=None, eps=self.eps,
-        )
-        normed, _ = torch.chunk(normed, 2, dim=-1)
-        return normed * self.w
+        in_dtype = x.dtype
+        x = x.float()
+        var = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.eps)
+        x = x * (1.0 + self.w.float())
+        return x.to(in_dtype)
 
 
 class MLP(nn.Module):
