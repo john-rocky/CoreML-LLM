@@ -8,6 +8,10 @@
 
 /* Begin PBXBuildFile section */
 		1A4D424E863ADC4ABC353497 /* qwen3_5_0_8b_fp16_seq64.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = 851443F2BBA6DCE16671F9ED /* qwen3_5_0_8b_fp16_seq64.mlpackage */; };
+		A62772C1BCA94C759F3BB958 /* qwen3_5_chunk_a.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = CED87CC5BDD1478D94EFC93F /* qwen3_5_chunk_a.mlpackage */; };
+		6B0CA96CEF724055A34F1464 /* qwen3_5_chunk_b.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = CE1F23FB41B44A0F94B200DB /* qwen3_5_chunk_b.mlpackage */; };
+		CED87CC5BDD1478D94EFC93F /* qwen3_5_chunk_a.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; name = qwen3_5_chunk_a.mlpackage; path = CoreMLLLMChat/qwen3_5_chunk_a.mlpackage; sourceTree = SOURCE_ROOT; };
+		CE1F23FB41B44A0F94B200DB /* qwen3_5_chunk_b.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; name = qwen3_5_chunk_b.mlpackage; path = CoreMLLLMChat/qwen3_5_chunk_b.mlpackage; sourceTree = SOURCE_ROOT; };
 		32404BC1AC91219654BB4034 /* Qwen35GeneratorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */; };
 		370C4C3589D85D9148AED4C9 /* Qwen35BenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8714748BF0A5E81B6E3499A /* Qwen35BenchmarkView.swift */; };
 		3D7B40A686C6B3EA9089FC5A /* Qwen35Generator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */; };
@@ -69,6 +73,8 @@
 				B5000002,
 				B5000003,
 				851443F2BBA6DCE16671F9ED /* qwen3_5_0_8b_fp16_seq64.mlpackage */,
+				CED87CC5BDD1478D94EFC93F /* qwen3_5_chunk_a.mlpackage */,
+				CE1F23FB41B44A0F94B200DB /* qwen3_5_chunk_b.mlpackage */,
 				B14B4DB0BA129FF2001C58F5 /* qwen3_5_0_8b_prefill_stateful_fp16_seq64.mlpackage */,
 				04014C52A374DE9E3B880786 /* qwen3_5_0_8b_decode_fp16_mseq128.mlpackage */,
 				96644CCA8CDD9D651ACBD01D /* qwen3_5_oracle_ios.json */,
@@ -167,6 +173,8 @@
 			files = (
 				B1000007,
 				1A4D424E863ADC4ABC353497 /* qwen3_5_0_8b_fp16_seq64.mlpackage in Resources */,
+				A62772C1BCA94C759F3BB958 /* qwen3_5_chunk_a.mlpackage in Resources */,
+				6B0CA96CEF724055A34F1464 /* qwen3_5_chunk_b.mlpackage in Resources */,
 				EA8F4D61A0F517EFB59D74EE /* qwen3_5_0_8b_prefill_stateful_fp16_seq64.mlpackage in Resources */,
 				755341D192E6CA33A7DA0857 /* qwen3_5_0_8b_decode_fp16_mseq128.mlpackage in Resources */,
 				72EA4F4B993C82EAA1F18FF1 /* qwen3_5_oracle_ios.json in Resources */,

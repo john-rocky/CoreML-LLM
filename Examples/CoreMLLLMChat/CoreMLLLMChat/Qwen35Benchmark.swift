@@ -67,31 +67,44 @@ final class Qwen35Benchmark {
     var tokensPerSecond: Double = 0
     var units: UnitsChoice = .cpuAndNE
 
-    private var model: MLModel?
+    private var chunkA: MLModel?
+    private var chunkB: MLModel?
     private var oracle: Oracle?
     private var vocabSize: Int = 248320
     private var seqLen: Int = 64
+    private var hiddenSize: Int = 1024
 
     // MARK: - Bundle loading
 
     func loadArtifacts() throws {
-        // Model
-        guard let mlcURL = Bundle.main.url(
-            forResource: "qwen3_5_0_8b_fp16_seq64", withExtension: "mlmodelc"
+        // Load chunked prefill: chunk_a (embed + layers 0-11) -> hidden
+        //                      chunk_b (layers 12-23 + lm_head) -> logits
+        // Chunking is Gemma 4's workaround for iOS 26.1 Core ML compiler
+        // limits (can't fit a 24-layer single-graph mlpackage on ANE).
+        guard let aURL = Bundle.main.url(
+            forResource: "qwen3_5_chunk_a", withExtension: "mlmodelc"
         ) else {
             throw NSError(domain: "Qwen35Benchmark", code: 1,
                           userInfo: [NSLocalizedDescriptionKey:
-                              "qwen3_5_0_8b_fp16_seq64.mlmodelc not found in app bundle"])
+                              "qwen3_5_chunk_a.mlmodelc not found in app bundle"])
+        }
+        guard let bURL = Bundle.main.url(
+            forResource: "qwen3_5_chunk_b", withExtension: "mlmodelc"
+        ) else {
+            throw NSError(domain: "Qwen35Benchmark", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey:
+                              "qwen3_5_chunk_b.mlmodelc not found in app bundle"])
         }
         let cfg = MLModelConfiguration()
         cfg.computeUnits = units.mlComputeUnits
-        model = try MLModel(contentsOf: mlcURL, configuration: cfg)
+        chunkA = try MLModel(contentsOf: aURL, configuration: cfg)
+        chunkB = try MLModel(contentsOf: bURL, configuration: cfg)
 
         // Oracle JSON
         guard let jsonURL = Bundle.main.url(
             forResource: "qwen3_5_oracle_ios", withExtension: "json"
         ) else {
-            throw NSError(domain: "Qwen35Benchmark", code: 2,
+            throw NSError(domain: "Qwen35Benchmark", code: 3,
                           userInfo: [NSLocalizedDescriptionKey:
                               "qwen3_5_oracle_ios.json not found in app bundle"])
         }
@@ -126,20 +139,26 @@ final class Qwen35Benchmark {
         let loadMs = Date().timeIntervalSince(loadStart) * 1000
         print("[Qwen35Bench] model loaded in \(String(format: "%.0f", loadMs))ms")
 
-        guard let model, let oracle else { return }
+        guard let chunkA, let chunkB, let oracle else { return }
 
-        // Warm-up: one dummy predict so first-call overhead doesn't skew timing.
-        // On ANE, this triggers the graph compile + weight upload; can take
-        // tens of seconds on first launch.
+        // Warm-up: run both chunks once so first-call overhead (ANE compile
+        // + weight upload) doesn't skew timing. With chunked prefill, both
+        // graphs need to be warmed up.
         status = units == .cpuAndNE
-            ? "Warming up (ANE compile, may take 30-90s)..."
+            ? "Warming up (ANE compile for both chunks, may take 30-90s)..."
             : "Warming up..."
         let warmStart = Date()
         do {
             let warm = try MLMultiArray(shape: [1, NSNumber(value: seqLen)], dataType: .int32)
             for i in 0..<seqLen { warm[[0, NSNumber(value: i)] as [NSNumber]] = 0 }
             let feat = try MLDictionaryFeatureProvider(dictionary: ["input_ids": MLFeatureValue(multiArray: warm)])
-            _ = try await model.prediction(from: feat)
+            let aOut = try await chunkA.prediction(from: feat)
+            guard let hidden = aOut.featureValue(for: "hidden")?.multiArrayValue else {
+                throw NSError(domain: "Qwen35Benchmark", code: 4,
+                              userInfo: [NSLocalizedDescriptionKey: "chunk_a output 'hidden' missing"])
+            }
+            let bFeat = try MLDictionaryFeatureProvider(dictionary: ["hidden_in": MLFeatureValue(multiArray: hidden)])
+            _ = try await chunkB.prediction(from: bFeat)
         } catch {
             status = "Warmup failed: \(error.localizedDescription)"
             return
@@ -162,7 +181,14 @@ final class Qwen35Benchmark {
                 let p = ids.dataPointer.assumingMemoryBound(to: Int32.self)
                 for i in 0..<seqLen { p[i] = i < rec.S_real ? rec.input_ids[i] : 0 }
                 let feat = try MLDictionaryFeatureProvider(dictionary: ["input_ids": MLFeatureValue(multiArray: ids)])
-                let w = try await model.prediction(from: feat)
+                let aOut = try await chunkA.prediction(from: feat)
+                guard let hidden = aOut.featureValue(for: "hidden")?.multiArrayValue else {
+                    print("[Qwen35Bench] diagnostic: chunk_a output 'hidden' missing")
+                    throw NSError(domain: "Qwen35Benchmark", code: 5,
+                                  userInfo: [NSLocalizedDescriptionKey: "missing hidden"])
+                }
+                let bFeat = try MLDictionaryFeatureProvider(dictionary: ["hidden_in": MLFeatureValue(multiArray: hidden)])
+                let w = try await chunkB.prediction(from: bFeat)
                 if let arr = w.featureValue(for: "logits")?.multiArrayValue {
                     let dtypeStr = arr.dataType == .float32 ? "f32"
                                  : arr.dataType == .float16 ? "f16"
@@ -213,11 +239,18 @@ final class Qwen35Benchmark {
                 return
             }
 
-            // Time a single prediction
+            // Time a chunked prediction: chunk_a -> hidden -> chunk_b -> logits.
             let t0 = Date()
             let out: MLFeatureProvider
             do {
-                out = try await model.prediction(from: feat)
+                let aOut = try await chunkA.prediction(from: feat)
+                guard let hidden = aOut.featureValue(for: "hidden")?.multiArrayValue else {
+                    status = "chunk_a missing 'hidden'"; return
+                }
+                let bFeat = try MLDictionaryFeatureProvider(dictionary: [
+                    "hidden_in": MLFeatureValue(multiArray: hidden)
+                ])
+                out = try await chunkB.prediction(from: bFeat)
             } catch {
                 status = "Predict failed: \(error.localizedDescription)"
                 return
