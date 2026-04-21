@@ -11,9 +11,70 @@ pip install scikit-learn  # for int4 quantization
 # Qwen2.5-0.5B
 python convert.py --model qwen2.5-0.5b --context-length 2048 --output ./output/qwen2.5-0.5b
 
-# Gemma 4 E2B (multimodal text decoder)
+# Gemma 4 E2B (monolithic decoder — not the SWA-chunked shipping layout)
 python convert.py --model gemma4-e2b --context-length 512 --output ./output/gemma4-e2b
 ```
+
+### Gemma 4 E2B / E4B — chunked SWA layout (what the iPhone app loads)
+
+The runtime in `Sources/CoreMLLLM/ChunkedEngine.swift` expects the 4-chunk
+SWA layout. Use `build_verify_chunks.py` for both variants — it auto-downloads
+the HF weights and writes `chunk{1..4}.mlpackage` (each containing both
+`decode_q1` and `verify_qK` functions):
+
+```bash
+# E2B — original shipping model (ctx=512 default via registry; override as needed)
+python build_verify_chunks.py --model gemma4-e2b --ctx 2048
+
+# E4B — 42 layers, hidden=2560, 2 KV heads, KV producers L22/L23
+python build_verify_chunks.py --model gemma4-e4b --ctx 2048
+```
+
+### One-shot on-device bundle (for the CoreMLLLMChat Example app)
+
+`build_verify_chunks.py` alone produces only the 4 `.mlpackage` files. The
+iPhone runtime also needs INT8 embeddings, PLE, RoPE tables, a
+`model_config.json`, tokenizer files, and `.mlmodelc`-compiled chunks. Use
+`build_gemma4_bundle.py` to produce the complete on-device directory in one
+step (internally it invokes `build_verify_chunks.py`, compiles `.mlpackage`
+→ `.mlmodelc` via the MLModel text-MIL recipe, INT8-quantizes the embedding
+and PLE tables, and writes the config):
+
+```bash
+python conversion/build_gemma4_bundle.py --model gemma4-e4b --ctx 2048
+# → output/gemma4-e4b/bundle/ ready for USB sideload
+```
+
+Then sideload to the app (see `docs/USB_MODEL_SIDELOAD.md`):
+
+```bash
+DEVICE=$(xcrun devicectl list devices | awk '/connected/{print $3}' | head -1)
+xcrun devicectl device copy to \
+    --device "$DEVICE" \
+    --domain-type appDataContainer \
+    --domain-identifier com.example.CoreMLLLMChat \
+    --source ./output/gemma4-e4b/bundle \
+    --destination Documents/Models/gemma4-e4b \
+    --remove-existing-content true
+```
+
+`ModelInfo.gemma4e4b` is already registered in
+`Sources/CoreMLLLM/ModelDownloader.swift` with `downloadURL=""` and
+`folderName: "gemma4-e4b"`. Once the sideloaded folder is at
+`Documents/Models/gemma4-e4b/`, the downloader's `isDownloaded` check
+(`:152`) returns true and the app's picker will surface it — no download is
+attempted because the folder already exists.
+
+Chunk boundaries are derived from `compute_chunk_boundaries(config)` in
+`conversion/models/gemma4_swa_chunks.py`:
+- E2B: L0–7 / L8–14 / L15–24 / L25–34 (preserves the original hand-tuned split)
+- E4B: L0–11 / L12–23 / L24–32 / L33–41
+
+The Swift runtime's `kv13_*`/`kv14_*` feature names are preserved as opaque
+aliases for the sliding/full producer outputs — no Swift edit is needed when
+swapping E2B for E4B, as long as `model_config.json` carries the right dims
+(`num_hidden_layers`, `hidden_size`, `num_key_value_heads`, `sliding_window`,
+`per_layer_dim`).
 
 ## Supported Models
 
@@ -21,7 +82,8 @@ python convert.py --model gemma4-e2b --context-length 512 --output ./output/gemm
 |-------|-------------|---------|---------|-------|
 | Qwen2.5-0.5B | qwen2 | Qwen/Qwen2.5-0.5B-Instruct | 2048 | Simplest, good for validation |
 | Qwen2.5-1.5B | qwen2 | Qwen/Qwen2.5-1.5B-Instruct | 2048 | Better quality |
-| Gemma 4 E2B | gemma4 | google/gemma-4-E2B-it | 512 | Complex, multimodal text decoder |
+| Gemma 4 E2B | gemma4 | google/gemma-4-E2B-it | 512 | 35 layers, hidden=1536, 1 KV head, KV producers L13/L14 |
+| Gemma 4 E4B | gemma4 | google/gemma-4-E4B-it | 2048 | 42 layers, hidden=2560, 2 KV heads, KV producers L22/L23 |
 
 ## Adding a New Model
 

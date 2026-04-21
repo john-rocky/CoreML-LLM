@@ -104,6 +104,22 @@ class Gemma4Config:
             return self.intermediate_size * 2
         return self.intermediate_size
 
+    @property
+    def kv_sliding_producer(self) -> int:
+        """Last non-shared sliding_attention layer; its KV is read by all shared sliding layers."""
+        for i in range(self.num_hidden_layers - 1, -1, -1):
+            if not self.is_kv_shared(i) and self.layer_types[i] == "sliding_attention":
+                return i
+        raise ValueError("No non-shared sliding_attention layer found")
+
+    @property
+    def kv_full_producer(self) -> int:
+        """Last non-shared full_attention layer; its KV is read by all shared full layers."""
+        for i in range(self.num_hidden_layers - 1, -1, -1):
+            if not self.is_kv_shared(i) and self.layer_types[i] == "full_attention":
+                return i
+        raise ValueError("No non-shared full_attention layer found")
+
 
 class Gemma4Model(nn.Module):
     """Gemma 4 E2B text decoder with ANE-optimized layers."""
@@ -142,6 +158,7 @@ class Gemma4Model(nn.Module):
                 eps=config.rms_norm_eps,
                 is_full_attention=is_full,
                 has_bias=config.attention_bias,
+                per_layer_dim=config.hidden_size_per_layer_input,
             )
             self.layers.append(layer)
 
@@ -367,6 +384,7 @@ class Gemma4DecoderLayer(nn.Module):
         eps: float,
         is_full_attention: bool,
         has_bias: bool,
+        per_layer_dim: int = 256,
     ):
         super().__init__()
         self.is_full_attention = is_full_attention
@@ -408,9 +426,7 @@ class Gemma4DecoderLayer(nn.Module):
         # Layer scalar (learnable scaling factor)
         self.layer_scalar = nn.Parameter(torch.ones(1))
 
-        # Per-layer input processing
-        per_layer_dim = 256  # hidden_size_per_layer_input
-        # Use Conv2d for ANE efficiency (3x throughput vs Linear on ANE)
+        # Per-layer input processing (Conv2d for ANE efficiency — 3x throughput vs Linear)
         self.per_layer_input_gate = nn.Conv2d(hidden_size, per_layer_dim, 1, bias=False, dtype=MODEL_DTYPE)
         self.per_layer_projection = nn.Conv2d(per_layer_dim, hidden_size, 1, bias=False, dtype=MODEL_DTYPE)
         self.post_per_layer_input_norm = ANERMSNorm(hidden_size, eps=eps)

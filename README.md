@@ -1,31 +1,58 @@
 # CoreML-LLM
 
-**On-device LLMs on Apple Neural Engine** — Run **Gemma 4** on iPhone with CoreML, ANE-optimized, no server.
+**On-device LLMs on Apple Neural Engine** — Run **Gemma 4 E2B / E4B** on iPhone with CoreML, ANE-optimized, no server.
 
 CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a good fit for always-on, battery-friendly inference. [MLX Swift](https://github.com/ml-explore/mlx-swift) is the best choice when you want maximum throughput from the GPU; CoreML-LLM is the answer when you want the LLM to live on the ANE so the GPU stays free.
 
-> **v0.7.0** — Video multimodal: native video vision encoder (64 tokens/frame), uniform frame sampling with per-frame thumbnails, `<|video|>` placeholder + bidirectional vision group attention. See [What's new](#whats-new).
+> **v0.8.0** — **Gemma 4 E4B** (42 layers, hidden=2560, ~14 tok/s on iPhone 17 Pro, 100% ANE). Second model option alongside E2B; swap in the Models picker. See [What's new](#whats-new).
+> **v0.7.0** — Video multimodal: native video vision encoder (64 tokens/frame), uniform frame sampling with per-frame thumbnails, `<|video|>` placeholder + bidirectional vision group attention.
 
-| Text | Image | Audio (v0.6) | Video (v0.7) |
-|------|-------|--------------|--------------|
-| ![text](https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a) | ![multimodal](https://github.com/user-attachments/assets/2a869bf5-8315-422d-8b06-a4a7edecd173) | <video src="https://github.com/user-attachments/assets/e8deb6d0-d8b0-4210-885c-5d7a7ddc7ad3" controls></video> | ![video](https://github.com/user-attachments/assets/1d2a9ff3-2912-40e9-895d-fbaa3c73ee3a) |
+<table>
+  <tr>
+    <td align="center" width="50%"><b>Text (E2B)</b><br><img src="https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a" width="100%"></td>
+    <td align="center" width="50%"><b>Text (E4B, v0.8)</b><br><img src="https://github.com/user-attachments/assets/5d514739-8538-4048-bfce-78605de64e83" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Image</b><br><img src="https://github.com/user-attachments/assets/2a869bf5-8315-422d-8b06-a4a7edecd173" width="100%"></td>
+    <td align="center"><b>Video (v0.7)</b><br><img src="https://github.com/user-attachments/assets/1d2a9ff3-2912-40e9-895d-fbaa3c73ee3a" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2"><b>Audio (v0.6)</b><br><video src="https://github.com/user-attachments/assets/e8deb6d0-d8b0-4210-885c-5d7a7ddc7ad3" controls></video></td>
+  </tr>
+</table>
 
-## Performance (Gemma 4 E2B, iPhone 17 Pro)
+## Performance (iPhone 17 Pro)
 
-| | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | v0.5.0 | v0.6.2 | **v0.7.0** |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Context length | 512 | 2048 | 2048 | 2048 | 2048 | 2048 | **2048** |
-| Decode speed | ~11 tok/s | ~11 tok/s | ~28 tok/s | ~28 tok/s | ~31 tok/s | ~31 tok/s | **~31 tok/s** |
-| Prefill | ~11 tok/s | ~175 tok/s | ~96 tok/s | ~96 tok/s | ~154 tok/s | ~154 tok/s | **~154 tok/s** |
-| Multimodal (image) | — | — | broken | working | working | working | **working** |
-| Multimodal (audio) | — | — | — | — | — | working | **working** |
-| Multimodal (video) | — | — | — | — | — | — | **working** |
-| ANE placement | — | — | 99.78% | 99.78% | 99.78% | 99.78% | **99.78%** |
-| Memory (`phys_footprint`) | — | — | — | ~1 GB | ~1 GB | ~1 GB | **~1 GB** |
+### Gemma 4 E2B (shipping)
 
-Context length is 2048. Extended context (8K) is under active development (see `docs/SPEED_8K.md` for the roadmap) but not yet stable for shipping: 8K chunk conversion and the inference path are still in flight. The shipped model on HuggingFace is ctx=2048.
+| | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | v0.5.0 | v0.6.2 | v0.7.0 | **v0.8.0** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Context length | 512 | 2048 | 2048 | 2048 | 2048 | 2048 | 2048 | **2048** |
+| Decode speed | ~11 tok/s | ~11 tok/s | ~28 tok/s | ~28 tok/s | ~31 tok/s | ~31 tok/s | ~31 tok/s | **~31 tok/s** |
+| Prefill | ~11 tok/s | ~175 tok/s | ~96 tok/s | ~96 tok/s | ~154 tok/s | ~154 tok/s | ~154 tok/s | **~154 tok/s** |
+| Multimodal (image) | — | — | broken | working | working | working | working | **working** |
+| Multimodal (audio) | — | — | — | — | — | working | working | **working** |
+| Multimodal (video) | — | — | — | — | — | — | working | **working** |
+| ANE placement | — | — | 99.78% | 99.78% | 99.78% | 99.78% | 99.78% | **99.78%** |
+| Memory (`phys_footprint`) | — | — | — | ~1 GB | ~1 GB | ~1 GB | ~1 GB | **~1 GB** |
 
-Ground-truth ANE placement measured via `MLComputePlan` (7,294 / 7,310 dispatched LLM ops on ANE). Vision encoder runs on GPU by design.
+### Gemma 4 E4B (v0.8.0, new)
+
+| | E2B | **E4B** |
+|---|---:|---:|
+| Parameters | ~2B effective | **~4B effective** |
+| num_hidden_layers | 35 | **42** |
+| hidden_size | 1536 | **2560** |
+| num_key_value_heads | 1 | **2** |
+| Context length | 2048 | **2048** |
+| Decode speed | ~31 tok/s | **~14 tok/s** |
+| Per-step latency | ~32 ms | **~71 ms** |
+| ANE placement | 99.78% | **100%** |
+| Bundle size (INT4) | 3.1 GB | **5.5 GB** |
+
+Context length is 2048 on both variants. Extended context (8K) is under active development (see `docs/SPEED_8K.md` for the roadmap) but not yet stable for shipping: 8K chunk conversion and the inference path are still in flight. The shipped model on HuggingFace is ctx=2048.
+
+Ground-truth ANE placement measured via `MLComputePlan` (E2B: 7,294 / 7,310 dispatched LLM ops on ANE; E4B: 100%). Vision encoder runs on GPU by design.
 
 > **Memory:** ~1 GB `phys_footprint` (the iOS jetsam basis), measured via `task_vm_info`. Previous versions of this README quoted ~250 MB from Xcode's memory gauge, which underreports when CoreML loads INT4 palettized weights. The actual number is ~873 MB after load, ~981 MB during inference. `os_proc_available` remains ~5 GB on iPhone 17 Pro (8 GB RAM).
 
@@ -34,6 +61,7 @@ Ground-truth ANE placement measured via `MLComputePlan` (7,294 / 7,310 dispatche
 | Model | Size | Multimodal | Download |
 |-------|------|------------|----------|
 | **Gemma 4 E2B** | 3.1 GB | Image + Video + Audio + Text | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
+| **Gemma 4 E4B** (new, v0.8.0) | 5.5 GB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml) |
 | Qwen2.5-0.5B | 302 MB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen2.5-0.5b-coreml) |
 
 The iOS sample app downloads models automatically. You can also convert your own.
@@ -138,13 +166,26 @@ python convert.py --model qwen2.5-0.5b --output ./output/qwen2.5-0.5b
 # Gemma 4 E2B (~15 min, 10 GB download)
 python convert.py --model gemma4-e2b --output ./output/gemma4-e2b
 
+# Gemma 4 E4B — one-shot bundle builder (chunks + embeds + PLE + RoPE +
+# tokenizer + model_config.json, ready for USB sideload or HF upload)
+python build_gemma4_bundle.py --model gemma4-e4b --ctx 2048
+
 # List available models
 python convert.py --list
 ```
 
 ## What's new
 
-Current release: **v0.7.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases/tag/v0.7.0)).
+Current release: **v0.8.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases/tag/v0.8.0)).
+
+### v0.8.0 — Gemma 4 E4B
+
+- **Gemma 4 E4B** — 42 layers, hidden=2560, 2 KV heads, text-only decoder. ~14 tok/s at INT4 on iPhone 17 Pro with 100% ANE placement. Second shipping model alongside E2B; switch between them in the Models picker. Bundle published at [`mlboydaisuke/gemma-4-E4B-coreml`](https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml).
+- **Generalized Gemma 4 conversion pipeline** — chunk boundaries and KV-producer layer indices are derived from the HF model config (`kv_sliding_producer` / `kv_full_producer` computed from `layer_types` + `num_kv_shared_layers`). Adding future Gemma 4 variants is now a registry entry away.
+- **One-shot bundle builder** — `python conversion/build_gemma4_bundle.py --model gemma4-e4b --ctx 2048` produces a complete ready-to-ship directory (chunks + compiled `.mlmodelc` + INT8 embeds + INT8 PLE + RoPE + tokenizer + `model_config.json`).
+- **Dynamic KV cache shapes in Swift** — `ChunkedEngine` reads `(slots, num_kv_heads)` from each chunk's `K_sliding_in` / `K_full_in` input description. Preserves E2B's (7/1, 5/2, nkv=1) exactly; enables E4B's (10/2, 10/2, nkv=2) with zero chunk-specific code.
+- **Safer model switching** — `LLMRunner.loadModel` now releases the previous model before allocating the new one, avoiding a ~8 GB double-buffer peak during E2B ↔ E4B swaps.
+- **Self-healing downloader** — skips prefill weight-sharing when prefill metadata wasn't part of the fetched file list; the engine cleans up zero-metadata `prefill_chunk*.mlmodelc` directories on launch.
 
 ### v0.7.0 — Video multimodal
 

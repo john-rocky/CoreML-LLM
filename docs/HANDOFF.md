@@ -97,6 +97,34 @@ PR #84 (video placeholder token fix) is OPEN. Phase 2 native encoder
 conversion is documented in `docs/VIDEO_PHASE2_CONTINUATION.md` but
 not started.
 
+### CPU/thermal — investigation closed (2026-04-18)
+
+Hypothesis "device feels hotter than LiteRT-LM because CPU
+orchestration around ANE saturates a P-core" was **refuted by E4B
+device measurement**: `cpu_active=3.0ms (4% CPU)`, `ANE_wait=68.7ms`.
+ANE is busy 97% of step time and that's the actual heat source. The
+1 W ANE the docs claim is correct; what makes it feel hot is *sustained
+dispatch keeping ANE pinned at high DVFS for 14 seconds per response*.
+
+Shipped (PR #98): `LLM_FAST_PREDICTION` (default ON, iOS 18+
+specializationStrategy), `LLM_DECODE_QOS`, `LLM_PROFILE_EVERY_STEP`,
+`[ANE/CPU]` log line, tethered powermetrics + Mac smoke scripts.
+
+Tried and removed: `LLM_DOUBLE_BUFFER_KV` — IOSurface-backed
+MLMultiArray gets locked when used as model input and cannot be reused
+as output backing in subsequent inferences (Apple-side limit, not
+fixable in our pipeline). 16× slowdown observed on iPhone before
+removal. Documented in `CPU_BOTTLENECK_INVESTIGATION.md` so the path
+isn't re-attempted.
+
+Remaining headroom is **conversion-side only**:
+- 2-chunk merge: tested 2026-04-17, +2% E2B (CHUNK_CONSOLIDATION_BENCH).
+  E4B 21+21 likely past ANE compiler ceiling — 14+14+14 (3-chunk) is
+  the safer experiment.
+- W2-QAT: only large remaining lever (~50% DRAM bandwidth → ~50% DRAM
+  heat). Multi-day GPU training. Apple FM 3.18B uses this recipe.
+- GPU path with ML Drift-style fusion: separate effort, "LiteRT route".
+
 ---
 
 ## Open PRs
@@ -124,35 +152,35 @@ not started.
 
 ## Docs landscape (for future sessions)
 
-44 docs exist. Most are **historical investigation records**, not
-active plans. The authoritative docs are:
+The authoritative docs are:
 
 | Doc | What it is |
 |---|---|
 | **This file** | Start here |
+| `CPU_BOTTLENECK_INVESTIGATION.md` | 2026-04-18 thermal investigation — confirms ANE itself is the heat source (CPU is 4% busy). Decision rules + iPhone checklist. |
 | `MOBILE_2K_COMPETITIVE_PLAN.md` | Value prop (power + TTFT + 32 tok/s) |
 | `BASELINE_SPEED_AUDIT.md` | Per-chunk cost breakdown |
 | `SESSION_STATE.md` | PR/branch state (stale after 4/15; this file is newer) |
 
-Everything else is historical context. Key investigation chains:
+Key investigation chains (the contributing docs are still in `docs/`):
 
 - **Spec decoding refutation:** PHASE_A5 → PHASE_B_LIVE_ACCEPT_RATE_GAP → V3_ARGMAX → V4_CHAIN → PHASE_C_TIGHTENING → PHASE_B_DECISION
-- **Pipelining refutation:** BASELINE_SPEED_AUDIT → PR #79 (branch docs)
-- **Conversion opts refutation:** INTEGRATED_ROADMAP (coremltools 9 already applies; no effect — verbal report 2026-04-16)
-- **MTP/EAGLE refutation:** MTP_PATH_A_FINDINGS → MTP_INTEGRATION_RESULTS → MTP_PATH_C_FINDINGS → EAGLE3_INTEGRATION_STATE
+- **MTP/EAGLE refutation:** MTP_INTEGRATION_RESULTS → MTP_PATH_C_FINDINGS → EAGLE3_INTEGRATION_STATE
+- **CPU/thermal refutation:** CPU_BOTTLENECK_INVESTIGATION (CPU is idle, ANE dispatch density isn't the lever; W2-QAT is the only large remaining headroom)
 
-### Known stale/contradictory docs
+### Stale-but-still-present docs (don't plan work on their numbers)
 
 | Doc | Issue |
 |---|---|
-| INTEGRATED_ROADMAP.md | Claims 50-65 tok/s via conversion opts; **invalidated** (coremltools 9 already applies them) |
-| ALTERNATIVE_APPROACHES.md | Uses wrong hidden_dim=2560 (actual: 1536); stale projections |
-| RESEARCH.md | Stale numbers (28 tok/s, LiteRT ~30 tok/s) |
 | CONVERSION.md | Claims MLState is "Shipping" — it's rejected |
 | EAGLE3_DEPLOY.md | Claims 55-70 tok/s target — EAGLE-3 is dead |
 | FUNDAMENTAL_UNTRIED.md | Optimistic on MLState and W2A16 — both rejected |
-| ROUTE_B_EXECUTION_PLAN.md | 70-85 tok/s target — invalidated by PR #62 |
 | UNEXPLORED_APPROACHES_V5.md | MTP as "S-tier" — all MTP paths failed |
 
-These docs are kept for historical context but **do not plan work on
-top of their numbers**.
+(2026-04-18 cleanup: 14 fully-superseded docs removed — RESEARCH,
+INTEGRATED_ROADMAP, ROUTE_B_EXECUTION_PLAN, ALTERNATIVE_APPROACHES,
+MTP_PATH_A_FINDINGS, PHASE_A5_DECISION, EMBEDDING_BYPASS_FINDINGS,
+SLIDING_WINDOW_FINDINGS, SPLIT_ROTATE_BENCH/FINDINGS,
+PHASE_C_TOLERANCE_FINDINGS, UNEXPLORED_APPROACHES.md/V2/V3. Some
+cross-references in other historical docs are now broken links —
+acceptable since those docs are themselves historical.)

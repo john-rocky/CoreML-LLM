@@ -72,6 +72,7 @@ final class ChunkedEngine {
     private var kFull2: MLMultiArray     // (2, 1, ctx, maxHd)
     private var vFull2: MLMultiArray
 
+
     // Phase 0e scratch pool: buffers rewritten each decode step instead of
     // freshly allocated. Holds the three largest per-step masks; smaller
     // buffers (RoPE rows, embeddings, plRaw) keep the allocating path since
@@ -152,21 +153,72 @@ final class ChunkedEngine {
 
     static func load(from directory: URL, config: ModelConfig,
                      computeUnits: MLComputeUnits) async throws -> ChunkedEngine {
+        // iOS 18+ MLOptimizationHints.specializationStrategy = .fastPrediction
+        // trades a longer first-load specialization for shorter per-prediction
+        // wall time. Enabled by default — the added load-time cost (~seconds)
+        // is amortized across the session, and a shorter ANE busy window per
+        // dispatch directly reduces sustained heat per token.
+        //
+        // Set LLM_FAST_PREDICTION=0 to disable (opt-out).
+        //
+        // Removed: .reshapeFrequency = .infrequent. Worked stand-alone but
+        // combined with LLM_PREFIX_CACHE=1 reproducibly triggered
+        // "MILCompilerForANE error: failed to compile ANE model using ANEF"
+        // on iPhone 17 Pro (A19 Pro, iOS 26). 1-3% gain not worth the
+        // instability; removed entirely rather than left as opt-in to
+        // prevent accidental enable.
+        let fastPredictionEnabled = ProcessInfo.processInfo.environment["LLM_FAST_PREDICTION"] != "0"
+        func applyHints(_ cfg: MLModelConfiguration) {
+            guard fastPredictionEnabled else { return }
+            if #available(iOS 18.0, macOS 15.0, *) {
+                var hints = MLOptimizationHints()
+                hints.specializationStrategy = .fastPrediction
+                cfg.optimizationHints = hints
+            }
+        }
+
         let mlConfig = MLModelConfiguration()
         mlConfig.computeUnits = computeUnits
+        applyHints(mlConfig)
 
         // Prefill chunks use GPU for compute-bound batch processing (TTFT win).
         // Decode chunks stay on ANE for bandwidth-bound single-token inference.
         let prefillConfig = MLModelConfiguration()
         let useGPUPrefill = ProcessInfo.processInfo.environment["GPU_PREFILL"] == "1"
         prefillConfig.computeUnits = useGPUPrefill ? .cpuAndGPU : computeUnits
+        applyHints(prefillConfig)
         if useGPUPrefill {
             print("[Load] GPU_PREFILL=1 — prefill chunks will use .cpuAndGPU")
         }
+        if fastPredictionEnabled {
+            print("[Load] MLOptimizationHints.specializationStrategy = .fastPrediction")
+        }
+
+        // Self-heal: remove any `prefill_chunk{i}.mlmodelc` directories that
+        // lack coremldata.bin. These leak onto disk when an older downloader
+        // build copied decode weights into prefill dirs whose metadata 404'd
+        // on the remote (e.g. E4B has no prefill on HF). Without cleanup they
+        // sit as ~2 GB of zombie weights and the loader's existence probe
+        // used to try (and fail) to open them as MLModels.
+        for i in 1...4 {
+            let prefillDir = directory.appendingPathComponent("prefill_chunk\(i).mlmodelc")
+            let coreML = prefillDir.appendingPathComponent("coremldata.bin")
+            let fm = FileManager.default
+            if fm.fileExists(atPath: prefillDir.path)
+                && !fm.fileExists(atPath: coreML.path) {
+                print("[Load] Removing stale prefill_chunk\(i).mlmodelc (missing coremldata.bin)")
+                try? fm.removeItem(at: prefillDir)
+            }
+        }
 
         func findModel(_ name: String) -> URL? {
+            // For .mlmodelc we require coremldata.bin alongside the directory
+            // — a half-populated directory (e.g. stray prefill_chunk with only
+            // weights from an older downloader build) must be treated as
+            // "not present" so it doesn't crash the loader.
             let compiled = directory.appendingPathComponent("\(name).mlmodelc")
-            if FileManager.default.fileExists(atPath: compiled.path) { return compiled }
+            let coreML = compiled.appendingPathComponent("coremldata.bin")
+            if FileManager.default.fileExists(atPath: coreML.path) { return compiled }
             let pkg = directory.appendingPathComponent("\(name).mlpackage")
             if FileManager.default.fileExists(atPath: pkg.path) { return pkg }
             return nil
@@ -260,6 +312,7 @@ final class ChunkedEngine {
             let verifyConfig = MLModelConfiguration()
             verifyConfig.computeUnits = computeUnits
             verifyConfig.functionName = "verify_qK"
+            applyHints(verifyConfig)
 
             let verifyT0 = CFAbsoluteTimeGetCurrent()
             try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
@@ -369,13 +422,16 @@ final class ChunkedEngine {
             }
         }
 
-        // SWA KV buffers — IOSurface-backed for zero-copy CPU↔ANE transfer
+        // SWA KV buffers — IOSurface-backed for zero-copy CPU↔ANE transfer.
+        // Slot counts (num_sliding_in_chunk / num_full_in_chunk) and num_kv_heads
+        // are read from each chunk's input description so E2B (nkv=1, 7/1, 5/2)
+        // and E4B (nkv=2, 10/2, 10/2) both allocate the right shapes.
         let maxHd = 512
         let ctx = configuredCtx
         let W = config.slidingWindow
-        func ioSurfaceArray(slots: Int, seqLen: Int) throws -> MLMultiArray {
+        func ioSurfaceArray(slots: Int, nkv: Int, seqLen: Int) throws -> MLMultiArray {
             let width = maxHd
-            let height = slots * 1 * seqLen
+            let height = slots * nkv * seqLen
             var pixelBuffer: CVPixelBuffer?
             let attrs: [String: Any] = [
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
@@ -389,19 +445,35 @@ final class ChunkedEngine {
                 CVPixelBufferLockBaseAddress(pb, [])
                 memset(CVPixelBufferGetBaseAddress(pb)!, 0, CVPixelBufferGetDataSize(pb))
                 CVPixelBufferUnlockBaseAddress(pb, [])
-                let shape: [NSNumber] = [NSNumber(value: slots), 1,
+                let shape: [NSNumber] = [NSNumber(value: slots), NSNumber(value: nkv),
                                           NSNumber(value: seqLen), NSNumber(value: maxHd)]
                 return try MLMultiArray(pixelBuffer: pb, shape: shape)
             }
             // Fallback to standard allocation
-            print("[KV] IOSurface failed for \(slots)x\(seqLen)x\(maxHd), using standard MLMultiArray")
+            print("[KV] IOSurface failed for \(slots)x\(nkv)x\(seqLen)x\(maxHd), using standard MLMultiArray")
             let arr = try MLMultiArray(
-                shape: [NSNumber(value: slots), 1, NSNumber(value: seqLen), NSNumber(value: maxHd)],
+                shape: [NSNumber(value: slots), NSNumber(value: nkv),
+                        NSNumber(value: seqLen), NSNumber(value: maxHd)],
                 dataType: .float16)
-            memset(arr.dataPointer, 0, slots * seqLen * maxHd * MemoryLayout<UInt16>.stride)
+            memset(arr.dataPointer, 0, slots * nkv * seqLen * maxHd * MemoryLayout<UInt16>.stride)
             return arr
         }
-        print("[KV] Allocating IOSurface-backed KV cache buffers (ctx=\(ctx))")
+
+        // Probe the chunk models for expected KV shapes. Shape is (slots, nkv, seqLen, maxHd).
+        func kvShape(_ model: MLModel, _ name: String) -> (slots: Int, nkv: Int)? {
+            guard let desc = model.modelDescription.inputDescriptionsByName[name],
+                  let c = desc.multiArrayConstraint else { return nil }
+            let s = c.shape
+            guard s.count == 4 else { return nil }
+            return (s[0].intValue, s[1].intValue)
+        }
+        let c1KS = kvShape(c1!, "K_sliding_in") ?? (7, 1)
+        let c1KF = kvShape(c1!, "K_full_in")    ?? (1, 1)
+        let c2KS = kvShape(c2!, "K_sliding_in") ?? (5, 1)
+        let c2KF = kvShape(c2!, "K_full_in")    ?? (2, 1)
+        print("[KV] Allocating IOSurface-backed KV cache buffers (ctx=\(ctx)) — " +
+              "c1 sliding=\(c1KS.slots)x\(c1KS.nkv) full=\(c1KF.slots)x\(c1KF.nkv), " +
+              "c2 sliding=\(c2KS.slots)x\(c2KS.nkv) full=\(c2KF.slots)x\(c2KF.nkv)")
 
         let engine = try ChunkedEngine(
             chunk1: c1, chunk2: c2, chunk3: c3, chunk4: c4,
@@ -413,10 +485,14 @@ final class ChunkedEngine {
             perLayerProjF32: projF32, perLayerNormWeight: normWeight,
             cosSlidingTable: cosS, sinSlidingTable: sinS,
             cosFullTable: cosF, sinFullTable: sinF,
-            kSliding1: ioSurfaceArray(slots: 7, seqLen: W), vSliding1: ioSurfaceArray(slots: 7, seqLen: W),
-            kFull1: ioSurfaceArray(slots: 1, seqLen: ctx), vFull1: ioSurfaceArray(slots: 1, seqLen: ctx),
-            kSliding2: ioSurfaceArray(slots: 5, seqLen: W), vSliding2: ioSurfaceArray(slots: 5, seqLen: W),
-            kFull2: ioSurfaceArray(slots: 2, seqLen: ctx), vFull2: ioSurfaceArray(slots: 2, seqLen: ctx),
+            kSliding1: ioSurfaceArray(slots: c1KS.slots, nkv: c1KS.nkv, seqLen: W),
+            vSliding1: ioSurfaceArray(slots: c1KS.slots, nkv: c1KS.nkv, seqLen: W),
+            kFull1:    ioSurfaceArray(slots: c1KF.slots, nkv: c1KF.nkv, seqLen: ctx),
+            vFull1:    ioSurfaceArray(slots: c1KF.slots, nkv: c1KF.nkv, seqLen: ctx),
+            kSliding2: ioSurfaceArray(slots: c2KS.slots, nkv: c2KS.nkv, seqLen: W),
+            vSliding2: ioSurfaceArray(slots: c2KS.slots, nkv: c2KS.nkv, seqLen: W),
+            kFull2:    ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx),
+            vFull2:    ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx),
             config: config, prefillN: prefillN)
 
         // ANE pipeline prewarm (Phase 0b): four dummy decode steps at load
@@ -471,6 +547,51 @@ final class ChunkedEngine {
         self.config = config; self.prefillN = prefillN
     }
 
+    // MARK: - Prefix cache (LLM_PREFIX_CACHE=1)
+
+    /// Disk-backed prefix cache. nil unless `LLM_PREFIX_CACHE=1` was set
+    /// when CoreMLLLM was loaded. Owned externally so the same cache can
+    /// be shared across reloads of the engine.
+    var prefixCache: PrefixCache?
+
+    /// Threshold below which a cache hit is ignored — re-prefilling small
+    /// prefixes is cheaper than per-token decode of the delta.
+    private let prefixCacheMinHit: Int = 64
+
+    /// Snapshot the 8 persistent KV buffers as a list of Data blobs in the
+    /// canonical order: kSliding1, vSliding1, kFull1, vFull1, kSliding2,
+    /// vSliding2, kFull2, vFull2.
+    func captureKVSnapshot() -> [Data] {
+        let bufs = [kSliding1, vSliding1, kFull1, vFull1,
+                    kSliding2, vSliding2, kFull2, vFull2]
+        return bufs.map { buf in
+            let bytes = buf.count * MemoryLayout<UInt16>.stride
+            return Data(bytes: buf.dataPointer, count: bytes)
+        }
+    }
+
+    /// Restore the 8 persistent KV buffers from snapshot data and set
+    /// `currentPosition`. Sizes must exactly match the live buffer sizes;
+    /// throws if not (cached snapshot from a different model / context len).
+    func restoreKVSnapshot(_ blobs: [Data], position: Int) throws {
+        let bufs = [kSliding1, vSliding1, kFull1, vFull1,
+                    kSliding2, vSliding2, kFull2, vFull2]
+        precondition(blobs.count == bufs.count, "snapshot buffer count mismatch")
+        for (i, buf) in bufs.enumerated() {
+            let expected = buf.count * MemoryLayout<UInt16>.stride
+            guard blobs[i].count == expected else {
+                throw NSError(
+                    domain: "ChunkedEngine", code: 100,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "snapshot buffer \(i) size mismatch (got \(blobs[i].count), need \(expected))"])
+            }
+            blobs[i].withUnsafeBytes { src in
+                memcpy(buf.dataPointer, src.baseAddress!, expected)
+            }
+        }
+        currentPosition = position
+    }
+
     // MARK: - Reset
 
     func reset() {
@@ -484,6 +605,7 @@ final class ChunkedEngine {
         profileCount = 0
         profileMask = 0
         profileC1 = 0; profileC2 = 0; profileC3 = 0; profileC4 = 0
+        profileANEWait = 0; profileCopyBack = 0
         // S2: any in-flight prefetch is now stale; cancel and drop.
         prefetchLock.lock()
         pendingPrefetch?.cancel()
@@ -506,6 +628,16 @@ final class ChunkedEngine {
     private var profileC2: Double = 0
     private var profileC3: Double = 0
     private var profileC4: Double = 0
+    // CPU-vs-ANE split: ANE wait = time spent inside chunk.prediction(from:);
+    // copyBack = CPU memcpy of KV tensors after each chunk; cpuPrep = remainder
+    // (mask/embed/dictionary build). Sum should approximate total wall time.
+    private var profileANEWait: Double = 0
+    private var profileCopyBack: Double = 0
+
+    // Print [Profile] / [ANE/CPU] every step instead of every 10 steps. Useful
+    // for short prompts where the 10-step gate would never fire. Set
+    // LLM_PROFILE_EVERY_STEP=1 to enable.
+    private let profileEveryStep = ProcessInfo.processInfo.environment["LLM_PROFILE_EVERY_STEP"] == "1"
 
     // LayerSkip probe: measures early-exit accuracy (chunk3 skipped)
     private let layerSkipProbe = ProcessInfo.processInfo.environment["LAYERSKIP_PROBE"] == "1"
@@ -563,7 +695,7 @@ final class ChunkedEngine {
 
         // Chunk 1
         let tC1Start = CFAbsoluteTimeGetCurrent()
-        let out1 = try chunk1.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+        let in1 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: hiddenIn),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
             "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
@@ -575,19 +707,25 @@ final class ChunkedEngine {
             "V_sliding_in": MLFeatureValue(multiArray: vSliding1),
             "K_full_in": MLFeatureValue(multiArray: kFull1),
             "V_full_in": MLFeatureValue(multiArray: vFull1),
-        ]))
+        ])
+        let tC1Wait0 = CFAbsoluteTimeGetCurrent()
+        let out1 = try chunk1.prediction(from: in1)
+        let tC1Wait1 = CFAbsoluteTimeGetCurrent()
+        profileANEWait += (tC1Wait1 - tC1Wait0)
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
+        let tC1Cb0 = CFAbsoluteTimeGetCurrent()
         copyBack(out1, "K_sliding_out", into: kSliding1)
         copyBack(out1, "V_sliding_out", into: vSliding1)
         copyBack(out1, "K_full_out", into: kFull1)
         copyBack(out1, "V_full_out", into: vFull1)
         let tC1End = CFAbsoluteTimeGetCurrent()
+        profileCopyBack += (tC1End - tC1Cb0)
         profileC1 += (tC1End - tC1Start)
 
         // Chunk 2
         let tC2Start = CFAbsoluteTimeGetCurrent()
-        let out2 = try chunk2.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+        let in2 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h1),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
             "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
@@ -599,12 +737,19 @@ final class ChunkedEngine {
             "V_sliding_in": MLFeatureValue(multiArray: vSliding2),
             "K_full_in": MLFeatureValue(multiArray: kFull2),
             "V_full_in": MLFeatureValue(multiArray: vFull2),
-        ]))
+        ])
+        let tC2Wait0 = CFAbsoluteTimeGetCurrent()
+        let out2 = try chunk2.prediction(from: in2)
+        let tC2Wait1 = CFAbsoluteTimeGetCurrent()
+        profileANEWait += (tC2Wait1 - tC2Wait0)
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        let tC2Cb0 = CFAbsoluteTimeGetCurrent()
         copyBack(out2, "K_sliding_out", into: kSliding2)
         copyBack(out2, "V_sliding_out", into: vSliding2)
         copyBack(out2, "K_full_out", into: kFull2)
         copyBack(out2, "V_full_out", into: vFull2)
+        let tC2Cb1 = CFAbsoluteTimeGetCurrent()
+        profileCopyBack += (tC2Cb1 - tC2Cb0)
         let kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
         let kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
         let kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
@@ -628,16 +773,22 @@ final class ChunkedEngine {
         // Chunk 3
         let tC3Start = CFAbsoluteTimeGetCurrent()
         var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
-        let h3 = try chunk3.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
+        let in3 = try MLDictionaryFeatureProvider(dictionary: d3)
+        let tC3Wait0 = CFAbsoluteTimeGetCurrent()
+        let h3 = try chunk3.prediction(from: in3)
             .featureValue(for: "hidden_states_out")!.multiArrayValue!
         let tC3End = CFAbsoluteTimeGetCurrent()
+        profileANEWait += (tC3End - tC3Wait0)
         profileC3 += (tC3End - tC3Start)
 
         // Chunk 4
         let tC4Start = CFAbsoluteTimeGetCurrent()
         var d4 = shared; d4["hidden_states"] = MLFeatureValue(multiArray: h3)
-        let out4 = try chunk4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4))
+        let in4 = try MLDictionaryFeatureProvider(dictionary: d4)
+        let tC4Wait0 = CFAbsoluteTimeGetCurrent()
+        let out4 = try chunk4.prediction(from: in4)
         let tC4End = CFAbsoluteTimeGetCurrent()
+        profileANEWait += (tC4End - tC4Wait0)
         profileC4 += (tC4End - tC4Start)
 
         // LayerSkip probe: skip chunk3, feed h2 directly to chunk4
@@ -657,7 +808,7 @@ final class ChunkedEngine {
 
         profilePredict += (CFAbsoluteTimeGetCurrent() - t1)
         profileCount += 1
-        if profileCount == 1 || profileCount % 10 == 0 {
+        if profileCount == 1 || profileCount % 10 == 0 || profileEveryStep {
             let n = Double(profileCount)
             let eMs = profileEmbed / n * 1000
             let pMs = profilePredict / n * 1000
@@ -666,11 +817,19 @@ final class ChunkedEngine {
             let c2 = profileC2 / n * 1000
             let c3 = profileC3 / n * 1000
             let c4 = profileC4 / n * 1000
+            let aneMs = profileANEWait / n * 1000
+            let cbMs = profileCopyBack / n * 1000
+            let totalMs = eMs + pMs
+            let cpuActiveMs = totalMs - aneMs
+            let cpuPct = totalMs > 0 ? (cpuActiveMs / totalMs * 100) : 0
             print(String(format:
                 "[Profile] emb=%.1fms mask=%.1fms | c1=%.1f c2=%.1f c3=%.1f c4=%.1f " +
                 "(sum=%.1fms) | predict=%.1fms total=%.1fms (%.1f tok/s)",
                 eMs, mMs, c1, c2, c3, c4, c1 + c2 + c3 + c4,
-                pMs, eMs + pMs, 1000.0 / (eMs + pMs)))
+                pMs, totalMs, 1000.0 / totalMs))
+            print(String(format:
+                "[ANE/CPU] ANE_wait=%.1fms copyBack=%.1fms cpu_active=%.1fms (%.0f%% CPU)",
+                aneMs, cbMs, cpuActiveMs, cpuPct))
         }
 
         return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
@@ -700,27 +859,92 @@ final class ChunkedEngine {
         }
         precondition(realLen > 0 && realLen <= N)
 
+        // ---- Prefix cache lookup (text-only) -----------------------------
+        // If a previously cached snapshot covers a prefix of this prompt,
+        // restore the KV state at that position and per-token decode the
+        // delta tokens. Skips the expensive batched prefill entirely.
+        // Multimodal prompts (image / audio) bypass the cache to avoid
+        // shape/feature mismatches.
+        if let cache = prefixCache,
+           imageFeatures == nil, audioFeatures == nil,
+           let match = cache.longestPrefixMatch(tokenIDs: tokenIDs),
+           match.matchLen >= prefixCacheMinHit,
+           match.matchLen < tokenIDs.count {
+            let cacheT0 = CFAbsoluteTimeGetCurrent()
+            do {
+                let blobs = try PrefixCache.readBlob(at: match.blobURL,
+                                                      expecting: match.entry)
+                try restoreKVSnapshot(blobs, position: match.matchLen)
+                var nextID = 0
+                for i in match.matchLen..<tokenIDs.count {
+                    nextID = try predictStep(tokenID: tokenIDs[i], position: i)
+                    currentPosition = i + 1
+                }
+                let dt = CFAbsoluteTimeGetCurrent() - cacheT0
+                let delta = tokenIDs.count - match.matchLen
+                print("[PrefixCache] HIT match=\(match.matchLen)/\(tokenIDs.count) " +
+                      "delta=\(delta) restore+decode=\(String(format: "%.1f", dt*1000))ms")
+                return nextID
+            } catch {
+                print("[PrefixCache] restore failed (\(error)) — full prefill fallback")
+                reset()  // restore() may have left partial state
+            }
+        }
+        // ------------------------------------------------------------------
+
         reset()
+
+        // ---- Pending-Token Skip decision ---------------------------------
+        // LiteRT-LM-style optimization: process only the first (realLen-1)
+        // prompt tokens through prefill chunks 1+2 (KV writes), skip
+        // chunks 3+4 entirely, and let the first decode step consume the
+        // stashed last prompt token — writing its KV and sampling the
+        // first generated token in one dispatch. Saves roughly half the
+        // prefill cost at the price of one decode step.
+        //
+        // Disabled when:
+        //   - realLen < 2 (nothing to pend)
+        //   - last prompt token is a multimodal placeholder (predictStep
+        //     would need image/audio features we can't reconstruct here)
+        //   - multimodal features are present at all (safety margin;
+        //     avoids per-token index drift between prefill and decode)
+        let IMAGE_TOKEN_ID = 258880
+        let AUDIO_TOKEN_ID = 258881
+        let VIDEO_TOKEN_ID = 258884
+        let pendingSkipEnabled = ProcessInfo.processInfo.environment["LLM_PENDING_TOKEN_SKIP"] == "1"
+        let lastPromptTid = tokenIDs[realLen - 1]
+        let lastIsMultimodal = lastPromptTid == IMAGE_TOKEN_ID
+            || lastPromptTid == AUDIO_TOKEN_ID
+            || lastPromptTid == VIDEO_TOKEN_ID
+        let hasMultimodalFeatures = imageFeatures != nil || audioFeatures != nil
+        let pendingSkip = pendingSkipEnabled && realLen >= 2
+            && !lastIsMultimodal && !hasMultimodalFeatures
+
+        let prefillTokens: [Int] = pendingSkip
+            ? Array(tokenIDs.prefix(realLen - 1))
+            : tokenIDs
+        let prefillLen = prefillTokens.count
+        // ------------------------------------------------------------------
 
         let prefillT0 = CFAbsoluteTimeGetCurrent()
 
-        let hiddenIn = try buildPrefillHidden(tokenIDs: tokenIDs, N: N, imageFeatures: imageFeatures,
+        let hiddenIn = try buildPrefillHidden(tokenIDs: prefillTokens, N: N, imageFeatures: imageFeatures,
                                                 imageNumTokens: imageNumTokens,
                                                 audioFeatures: audioFeatures, audioNumTokens: audioNumTokens)
-        let plRaw = try buildPrefillPLR(tokenIDs: tokenIDs, N: N)
+        let plRaw = try buildPrefillPLR(tokenIDs: prefillTokens, N: N)
         // If the prompt has any vision placeholders, use the
         // vision-group-aware mask so each contiguous run of image/video
         // tokens (= one frame / one image) attends bidirectionally
         // within itself — matching HF's `mm_token_type_ids` behavior.
-        let hasVision = tokenIDs.contains { $0 == 258880 || $0 == 258884 }
+        let hasVision = prefillTokens.contains { $0 == IMAGE_TOKEN_ID || $0 == VIDEO_TOKEN_ID }
         let causal = hasVision
-            ? try makePrefillVisionMask(tokenIDs: tokenIDs, N: N)
+            ? try makePrefillVisionMask(tokenIDs: prefillTokens, N: N)
             : try makePrefillCausalMask(N: N)
         let cosS = try buildPrefillRoPE(table: cosSlidingTable, N: N, dim: 256)
         let sinS = try buildPrefillRoPE(table: sinSlidingTable, N: N, dim: 256)
         let cosF = try buildPrefillRoPE(table: cosFullTable, N: N, dim: 512)
         let sinF = try buildPrefillRoPE(table: sinFullTable, N: N, dim: 512)
-        let lastMask = try makeLastPositionMask(N: N, realLen: realLen)
+        let lastMask = try makeLastPositionMask(N: N, realLen: prefillLen)
 
         let prepDt = CFAbsoluteTimeGetCurrent() - prefillT0
 
@@ -748,11 +972,11 @@ final class ChunkedEngine {
         // Write KV from chunk1 prefill → decode sliding/full caches
         for (name, slot, kv, hd) in kvMapChunk1Sliding() {
             try writeSlidingFromPrefill(src: out1, name: name, cache: kv, slot: slot,
-                                        realLen: realLen, hd: hd)
+                                        realLen: prefillLen, hd: hd)
         }
         for (name, slot, kv, hd) in kvMapChunk1Full() {
             try writeFullFromPrefill(src: out1, name: name, cache: kv, slot: slot,
-                                     realLen: realLen, hd: hd)
+                                     realLen: prefillLen, hd: hd)
         }
 
         try Task.checkCancellation()
@@ -771,11 +995,11 @@ final class ChunkedEngine {
 
         for (name, slot, kv, hd) in kvMapChunk2Sliding() {
             try writeSlidingFromPrefill(src: out2, name: name, cache: kv, slot: slot,
-                                        realLen: realLen, hd: hd)
+                                        realLen: prefillLen, hd: hd)
         }
         for (name, slot, kv, hd) in kvMapChunk2Full() {
             try writeFullFromPrefill(src: out2, name: name, cache: kv, slot: slot,
-                                     realLen: realLen, hd: hd)
+                                     realLen: prefillLen, hd: hd)
         }
 
         let kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
@@ -793,6 +1017,34 @@ final class ChunkedEngine {
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
         ]
+
+        // Pending-Token Skip (LLM_PENDING_TOKEN_SKIP=1): prefill chunks 1+2
+        // already wrote KV for positions 0..realLen-2 (prefillLen = realLen-1
+        // tokens were passed in). Skip chunks 3+4 of prefill and let the
+        // first decode step write KV at position realLen-1 AND sample the
+        // first generated token in the same dispatch. Semantically cleaner
+        // than PREFILL_BYPASS because there is no redundant KV write at the
+        // last position (PREFILL_BYPASS would have prefill c1/c2 and decode
+        // c1/c2 both write position realLen-1, idempotent but wasteful).
+        if pendingSkip {
+            let preDecodeTotal = CFAbsoluteTimeGetCurrent() - prefillT0
+            print("[Prefill] PENDING_SKIP prep=\(String(format: "%.1f", prepDt*1000))ms " +
+                  "c1=\(String(format: "%.1f", pc1Dt*1000))ms " +
+                  "c2=\(String(format: "%.1f", pc2Dt*1000))ms " +
+                  "c3/4=skipped " +
+                  "prefill=\(String(format: "%.1f", preDecodeTotal*1000))ms " +
+                  "(\(prefillLen) prefilled + 1 pending)")
+            let nextToken = try predictStep(tokenID: lastPromptTid, position: realLen - 1)
+            if let cache = prefixCache {
+                do {
+                    let blobs = captureKVSnapshot()
+                    try cache.store(tokenIDs: tokenIDs, buffers: blobs, position: realLen)
+                } catch {
+                    print("[PrefixCache] store failed: \(error)")
+                }
+            }
+            return nextToken
+        }
 
         // B1 bypass: chunks 3+4 are KV-shared read-only (no KV writes). For
         // prompt tokens 0..N-2 their hidden-state outputs are discarded; only
@@ -863,11 +1115,25 @@ final class ChunkedEngine {
               "total=\(String(format: "%.1f", totalPrefill*1000))ms " +
               "(\(realLen) tokens, \(String(format: "%.0f", Double(realLen)/totalPrefill)) tok/s)")
 
+        let nextToken = out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+
+        // Snapshot the KV state for future prefix-match hits. Text-only and
+        // only when caching is enabled. Multimodal snapshots are skipped
+        // (image/audio embeddings aren't part of the cache key contract).
+        if let cache = prefixCache, imageFeatures == nil, audioFeatures == nil {
+            do {
+                let blobs = captureKVSnapshot()
+                try cache.store(tokenIDs: tokenIDs, buffers: blobs, position: realLen)
+            } catch {
+                print("[PrefixCache] store failed: \(error)")
+            }
+        }
+
         // S2: pre-build inputs for the first decode position so it lands
         // as a hit instead of paying the build cost in the critical
-        // first-token path.
+        // first-token path. No-op unless ENABLE_PREFETCH=1.
         schedulePrefetch(forPosition: realLen)
-        return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+        return nextToken
     }
 
     // MARK: - Batched speculative verification (Q=K)

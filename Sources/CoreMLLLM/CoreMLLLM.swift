@@ -188,6 +188,35 @@ public final class CoreMLLLM: @unchecked Sendable {
             // COMPUTE_PLAN_AUDIT env var or UserDefaults key is set.
             await ComputePlanAudit.run(modelDirectory: directory,
                                        computeUnits: computeUnits)
+
+            // Optional disk-backed prefix cache (LLM_PREFIX_CACHE=1).
+            // Cache directory is namespaced by model directory's last
+            // path component (e.g. "gemma4-e2b") so multiple models
+            // don't collide. Capacity defaults to 256 MB which fits
+            // 3-7 snapshots at 2K context (more at 8K = fewer entries).
+            if let engine = llm.chunkedEngine,
+               ProcessInfo.processInfo.environment["LLM_PREFIX_CACHE"] == "1" {
+                do {
+                    let cachesDir = try FileManager.default.url(
+                        for: .cachesDirectory, in: .userDomainMask,
+                        appropriateFor: nil, create: true)
+                    let modelTag = directory.lastPathComponent.isEmpty
+                        ? "default" : directory.lastPathComponent
+                    let cacheDir = cachesDir
+                        .appendingPathComponent("coreml-llm-prefix-cache")
+                        .appendingPathComponent(modelTag)
+                    let capStr = ProcessInfo.processInfo
+                        .environment["LLM_PREFIX_CACHE_MB"]
+                    let capMB = Int(capStr ?? "") ?? 256
+                    engine.prefixCache = try PrefixCache(
+                        directory: cacheDir,
+                        capacityBytes: capMB * 1024 * 1024)
+                    print("[PrefixCache] enabled at \(cacheDir.path) " +
+                          "cap=\(capMB)MB existing=\(engine.prefixCache!.totalBytes()/(1024*1024))MB")
+                } catch {
+                    print("[PrefixCache] init failed: \(error)")
+                }
+            }
         } else {
             let mlConfig = MLModelConfiguration()
             mlConfig.computeUnits = computeUnits
@@ -574,21 +603,25 @@ public final class CoreMLLLM: @unchecked Sendable {
         let audTokenCount = audioTokenCount
         let ctxLimit = config.contextLength
 
+        // Decode-loop QoS: defaults to inherited (.userInitiated when called from
+        // UI). Set LLM_DECODE_QOS=utility (or background) to bias toward
+        // efficiency cores — trades a small tok/s loss for cooler sustained
+        // operation. CPU memcpy/copyBack between ANE dispatches is the
+        // dominant CPU draw at 31 tok/s; E-cores cut that ~4x.
+        let qosEnv = ProcessInfo.processInfo.environment["LLM_DECODE_QOS"]?.lowercased()
+        let decodePriority: TaskPriority?
+        switch qosEnv {
+        case "background": decodePriority = .background
+        case "utility":    decodePriority = .utility
+        case "userinitiated", "user": decodePriority = .userInitiated
+        case "high":       decodePriority = .high
+        default:           decodePriority = nil  // inherit
+        }
+        if decodePriority != nil {
+            print("[QoS] LLM_DECODE_QOS=\(qosEnv!) — decode loop priority overridden")
+        }
+
         return AsyncStream { continuation in
-            // T3 NOTE (2026-04-19): we initially pinned this Task to
-            // `.utility` to prefer E-core for the CPU prep between ANE
-            // dispatches (thermal hypothesis). On Mac that was harmless
-            // (~33 tok/s either way), but the first iPhone 17 Pro run
-            // measured ~25 tok/s — a ~20% regression vs the documented
-            // baseline of 31 tok/s. iPhone's E/P scheduler is much more
-            // strict than Mac's: a `.utility` Task that submits ANE
-            // requests from an E-core lengthens every per-chunk dispatch
-            // round-trip enough to dominate the savings. Switched to
-            // `.userInitiated` (the Apple-recommended class for "user
-            // initiated this, show progress") which keeps the dispatch
-            // thread on P-core. The thermal-leaning version is an opt-in
-            // env var instead of the default. See LITERT_PERF_ADOPTIONS.md §T3.
-            //
             // T4: cancellation. AsyncStream does NOT auto-cancel the
             // producer task when the consumer breaks out of `for await`.
             // We bind onTermination so a user-initiated cancel (or
@@ -596,8 +629,13 @@ public final class CoreMLLLM: @unchecked Sendable {
             // point — a chunk boundary in prefill, the top of the
             // decode loop. Without this hook, cancelled generations
             // keep burning ANE energy until maxDecode tokens.
-            let useUtilityQoS = ProcessInfo.processInfo.environment["DECODE_UTILITY_QOS"] == "1"
-            let genTask = Task(priority: useUtilityQoS ? .utility : .userInitiated) {
+            //
+            // QoS: `decodePriority` is driven by `LLM_DECODE_QOS`
+            // (utility / userinitiated / high, default inherit). T3 in
+            // `LITERT_PERF_ADOPTIONS.md` originally added a
+            // `DECODE_UTILITY_QOS` flag; that's been superseded by the
+            // richer `LLM_DECODE_QOS` knob landed later on main.
+            let genTask = Task(priority: decodePriority) {
                 do {
                     let IMAGE_TOKEN_ID = 258880
                     let AUDIO_TOKEN_ID = 258881

@@ -36,6 +36,29 @@ final class LLMRunner {
 
     func loadModel(from url: URL) async throws {
         let folder = url.deletingLastPathComponent()
+
+        // Release the previous model BEFORE allocating the new one — otherwise
+        // the `try await CoreMLLLM.load(...)` call below holds both instances
+        // in memory simultaneously. Peak footprint on a E2B → E4B switch is
+        // ~3 GB + ~5 GB = 8 GB, which OOMs on 8 GB devices and pushes a 12 GB
+        // iPhone 17 Pro into jetsam territory. Setting `llm = nil` triggers
+        // ARC release of ChunkedEngine, which in turn releases every
+        // per-chunk MLModel and unmaps the INT8 embed/PLE data files.
+        if llm != nil {
+            llm = nil
+            isLoaded = false
+            modelName = ""
+            hasVision = false
+            hasAudio = false
+            mtpAcceptanceRate = 0
+            mtpTokensPerRound = 0
+            crossVocabAcceptanceRate = 0
+            crossVocabTokensPerCycle = 0
+            loadingStatus = "Releasing previous model..."
+            // Yield so the autorelease pool drains before we start the next load.
+            await Task.yield()
+        }
+
         modelFolderURL = folder
         loadingStatus = "Loading..."
 
@@ -323,12 +346,18 @@ final class LLMRunner {
 
     @available(iOS 17.0, macOS 14.0, *)
     private func countOps(plan: MLComputePlan) -> (total: Int, ane: Int, gpu: Int, cpu: Int) {
-        guard case let .program(program) = plan.modelStructure,
-              let main = program.functions["main"] else {
+        // Multi-function chunks (build_verify_chunks.py output) name their
+        // entry points "decode_q1" / "verify_qK", not "main". Fall through to
+        // any available function so audit works across both layouts.
+        guard case let .program(program) = plan.modelStructure else {
             return (0, 0, 0, 0)
         }
+        let fn = program.functions["decode_q1"]
+            ?? program.functions["main"]
+            ?? program.functions.values.first
+        guard let function = fn else { return (0, 0, 0, 0) }
         var total = 0, ane = 0, gpu = 0, cpu = 0
-        var stack: [MLModelStructure.Program.Block] = [main.block]
+        var stack: [MLModelStructure.Program.Block] = [function.block]
         while let block = stack.popLast() {
             for op in block.operations {
                 total += 1
