@@ -7,7 +7,10 @@ struct ChatView: View {
     @State private var messages: [ChatMessage] = []
     @State private var inputText = ""
     @State private var showModelPicker = false
-    @State private var streamingText = ""
+    /// Per-token streaming text lives on its own @Observable so that only
+    /// the streaming bubble (and nothing else in ChatView's body) is
+    /// invalidated per generated token. See `StreamingBuffer` below.
+    @State private var streaming = StreamingBuffer()
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var selectedImage: CGImage?
     @State private var selectedImageData: Data?
@@ -46,52 +49,28 @@ struct ChatView: View {
                     .padding(.top, 12)
                 }
 
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 12) {
-                            ForEach(messages) { message in
-                                MessageBubble(message: message)
-                            }
-                            if !streamingText.isEmpty {
-                                MessageBubble(message: ChatMessage(role: .assistant, content: streamingText))
-                                    .id("streaming")
-                            }
+                // `.defaultScrollAnchor(.bottom)` keeps the viewport pinned
+                // to the bottom as content grows, without a per-token
+                // `withAnimation { scrollTo }`. Each generated token used
+                // to open a Core Animation transaction; at 31 tok/s those
+                // overlapped and kept the CPU busy building implicit
+                // animations no one asked for.
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(messages) { message in
+                            MessageBubble(message: message)
                         }
-                        .padding()
+                        StreamingBubble(buffer: streaming)
                     }
-                    .onChange(of: streamingText) {
-                        withAnimation { proxy.scrollTo("streaming", anchor: .bottom) }
-                    }
+                    .padding()
                 }
+                .defaultScrollAnchor(.bottom)
 
-                // tok/s stays visible after generation finishes so the
-                // final speed can still be read off the screen.
-                if runner.isLoaded && (runner.isGenerating || runner.tokensPerSecond > 0) {
-                    HStack(spacing: 6) {
-                        if runner.isGenerating {
-                            ProgressView().scaleEffect(0.8)
-                        }
-                        Text(String(format: "%.1f tok/s", runner.tokensPerSecond))
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                        if runner.mtpAcceptanceRate > 0 {
-                            Text(String(format: "acc0=%.0f%%", runner.mtpAcceptanceRate * 100))
-                                .font(.caption.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                        }
-                        if runner.crossVocabAcceptanceRate > 0 {
-                            Text(String(format: "xv=%.0f%%", runner.crossVocabAcceptanceRate * 100))
-                                .font(.caption.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                        }
-                        if !runner.isGenerating {
-                            Text("(last)")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
+                // The HUD reads `runner.tokensPerSecond` etc., which change
+                // every token. Keeping it in a nested view scopes those
+                // observations so that ChatView's body is not re-evaluated
+                // per token just to redraw the tok/s counter.
+                TokHUD(runner: runner)
 
                 // Image preview
                 if let imageData = selectedImageData, let uiImage = UIImage(data: imageData) {
@@ -223,7 +202,7 @@ struct ChatView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Clear") {
                         messages.removeAll()
-                        streamingText = ""
+                        streaming.text = ""
                         clearImage()
                         runner.resetConversation()
                     }
@@ -358,7 +337,7 @@ struct ChatView: View {
         let userMessageId = userMessage.id
         messages.append(userMessage)
         inputText = ""
-        streamingText = ""
+        streaming.text = ""
 
         let image = selectedImage
         let frames = videoFrames
@@ -394,11 +373,11 @@ struct ChatView: View {
                         messages: messages, image: image, audio: audio)
                 }
                 for await token in stream {
-                    streamingText += token
+                    streaming.text += token
                 }
-                if !streamingText.isEmpty {
-                    messages.append(ChatMessage(role: .assistant, content: streamingText))
-                    streamingText = ""
+                if !streaming.text.isEmpty {
+                    messages.append(ChatMessage(role: .assistant, content: streaming.text))
+                    streaming.text = ""
                 }
                 if videoURL != nil { await MainActor.run { clearVideo() } }
             } catch {
@@ -626,6 +605,71 @@ struct ChatView: View {
             } catch {
                 messages.append(ChatMessage(role: .system, content: "Error: \(error.localizedDescription)"))
             }
+        }
+    }
+}
+
+/// Streaming-only text buffer. Kept as a reference type so that mutating
+/// `text` from the decode loop does **not** invalidate ChatView's body —
+/// only views that actually read `buffer.text` (i.e. `StreamingBubble`)
+/// re-render per token. The previous `@State var streamingText: String`
+/// forced the whole ChatView tree to be re-evaluated at the decode rate
+/// (~31 Hz on Gemma 4 E2B), which showed up as sustained CPU load during
+/// long responses.
+@Observable
+final class StreamingBuffer {
+    var text: String = ""
+}
+
+/// The assistant-side bubble shown while tokens are streaming in. Isolated
+/// into its own view so that per-token mutations of `buffer.text` only
+/// invalidate this subtree, not the parent ChatView.
+private struct StreamingBubble: View {
+    let buffer: StreamingBuffer
+
+    var body: some View {
+        if !buffer.text.isEmpty {
+            MessageBubble(
+                message: ChatMessage(role: .assistant, content: buffer.text)
+            )
+            .id("streaming")
+        }
+    }
+}
+
+/// tok/s counter + speculative acceptance rates. Split out so that the
+/// @Observable reads on `runner.tokensPerSecond` / `isGenerating` /
+/// acceptance-rate properties only invalidate this HUD, not ChatView's
+/// toolbar, previews, or message list.
+private struct TokHUD: View {
+    let runner: LLMRunner
+
+    var body: some View {
+        if runner.isLoaded && (runner.isGenerating || runner.tokensPerSecond > 0) {
+            HStack(spacing: 6) {
+                if runner.isGenerating {
+                    ProgressView().scaleEffect(0.8)
+                }
+                Text(String(format: "%.1f tok/s", runner.tokensPerSecond))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                if runner.mtpAcceptanceRate > 0 {
+                    Text(String(format: "acc0=%.0f%%", runner.mtpAcceptanceRate * 100))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                if runner.crossVocabAcceptanceRate > 0 {
+                    Text(String(format: "xv=%.0f%%", runner.crossVocabAcceptanceRate * 100))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                if !runner.isGenerating {
+                    Text("(last)")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.vertical, 4)
         }
     }
 }
