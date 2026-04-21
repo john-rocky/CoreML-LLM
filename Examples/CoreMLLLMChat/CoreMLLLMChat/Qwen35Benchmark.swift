@@ -44,15 +44,17 @@ final class Qwen35Benchmark {
     }
 
     enum UnitsChoice: String, CaseIterable {
-        case cpuAndNE = "CPU+ANE"
-        case cpuOnly  = "CPU only"
-        case all      = "All"
+        case cpuAndNE  = "CPU+ANE"
+        case cpuAndGPU = "CPU+GPU"
+        case cpuOnly   = "CPU"
+        case all       = "All"
 
         var mlComputeUnits: MLComputeUnits {
             switch self {
-            case .cpuAndNE: return .cpuAndNeuralEngine
-            case .cpuOnly:  return .cpuOnly
-            case .all:      return .all
+            case .cpuAndNE:  return .cpuAndNeuralEngine
+            case .cpuAndGPU: return .cpuAndGPU
+            case .cpuOnly:   return .cpuOnly
+            case .all:       return .all
             }
         }
     }
@@ -180,9 +182,7 @@ final class Qwen35Benchmark {
         meanCos = 0; worstCos = 1.0; top1Rate = 0
         meanPrefillMs = 0; tokensPerSecond = 0
 
-        status = units == .cpuAndNE
-            ? "Loading & compiling ANE graph (first run can take 30-90s for 1.5GB model)..."
-            : "Loading model..."
+        status = "Loading model... (first run may compile 30-90s)"
         let loadStart = Date()
         do {
             try loadArtifacts()
@@ -195,9 +195,7 @@ final class Qwen35Benchmark {
 
         guard let oracle else { return }
 
-        status = units == .cpuAndNE
-            ? "Warming up (ANE compile, may take 30-90s)..."
-            : "Warming up..."
+        status = "Warming up..."
         let warmStart = Date()
         do {
             let warm = try MLMultiArray(shape: [1, NSNumber(value: seqLen)], dataType: .int32)
