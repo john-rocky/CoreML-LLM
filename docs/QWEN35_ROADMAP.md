@@ -42,16 +42,16 @@ Long-running effort to add `Qwen/Qwen3.5-0.8B` to the CoreML-LLM collection. Kic
 
 ## Revised odds
 
-(Updated 2026-04-21 post Phase 2a result — decode gate proven.)
+(Updated 2026-04-21 post Phase 2b — both decode and prefill gates proven.)
 
-| Goal | Pre-Phase 2a | **Post-Phase 2a** | Reasoning |
-|---|---:|---:|---|
-| Text-only parity cos≥0.998 vs HF | 60-70% | **95%** | Phase 1: prefill vs recurrent cos=0.999998; Phase 2a: decode-step cos=1.000000 at 6 positions |
-| ≥95% ANE placement on decode | 60-70% | **~99%** (proven on one layer) | 63/63 non-const ops on ANE including linear/reduce_sum/rsqrt/silu/softplus/sigmoid |
-| ≥95% ANE placement on prefill | 25-35% | 25-35% (unchanged) | Chunked algorithm still untested; cumsum & fp32 scan remain risks |
-| Beat Gemma 4 E2B decode (31 tok/s) on iPhone 17 Pro | 25-35% | 30-45% | Decode math is trivially ANE, per-step cost ≈ 5 linear + 5 reduce_sum + elementwise × 24 layers |
+| Goal | Pre-Phase 2a | Post-Phase 2a | **Post-Phase 2b** | Reasoning |
+|---|---:|---:|---:|---|
+| Text-only parity cos≥0.998 vs HF | 60-70% | 95% | **99%** | Phase 1 prefill vs recurrent cos=0.999998; Phase 2a cos=1.000000; Phase 2b chunked prefill cos=1.000+ at seq 64/128/256 |
+| ≥95% ANE placement on decode | 60-70% | ~99% | **~99%** | 63/63 non-const ops on ANE in single-layer test |
+| ≥95% ANE placement on prefill | 25-35% | 25-35% | **99.9%** (seq=2048) | 1088/1089 non-const ops on ANE; only `cumsum` stays CPU. Neumann iteration avoids the 441-op Gauss-elim tangle |
+| Beat Gemma 4 E2B decode (31 tok/s) on iPhone 17 Pro | 25-35% | 30-45% | **40-55%** | Both hot paths ANE-resident; remaining unknowns: 24-layer stack, INT4 quant parity |
 
-Fallback trigger: if by end of Phase 2 step 2 the decode path can't stay ≥80% ANE, pivot to **Qwen3-0.6B** (plain transformer, ~80% success probability for full integration). **Phase 2a passed this gate on 2026-04-21.**
+Fallback trigger: if by end of Phase 2b the prefill path can't stay ≥80% ANE, pivot to **Qwen3-0.6B** (plain transformer, ~80% success probability for full integration). **Phase 2a passed 2026-04-21; Phase 2b passed 2026-04-21 same day.**
 
 ## Phase 2a result (2026-04-21)
 
@@ -68,6 +68,32 @@ a 21MB mlpackage.
 - Zero `cumsum`, `cumprod`, `scatter`, `while_loop` in the decode graph — the recurrent form is genuinely matmul-only.
 
 Implication: the single biggest architecture risk (SSM on ANE) is resolved for the decode path. The prefill path remains the open question; that's Phase 2b.
+
+## Phase 2b result (2026-04-21)
+
+`conversion/test_qwen3_5_prefill_trace.py` ports the prefill `torch_chunk_gated_delta_rule` into a trace-friendly `PrefillLinearAttnLayer` and converts at multiple seq lengths.
+
+Two key transforms over the verbatim HF code:
+
+1. **Replace the 63-iter Gauss-elim inner loop with a numerically stable Neumann iteration.** The in-place-scatter loop that HF uses maps to ~441 `slice_by_index` / `concat` / `pad` ops, most of which land on CPU. Since the matrix being inverted is `(I - L)` with `L` strictly lower-triangular (nilpotent, `L^CS = 0`), we compute `(I - L)^{-1}` via `T_{k+1} = I + L @ T_k` in CS=64 steps. Bounded intermediate values and CS small matmul ops — all ANE.
+   - Tried repeated-squaring first (`(I+L)(I+L²)(I+L⁴)...(I+L³²)`, 10 matmul) — **numerically unstable** at realistic L magnitudes (intermediate `L^32` had values up to 1.5×10⁵, catastrophic cancellation broke parity to cos=0.92). The iterative form has no such blow-up.
+2. **Flatten `(B, H, NC)` → 3D `bmm` for all chunk-local matmuls.** 5D matmul `(B,H,NC,CS,CS)` tends to CPU; 3D `bmm` over `(B*H*NC, CS, CS)` stays on ANE.
+
+Results (all at single linear_attention layer, fp16 compute, iOS18):
+
+| seq_len | num_chunks | total ops | ANE ops | CPU ops | ANE% of compute |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 1 | 471 | 220 | 1 | 99.55% |
+| 128 | 2 | 539 | 247 | 1 | 99.60% |
+| 256 | 4 | 678 | 304 | 1 | 99.67% |
+| 512 | 8 | 954 | 416 | 1 | 99.76% |
+| 2048 | 32 | 2610 | 1088 | 1 | **99.91%** |
+
+The single CPU op at every length is the `cumsum` over the chunk-local `g` (length CS=64) — confirms `docs/MIL_OP_CATALOG.md` but does not contaminate neighbors.
+
+Parity cos ≥ 0.999999 vs HF reference at seq=64/128/256.
+
+Implication: **the SSM-on-ANE question is fully answered. Both hot paths (decode + prefill) run ≥99% on ANE.**
 
 ## Phased plan
 
