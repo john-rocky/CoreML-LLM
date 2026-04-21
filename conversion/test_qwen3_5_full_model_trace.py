@@ -144,12 +144,14 @@ def parity_vs_oracle(model: FullModel, oracle: dict, seq_len: int):
     return overall_min, overall_mean, top1_rate
 
 
-def convert_to_coreml(model: FullModel, seq_len: int, out_path: Path):
-    print(f"\n=== CoreML conversion (seq={seq_len}) ===")
+def convert_to_coreml(model: FullModel, seq_len: int, out_path: Path,
+                      precision: str = "fp16"):
+    print(f"\n=== CoreML conversion (seq={seq_len}, precision={precision}) ===")
     example = (torch.zeros(1, seq_len, dtype=torch.int32),)
     traced = torch.jit.trace(model, example, strict=False)
     print("  trace OK")
 
+    ct_precision = ct.precision.FLOAT32 if precision == "fp32" else ct.precision.FLOAT16
     ct_model = ct.convert(
         traced,
         convert_to="mlprogram",
@@ -157,9 +159,11 @@ def convert_to_coreml(model: FullModel, seq_len: int, out_path: Path):
             ct.TensorType(name="input_ids", shape=(1, seq_len), dtype=np.int32),
         ],
         outputs=[
-            ct.TensorType(name="logits", dtype=np.float16),
+            # fp32 output always: vocab-sized logits (248K) can exceed the fp16
+            # range at the boundary cast, flipping top-1 stability.
+            ct.TensorType(name="logits", dtype=np.float32),
         ],
-        compute_precision=ct.precision.FLOAT16,
+        compute_precision=ct_precision,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
         minimum_deployment_target=ct.target.iOS18,
     )
@@ -229,6 +233,8 @@ def main():
                     help="parity only, skip CoreML conversion")
     ap.add_argument("--out-dir", type=str, default=None,
                     help="if set, save mlpackage here; else use a tempdir")
+    ap.add_argument("--precision", choices=["fp16", "fp32"], default="fp16",
+                    help="compute precision inside the mlprogram")
     args = ap.parse_args()
 
     print("loading HF model fp32...")
@@ -275,8 +281,8 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
     else:
         out_dir = Path(tempfile.mkdtemp(prefix="qwen35_full_"))
-    out_path = out_dir / f"qwen3_5_0_8b_fp16_seq{args.seq_len}.mlpackage"
-    convert_to_coreml(model, args.seq_len, out_path)
+    out_path = out_dir / f"qwen3_5_0_8b_{args.precision}_seq{args.seq_len}.mlpackage"
+    convert_to_coreml(model, args.seq_len, out_path, precision=args.precision)
     ane_pct, dev_counts = audit_placement(out_path)
 
     print(f"\n=== Phase 4a summary ===")
