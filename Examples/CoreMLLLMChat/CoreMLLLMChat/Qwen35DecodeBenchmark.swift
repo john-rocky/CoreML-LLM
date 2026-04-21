@@ -53,11 +53,15 @@ final class Qwen35DecodeBenchmark {
 
     private func isLinearAttn(layer i: Int) -> Bool { i % 4 != 3 }
 
-    // RoPE cos/sin precomputed once at init (max_seq, rotary_dim) as fp16
-    // Computed from Qwen3.5 text-RoPE: theta=10M, partial_rotary=0.25, head_dim=256
-    // We emit cos[p], sin[p] for each decode step.
-    private lazy var cosTable: [Float] = buildRopeTable(cos: true)
-    private lazy var sinTable: [Float] = buildRopeTable(cos: false)
+    // RoPE cos/sin precomputed once at init (max_seq, rotary_dim) as fp16.
+    // @ObservationIgnored avoids the macro-vs-lazy conflict; filled in init().
+    @ObservationIgnored private var cosTable: [Float] = []
+    @ObservationIgnored private var sinTable: [Float] = []
+
+    init() {
+        cosTable = buildRopeTable(cos: true)
+        sinTable = buildRopeTable(cos: false)
+    }
 
     private func buildRopeTable(cos: Bool) -> [Float] {
         // rotary_dim = 64 (head_dim * 0.25 for partial RoPE)

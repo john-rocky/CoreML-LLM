@@ -43,11 +43,16 @@ final class Qwen35Generator {
     private let cfg: Config
 
     // RoPE cos/sin tables (max_seq, rotary_dim) — Qwen3.5 text: theta=1e7, partial=0.25
-    private lazy var cosTable: [Float] = buildRope(isCos: true)
-    private lazy var sinTable: [Float] = buildRope(isCos: false)
+    // @ObservationIgnored + explicit init avoids the @Observable-vs-`lazy`
+    // macro conflict: Observation-tracked lazy properties would need init
+    // accessors that can't reach the backing storage.
+    @ObservationIgnored private var cosTable: [Float] = []
+    @ObservationIgnored private var sinTable: [Float] = []
 
     init(cfg: Config = .default) {
         self.cfg = cfg
+        self.cosTable = buildRope(isCos: true)
+        self.sinTable = buildRope(isCos: false)
     }
 
     private func buildRope(isCos: Bool) -> [Float] {
