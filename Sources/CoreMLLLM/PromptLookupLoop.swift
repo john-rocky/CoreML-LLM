@@ -197,16 +197,17 @@ public final class PromptLookupLoop {
         // consult — the model only computed verifyK positions.)
 
         // Position advance: tTokNext + matched proposals are now committed
-        // in the KV cache. The correction/bonus is the carry seed for the
-        // next burst and is intentionally NOT committed yet — its KV slot
-        // will be (re)written by the next verify pass.
+        // in the KV cache. The correction/bonus stays as the carry seed for the
+        // next burst and is NOT committed here — its KV slot will be written
+        // by the next verify pass.
         //
-        // We use `commitAccepted` purely for its position-advance side
-        // effect; ChunkedEngine ignores the token contents. Verify already
-        // wrote KV at positions startPosition..+verifyK-1.
+        // 11c protocol: pass the ACTUAL accepted tokens (not stub zeros).
+        // ChunkedEngine.commitAccepted matches each position against the verify
+        // input to decide which slices to commit vs which need a fresh T=1.
         let committed = matchCount + 1
         _ = startPosition  // documented for caller clarity; engine uses its own currentPosition
-        try target.commitAccepted([Int32](repeating: 0, count: committed))
+        let committedTokens = Array(emitted.prefix(committed))
+        try target.commitAccepted(committedTokens)
 
         // Metrics
         totalRounds += 1

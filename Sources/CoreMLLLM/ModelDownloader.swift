@@ -90,7 +90,33 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml/resolve/main",
             folderName: "gemma4-e4b")
 
-        public static let defaults: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b]
+        /// Gemma 4 E2B + EAGLE-3 speculative — same 4.6B E2B base but with
+        /// decode chunks that emit `hidden_at_L{8,17,34}` taps plus three
+        /// extra mlmodelc bundles (`eagle3_draft`, `eagle3_fusion`,
+        /// `verify_chunk{1..4}`). CoreMLLLM auto-loads SpeculativeLoop when
+        /// all three are present and the decode stream uses K=3 speculative
+        /// bursts with T=1 fallback on any burst error. Sideload-only (no HF
+        /// distribution yet); the app treats the folder as "downloaded"
+        /// once present under `Documents/Models/gemma4-e2b-eagle3/`.
+        public static let gemma4e2bEagle3 = ModelInfo(
+            id: "gemma4-e2b-eagle3", name: "Gemma 4 E2B + EAGLE-3 (K=3)", size: "5.0 GB",
+            downloadURL: "",
+            folderName: "gemma4-e2b-eagle3")
+
+        /// Visible in the UI picker. EAGLE-3 variant is hidden unless
+        /// `LLM_SHOW_EXPERIMENTAL=1` is set (or the UserDefaults key
+        /// `showExperimentalModels` is true). Keeps production picker
+        /// clean while letting devs flip the flag for sideload testing.
+        public static var defaults: [ModelInfo] {
+            let experimental =
+                ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
+                || UserDefaults.standard.bool(forKey: "showExperimentalModels")
+            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b]
+            if experimental {
+                list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
+            }
+            return list
+        }
     }
 
     private struct DownloadFile: Codable {

@@ -135,6 +135,11 @@ def main():
                         help="Context length (default: registry entry's default)")
     parser.add_argument("--no-quantize", action="store_true",
                         help="Skip int4 palettization")
+    parser.add_argument("--keep-tmp", action="store_true",
+                        help="Keep the _tmp/chunkN_{decode,verify}.mlpackage "
+                             "intermediates so standalone verify-only chunks "
+                             "can be pushed to iPhone without the multi-function "
+                             "mlpackage (some iOS CoreML builds reject multi-function).")
     args = parser.parse_args()
 
     if args.output is None:
@@ -290,8 +295,10 @@ def main():
         ct.TensorType(name="K_full_in",            shape=vs1[11].shape, dtype=fp16),
         ct.TensorType(name="V_full_in",            shape=vs1[12].shape, dtype=fp16),
     ]
-    vout1 = ["hidden_states_out", "K_sliding_out", "V_sliding_out",
-             "K_full_out", "V_full_out", "per_layer_combined_out"]
+    # 11c: per-T K/V slices replace full-cache outputs.
+    # Sliding hd=256, full hd=512. Swift zero-pads sliding writes to max_hd=512.
+    vout1 = ["hidden_states_out", "per_layer_combined_out",
+             "new_K_sliding", "new_V_sliding", "new_K_full", "new_V_full"]
     verify1 = trace_and_convert(vc1, vs1, vin1, vout1, quantize=quantize)
     save_temp(verify1, f"{tmp}/chunk1_verify.mlpackage")
     del verify1
@@ -384,8 +391,12 @@ def main():
         ct.TensorType(name="K_full_in",            shape=vs2[11].shape, dtype=fp16),
         ct.TensorType(name="V_full_in",            shape=vs2[12].shape, dtype=fp16),
     ]
-    vout2 = ["hidden_states_out", "K_sliding_out", "V_sliding_out",
-             "K_full_out", "V_full_out",
+    # 11c: per-T K/V slices replace full-cache outputs.
+    # kv13_k/v + kv14_k/v are the extended within-verify caches feeding chunks 3/4
+    # (NOT persisted by Swift; persistent kv13/kv14 are the L13/L14 slots of
+    # kSliding2/kFull2, written via new_K_sliding/new_K_full slices).
+    vout2 = ["hidden_states_out",
+             "new_K_sliding", "new_V_sliding", "new_K_full", "new_V_full",
              "kv13_k", "kv13_v", "kv14_k", "kv14_v"]
     verify2 = trace_and_convert(vc2, vs2, vin2, vout2, quantize=quantize)
     save_temp(verify2, f"{tmp}/chunk2_verify.mlpackage")
@@ -527,9 +538,15 @@ def main():
         f"{args.output}/chunk4.mlpackage")
 
     # ================================================================
-    # Cleanup temp files
+    # Cleanup temp files (unless --keep-tmp). Retained intermediates are
+    # usable as standalone chunk{N}_{decode,verify}.mlpackage which match
+    # Swift's "standalone verify chunks" fallback when multi-function
+    # loading is unsupported on the target OS.
     # ================================================================
-    shutil.rmtree(tmp, ignore_errors=True)
+    if not args.keep_tmp:
+        shutil.rmtree(tmp, ignore_errors=True)
+    else:
+        print(f"\n  [keep-tmp] intermediates preserved under {tmp}/")
 
     print(f"\n{'='*60}")
     print(f"Multi-function chunks saved to {args.output}/")

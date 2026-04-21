@@ -78,6 +78,18 @@ final class ChunkedEngine {
     let prefillN: Int
     var currentPosition: Int = 0
 
+    // EAGLE-3 speculative decoding state (Phase 2B).
+    // hidden_at_L{8,17,34} are captured from decode chunks 2/3/4 on each step,
+    // then consumed by `SpeculativeLoop` to build the draft's fused hidden. They
+    // stay nil until an EAGLE-3-capable decode chunk set is loaded.
+    var lastHiddenAtL8:  MLMultiArray?
+    var lastHiddenAtL17: MLMultiArray?
+    var lastHiddenAtL34: MLMultiArray?
+
+    /// Most recent token produced by `predictStep`. Used to hand the next
+    /// `tTokNext` back to `SpeculativeLoop.drawBurst` after a commit burst.
+    private(set) var lastArgmaxAfterDecode: Int = 0
+
     var hasPrefill: Bool {
         prefillChunk1 != nil && prefillChunk2 != nil
             && prefillChunk3 != nil && prefillChunk4 != nil
@@ -97,6 +109,37 @@ final class ChunkedEngine {
     private(set) var lastKV13V: MLMultiArray?
     private(set) var lastKV14K: MLMultiArray?
     private(set) var lastKV14V: MLMultiArray?
+
+    // 11c write-after-accept: per-T raw K/V slices captured from the last
+    // verify call, used by commitAccepted to selectively write only the
+    // accepted prefix into persistent kSliding/kFull buffers.
+    // Shapes: new_K_sliding_cN (num_slots, 1, K, 256), new_K_full_cN (num_slots, 1, K, 512).
+    private var lastNewKSliding1: MLMultiArray?  // (7, 1, K, 256)
+    private var lastNewVSliding1: MLMultiArray?
+    private var lastNewKFull1: MLMultiArray?     // (1, 1, K, 512)
+    private var lastNewVFull1: MLMultiArray?
+    private var lastNewKSliding2: MLMultiArray?  // (5, 1, K, 256)
+    private var lastNewVSliding2: MLMultiArray?
+    private var lastNewKFull2: MLMultiArray?     // (2, 1, K, 512)
+    private var lastNewVFull2: MLMultiArray?
+    /// Tokens that were the verify input — needed by commitAccepted to detect
+    /// which accepted positions match a verified slice (writeable) vs which
+    /// need a fresh T=1 step (correction or bonus past the verify range).
+    private var lastVerifyInputTokens: [Int32] = []
+
+    /// Test-only KV snapshot. Returns a byte-copy of all 8 persistent KV
+    /// buffers, so a test can run two paths and assert byte-identical state.
+    internal func _kvSnapshotBytes() -> [String: Data] {
+        func snap(_ a: MLMultiArray) -> Data {
+            return Data(bytes: a.dataPointer, count: a.count * MemoryLayout<UInt16>.stride)
+        }
+        return [
+            "kSliding1": snap(kSliding1), "vSliding1": snap(vSliding1),
+            "kFull1": snap(kFull1), "vFull1": snap(vFull1),
+            "kSliding2": snap(kSliding2), "vSliding2": snap(vSliding2),
+            "kFull2": snap(kFull2), "vFull2": snap(vFull2),
+        ]
+    }
 
     // MARK: - Loading
 
@@ -126,15 +169,38 @@ final class ChunkedEngine {
             }
         }
 
+        // Env override: LLM_COMPUTE_UNITS=cpu|cpuGpu|cpuAne|all — for
+        // diagnosing ANE-vs-other-device numerical differences. When a per-
+        // device ANE gives very different numerics (e.g., 4-bit palettized
+        // weights decoded differently on A-series vs M-series), routing the
+        // same .mlmodelc through CPU eliminates the hardware variance at the
+        // cost of speed.
+        var effectiveUnits = computeUnits
+        if let raw = ProcessInfo.processInfo.environment["LLM_COMPUTE_UNITS"]?.lowercased() {
+            switch raw {
+            case "cpu", "cpuonly":
+                effectiveUnits = .cpuOnly
+            case "cpugpu", "cpuandgpu":
+                effectiveUnits = .cpuAndGPU
+            case "cpuane", "cpuandneuralengine":
+                effectiveUnits = .cpuAndNeuralEngine
+            case "all":
+                effectiveUnits = .all
+            default:
+                break
+            }
+            print("[Load] LLM_COMPUTE_UNITS=\(raw) → computeUnits=\(effectiveUnits)")
+        }
+
         let mlConfig = MLModelConfiguration()
-        mlConfig.computeUnits = computeUnits
+        mlConfig.computeUnits = effectiveUnits
         applyHints(mlConfig)
 
         // Prefill chunks use GPU for compute-bound batch processing (TTFT win).
         // Decode chunks stay on ANE for bandwidth-bound single-token inference.
         let prefillConfig = MLModelConfiguration()
         let useGPUPrefill = ProcessInfo.processInfo.environment["GPU_PREFILL"] == "1"
-        prefillConfig.computeUnits = useGPUPrefill ? .cpuAndGPU : computeUnits
+        prefillConfig.computeUnits = useGPUPrefill ? .cpuAndGPU : effectiveUnits
         applyHints(prefillConfig)
         if useGPUPrefill {
             print("[Load] GPU_PREFILL=1 — prefill chunks will use .cpuAndGPU")
@@ -221,11 +287,21 @@ final class ChunkedEngine {
         // Multi-function chunks have a "verify_qK" function alongside the
         // default "decode_q1". We detect this by checking if the chunk has
         // the verify function and load it with a separate configuration.
+        //
+        // Opt-in: verify chunks add ~600 MB ANE-resident. Only load if
+        // the caller has enabled a speculative path (LLM_EAGLE3_ENABLE=1
+        // for the trained EAGLE-3 draft, or SPECULATIVE_PROFILE=1 for
+        // the cross-vocab Qwen drafter). Default mode (no env set) skips
+        // verify entirely so baseline memory footprint matches pre-spec.
+        let specRequested =
+            ProcessInfo.processInfo.environment["LLM_EAGLE3_ENABLE"] == "1"
+            || ProcessInfo.processInfo.environment["SPECULATIVE_PROFILE"] != nil
         var v1: MLModel?, v2: MLModel?, v3: MLModel?, v4: MLModel?
         var detectedK = 0
+        if specRequested {
         do {
             let verifyConfig = MLModelConfiguration()
-            verifyConfig.computeUnits = computeUnits
+            verifyConfig.computeUnits = effectiveUnits
             verifyConfig.functionName = "verify_qK"
             applyHints(verifyConfig)
 
@@ -264,6 +340,66 @@ final class ChunkedEngine {
             // Multi-function not available — verify chunks stay nil
             print("[Load] No verify_qK function found, speculative verification disabled")
             v1 = nil; v2 = nil; v3 = nil; v4 = nil
+        }
+
+        // EAGLE-3 fallback: if multi-function verify isn't present, try loading
+        // standalone verify_chunk{1..4}.mlmodelc files (produced by
+        // build_eagle3_verify.py). These have the same schema as the
+        // verify_qK function and work with the existing verifyCandidates()
+        // path. All four must be present to enable speculative.
+        if v1 == nil || v2 == nil || v3 == nil || v4 == nil {
+            if findModel("verify_chunk1") != nil {
+                do {
+                    let verifyConfig = MLModelConfiguration()
+                    verifyConfig.computeUnits = effectiveUnits
+                    applyHints(verifyConfig)
+                    let verifyT0 = CFAbsoluteTimeGetCurrent()
+                    try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
+                        for name in ["verify_chunk1", "verify_chunk2", "verify_chunk3", "verify_chunk4"] {
+                            guard let url = findModel(name) else { continue }
+                            group.addTask { (name, try MLModel(contentsOf: url, configuration: verifyConfig)) }
+                        }
+                        for try await (name, model) in group {
+                            switch name {
+                            case "verify_chunk1": v1 = model
+                            case "verify_chunk2": v2 = model
+                            case "verify_chunk3": v3 = model
+                            case "verify_chunk4": v4 = model
+                            default: break
+                            }
+                        }
+                    }
+                    if v1 != nil && v2 != nil && v3 != nil && v4 != nil {
+                        // Standalone eagle3 verify chunks emit token_ids as (T,) 1D;
+                        // multi-function verify_qK emits (1, T). Handle both.
+                        if let desc = v4!.modelDescription.outputDescriptionsByName["token_ids"],
+                           let c = desc.multiArrayConstraint {
+                            if c.shape.count >= 2 {
+                                detectedK = c.shape[1].intValue
+                            } else if c.shape.count == 1 {
+                                detectedK = c.shape[0].intValue
+                            }
+                        }
+                        if detectedK == 0 {
+                            // Fallback: assume K=3 for EAGLE-3 build convention.
+                            detectedK = 3
+                            print("[Load] Could not infer K from verify_chunk4 token_ids shape; defaulting to 3")
+                        }
+                        let vDt = CFAbsoluteTimeGetCurrent() - verifyT0
+                        print("[Load] Standalone verify chunks loaded (K=\(detectedK)) in \(String(format: "%.1f", vDt))s")
+                    } else {
+                        print("[Load] Partial verify_chunk*.mlmodelc set — speculative disabled")
+                        v1 = nil; v2 = nil; v3 = nil; v4 = nil
+                    }
+                } catch {
+                    print("[Load] verify_chunk*.mlmodelc load failed (\(error)) — speculative disabled")
+                    v1 = nil; v2 = nil; v3 = nil; v4 = nil
+                }
+            }
+        }
+        }  // end if specRequested
+        if !specRequested {
+            print("[Load] speculative disabled by default — set LLM_EAGLE3_ENABLE=1 or SPECULATIVE_PROFILE=1 to load verify chunks")
         }
 
         // Embeddings
@@ -402,11 +538,15 @@ final class ChunkedEngine {
             vFull2:    ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx),
             config: config, prefillN: prefillN)
 
-        // ANE pipeline prewarm (Phase 0b): four dummy decode steps at load
-        // time force the ANE compiler to finalize dispatch schedules and
-        // resident weight layouts before the first user token arrives —
-        // eliminating the ~0.5-1.5s first-token stall. KV cache is reset
-        // afterwards so the dummy tokens leave no state behind.
+        // ANE pipeline prewarm (Phase 0b): dummy decode steps at load time
+        // force the ANE compiler to finalize dispatch schedules and resident
+        // weight layouts before the first user token arrives. KV cache is
+        // reset afterwards so the dummy tokens leave no state behind.
+        //
+        // NOTE: this is the EARLY prewarm. After this returns, CoreMLLLM.load
+        // may load additional models (EAGLE-3 draft/fusion, cross-vocab Qwen,
+        // etc.) which can evict this ANE cache — call engine.finalPrewarm()
+        // at end of full load to re-warm decode + verify paths.
         let warmT0 = CFAbsoluteTimeGetCurrent()
         for i in 0..<4 {
             _ = try engine.predictStep(tokenID: 0, position: i)
@@ -415,6 +555,30 @@ final class ChunkedEngine {
         print("[Load] ANE prewarm (4 steps) done in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - warmT0))s")
 
         return engine
+    }
+
+    /// Final prewarm after ALL auxiliary models (EAGLE-3 draft/fusion,
+    /// cross-vocab Qwen, etc.) have loaded — those loads can evict the
+    /// decode chunks' ANE cache, causing the first user prompt to see
+    /// ~50ms extra per decode step (observed on iPhone 17 Pro).
+    /// Call once from CoreMLLLM.load after everything is loaded.
+    public func finalPrewarm() throws {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        // 8 T=1 decode steps (double the early prewarm) so ANE has more
+        // dispatch samples to stabilize.
+        for i in 0..<8 {
+            _ = try predictStep(tokenID: 0, position: i)
+        }
+        // Warm verify path too — verify_qK is a separate compiled graph
+        // that predictStep never touches, so first verifyCandidates is
+        // otherwise a cold ANE hit (~100ms extra on first spec burst).
+        if hasVerify {
+            let dummy: [Int32] = Array(repeating: 0, count: verifyK)
+            _ = try? verifyCandidates(tokens: dummy, startPosition: 0)
+        }
+        reset()
+        let dt = CFAbsoluteTimeGetCurrent() - t0
+        print("[Load] Final prewarm (8 decode + verify) done in \(String(format: "%.2f", dt))s")
     }
 
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
@@ -503,6 +667,11 @@ final class ChunkedEngine {
             memset(buf.dataPointer, 0, buf.count * MemoryLayout<UInt16>.stride)
         }
         currentPosition = 0
+        lastVerifyInputTokens = []
+        lastNewKSliding1 = nil; lastNewVSliding1 = nil
+        lastNewKFull1 = nil;    lastNewVFull1 = nil
+        lastNewKSliding2 = nil; lastNewVSliding2 = nil
+        lastNewKFull2 = nil;    lastNewVFull2 = nil
         profileEmbed = 0
         profilePredict = 0
         profileCount = 0
@@ -620,6 +789,8 @@ final class ChunkedEngine {
         let tC2Wait1 = CFAbsoluteTimeGetCurrent()
         profileANEWait += (tC2Wait1 - tC2Wait0)
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        // EAGLE-3 hidden tap (present only in EAGLE-3 decode chunks).
+        lastHiddenAtL8 = out2.featureValue(for: "hidden_at_L8")?.multiArrayValue
         let tC2Cb0 = CFAbsoluteTimeGetCurrent()
         copyBack(out2, "K_sliding_out", into: kSliding2)
         copyBack(out2, "V_sliding_out", into: vSliding2)
@@ -652,8 +823,10 @@ final class ChunkedEngine {
         var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
         let in3 = try MLDictionaryFeatureProvider(dictionary: d3)
         let tC3Wait0 = CFAbsoluteTimeGetCurrent()
-        let h3 = try chunk3.prediction(from: in3)
-            .featureValue(for: "hidden_states_out")!.multiArrayValue!
+        let out3 = try chunk3.prediction(from: in3)
+        let h3 = out3.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        // EAGLE-3 hidden tap (present only in EAGLE-3 decode chunks).
+        lastHiddenAtL17 = out3.featureValue(for: "hidden_at_L17")?.multiArrayValue
         let tC3End = CFAbsoluteTimeGetCurrent()
         profileANEWait += (tC3End - tC3Wait0)
         profileC3 += (tC3End - tC3Start)
@@ -664,6 +837,8 @@ final class ChunkedEngine {
         let in4 = try MLDictionaryFeatureProvider(dictionary: d4)
         let tC4Wait0 = CFAbsoluteTimeGetCurrent()
         let out4 = try chunk4.prediction(from: in4)
+        // EAGLE-3 hidden tap (present only in EAGLE-3 decode chunks).
+        lastHiddenAtL34 = out4.featureValue(for: "hidden_at_L34")?.multiArrayValue
         let tC4End = CFAbsoluteTimeGetCurrent()
         profileANEWait += (tC4End - tC4Wait0)
         profileC4 += (tC4End - tC4Start)
@@ -709,7 +884,9 @@ final class ChunkedEngine {
                 aneMs, cbMs, cpuActiveMs, cpuPct))
         }
 
-        return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+        let next = out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+        self.lastArgmaxAfterDecode = next
+        return next
     }
 
     // MARK: - Batched prefill (seq=N)
@@ -1045,13 +1222,13 @@ final class ChunkedEngine {
         ]))
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
-        // Copy back updated KV caches from verify
-        copyBack(out1, "K_sliding_out", into: kSliding1)
-        copyBack(out1, "V_sliding_out", into: vSliding1)
-        copyBack(out1, "K_full_out", into: kFull1)
-        copyBack(out1, "V_full_out", into: vFull1)
+        // 11c: capture per-T K/V slices for selective commit; do NOT write to persistent cache yet.
+        lastNewKSliding1 = out1.featureValue(for: "new_K_sliding")?.multiArrayValue
+        lastNewVSliding1 = out1.featureValue(for: "new_V_sliding")?.multiArrayValue
+        lastNewKFull1    = out1.featureValue(for: "new_K_full")?.multiArrayValue
+        lastNewVFull1    = out1.featureValue(for: "new_V_full")?.multiArrayValue
 
-        // Verify chunk 2: write-through KV, outputs updated kv13/kv14
+        // Verify chunk 2: emits per-T slices + within-verify extended kv13/kv14 for chunks 3/4.
         let out2 = try verifyChunk2!.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h1),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
@@ -1066,17 +1243,18 @@ final class ChunkedEngine {
             "V_full_in": MLFeatureValue(multiArray: vFull2),
         ]))
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
-        // Copy back updated KV caches
-        copyBack(out2, "K_sliding_out", into: kSliding2)
-        copyBack(out2, "V_sliding_out", into: vSliding2)
-        copyBack(out2, "K_full_out", into: kFull2)
-        copyBack(out2, "V_full_out", into: vFull2)
+        lastNewKSliding2 = out2.featureValue(for: "new_K_sliding")?.multiArrayValue
+        lastNewVSliding2 = out2.featureValue(for: "new_V_sliding")?.multiArrayValue
+        lastNewKFull2    = out2.featureValue(for: "new_K_full")?.multiArrayValue
+        lastNewVFull2    = out2.featureValue(for: "new_V_full")?.multiArrayValue
         let kv13k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
         let kv13v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
         let kv14k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
         let kv14v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
         lastKV13K = kv13k; lastKV13V = kv13v
         lastKV14K = kv14k; lastKV14V = kv14v
+        // Remember verify inputs for commitAccepted's match check.
+        lastVerifyInputTokens = tokens
 
         let shared: [String: MLFeatureValue] = [
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
@@ -1177,10 +1355,11 @@ final class ChunkedEngine {
         ]))
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
-        copyBack(out1, "K_sliding_out", into: kSliding1)
-        copyBack(out1, "V_sliding_out", into: vSliding1)
-        copyBack(out1, "K_full_out", into: kFull1)
-        copyBack(out1, "V_full_out", into: vFull1)
+        // 11c: capture per-T K/V slices; persistent cache untouched until commitAccepted.
+        lastNewKSliding1 = out1.featureValue(for: "new_K_sliding")?.multiArrayValue
+        lastNewVSliding1 = out1.featureValue(for: "new_V_sliding")?.multiArrayValue
+        lastNewKFull1    = out1.featureValue(for: "new_K_full")?.multiArrayValue
+        lastNewVFull1    = out1.featureValue(for: "new_V_full")?.multiArrayValue
 
         // Verify chunk 2
         let out2 = try verifyChunk2!.prediction(from: MLDictionaryFeatureProvider(dictionary: [
@@ -1197,16 +1376,23 @@ final class ChunkedEngine {
             "V_full_in": MLFeatureValue(multiArray: vFull2),
         ]))
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
-        copyBack(out2, "K_sliding_out", into: kSliding2)
-        copyBack(out2, "V_sliding_out", into: vSliding2)
-        copyBack(out2, "K_full_out", into: kFull2)
-        copyBack(out2, "V_full_out", into: vFull2)
+        // EAGLE-3 hidden tap (present only in EAGLE-3 decode chunks; nil for
+        // verify_chunk2 that predates the EAGLE-3 fusion build).
+        lastHiddenAtL8 = out2.featureValue(for: "hidden_at_L8")?.multiArrayValue
+        // 11c write-after-accept: capture per-T raw K/V slices; commitAccepted
+        // selectively writes only the accepted prefix into persistent storage.
+        // No copyBack(...) calls here — verify MUST NOT pollute persistent KV.
+        lastNewKSliding2 = out2.featureValue(for: "new_K_sliding")?.multiArrayValue
+        lastNewVSliding2 = out2.featureValue(for: "new_V_sliding")?.multiArrayValue
+        lastNewKFull2    = out2.featureValue(for: "new_K_full")?.multiArrayValue
+        lastNewVFull2    = out2.featureValue(for: "new_V_full")?.multiArrayValue
         let kv13k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
         let kv13v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
         let kv14k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
         let kv14v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
         lastKV13K = kv13k; lastKV13V = kv13v
         lastKV14K = kv14k; lastKV14V = kv14v
+        lastVerifyInputTokens = tokens
 
         let shared: [String: MLFeatureValue] = [
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
@@ -1279,6 +1465,14 @@ final class ChunkedEngine {
             topKOut.append(best)
         }
         return (argmax, topKOut)
+    }
+
+    /// Embed a single token id into a (1, 1, hidden) fp16 MLMultiArray, with
+    /// the hidden-scale factor already applied (matches draft training
+    /// convention). Exposed for `SpeculativeLoop`'s `tokenEmbed` closure.
+    func embedToken(_ tokenID: Int32) throws -> MLMultiArray {
+        try embedTokens.lookup(Int(tokenID),
+                               shape: [1, 1, NSNumber(value: config.hiddenSize)])
     }
 
     // MARK: - Verify helpers
@@ -1746,23 +1940,402 @@ final class ChunkedEngine {
     }
 }
 
+// MARK: - EAGLE-3 speculative decoding (Phase 2B)
+
+extension ChunkedEngine {
+    /// True when all four verify chunks are loaded and the most recent decode
+    /// step captured EAGLE-3 hidden taps (L8/L17/L34).
+    var canSpeculate: Bool {
+        verifyChunk1 != nil && verifyChunk2 != nil
+            && verifyChunk3 != nil && verifyChunk4 != nil
+            && lastHiddenAtL8 != nil && lastHiddenAtL17 != nil && lastHiddenAtL34 != nil
+    }
+
+    // MARK: - Verify-side mask / RoPE / input builders
+
+    /// Full-attention causal mask for T batched queries at positions
+    /// [position, position + T - 1], last dim ctx + T.
+    ///   mask[t, i] for i in 0..<ctx = 0 if i < position else -inf
+    ///   mask[t, ctx+j] = 0 if j <= t else -inf
+    func makeVerifyCausalMaskFull(position: Int, T: Int, ctx: Int) throws -> MLMultiArray {
+        let lastDim = ctx + T
+        let arr = try MLMultiArray(
+            shape: [1, 1, NSNumber(value: T), NSNumber(value: lastDim)], dataType: .float16)
+        let p = arr.dataPointer.bindMemory(to: UInt16.self, capacity: T * lastDim)
+        // Default: -inf
+        for i in 0..<(T * lastDim) { p[i] = 0xFC00 }
+        for t in 0..<T {
+            let base = t * lastDim
+            // Cache portion: 0..<position allowed.
+            for i in 0..<min(position, ctx) { p[base + i] = 0 }
+            // New-K portion: 0..t allowed within the trailing T slots.
+            for j in 0...t { p[base + ctx + j] = 0 }
+        }
+        return arr
+    }
+
+    /// Sliding causal mask for T batched queries. Last dim W + T.
+    ///   mask[t, i] for i in 0..<W: 0 iff cache slot i is within the
+    ///     position-indexed window AND < position. When cache is partially
+    ///     filled (position < W), slots [0, W-position-1] are invalid.
+    ///   mask[t, W+j]: 0 iff j <= t.
+    func makeVerifyCausalMaskSliding(position: Int, T: Int, W: Int) throws -> MLMultiArray {
+        let lastDim = W + T
+        let arr = try MLMultiArray(
+            shape: [1, 1, NSNumber(value: T), NSNumber(value: lastDim)], dataType: .float16)
+        let p = arr.dataPointer.bindMemory(to: UInt16.self, capacity: T * lastDim)
+        for i in 0..<(T * lastDim) { p[i] = 0xFC00 }
+        // Valid cache length = min(position, W). Cache slot i represents
+        // abs position (position - validCache + i) for i >= W - validCache.
+        let validCache = min(position, W)
+        let cacheStart = W - validCache
+        for t in 0..<T {
+            let base = t * lastDim
+            // For query t at abs pos (position + t), sliding window admits
+            // abs range [position + t - W + 1, position + t]. Map to cache
+            // slot index. Cache slots [cacheStart .. W-1] are valid.
+            // All valid cache slots satisfy the window condition when the
+            // window is at least the cache length (always true here since
+            // cache length = validCache ≤ W ≤ W + t).
+            for i in cacheStart..<W { p[base + i] = 0 }
+            // New positions within the trailing T slots.
+            for j in 0...t { p[base + W + j] = 0 }
+        }
+        return arr
+    }
+
+    /// Stack embed(token) for each token into a single (1, T, hidden) fp16 array.
+    func buildVerifyHidden(tokenIDs: [Int32]) throws -> MLMultiArray {
+        let T = tokenIDs.count
+        let h = config.hiddenSize
+        let arr = try MLMultiArray(
+            shape: [1, NSNumber(value: T), NSNumber(value: h)], dataType: .float16)
+        let dst = arr.dataPointer.bindMemory(to: UInt16.self, capacity: T * h)
+        for (i, tid) in tokenIDs.enumerated() {
+            let e = try embedTokens.lookup(Int(tid), shape: [1, 1, NSNumber(value: h)])
+            let src = e.dataPointer.bindMemory(to: UInt16.self, capacity: h)
+            memcpy(dst.advanced(by: i * h), src, h * MemoryLayout<UInt16>.stride)
+        }
+        return arr
+    }
+
+    /// Stack per-layer-raw embedding for each token into (1, T, numLayers*pld) fp16.
+    func buildVerifyPLR(tokenIDs: [Int32]) throws -> MLMultiArray {
+        let T = tokenIDs.count
+        let totalDim = config.numLayers * config.perLayerDim
+        let arr = try MLMultiArray(
+            shape: [1, NSNumber(value: T), NSNumber(value: totalDim)], dataType: .float16)
+        let dst = arr.dataPointer.bindMemory(to: UInt16.self, capacity: T * totalDim)
+        memset(dst, 0, T * totalDim * MemoryLayout<UInt16>.stride)
+        for (i, tid) in tokenIDs.enumerated() {
+            let raw = embedPerLayer.lookupRaw(Int(tid))
+            memcpy(dst.advanced(by: i * totalDim), raw, totalDim * MemoryLayout<UInt16>.stride)
+        }
+        return arr
+    }
+
+    /// Read T consecutive rows from a RoPE table starting at `position`, stack
+    /// into shape (1, 1, T, dim).
+    func buildVerifyRoPE(table: Data?, position: Int, T: Int, dim: Int) throws -> MLMultiArray {
+        let arr = try MLMultiArray(
+            shape: [1, 1, NSNumber(value: T), NSNumber(value: dim)], dataType: .float16)
+        let dst = arr.dataPointer.bindMemory(to: UInt16.self, capacity: T * dim)
+        guard let table else {
+            memset(dst, 0, T * dim * MemoryLayout<UInt16>.stride); return arr
+        }
+        var headerSize = 128
+        table.withUnsafeBytes { raw in
+            let b = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            headerSize = 10 + (Int(b[8]) | (Int(b[9]) << 8))
+        }
+        let rowBytes = dim * MemoryLayout<UInt16>.stride
+        table.withUnsafeBytes { raw in
+            let base = raw.baseAddress!
+            for t in 0..<T {
+                let off = headerSize + (position + t) * rowBytes
+                if off + rowBytes <= table.count {
+                    memcpy(dst.advanced(by: t * dim), base.advanced(by: off), rowBytes)
+                } else {
+                    memset(dst.advanced(by: t * dim), 0, rowBytes)
+                }
+            }
+        }
+        return arr
+    }
+}
+
 // MARK: - SpeculativeTarget conformance
 
 extension ChunkedEngine: SpeculativeTarget {
     public func lastHiddenMulti(at layerIndices: [Int]) throws -> [MLMultiArray] {
-        // Placeholder: requires chunk modifications to expose per-layer hidden states.
-        // For now, return empty arrays; EAGLE-3 integration will fill this in.
-        throw CoreMLLLMError.predictionFailed
-    }
-
-    public func verifyCandidates(_ candidates: [Int32], K: Int) throws -> [Int32] {
-        return try verifyCandidates(tokens: candidates, startPosition: currentPosition)
+        try layerIndices.map { idx in
+            switch idx {
+            case 8:
+                guard let h = lastHiddenAtL8 else {
+                    throw SpeculativeError.missingModel("lastHiddenAtL8 not captured yet")
+                }
+                return h
+            case 17:
+                guard let h = lastHiddenAtL17 else {
+                    throw SpeculativeError.missingModel("lastHiddenAtL17 not captured yet")
+                }
+                return h
+            case 34:
+                guard let h = lastHiddenAtL34 else {
+                    throw SpeculativeError.missingModel("lastHiddenAtL34 not captured yet")
+                }
+                return h
+            default:
+                throw SpeculativeError.missingModel("no hidden tap for layer \(idx)")
+            }
+        }
     }
 
     public func commitAccepted(_ tokens: [Int32]) throws {
-        // Write-through: verify already wrote KV for all K positions.
-        // Rejected entries are masked out by causal mask in future steps.
-        // Just advance the position counter.
-        currentPosition += tokens.count
+        // 11c write-after-accept:
+        //   For each accepted token at position currentPosition + t:
+        //     - if it equals the verify input at slot t (i.e. that verify K/V is
+        //       valid for this token), commit verify slice t into persistent cache.
+        //     - else (correction, or beyond the verify range), run a T=1 predictStep
+        //       to compute and write its K/V.
+        //   Then advance currentPosition by tokens.count.
+        let N = tokens.count
+        if N == 0 { return }
+        let P = currentPosition
+
+        let inputs = lastVerifyInputTokens
+        let K = inputs.count
+        var M = 0
+        while M < N && M < K && tokens[M] == inputs[M] {
+            M += 1
+        }
+
+        if M > 0 {
+            try commitKVSlices(count: M, basePosition: P)
+        }
+
+        // Tail tokens (correction / bonus / beyond verify range): compute K/V via T=1.
+        for t in M..<N {
+            _ = try predictStep(tokenID: Int(tokens[t]), position: P + t)
+        }
+
+        currentPosition = P + N
     }
+
+    /// Commits the first `count` per-T K/V slices captured during the most
+    /// recent verify call into the persistent IOSurface-backed caches.
+    /// Sliding caches are shifted left by `count` and the new slices appended.
+    /// Full caches are scattered into ctx-positions [basePosition .. basePosition+count-1].
+    /// `count` MUST be ≤ K (the verify batch size) and ≤ verify slice tensors' second dim.
+    private func commitKVSlices(count M: Int, basePosition P: Int) throws {
+        guard M > 0,
+              let nKs1 = lastNewKSliding1, let nVs1 = lastNewVSliding1,
+              let nKf1 = lastNewKFull1,    let nVf1 = lastNewVFull1,
+              let nKs2 = lastNewKSliding2, let nVs2 = lastNewVSliding2,
+              let nKf2 = lastNewKFull2,    let nVf2 = lastNewVFull2 else {
+            // No staged slices — caller must have called verifyCandidates first.
+            // (PromptLookupLoop's stub-zero path is no longer supported; callers must
+            //  pass actual accepted tokens.)
+            return
+        }
+        let W = config.slidingWindow
+        let ctx = config.contextLength
+        let maxHd = 512
+        let slidingHd = 256
+
+        // Sliding writes (shift left by M, append M new rows per slot).
+        commitSlidingSlots(buf: kSliding1, slices: nKs1, slotCount: 7,
+                           M: M, W: W, slidingHd: slidingHd, maxHd: maxHd)
+        commitSlidingSlots(buf: vSliding1, slices: nVs1, slotCount: 7,
+                           M: M, W: W, slidingHd: slidingHd, maxHd: maxHd)
+        commitSlidingSlots(buf: kSliding2, slices: nKs2, slotCount: 5,
+                           M: M, W: W, slidingHd: slidingHd, maxHd: maxHd)
+        commitSlidingSlots(buf: vSliding2, slices: nVs2, slotCount: 5,
+                           M: M, W: W, slidingHd: slidingHd, maxHd: maxHd)
+
+        // Full writes (scatter at positions P..P+M-1; full hd == maxHd, no padding).
+        commitFullSlots(buf: kFull1, slices: nKf1, slotCount: 1,
+                        M: M, P: P, ctx: ctx, fullHd: maxHd)
+        commitFullSlots(buf: vFull1, slices: nVf1, slotCount: 1,
+                        M: M, P: P, ctx: ctx, fullHd: maxHd)
+        commitFullSlots(buf: kFull2, slices: nKf2, slotCount: 2,
+                        M: M, P: P, ctx: ctx, fullHd: maxHd)
+        commitFullSlots(buf: vFull2, slices: nVf2, slotCount: 2,
+                        M: M, P: P, ctx: ctx, fullHd: maxHd)
+    }
+
+    private func commitSlidingSlots(buf: MLMultiArray, slices: MLMultiArray,
+                                    slotCount: Int,
+                                    M: Int, W: Int, slidingHd: Int, maxHd: Int) {
+        let bufBase = buf.dataPointer.bindMemory(to: UInt16.self, capacity: buf.count)
+        let srcBase = slices.dataPointer.bindMemory(to: UInt16.self, capacity: slices.count)
+        let K = slices.shape[2].intValue
+        precondition(M <= K, "commitSlidingSlots: M=\(M) > K=\(K)")
+        let bytesPerSlidingRow = slidingHd * MemoryLayout<UInt16>.stride
+        let bytesPadHigh       = (maxHd - slidingHd) * MemoryLayout<UInt16>.stride
+        for slot in 0..<slotCount {
+            let slotPtr = bufBase.advanced(by: slot * W * maxHd)
+            // Shift left by M positions: dst rows [0..W-M-1] = src rows [M..W-1].
+            memmove(slotPtr,
+                    slotPtr.advanced(by: M * maxHd),
+                    (W - M) * maxHd * MemoryLayout<UInt16>.stride)
+            // Append M new rows at end, zero-padded high half (maxHd-slidingHd).
+            let srcSlot = srcBase.advanced(by: slot * K * slidingHd)
+            for n in 0..<M {
+                let dstRow = slotPtr.advanced(by: (W - M + n) * maxHd)
+                let srcRow = srcSlot.advanced(by: n * slidingHd)
+                memcpy(dstRow, srcRow, bytesPerSlidingRow)
+                if bytesPadHigh > 0 {
+                    memset(dstRow.advanced(by: slidingHd), 0, bytesPadHigh)
+                }
+            }
+        }
+    }
+
+    private func commitFullSlots(buf: MLMultiArray, slices: MLMultiArray,
+                                 slotCount: Int,
+                                 M: Int, P: Int, ctx: Int, fullHd: Int) {
+        let bufBase = buf.dataPointer.bindMemory(to: UInt16.self, capacity: buf.count)
+        let srcBase = slices.dataPointer.bindMemory(to: UInt16.self, capacity: slices.count)
+        let K = slices.shape[2].intValue
+        precondition(M <= K, "commitFullSlots: M=\(M) > K=\(K)")
+        let bytesPerRow = fullHd * MemoryLayout<UInt16>.stride
+        for slot in 0..<slotCount {
+            let slotPtr = bufBase.advanced(by: slot * ctx * fullHd)
+            let srcSlot = srcBase.advanced(by: slot * K * fullHd)
+            for n in 0..<M {
+                let pos = P + n
+                precondition(pos < ctx, "commitFullSlots: pos \(pos) >= ctx \(ctx)")
+                memcpy(slotPtr.advanced(by: pos * fullHd),
+                       srcSlot.advanced(by: n * fullHd),
+                       bytesPerRow)
+            }
+        }
+    }
+
+    public func verifyCandidates(_ candidates: [Int32], K: Int) throws -> [Int32] {
+        guard let v1 = verifyChunk1, let v2 = verifyChunk2,
+              let v3 = verifyChunk3, let v4 = verifyChunk4 else {
+            throw SpeculativeError.missingModel("verify_chunk{1..4} not loaded")
+        }
+        precondition(candidates.count == K, "candidates.count must equal K")
+        let ctx = config.contextLength
+        let W = config.slidingWindow
+        let P = currentPosition
+
+        let hiddenIn = try buildVerifyHidden(tokenIDs: candidates)
+        let plRaw = try buildVerifyPLR(tokenIDs: candidates)
+        // 11c verify chunks use (1,1,K,ctx) for full and (1,1,K,W) for sliding
+        // (the cache IS W — new K rows are appended by torch.cat(slot[K:], k_new)
+        // inside the Python verify graph, so the query-side mask is just the
+        // cache mask). Old (W+K) / (ctx+K) shapes rejected on iPhone.
+        let maskFull = try makeVerifyCausalMask(startPos: P, K: K, length: ctx)
+        let maskSliding = try makeVerifySlidingMask(startPos: P, K: K, W: W)
+        // update_indicator: (1, 1, ctx, K) — one-hot column k at abs pos P+k.
+        // Required by the 11c verify chunks for in-graph full-attn K scatter.
+        let updateIndicator = try MLMultiArray(
+            shape: [1, 1, NSNumber(value: ctx), NSNumber(value: K)],
+            dataType: .float16)
+        let indPtr = updateIndicator.dataPointer.bindMemory(to: UInt16.self, capacity: ctx * K)
+        memset(indPtr, 0, ctx * K * MemoryLayout<UInt16>.stride)
+        for k in 0..<K {
+            let pos = P + k
+            if pos < ctx {
+                indPtr[pos * K + k] = 0x3C00  // fp16 1.0
+            }
+        }
+        let cosS = try buildVerifyRoPE(table: cosSlidingTable, position: P, T: K, dim: 256)
+        let sinS = try buildVerifyRoPE(table: sinSlidingTable, position: P, T: K, dim: 256)
+        let cosF = try buildVerifyRoPE(table: cosFullTable, position: P, T: K, dim: 512)
+        let sinF = try buildVerifyRoPE(table: sinFullTable, position: P, T: K, dim: 512)
+
+        // Verify chunk 1 — same KV cache inputs as decode (read-only here).
+        let out1 = try v1.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: hiddenIn),
+            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+            "update_indicator": MLFeatureValue(multiArray: updateIndicator),
+            "per_layer_raw": MLFeatureValue(multiArray: plRaw),
+            "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
+            "K_sliding_in": MLFeatureValue(multiArray: kSliding1),
+            "V_sliding_in": MLFeatureValue(multiArray: vSliding1),
+            "K_full_in": MLFeatureValue(multiArray: kFull1),
+            "V_full_in": MLFeatureValue(multiArray: vFull1),
+        ]))
+        let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
+        // 11c write-after-accept: capture per-T K/V slices; verify does NOT
+        // write to persistent cache. Names match the 11c verify chunks:
+        // new_K_sliding / new_V_sliding / new_K_full / new_V_full.
+        lastNewKSliding1 = out1.featureValue(for: "new_K_sliding")?.multiArrayValue
+        lastNewVSliding1 = out1.featureValue(for: "new_V_sliding")?.multiArrayValue
+        lastNewKFull1    = out1.featureValue(for: "new_K_full")?.multiArrayValue
+        lastNewVFull1    = out1.featureValue(for: "new_V_full")?.multiArrayValue
+
+        // Verify chunk 2 — emits within-verify kv13/kv14 used by chunks 3/4
+        // in this verify call. Under 11c these are NOT persisted to the
+        // device KV cache — commitAccepted writes per-T slices instead.
+        let out2 = try v2.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: h1),
+            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+            "update_indicator": MLFeatureValue(multiArray: updateIndicator),
+            "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
+            "K_sliding_in": MLFeatureValue(multiArray: kSliding2),
+            "V_sliding_in": MLFeatureValue(multiArray: vSliding2),
+            "K_full_in": MLFeatureValue(multiArray: kFull2),
+            "V_full_in": MLFeatureValue(multiArray: vFull2),
+        ]))
+        let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        // 11c verify chunks emit kv13_k / kv14_k (no `_out` suffix).
+        let kv13k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
+        let kv13v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
+        let kv14k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
+        let kv14v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
+        // 11c per-T K/V slices for L8-14 (persistent cache update happens in
+        // commitAccepted, not here).
+        lastNewKSliding2 = out2.featureValue(for: "new_K_sliding")?.multiArrayValue
+        lastNewVSliding2 = out2.featureValue(for: "new_V_sliding")?.multiArrayValue
+        lastNewKFull2    = out2.featureValue(for: "new_K_full")?.multiArrayValue
+        lastNewVFull2    = out2.featureValue(for: "new_V_full")?.multiArrayValue
+        // Stamp verify input tokens so commitAccepted can decide which
+        // accepted positions have a valid verified slice (commit directly)
+        // vs require a T=1 recompute (correction / bonus past verify range).
+        lastVerifyInputTokens = candidates
+
+        let shared: [String: MLFeatureValue] = [
+            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+            "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
+            "kv13_k": MLFeatureValue(multiArray: kv13k), "kv13_v": MLFeatureValue(multiArray: kv13v),
+            "kv14_k": MLFeatureValue(multiArray: kv14k), "kv14_v": MLFeatureValue(multiArray: kv14v),
+        ]
+
+        var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
+        let h3 = try v3.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
+            .featureValue(for: "hidden_states_out")!.multiArrayValue!
+
+        var d4 = shared; d4["hidden_states"] = MLFeatureValue(multiArray: h3)
+        let out4 = try v4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4))
+        guard let tokenIdsArr = out4.featureValue(for: "token_ids")?.multiArrayValue else {
+            throw SpeculativeError.verifyFailed("verify_chunk4 missing token_ids")
+        }
+        // token_ids shape is (T,) int32.
+        let n = tokenIdsArr.count
+        let p = tokenIdsArr.dataPointer.bindMemory(to: Int32.self, capacity: n)
+        return (0..<n).map { p[$0] }
+    }
+
+    // No `verifyCandidatesTopN` override — the standalone verify_chunk4
+    // exposes only `token_ids` + per-position `token_logits` (argmax logit
+    // value), not the full (T, vocab) logits needed to rank alternatives.
+    // Rebuilding chunk4 with a top-N output is required before tolerance>1
+    // can do anything useful. For now, fall through to the protocol default
+    // extension, which wraps argmax as a single-entry top list — so
+    // LLM_EAGLE3_TOLERANCE>1 degrades safely to strict argmax match.
 }

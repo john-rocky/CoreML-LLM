@@ -280,14 +280,29 @@ def main():
     print(f"config: hidden={cfg['hidden']} heads={cfg['num_heads']} kv={cfg['num_kv']} "
           f"head_dim={cfg['head_dim']} ffn={cfg['ffn']} vocab={cfg['vocab']}")
 
-    # Load ckpt
+    # Load ckpt (torch.save dict; weights_only=False to accept full pickle,
+    # since the trainer saves {"model": state_dict, "cfg": ..., "epoch": ...}).
     print(f"loading ckpt: {args.ckpt}")
-    state = torch.load(args.ckpt, map_location="cpu")
+    state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 
-    # Obtain lm_head weight
+    # Obtain lm_head weight. Support both:
+    #   .bin — raw fp16 bytes from `arr.tofile(...)` (used by HASS trainer),
+    #          load via np.fromfile and reshape to (vocab, hidden).
+    #   .pt  — torch pickle (legacy), loaded via torch.load.
     if args.lm_head:
         print(f"loading lm_head from {args.lm_head}")
-        lm_head_weight = torch.load(args.lm_head, map_location="cpu")
+        p = str(args.lm_head)
+        if p.endswith(".bin"):
+            import numpy as np
+            lm_head_np = np.fromfile(p, dtype=np.float16)
+            # Shape is (vocab, hidden) = (262144, 1536) for Gemma 4 E2B.
+            if lm_head_np.size % 1536 != 0:
+                raise ValueError(
+                    f"lm_head .bin size {lm_head_np.size} not divisible by hidden=1536")
+            lm_head_weight = torch.from_numpy(
+                lm_head_np.reshape(lm_head_np.size // 1536, 1536).copy())
+        else:
+            lm_head_weight = torch.load(p, map_location="cpu", weights_only=False)
     else:
         print(f"loading lm_head from HF {args.model_id} (will cache)")
         try:
