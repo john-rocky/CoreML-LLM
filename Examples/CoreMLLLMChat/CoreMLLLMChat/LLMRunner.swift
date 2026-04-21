@@ -62,6 +62,16 @@ final class LLMRunner {
         modelFolderURL = folder
         loadingStatus = "Loading..."
 
+        // LookAhead K=8 probe bundles ship a `probe.marker` file so the runner
+        // can enable verify-chunk loading without requiring the user to set
+        // SPECULATIVE_PROFILE in the Xcode scheme. Normal bundles don't have
+        // this file, so their load path is unchanged.
+        let probeMarker = folder.appendingPathComponent("probe.marker")
+        if FileManager.default.fileExists(atPath: probeMarker.path) {
+            setenv("SPECULATIVE_PROFILE", "1", 1)
+            print("[LLMRunner] probe.marker detected — SPECULATIVE_PROFILE=1 forced for verify loading")
+        }
+
         llm = try await CoreMLLLM.load(from: folder) { [weak self] status in
             Task { @MainActor in
                 self?.loadingStatus = status
@@ -273,6 +283,99 @@ final class LLMRunner {
         case .critical: return "critical"
         @unknown default: return "?"
         }
+    }
+
+    // MARK: - LookAhead K=8 probe
+
+    /// Timing summary for verify_qK, filled by `runVerifyKProbe`. All ms.
+    struct VerifyKProbeResult {
+        var k: Int
+        var iterations: Int
+        var prefillTokens: Int
+        var minMs: Double
+        var medianMs: Double
+        var meanMs: Double
+        var p90Ms: Double
+        var p99Ms: Double
+        var maxMs: Double
+        var stdMs: Double
+
+        var verdict: String {
+            if medianMs < 50 { return "GO — LookAhead impl worth committing to" }
+            if medianMs <= 70 { return "MARGINAL — defer unless Metal Phase 3 slips" }
+            return "KILL — K-linear scaling confirmed, LookAhead dead on ANE"
+        }
+
+        var summary: String {
+            let fmt = { (x: Double) in String(format: "%.2f", x) }
+            return """
+            verify_qK=\(k) over \(iterations) iters (ms)
+              min=\(fmt(minMs)) median=\(fmt(medianMs)) mean=\(fmt(meanMs))
+              p90=\(fmt(p90Ms)) p99=\(fmt(p99Ms)) max=\(fmt(maxMs)) std=\(fmt(stdMs))
+              prefill=\(prefillTokens) tokens
+            verdict: \(verdict)
+            """
+        }
+    }
+
+    /// Run verify_qK in a tight loop and return timing stats. Used for the
+    /// LookAhead K=8 probe gate (`docs/LOOKAHEAD_PROBE_HANDOFF.md`).
+    ///
+    /// Assumes the bundle was built with `--K <k>` verify chunks and that
+    /// `SPECULATIVE_PROFILE` was set at load time (handled automatically
+    /// when `probe.marker` ships in the bundle).
+    func runVerifyKProbe(
+        iterations: Int = 25,
+        prompt: String = "The quick brown fox jumps over the lazy dog."
+    ) async throws -> VerifyKProbeResult {
+        guard let llm else {
+            throw NSError(domain: "LLMRunner", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Model not loaded"])
+        }
+        guard let k = llm.benchVerifyK else {
+            throw NSError(domain: "LLMRunner", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "Verify chunks not loaded. Push a probe bundle or set SPECULATIVE_PROFILE=1."
+            ])
+        }
+
+        // Deterministic candidate pattern. ANE runtime cost is independent
+        // of the integer values, so we just need `k` valid Int32s. Anchor
+        // the first slot to the prefill seed to keep the pattern plausible.
+        let (_, seed) = try await llm.benchPrefill(prompt)
+        var base: [Int32] = [seed, 100, 200, 500, 1000, 2000, 5000, 10000,
+                             20000, 50000, 100, 200, 500, 1000, 2000, 5000]
+        if base.count < k {
+            base.append(contentsOf: Array(repeating: Int32(100), count: k - base.count))
+        }
+        let candidates = Array(base.prefix(k))
+        let prefillLen = llm.benchCurrentPosition ?? 0
+
+        // Warmup: first calls pay ANE compile-schedule cost.
+        for _ in 0..<3 {
+            _ = try llm.benchVerify(candidates)
+        }
+
+        var times: [Double] = []
+        times.reserveCapacity(iterations)
+        for _ in 0..<iterations {
+            let ts = CFAbsoluteTimeGetCurrent()
+            _ = try llm.benchVerify(candidates)
+            times.append((CFAbsoluteTimeGetCurrent() - ts) * 1000.0)
+        }
+        let sorted = times.sorted()
+        let minMs = sorted.first!
+        let maxMs = sorted.last!
+        let medianMs = sorted[sorted.count / 2]
+        let p90Ms = sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.90))]
+        let p99Ms = sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.99))]
+        let meanMs = times.reduce(0, +) / Double(times.count)
+        let varMs = times.map { pow($0 - meanMs, 2) }.reduce(0, +) / Double(times.count)
+        let stdMs = sqrt(varMs)
+
+        return VerifyKProbeResult(
+            k: k, iterations: iterations, prefillTokens: prefillLen,
+            minMs: minMs, medianMs: medianMs, meanMs: meanMs,
+            p90Ms: p90Ms, p99Ms: p99Ms, maxMs: maxMs, stdMs: stdMs)
     }
 
     // MARK: - ANE placement verification

@@ -96,6 +96,19 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// Takes precedence over crossVocabEnabled when both are true.
     public var drafterUnionEnabled: Bool = false
 
+    // Linear LookAhead / Jacobi (drafter-free, docs/LOOKAHEAD_PROBE_HANDOFF.md).
+    // Drafts K-1 tokens per cycle via n-gram lookup + Jacobi warm-start,
+    // verifies in one ANE dispatch. Opt-in; defaults off until iPhone
+    // baseline check confirms no regression.
+    private var lookaheadEngine: LookaheadEngine?
+    public var lookaheadEnabled: Bool = false
+    public var lookaheadAcceptanceRate: Double {
+        lookaheadEngine?.acceptanceRate ?? 0
+    }
+    public var lookaheadTokensPerCycle: Double {
+        lookaheadEngine?.tokensPerCycle ?? 0
+    }
+
     // Generation metrics
     public private(set) var tokensPerSecond: Double = 0
     public var mtpAcceptanceRate: Double { mtpEngine?.acceptanceRate ?? 0 }
@@ -379,6 +392,19 @@ public final class CoreMLLLM: @unchecked Sendable {
             llm.drafterUnion = DrafterUnion(
                 engine: engine, crossVocab: nil, K: engine.verifyK)
             print("[DrafterUnion] PLD-only mode (cross-vocab drafter not loaded)")
+        }
+
+        // LookaheadEngine: zero-weight, drafter-free speculation. Always
+        // constructable when verify chunks are present — the actual
+        // routing is gated by `lookaheadEnabled` or LLM_LOOKAHEAD_ENABLE.
+        if let engine = llm.chunkedEngine, engine.hasVerify {
+            llm.lookaheadEngine = LookaheadEngine(engine: engine)
+            if ProcessInfo.processInfo.environment["LLM_LOOKAHEAD_ENABLE"] == "1" {
+                llm.lookaheadEnabled = true
+                print("[Lookahead] enabled via LLM_LOOKAHEAD_ENABLE=1 (K=\(engine.verifyK))")
+            } else {
+                print("[Lookahead] engine ready (K=\(engine.verifyK)); opt-in via lookaheadEnabled=true or LLM_LOOKAHEAD_ENABLE=1")
+            }
         }
 
         // Vision model (optional, lazy loaded on first image)
@@ -839,14 +865,24 @@ public final class CoreMLLLM: @unchecked Sendable {
                         let eagleDisabled = ProcessInfo.processInfo
                             .environment["LLM_EAGLE3_DISABLE"] == "1"
                         let eagleSpec = eagleDisabled ? nil : mutableSelf.speculativeLoop
-                        let mtpSpec = (eagleSpec == nil && mutableSelf.mtpEnabled)
+                        // LookaheadEngine takes precedence over MTP/Union/CV
+                        // when enabled — it is drafter-free and subsumes the
+                        // union's PLD path while adding Jacobi warm-start.
+                        let lookaheadSpec = (eagleSpec == nil && mutableSelf.lookaheadEnabled)
+                            ? mutableSelf.lookaheadEngine : nil
+                        let mtpSpec = (eagleSpec == nil && lookaheadSpec == nil
+                                       && mutableSelf.mtpEnabled)
                             ? mutableSelf.mtpEngine : nil
-                        let unionSpec = (eagleSpec == nil && mtpSpec == nil
+                        let unionSpec = (eagleSpec == nil && lookaheadSpec == nil
+                                         && mtpSpec == nil
                                          && mutableSelf.drafterUnionEnabled)
                             ? mutableSelf.drafterUnion : nil
-                        let cvSpec = (eagleSpec == nil && mtpSpec == nil && unionSpec == nil
+                        let cvSpec = (eagleSpec == nil && lookaheadSpec == nil
+                                      && mtpSpec == nil && unionSpec == nil
                                       && mutableSelf.crossVocabEnabled)
                             ? mutableSelf.crossVocabEngine : nil
+                        lookaheadSpec?.reset()
+                        lookaheadSpec?.setPrefillHistory(tokens.map { Int32($0) })
                         mtpSpec?.reset()
                         unionSpec?.reset()
                         unionSpec?.setPrefillHistory(tokens.map { Int32($0) })
@@ -922,6 +958,20 @@ public final class CoreMLLLM: @unchecked Sendable {
                                     if tokenCount >= maxDecode { break decodeLoop }
                                 }
                                 nid = Int32(engine.lastArgmaxAfterDecode)
+                            } else if let se = lookaheadSpec, se.shouldSpeculate {
+                                let emitted = try autoreleasepool {
+                                    try se.speculateStep(nextID: &nid)
+                                }
+                                for tok in emitted {
+                                    if eosIDs.contains(Int(tok)) {
+                                        nid = tok
+                                        break
+                                    }
+                                    mutableSelf.lastEmittedTokenIDs.append(tok)
+                                    let text = mutableSelf.tokenizer.decode(tokens: [Int(tok)])
+                                    continuation.yield(text)
+                                    tokenCount += 1
+                                }
                             } else if let se = mtpSpec, se.shouldSpeculate {
                                 let emitted = try autoreleasepool {
                                     try se.speculateStep(nextID: &nid)
@@ -1045,6 +1095,7 @@ public final class CoreMLLLM: @unchecked Sendable {
         mtpEngine?.reset()
         crossVocabEngine?.reset()
         drafterUnion?.reset()
+        lookaheadEngine?.reset()
         tokensPerSecond = 0
     }
 

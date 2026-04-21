@@ -13,6 +13,7 @@ let package = Package(
         .executable(name: "accept-rate-bench", targets: ["AcceptRateBench"]),
         .executable(name: "coreml-llm-smoke", targets: ["CoreMLLLMSmoke"]),
         .executable(name: "union-bitexact", targets: ["UnionBitExact"]),
+        .executable(name: "verify-k8-probe", targets: ["VerifyK8Probe"]),
     ],
     dependencies: [
         // Range widened to 1.0.x: mlx-swift-examples caps swift-transformers at
@@ -61,6 +62,15 @@ let package = Package(
             name: "UnionBitExact",
             dependencies: ["CoreMLLLM"],
             path: "Sources/union-bitexact",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // LookAhead K=8 probe harness — measures pure verify_qK=8 wall-clock
+        // on ANE. Go / no-go gate before committing to full LookAhead impl.
+        // See docs/LOOKAHEAD_PROBE_HANDOFF.md.
+        .executableTarget(
+            name: "VerifyK8Probe",
+            dependencies: ["CoreMLLLM"],
+            path: "Sources/verify-k8-probe",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
