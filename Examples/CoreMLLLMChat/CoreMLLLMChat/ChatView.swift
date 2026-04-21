@@ -74,14 +74,31 @@ struct ChatView: View {
                             // Zero-height sentinel that is always present so
                             // scrollTo has a stable target whether or not
                             // the streaming bubble is currently visible.
+                            // Placed *below* LazyVStack's bottom padding
+                            // (which we drop — see padding call below) so
+                            // that scrollTo(anchor: .bottom) lands exactly
+                            // at content end; otherwise the bottom padding
+                            // sits below the sentinel and shows as empty
+                            // space at max scroll.
                             Color.clear
                                 .frame(height: 1)
                                 .id("bottom-anchor")
                         }
-                        .padding()
+                        // Deliberately no `.padding(.bottom)` — bottom padding
+                        // below the sentinel would be visible as dead space
+                        // after scrollTo(anchor: .bottom).
+                        .padding(.horizontal)
+                        .padding(.top)
                     }
                     .onChange(of: messages.count) { _, _ in
-                        proxy.scrollTo("bottom-anchor", anchor: .bottom)
+                        // Dispatch to the next runloop tick so LazyVStack has
+                        // laid out the freshly appended MessageBubble before
+                        // we compute the scroll target. Without this, the
+                        // scrollTo can run against the *previous* content
+                        // size and overshoot once the new bubble appears.
+                        Task { @MainActor in
+                            proxy.scrollTo("bottom-anchor", anchor: .bottom)
+                        }
                     }
                 }
 
