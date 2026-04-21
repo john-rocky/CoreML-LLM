@@ -200,10 +200,15 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Hidden tensor between chunks as fp32 to dodge an iPhone Core ML CPU
+    # kernel bug: feeding an fp16 MLMultiArray output from one model into
+    # another model's fp16 input produces wrong values on iPhone CPU only
+    # (tested on iOS 26.1, Mac CPU handled the same pair correctly).
+    # fp32 hidden = +128 KB at seq=64/hidden=1024, negligible.
     convert_chunk(
         chunk_a,
         input_specs=[{"name": "input_ids", "shape": (1, args.seq_len), "dtype": np.int32}],
-        output_specs=[{"name": "hidden", "dtype": np.float16}],
+        output_specs=[{"name": "hidden", "dtype": np.float32}],
         out_path=out_dir / "qwen3_5_chunk_a.mlpackage",
         label=f"chunk_a (embed + layers [0, {args.split}))",
     )
@@ -211,7 +216,7 @@ def main():
         chunk_b,
         input_specs=[{"name": "hidden_in",
                       "shape": (1, args.seq_len, cfg.hidden_size),
-                      "dtype": np.float16}],
+                      "dtype": np.float32}],
         output_specs=[{"name": "logits", "dtype": np.float32}],
         out_path=out_dir / "qwen3_5_chunk_b.mlpackage",
         label=f"chunk_b (layers [{args.split}, {cfg.num_hidden_layers}) + lm_head)",
