@@ -81,12 +81,17 @@ public final class MtpSpeculativeEngine {
         }
 
         guard let kv13K = engine.lastKV13K,
-              let kv13V = engine.lastKV13V,
+              let kv13VRaw = engine.lastKV13V,
               let kv14K = engine.lastKV14K,
-              let kv14V = engine.lastKV14V
+              let kv14VRaw = engine.lastKV14V
         else {
             throw SpeculativeError.verifyFailed("kv13/kv14 not available for MTP drafter")
         }
+        // The MTP drafter (per build_mtp_drafter.py metadata) expects V
+        // transposed as (1, 1, head_dim, seq). ChunkedEngine stores V as
+        // (1, 1, seq, head_dim), so we transpose the last two dims once per cycle.
+        let kv13V = try Self.transposeLastTwoDims(kv13VRaw)
+        let kv14V = try Self.transposeLastTwoDims(kv14VRaw)
 
         // Build mask ONCE per cycle at the last committed position.
         // The drafter reads target KV (positions 0..pos-1), so mask allows 0..pos-1.
@@ -103,10 +108,14 @@ public final class MtpSpeculativeEngine {
         let (_, draftMs) = try SpecProfile.time {
             for k in 0..<K {
                 let draftPos = pos + k
-                let cosSwa = try engine.lookupCosSWA(position: draftPos)
-                let sinSwa = try engine.lookupSinSWA(position: draftPos)
-                let cosFull = try engine.lookupCosFull(position: draftPos)
-                let sinFull = try engine.lookupSinFull(position: draftPos)
+                let cosSwa = try Self.reshapeRoPEForDrafter(
+                    try engine.lookupCosSWA(position: draftPos))
+                let sinSwa = try Self.reshapeRoPEForDrafter(
+                    try engine.lookupSinSWA(position: draftPos))
+                let cosFull = try Self.reshapeRoPEForDrafter(
+                    try engine.lookupCosFull(position: draftPos))
+                let sinFull = try Self.reshapeRoPEForDrafter(
+                    try engine.lookupSinFull(position: draftPos))
 
                 let (tokenId, projActOut) = try drafter.draftOne(
                     embedToken: embedToken,
@@ -243,5 +252,50 @@ public final class MtpSpeculativeEngine {
         let dst = result.dataPointer.bindMemory(to: UInt16.self, capacity: hidden)
         memcpy(dst, src.advanced(by: k * hidden), hidden * MemoryLayout<UInt16>.stride)
         return result
+    }
+
+    /// Transpose the last two dimensions of a rank-4 MLMultiArray [1, 1, A, B] → [1, 1, B, A].
+    /// Used for V caches: ChunkedEngine stores V as (1, 1, seq, hd) but the
+    /// MTP drafter expects (1, 1, hd, seq) (Google TFLite pre-transposed layout).
+    static func transposeLastTwoDims(_ a: MLMultiArray) throws -> MLMultiArray {
+        let shape = a.shape.map { $0.intValue }
+        guard shape.count == 4, shape[0] == 1, shape[1] == 1 else {
+            throw SpeculativeError.verifyFailed(
+                "transposeLastTwoDims: unexpected shape \(a.shape)")
+        }
+        let A = shape[2]
+        let B = shape[3]
+        let out = try MLMultiArray(
+            shape: [1, 1, NSNumber(value: B), NSNumber(value: A)], dataType: .float16)
+        let src = a.dataPointer.bindMemory(to: UInt16.self, capacity: A * B)
+        let dst = out.dataPointer.bindMemory(to: UInt16.self, capacity: A * B)
+        // src layout: src[i, j] = src[i*B + j], want dst[j, i] = dst[j*A + i]
+        for i in 0..<A {
+            for j in 0..<B {
+                dst[j * A + i] = src[i * B + j]
+            }
+        }
+        return out
+    }
+
+    /// Reshape RoPE cos/sin table for drafter I/O.
+    /// ChunkedEngine.lookupRoPE returns shape `[1, 1, 1, dim]` (LLaMA-style
+    /// duplicated halves). The MTP drafter (built by conversion/build_mtp_drafter.py)
+    /// expects `[1, dim/2]` with only the unique half.
+    /// Since `cos_full[:half] == cos_full[half:]` by construction, we copy
+    /// the first half and reshape to rank 2.
+    static func reshapeRoPEForDrafter(_ a: MLMultiArray) throws -> MLMultiArray {
+        // Expect shape [1, 1, 1, dim]; output [1, dim/2]
+        let dim = a.shape.last?.intValue ?? 0
+        guard dim > 0 && dim % 2 == 0 else {
+            throw SpeculativeError.verifyFailed(
+                "reshapeRoPEForDrafter: unexpected dim \(dim) in shape \(a.shape)")
+        }
+        let half = dim / 2
+        let out = try MLMultiArray(shape: [1, NSNumber(value: half)], dataType: .float16)
+        let src = a.dataPointer.bindMemory(to: UInt16.self, capacity: dim)
+        let dst = out.dataPointer.bindMemory(to: UInt16.self, capacity: half)
+        memcpy(dst, src, half * MemoryLayout<UInt16>.stride)
+        return out
     }
 }
