@@ -148,6 +148,21 @@ final class Qwen35Benchmark {
         print("[Qwen35Bench] warmup took \(String(format: "%.0f", warmMs))ms")
         status = "Warmup done (\(Int(warmMs))ms). Starting benchmark..."
 
+        // Diagnostic: dump the shape/strides/dtype of the warmup logits so
+        // we can tell whether the runtime is handing us the layout our
+        // slicer assumes.
+        do {
+            let warm = try MLMultiArray(shape: [1, NSNumber(value: seqLen)], dataType: .int32)
+            for i in 0..<seqLen { warm[[0, NSNumber(value: i)] as [NSNumber]] = 0 }
+            let feat = try MLDictionaryFeatureProvider(dictionary: ["input_ids": MLFeatureValue(multiArray: warm)])
+            let w = try await model.prediction(from: feat)
+            if let arr = w.featureValue(for: "logits")?.multiArrayValue {
+                print("[Qwen35Bench] logits shape=\(arr.shape) strides=\(arr.strides) dtype=\(arr.dataType.rawValue) count=\(arr.count)")
+            }
+        } catch {
+            // non-fatal
+        }
+
         var collected: [PromptResult] = []
         var totalMs = 0.0
         var totalTokens = 0
@@ -227,18 +242,27 @@ final class Qwen35Benchmark {
     private func sliceLastPositionLogits(_ arr: MLMultiArray, seqLen: Int,
                                           position: Int, vocab: Int) -> [Float] {
         var out = [Float](repeating: 0, count: vocab)
-        // Stride for (1, seqLen, vocab): element [0, p, v] = base + p*vocab + v
-        let base = position * vocab
-        if arr.dataType == .float32 {
-            let p = arr.dataPointer.assumingMemoryBound(to: Float.self)
-            for v in 0..<vocab { out[v] = p[base + v] }
-        } else if arr.dataType == .float16 {
-            let p = arr.dataPointer.assumingMemoryBound(to: UInt16.self)
+        // Use the stride-aware byte offset per element so non-contiguous
+        // MLMultiArray layouts (which CoreML produces after fp16->fp32 casts
+        // on ANE outputs) work correctly. Raw dataPointer indexing assumes
+        // default row-major stride and silently reads garbage otherwise.
+        let strides = arr.strides.map(\.intValue)
+        guard strides.count >= 3 else {
             for v in 0..<vocab {
-                out[v] = fp16BitsToFloat(p[base + v])
+                out[v] = arr[[0, NSNumber(value: position), NSNumber(value: v)] as [NSNumber]].floatValue
             }
-        } else {
-            // Fallback via subscript
+            return out
+        }
+        let s0 = strides[0], s1 = strides[1], s2 = strides[2]
+        let baseElems = 0 * s0 + position * s1
+        switch arr.dataType {
+        case .float32:
+            let p = arr.dataPointer.assumingMemoryBound(to: Float.self)
+            for v in 0..<vocab { out[v] = p[baseElems + v * s2] }
+        case .float16:
+            let p = arr.dataPointer.assumingMemoryBound(to: UInt16.self)
+            for v in 0..<vocab { out[v] = fp16BitsToFloat(p[baseElems + v * s2]) }
+        default:
             for v in 0..<vocab {
                 out[v] = arr[[0, NSNumber(value: position), NSNumber(value: v)] as [NSNumber]].floatValue
             }
