@@ -103,7 +103,20 @@ public final class ModelDownloader: NSObject {
             downloadURL: "",
             folderName: "gemma4-e2b-eagle3")
 
-        public static let defaults: [ModelInfo] = [gemma4e2b, gemma4e4b, gemma4e2bEagle3, qwen25_05b]
+        /// Visible in the UI picker. EAGLE-3 variant is hidden unless
+        /// `LLM_SHOW_EXPERIMENTAL=1` is set (or the UserDefaults key
+        /// `showExperimentalModels` is true). Keeps production picker
+        /// clean while letting devs flip the flag for sideload testing.
+        public static var defaults: [ModelInfo] {
+            let experimental =
+                ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
+                || UserDefaults.standard.bool(forKey: "showExperimentalModels")
+            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b]
+            if experimental {
+                list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
+            }
+            return list
+        }
     }
 
     private struct DownloadFile: Codable {
