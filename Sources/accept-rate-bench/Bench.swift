@@ -1,3 +1,4 @@
+#if os(macOS)
 //
 //  main.swift — offline accept-rate bench (Phase A1–A3).
 //
@@ -620,3 +621,4 @@ func runChainModeTolerance(
     }
     return (promptTokens, emitted, stats)
 }
+#endif

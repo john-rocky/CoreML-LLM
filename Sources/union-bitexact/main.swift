@@ -1,3 +1,4 @@
+#if os(macOS)
 // Mac-side bit-exact verifier for DrafterUnion (Phase B Task 1).
 //
 // Runs each prompt twice on the same loaded model:
@@ -144,3 +145,4 @@ struct Verifier {
         }
     }
 }
+#endif

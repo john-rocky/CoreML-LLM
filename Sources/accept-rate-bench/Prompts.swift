@@ -1,3 +1,4 @@
+#if os(macOS)
 //
 //  Prompts.swift — bench corpus.
 //
@@ -48,3 +49,4 @@ let benchPrompts: [BenchPrompt] = [
     .init(id: "chat-greeting", category: "chat",
           text: "Hi, I'm testing a speech model. Say hello and ask me what I want to do today."),
 ]
+#endif

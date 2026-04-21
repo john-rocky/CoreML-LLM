@@ -1,3 +1,4 @@
+#if os(macOS)
 //
 //  Drafters.swift — speculative draft sources for accept-rate bench.
 //
@@ -199,3 +200,4 @@ func replayDrafter(
     }
     return stats
 }
+#endif
