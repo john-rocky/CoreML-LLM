@@ -45,6 +45,14 @@ public enum Gemma3BundleDownloader {
                     "model.mlmodelc/model.mil",
                     "model.mlmodelc/metadata.json",
                     "model.mlmodelc/analytics/coremldata.bin",
+                    // Batched prefill mlpackage (T=32). ~10× faster prompt
+                    // ingestion; `Gemma3FunctionGemma.load` picks it up
+                    // automatically when present.
+                    "prefill_t32.mlmodelc/weights/weight.bin",
+                    "prefill_t32.mlmodelc/coremldata.bin",
+                    "prefill_t32.mlmodelc/model.mil",
+                    "prefill_t32.mlmodelc/metadata.json",
+                    "prefill_t32.mlmodelc/analytics/coremldata.bin",
                     "model_config.json",
                     "hf_model/tokenizer.json",
                     "hf_model/tokenizer_config.json",
@@ -76,6 +84,11 @@ public enum Gemma3BundleDownloader {
             [
                 "model.mlmodelc/metadata.json",
                 "model.mlmodelc/analytics/coremldata.bin",
+                "prefill_t32.mlmodelc/weights/weight.bin",
+                "prefill_t32.mlmodelc/coremldata.bin",
+                "prefill_t32.mlmodelc/model.mil",
+                "prefill_t32.mlmodelc/metadata.json",
+                "prefill_t32.mlmodelc/analytics/coremldata.bin",
                 "encoder.mlmodelc/metadata.json",
                 "encoder.mlmodelc/analytics/coremldata.bin",
                 "hf_model/chat_template.jinja",
@@ -102,18 +115,23 @@ public enum Gemma3BundleDownloader {
     /// artifact sizes; Content-Length from the server overrides at download
     /// time. Missing entries fall back to 1 MB placeholder.
     static let defaultFileSizes: [String: Int64] = [
-        // FunctionGemma
-        "model.mlmodelc/weights/weight.bin":         840_000_000,
+        // FunctionGemma (INT8-quantized, decode + prefill_t32)
+        "model.mlmodelc/weights/weight.bin":         422_000_000,
         "model.mlmodelc/coremldata.bin":                   1_000,
         "model.mlmodelc/model.mil":                      400_000,
         "model.mlmodelc/metadata.json":                    8_000,
         "model.mlmodelc/analytics/coremldata.bin":           250,
+        "prefill_t32.mlmodelc/weights/weight.bin":   422_000_000,
+        "prefill_t32.mlmodelc/coremldata.bin":             1_000,
+        "prefill_t32.mlmodelc/model.mil":                450_000,
+        "prefill_t32.mlmodelc/metadata.json":              8_000,
+        "prefill_t32.mlmodelc/analytics/coremldata.bin":     250,
         "cos_sliding.npy":                             2_097_280,
         "sin_sliding.npy":                             2_097_280,
         "cos_full.npy":                                2_097_280,
         "sin_full.npy":                                2_097_280,
-        // EmbeddingGemma
-        "encoder.mlmodelc/weights/weight.bin":       588_000_000,
+        // EmbeddingGemma (INT8)
+        "encoder.mlmodelc/weights/weight.bin":       295_000_000,
         "encoder.mlmodelc/coremldata.bin":                  1_000,
         "encoder.mlmodelc/model.mil":                     700_000,
         "encoder.mlmodelc/metadata.json":                   8_000,

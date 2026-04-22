@@ -74,9 +74,11 @@ def _load_hf_text_config(hf_dir: str) -> dict:
 
 
 def _export_monolithic(hf_dir: str, bundle_dir: str, ctx_length: int,
-                       quantize: str | None) -> None:
-    """Run CoreMLExporter on a Gemma3Model; moves the resulting model.mlpackage
-    into the bundle directory (exporter writes to the same dir by default)."""
+                       quantize: str | None, prefill_T: int) -> None:
+    """Export the decode mlpackage (T=1) and, if prefill_T > 1, also a
+    batched-prefill mlpackage with the given T. Both share weights but have
+    independent `kv_cache_0` states — Swift bridges them by copying the
+    state buffer after the last prefill chunk."""
     from models.gemma3 import Gemma3Model
     from exporter import CoreMLExporter
 
@@ -84,18 +86,85 @@ def _export_monolithic(hf_dir: str, bundle_dir: str, ctx_length: int,
     model = Gemma3Model.from_pretrained(hf_dir, context_length=ctx_length)
     model.eval()
 
-    print(f"\n[2/4] Exporting monolithic mlpackage (quantize={quantize or 'fp16'})")
+    print(f"\n[2/4] Exporting decode mlpackage (T=1, quantize={quantize or 'fp16'})")
     exporter = CoreMLExporter(model)
-    # Default fp16 lowering. Empirically the model produces coherent output on
-    # ANE (51 tok/s, sensible text) despite our PyTorch CPU trace showing fp16
-    # overflow by layer 7. ANE silicon's internal handling appears to saturate
-    # rather than NaN; the fp32 residual stream we keep in the PyTorch wrapper
-    # for parity testing gets collapsed during coremltools fp16 lowering, but
-    # the model is still good enough to ship. Re-investigate if quality suffers
-    # vs the PyTorch reference.
     exporter.export(bundle_dir, quantize=quantize)
     # exporter writes model.mlpackage + model_config.json into bundle_dir; we
     # overwrite model_config.json in step 4 with richer Gemma 3 metadata.
+
+    if prefill_T and prefill_T > 1:
+        print(f"\n[2b/4] Exporting prefill mlpackage (T={prefill_T}, quantize={quantize or 'fp16'})")
+        _export_prefill_mlpackage(model, bundle_dir, ctx_length, prefill_T, quantize)
+
+
+def _export_prefill_mlpackage(model, bundle_dir: str, ctx: int, T: int,
+                              quantize: str | None) -> None:
+    import numpy as np
+    import coremltools as ct
+    import torch
+    import shutil
+
+    from models.gemma3_prefill_wrapper import Gemma3PrefillWrapper
+
+    wrapper = Gemma3PrefillWrapper(model, T=T).eval()
+
+    sample_ids = torch.zeros((1, T), dtype=torch.int32)
+    sample_pos = torch.arange(T, dtype=torch.int32)
+    sample_cmask = torch.zeros((1, 1, T, ctx), dtype=torch.float16)
+    sample_umask = torch.zeros((1, 1, ctx, T), dtype=torch.float16)
+    for t in range(T):
+        if t < ctx:
+            sample_umask[0, 0, t, t] = 1.0
+
+    with torch.no_grad():
+        wrapper.kv_cache_0.zero_()
+        traced = torch.jit.trace(
+            wrapper, (sample_ids, sample_pos, sample_cmask, sample_umask))
+
+    cache_shape = tuple(wrapper.kv_cache_0.shape)
+    mlmodel = ct.convert(
+        traced,
+        inputs=[
+            ct.TensorType(name="input_ids", shape=(1, T), dtype=np.int32),
+            ct.TensorType(name="position_ids", shape=(T,), dtype=np.int32),
+            ct.TensorType(name="causal_mask", shape=(1, 1, T, ctx), dtype=np.float16),
+            ct.TensorType(name="update_mask", shape=(1, 1, ctx, T), dtype=np.float16),
+        ],
+        outputs=[
+            ct.TensorType(name="token_id", dtype=np.int32),
+            ct.TensorType(name="token_logit", dtype=np.float16),
+        ],
+        states=[
+            ct.StateType(
+                wrapped_type=ct.TensorType(shape=cache_shape, dtype=np.float16),
+                name="kv_cache_0",
+            ),
+        ],
+        minimum_deployment_target=ct.target.iOS26,
+        compute_units=ct.ComputeUnit.ALL,
+    )
+
+    if quantize == "int4":
+        op_config = ct.optimize.coreml.OpPalettizerConfig(
+            nbits=4, granularity="per_grouped_channel", group_size=32)
+        config = ct.optimize.coreml.OptimizationConfig(global_config=op_config)
+        mlmodel = ct.optimize.coreml.palettize_weights(mlmodel, config)
+    elif quantize == "int8":
+        op_config = ct.optimize.coreml.OpLinearQuantizerConfig(
+            mode="linear_symmetric", dtype="int8")
+        config = ct.optimize.coreml.OptimizationConfig(global_config=op_config)
+        mlmodel = ct.optimize.coreml.linear_quantize_weights(mlmodel, config)
+
+    out_path = os.path.join(bundle_dir, f"prefill_t{T}.mlpackage")
+    if os.path.exists(out_path):
+        shutil.rmtree(out_path)
+    mlmodel.save(out_path)
+    size_mb = sum(
+        os.path.getsize(os.path.join(dp, f))
+        for dp, _, fns in os.walk(out_path)
+        for f in fns
+    ) / 1024 / 1024
+    print(f"  saved {out_path} ({size_mb:.1f} MB)")
 
 
 def _write_rope(bundle_dir: str, text_cfg: dict, ctx_length: int) -> None:
@@ -225,9 +294,12 @@ def main():
     parser = argparse.ArgumentParser(description="Build on-device bundle for FunctionGemma-270M")
     parser.add_argument("--ctx", type=int, default=None,
                         help="Context length (default: registry entry's default)")
-    parser.add_argument("--quantize", type=str, default="int4",
+    parser.add_argument("--quantize", type=str, default="int8",
                         choices=["int4", "int8", "none"],
-                        help="Quantization mode (default: int4)")
+                        help="Quantization mode (default: int8 — int4 loses quality on 270M)")
+    parser.add_argument("--prefill-t", type=int, default=32,
+                        help="Batch size for prefill mlpackage (0 to skip). "
+                             "T=32 roughly 10x-speeds up prompt ingestion on ANE.")
     parser.add_argument("--hf-dir", type=str, default=None,
                         help="Override HF model directory (skip auto-download)")
     parser.add_argument("--output", type=str, default=None,
@@ -253,7 +325,7 @@ def main():
           f"heads: {text_cfg.get('num_attention_heads')}/"
           f"{text_cfg.get('num_key_value_heads')}")
 
-    _export_monolithic(hf_dir, output, ctx, quantize)
+    _export_monolithic(hf_dir, output, ctx, quantize, args.prefill_t)
     _write_rope(output, text_cfg, ctx)
     _copy_tokenizer(hf_dir, output)
     _write_model_config(output, text_cfg, ctx, quantize)

@@ -64,14 +64,21 @@ public final class FunctionGemma {
 
     public let config: Config
     private let model: MLModel
+    private let prefillModel: MLModel?
+    private let prefillT: Int
     private let tokenizer: Tokenizer
     private var state: MLState
+    private var prefillState: MLState?
 
-    private init(model: MLModel, tokenizer: Tokenizer, config: Config) {
+    private init(model: MLModel, prefillModel: MLModel?, prefillT: Int,
+                 tokenizer: Tokenizer, config: Config) {
         self.model = model
+        self.prefillModel = prefillModel
+        self.prefillT = prefillT
         self.tokenizer = tokenizer
         self.config = config
         self.state = model.makeState()
+        self.prefillState = prefillModel?.makeState()
     }
 
     /// Load a FunctionGemma bundle from disk. Directory layout (produced by
@@ -99,11 +106,36 @@ public final class FunctionGemma {
         }
         let model = try MLModel(contentsOf: modelURL, configuration: mlConfig)
 
+        // Optional prefill mlpackage (batched T=32 or other). If present, it
+        // shares weights with the decode model but has its own MLState; we
+        // copy the state buffer after prefill finishes so decode picks up
+        // where prefill left off.
+        var prefillModel: MLModel? = nil
+        var prefillT = 1
+        for t in [64, 32, 16, 8] {
+            let pcompiled = bundleURL.appendingPathComponent("prefill_t\(t).mlmodelc")
+            let ppkg = bundleURL.appendingPathComponent("prefill_t\(t).mlpackage")
+            let pURL: URL? = FileManager.default.fileExists(atPath: pcompiled.path) ? pcompiled
+                : FileManager.default.fileExists(atPath: ppkg.path) ? ppkg : nil
+            if let pURL {
+                let compiledURL: URL
+                if pURL.pathExtension == "mlpackage" {
+                    compiledURL = try await MLModel.compileModel(at: pURL)
+                } else {
+                    compiledURL = pURL
+                }
+                prefillModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+                prefillT = t
+                break
+            }
+        }
+
         let hfDir = bundleURL.appendingPathComponent("hf_model")
         let tokenizer = try await AutoTokenizer.from(modelFolder: hfDir)
 
-        return FunctionGemma(model: model, tokenizer: tokenizer,
-                             config: Config.load(from: bundleURL))
+        return FunctionGemma(
+            model: model, prefillModel: prefillModel, prefillT: prefillT,
+            tokenizer: tokenizer, config: Config.load(from: bundleURL))
     }
 
     /// One-call convenience for wrapper libraries: download the bundle from
@@ -129,6 +161,7 @@ public final class FunctionGemma {
     /// empty context. Call between unrelated prompts.
     public func resetState() {
         state = model.makeState()
+        prefillState = prefillModel?.makeState()
     }
 
     // MARK: - Generation
@@ -200,22 +233,33 @@ public final class FunctionGemma {
         let eos = Set(config.eosTokenIds)
         var position = 0
         var generatedText = ""
-
-        // Prefill: feed every prompt token through the stateful decoder. The
-        // argmax at the LAST prefill token is the first generated token, so
-        // capture it as `nextId` and emit it before entering the main loop.
-        // (One-token-at-a-time prefill — simpler to ship than a batched
-        // prefill chunk. For 270M on ANE it's fast enough; benchmark later.)
         var nextId: Int32 = 0
-        for tok in promptIds {
+        var usedPrefill = false
+
+        // 1) Batched prefill if available (T=prefillT tokens per forward).
+        if prefillModel != nil, prefillT > 1 {
+            while position + prefillT <= promptIds.count,
+                  position + prefillT <= ctx {
+                let chunk = Array(promptIds[position..<position + prefillT])
+                nextId = try prefillBatch(tokens: chunk, startPosition: position)
+                position += prefillT
+                usedPrefill = true
+            }
+        }
+
+        // 2) Bridge prefill state → decode state (one memcpy of the KV buffer).
+        if usedPrefill {
+            try bridgePrefillStateIntoDecode()
+        }
+
+        // 3) Any remaining tokens (< T) go through the single-token decode path.
+        while position < promptIds.count {
             if position >= ctx { throw CoreMLLLMError.predictionFailed }
-            nextId = try predict(tokenId: Int32(tok), position: position)
+            nextId = try predict(tokenId: Int32(promptIds[position]), position: position)
             position += 1
         }
 
-        // Generation loop — nextId at this point is the prediction for the
-        // slot AFTER the last prompt token, which is exactly the first token
-        // we want to emit.
+        // 4) Generation loop — nextId is already the first generated token.
         for _ in 0..<maxNewTokens {
             if eos.contains(Int(nextId)) { break }
             let piece = tokenizer.decode(tokens: [Int(nextId)])
@@ -229,6 +273,79 @@ public final class FunctionGemma {
         }
 
         return generatedText
+    }
+
+    /// Run the prefill model once over `prefillT` prompt tokens starting at
+    /// `startPosition`. Returns the argmax of the position right after the
+    /// last prefilled token (ready to be consumed as the first generated
+    /// token if this is the final prefill chunk).
+    private func prefillBatch(tokens: [Int], startPosition: Int) throws -> Int32 {
+        guard let prefillModel, let prefillState else {
+            throw CoreMLLLMError.predictionFailed
+        }
+        let T = prefillT
+        let ctx = config.contextLength
+        assert(tokens.count == T, "prefillBatch expects exactly prefillT tokens")
+
+        let ids = try MLMultiArray(shape: [1, NSNumber(value: T)], dataType: .int32)
+        let ip = ids.dataPointer.bindMemory(to: Int32.self, capacity: T)
+        for i in 0..<T { ip[i] = Int32(tokens[i]) }
+
+        let pos = try MLMultiArray(shape: [NSNumber(value: T)], dataType: .int32)
+        let pp = pos.dataPointer.bindMemory(to: Int32.self, capacity: T)
+        for i in 0..<T { pp[i] = Int32(startPosition + i) }
+
+        // Causal mask (1, 1, T, ctx): row t sees keys 0..startPosition+t.
+        let mask = try MLMultiArray(
+            shape: [1, 1, NSNumber(value: T), NSNumber(value: ctx)], dataType: .float16)
+        let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: T * ctx)
+        let negInf: UInt16 = 0xF0E2  // ≈ -10000 in fp16
+        for t in 0..<T {
+            let writePos = startPosition + t
+            let row = mp.advanced(by: t * ctx)
+            for c in 0..<ctx { row[c] = c <= writePos ? 0 : negInf }
+        }
+
+        // Update mask (1, 1, ctx, T): column t has a single 1.0 at row startPosition+t.
+        let umask = try MLMultiArray(
+            shape: [1, 1, NSNumber(value: ctx), NSNumber(value: T)], dataType: .float16)
+        let up = umask.dataPointer.bindMemory(to: UInt16.self, capacity: ctx * T)
+        memset(up, 0, ctx * T * MemoryLayout<UInt16>.stride)
+        for t in 0..<T {
+            let c = startPosition + t
+            if c < ctx { up[c * T + t] = 0x3C00 }  // 1.0 in fp16
+        }
+
+        let dict: [String: MLFeatureValue] = [
+            "input_ids": MLFeatureValue(multiArray: ids),
+            "position_ids": MLFeatureValue(multiArray: pos),
+            "causal_mask": MLFeatureValue(multiArray: mask),
+            "update_mask": MLFeatureValue(multiArray: umask),
+        ]
+        let output = try prefillModel.prediction(
+            from: MLDictionaryFeatureProvider(dictionary: dict),
+            using: prefillState)
+        let out = output.featureValue(for: "token_id")!.multiArrayValue!
+        return Int32(truncating: out[0])
+    }
+
+    /// Copy the prefill model's KV cache (MLState buffer) byte-wise into
+    /// the decode model's KV cache. Both states are shaped identically
+    /// (2·L × kv_heads × ctx × head_dim, fp16) because they're produced by
+    /// two traces of the same underlying Gemma3Model.
+    ///
+    /// Uses the NS_REFINED_FOR_SWIFT `withMultiArray(for:handler:)` bridge —
+    /// the handler closure is the only legal scope to access the underlying
+    /// buffer (Apple's contract — the backing address can differ between
+    /// calls).
+    private func bridgePrefillStateIntoDecode() throws {
+        guard let prefillState else { return }
+        prefillState.withMultiArray(for: "kv_cache_0") { src in
+            state.withMultiArray(for: "kv_cache_0") { dst in
+                guard src.count == dst.count else { return }
+                memcpy(dst.dataPointer, src.dataPointer, src.count * 2)
+            }
+        }
     }
 
     /// Run `generate(messages:tools:)` and return the first

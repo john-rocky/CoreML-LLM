@@ -37,6 +37,12 @@ FUNCTIONGEMMA_FILES = [
     "model.mlmodelc/model.mil",
     "model.mlmodelc/metadata.json",
     "model.mlmodelc/analytics/coremldata.bin",
+    # Batched prefill T=32 — ~10× faster prompt ingestion on ANE.
+    "prefill_t32.mlmodelc/weights/weight.bin",
+    "prefill_t32.mlmodelc/coremldata.bin",
+    "prefill_t32.mlmodelc/model.mil",
+    "prefill_t32.mlmodelc/metadata.json",
+    "prefill_t32.mlmodelc/analytics/coremldata.bin",
     "model_config.json",
     "hf_model/tokenizer.json",
     "hf_model/tokenizer_config.json",
