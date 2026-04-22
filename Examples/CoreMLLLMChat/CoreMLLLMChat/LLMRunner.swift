@@ -69,10 +69,14 @@ final class LLMRunner {
 
         // Qwen3.5 detection: the downloaded folder contains the decode
         // mlpackage directly — no `model_config.json` / `hf_model/` layout
-        // that Gemma uses.
-        let qwen35Pkg = folder.appendingPathComponent(
+        // that Gemma uses. Accept either the INT8 (default shipping) or
+        // fp16 (legacy / high-precision) variant.
+        let qwen35Int8 = folder.appendingPathComponent(
+            "qwen3_5_0_8b_decode_int8_mseq128.mlpackage")
+        let qwen35Fp16 = folder.appendingPathComponent(
             "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage")
-        if FileManager.default.fileExists(atPath: qwen35Pkg.path) {
+        if FileManager.default.fileExists(atPath: qwen35Int8.path) ||
+           FileManager.default.fileExists(atPath: qwen35Fp16.path) {
             try await loadQwen35(folder: folder)
             return
         }

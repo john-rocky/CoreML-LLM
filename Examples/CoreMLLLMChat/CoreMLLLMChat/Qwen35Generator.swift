@@ -458,10 +458,10 @@ final class Qwen35Generator {
         return generatedIds
     }
 
-    /// Load only the decode model. Prefers the in-graph argmax variant
-    /// (`next_token` int32 output, ~500 KB / step less CPU transfer) if
-    /// present; otherwise falls back to the full-logits variant and
-    /// performs argmax/sampling in Swift.
+    /// Load only the decode model. Preference order:
+    ///   1. argmax-in-graph fp16 (`next_token` int32 output) — not shipped
+    ///   2. INT8 palettized (754 MB, same parity as fp16, preferred default)
+    ///   3. fp16 (1.4 GB, ground-truth precision)
     func loadDecodeOnly() throws {
         let dCfg = MLModelConfiguration(); dCfg.computeUnits = cfg.decodeUnits
         if let url = try? resolveModelURL("qwen3_5_0_8b_decode_argmax_fp16_mseq128") {
@@ -470,10 +470,16 @@ final class Qwen35Generator {
             status = "Loaded decode-argmax on \(unitsName(cfg.decodeUnits))"
             return
         }
+        if let url = try? resolveModelURL("qwen3_5_0_8b_decode_int8_mseq128") {
+            decode = try MLModel(contentsOf: url, configuration: dCfg)
+            decodeHasInGraphArgmax = false
+            status = "Loaded decode (int8) on \(unitsName(cfg.decodeUnits))"
+            return
+        }
         let dURL = try resolveModelURL("qwen3_5_0_8b_decode_fp16_mseq128")
         decode = try MLModel(contentsOf: dURL, configuration: dCfg)
         decodeHasInGraphArgmax = false
-        status = "Loaded decode (logits) on \(unitsName(cfg.decodeUnits))"
+        status = "Loaded decode (fp16) on \(unitsName(cfg.decodeUnits))"
     }
 
     /// Build zero-initialized state tensors matching the decode inputs.
