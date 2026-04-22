@@ -716,12 +716,14 @@ final class Qwen35Generator {
                                  rng: inout SystemRandomNumberGenerator) -> Int32 {
         // Fast path: argmax directly on the MLMultiArray without allocating
         // a 248K Float buffer. Single pass, stride-safe fp16 read, no
-        // intermediate NaN-filtered copy.
-        if temperature <= 0 {
+        // intermediate NaN-filtered copy. Requires rep_penalty == 1.0
+        // (no-op); otherwise we need the full logits buffer to apply
+        // the penalty on recent tokens before picking the max.
+        if temperature <= 0 && repetitionPenalty <= 1.0 {
             return fastArgmax(arr, position: position, vocab: vocab)
         }
-        // Sampling path reuses the pre-allocated logitsBuffer to avoid
-        // 1 MB heap allocation every decode step.
+        // Sampling / rep-penalty path reuses the pre-allocated logitsBuffer
+        // to avoid 1 MB heap allocation every decode step.
         copyLogitsInto(&logitsBuffer, arr: arr, position: position, vocab: vocab)
         var logits = logitsBuffer
         // Repetition penalty on recent tokens (small set, scalar loop is fine)
@@ -735,6 +737,14 @@ final class Qwen35Generator {
                 if logits[idx] > 0 { logits[idx] /= repetitionPenalty }
                 else                 { logits[idx] *= repetitionPenalty }
             }
+        }
+        // Greedy-with-rep-penalty: pick argmax on adjusted logits
+        // without entering the softmax sampling path. This is what loop-
+        // breaking mode wants: deterministic but not locked-in.
+        if temperature <= 0 {
+            var best = 0; var bv: Float = -.infinity
+            for v in 0..<vocab { if logits[v] > bv { bv = logits[v]; best = v } }
+            return Int32(best)
         }
         // Temperature scaling via SIMD
         if temperature != 1.0 {
