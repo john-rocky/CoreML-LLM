@@ -89,7 +89,14 @@ struct ChatView: View {
                         // after scrollTo(anchor: .bottom).
                         .padding(.horizontal)
                         .padding(.top)
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(TapGesture().onEnded {
+                            UIApplication.shared.sendAction(
+                                #selector(UIResponder.resignFirstResponder),
+                                to: nil, from: nil, for: nil)
+                        })
                     }
+                    .scrollDismissesKeyboard(.interactively)
                     .onChange(of: messages.count) { _, _ in
                         // Dispatch to the next runloop tick so LazyVStack has
                         // laid out the freshly appended MessageBubble before

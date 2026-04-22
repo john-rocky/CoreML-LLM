@@ -69,16 +69,31 @@ final class LLMRunner {
 
         // Qwen3.5 detection: the downloaded folder contains the decode
         // mlpackage directly — no `model_config.json` / `hf_model/` layout
-        // that Gemma uses. Accept either the INT8 (default shipping) or
-        // fp16 (legacy / high-precision) variant.
-        let qwen35Int8 = folder.appendingPathComponent(
-            "qwen3_5_0_8b_decode_int8_mseq128.mlpackage")
-        let qwen35Fp16 = folder.appendingPathComponent(
-            "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage")
-        if FileManager.default.fileExists(atPath: qwen35Int8.path) ||
-           FileManager.default.fileExists(atPath: qwen35Fp16.path) {
+        // that Gemma uses. Accept any of the shipping variants, including
+        // the 4-chunk + embed.bin 2B layout under `qwen3_5_2b_decode_chunks/`.
+        // Chunked detection honors BOTH `.mlpackage` (from the HF download
+        // path) and `.mlmodelc` (from `devicectl copy to` sideload) so we
+        // can iterate on device without re-uploading to HF between runs.
+        let chunksDir = folder.appendingPathComponent("qwen3_5_2b_decode_chunks")
+        let fm = FileManager.default
+        func chunkPresent(_ base: String) -> Bool {
+            fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlpackage").path)
+                || fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlmodelc").path)
+        }
+        let embedPresent = fm.fileExists(atPath:
+            chunksDir.appendingPathComponent("embed_weight.bin").path)
+        if embedPresent && ["chunk_a", "chunk_b", "chunk_c", "chunk_d"].allSatisfy(chunkPresent) {
             try await loadQwen35(folder: folder)
             return
+        }
+        for mlpkgName in ["qwen3_5_0_8b_decode_int8_mseq128.mlpackage",
+                          "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage",
+                          "qwen3_5_2b_decode_int8_mseq128.mlpackage"] {
+            let path = folder.appendingPathComponent(mlpkgName)
+            if FileManager.default.fileExists(atPath: path.path) {
+                try await loadQwen35(folder: folder)
+                return
+            }
         }
 
         // LookAhead K=8 probe bundles ship a `probe.marker` file so the runner
@@ -225,12 +240,30 @@ final class LLMRunner {
         }
         qwen35Generator = gen
         qwen35Tokenizer = tok
-        modelName = "Qwen3.5 0.8B"
+        // Display variant reflects which decode bundle shipped in the folder.
+        // 2B 5-chunk takes precedence over 2B monolithic (the monolithic
+        // path stays for Mac compatibility but fails iPhone ANE budget).
+        // Honors both `.mlpackage` (HF download) and `.mlmodelc`
+        // (devicectl sideload) for the chunked layout. Check chunk_a as
+        // a representative marker — full presence is validated in the
+        // router block above.
+        let chunksDir = folder.appendingPathComponent("qwen3_5_2b_decode_chunks")
+        let chunkAPkg = chunksDir.appendingPathComponent("chunk_a.mlpackage")
+        let chunkAMlc = chunksDir.appendingPathComponent("chunk_a.mlmodelc")
+        let mono2B = folder.appendingPathComponent("qwen3_5_2b_decode_int8_mseq128.mlpackage")
+        if FileManager.default.fileExists(atPath: chunkAPkg.path)
+            || FileManager.default.fileExists(atPath: chunkAMlc.path) {
+            modelName = "Qwen3.5 2B (mmap embed + 4-chunk)"
+        } else if FileManager.default.fileExists(atPath: mono2B.path) {
+            modelName = "Qwen3.5 2B"
+        } else {
+            modelName = "Qwen3.5 0.8B"
+        }
         hasVision = false
         hasAudio = false
         isLoaded = true
         loadingStatus = "Ready"
-        print("[LLMRunner] loaded Qwen3.5 from \(folder.lastPathComponent)")
+        print("[LLMRunner] loaded Qwen3.5 (\(modelName)) from \(folder.lastPathComponent)")
     }
 
     private func generateQwen35(messages: [ChatMessage]) async throws -> AsyncStream<String> {
@@ -260,18 +293,19 @@ final class LLMRunner {
             ?? tok.encode(text: messages.last?.content ?? "")
         let inputIdsInt32 = inputIds.map { Int32($0) }
 
-        // Qwen3.5 decode mlpackage is built with max_seq=128, so total
-        // tokens (prompt + generation) must fit in 128. Compute remaining
-        // budget from the prompt length; cap at a reasonable chat ceiling.
-        // If prompt alone already exceeds the budget, throw a clear error.
-        let maxSeq = 128
+        // Qwen3.5 decode mlpackage is built with max_seq=2048, so total
+        // tokens (prompt + generation) must fit in 2048. Compute
+        // remaining budget from the prompt length; cap at a reasonable
+        // chat ceiling. If prompt alone already exceeds the budget,
+        // throw a clear error.
+        let maxSeq = 2048
         let remaining = maxSeq - inputIds.count - 1
         if remaining < 1 {
             throw NSError(domain: "LLMRunner", code: 22,
                 userInfo: [NSLocalizedDescriptionKey:
                     "Qwen3.5 prompt (\(inputIds.count) tokens) exceeds max_seq=\(maxSeq). Shorten the message or clear the chat history."])
         }
-        let maxNew = min(remaining, 120)  // soft cap to avoid long hangs
+        let maxNew = min(remaining, 1024)  // soft cap to avoid long hangs
 
         // Qwen3.5 has multiple stop tokens that all legitimately end a
         // turn. Stopping on any of them prevents the model from leaking
@@ -437,99 +471,6 @@ final class LLMRunner {
         case .critical: return "critical"
         @unknown default: return "?"
         }
-    }
-
-    // MARK: - LookAhead K=8 probe
-
-    /// Timing summary for verify_qK, filled by `runVerifyKProbe`. All ms.
-    struct VerifyKProbeResult {
-        var k: Int
-        var iterations: Int
-        var prefillTokens: Int
-        var minMs: Double
-        var medianMs: Double
-        var meanMs: Double
-        var p90Ms: Double
-        var p99Ms: Double
-        var maxMs: Double
-        var stdMs: Double
-
-        var verdict: String {
-            if medianMs < 50 { return "GO — LookAhead impl worth committing to" }
-            if medianMs <= 70 { return "MARGINAL — defer unless Metal Phase 3 slips" }
-            return "KILL — K-linear scaling confirmed, LookAhead dead on ANE"
-        }
-
-        var summary: String {
-            let fmt = { (x: Double) in String(format: "%.2f", x) }
-            return """
-            verify_qK=\(k) over \(iterations) iters (ms)
-              min=\(fmt(minMs)) median=\(fmt(medianMs)) mean=\(fmt(meanMs))
-              p90=\(fmt(p90Ms)) p99=\(fmt(p99Ms)) max=\(fmt(maxMs)) std=\(fmt(stdMs))
-              prefill=\(prefillTokens) tokens
-            verdict: \(verdict)
-            """
-        }
-    }
-
-    /// Run verify_qK in a tight loop and return timing stats. Used for the
-    /// LookAhead K=8 probe gate (`docs/LOOKAHEAD_PROBE_HANDOFF.md`).
-    ///
-    /// Assumes the bundle was built with `--K <k>` verify chunks and that
-    /// `SPECULATIVE_PROFILE` was set at load time (handled automatically
-    /// when `probe.marker` ships in the bundle).
-    func runVerifyKProbe(
-        iterations: Int = 25,
-        prompt: String = "The quick brown fox jumps over the lazy dog."
-    ) async throws -> VerifyKProbeResult {
-        guard let llm else {
-            throw NSError(domain: "LLMRunner", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "Model not loaded"])
-        }
-        guard let k = llm.benchVerifyK else {
-            throw NSError(domain: "LLMRunner", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "Verify chunks not loaded. Push a probe bundle or set SPECULATIVE_PROFILE=1."
-            ])
-        }
-
-        // Deterministic candidate pattern. ANE runtime cost is independent
-        // of the integer values, so we just need `k` valid Int32s. Anchor
-        // the first slot to the prefill seed to keep the pattern plausible.
-        let (_, seed) = try await llm.benchPrefill(prompt)
-        var base: [Int32] = [seed, 100, 200, 500, 1000, 2000, 5000, 10000,
-                             20000, 50000, 100, 200, 500, 1000, 2000, 5000]
-        if base.count < k {
-            base.append(contentsOf: Array(repeating: Int32(100), count: k - base.count))
-        }
-        let candidates = Array(base.prefix(k))
-        let prefillLen = llm.benchCurrentPosition ?? 0
-
-        // Warmup: first calls pay ANE compile-schedule cost.
-        for _ in 0..<3 {
-            _ = try llm.benchVerify(candidates)
-        }
-
-        var times: [Double] = []
-        times.reserveCapacity(iterations)
-        for _ in 0..<iterations {
-            let ts = CFAbsoluteTimeGetCurrent()
-            _ = try llm.benchVerify(candidates)
-            times.append((CFAbsoluteTimeGetCurrent() - ts) * 1000.0)
-        }
-        let sorted = times.sorted()
-        let minMs = sorted.first!
-        let maxMs = sorted.last!
-        let medianMs = sorted[sorted.count / 2]
-        let p90Ms = sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.90))]
-        let p99Ms = sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.99))]
-        let meanMs = times.reduce(0, +) / Double(times.count)
-        let varMs = times.map { pow($0 - meanMs, 2) }.reduce(0, +) / Double(times.count)
-        let stdMs = sqrt(varMs)
-
-        return VerifyKProbeResult(
-            k: k, iterations: iterations, prefillTokens: prefillLen,
-            minMs: minMs, medianMs: medianMs, meanMs: meanMs,
-            p90Ms: p90Ms, p99Ms: p99Ms, maxMs: maxMs, stdMs: stdMs)
     }
 
     // MARK: - ANE placement verification

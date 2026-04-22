@@ -90,6 +90,18 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML/resolve/main",
             folderName: "qwen3.5-0.8b")
 
+        /// Qwen3.5 2B — same hybrid SSM/attention architecture as 0.8B,
+        /// just hidden_size doubled (1024→2048) and intermediate
+        /// (3072→6144). Shipped as 4 INT8 chunks (6 layers each, ~1.7 GB
+        /// fp16-dequantized per chunk) matching the Gemma 4 E4B pattern
+        /// that fits iPhone's single-mlprogram ANE compile budget.
+        /// 2-chunk at 2 GB fp16/chunk failed ANE and fell to GPU; 4-chunk
+        /// stays ANE-resident. Bigger = higher quality, slower vs 0.8B.
+        public static let qwen35_2b = ModelInfo(
+            id: "qwen3.5-2b", name: "Qwen3.5 2B (ANE)", size: "2.4 GB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML/resolve/main",
+            folderName: "qwen3.5-2b")
+
         /// Gemma 4 E4B — 42 layers, hidden=2560, 2 KV heads, text-only decoder.
         /// INT4 palettized, ctx=2048. Baseline ~14 tok/s on iPhone 17 Pro.
         /// A local build (`conversion/build_gemma4_bundle.py --model gemma4-e4b`)
@@ -136,7 +148,7 @@ public final class ModelDownloader: NSObject {
             let experimental =
                 ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
                 || UserDefaults.standard.bool(forKey: "showExperimentalModels")
-            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b, qwen35_08b]
+            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b, qwen35_08b, qwen35_2b]
             if experimental {
                 list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
                 list.insert(gemma4e2bLookaheadProbe, at: 3)  // after EAGLE-3
@@ -217,11 +229,43 @@ public final class ModelDownloader: NSObject {
     public func localModelURL(for model: ModelInfo) -> URL? {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
         // Qwen3.5 has its own mlpackage names (no `model.mlpackage`).
-        // Check INT8 first (default shipping variant), then fp16 (legacy /
-        // ground-truth). Either presence marks this folder as a Qwen3.5
-        // model folder.
+        // Check shipping variants in order. Any one of these marks the
+        // folder as a Qwen3.5 model folder.
+        //   1. 2B chunked (chunk_a + chunk_b must both exist)
+        //   2. 0.8B INT8 (default shipping)
+        //   3. 0.8B fp16 (ground-truth)
+        //   4. 2B monolithic INT8 (Mac fallback; fails ANE budget on iPhone)
+        let chunksDir = dir.appendingPathComponent("qwen3_5_2b_decode_chunks")
+        func chunkExists(_ base: String) -> Bool {
+            // HF-downloaded layout: chunk_X.mlpackage/Data/.../weight.bin
+            let pkgWeights = chunksDir
+                .appendingPathComponent("\(base).mlpackage")
+                .appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")
+            if fileManager.fileExists(atPath: pkgWeights.path) { return true }
+            // Sideload layout: chunk_X.mlmodelc/weights/weight.bin
+            let mlcWeights = chunksDir
+                .appendingPathComponent("\(base).mlmodelc")
+                .appendingPathComponent("weights/weight.bin")
+            return fileManager.fileExists(atPath: mlcWeights.path)
+        }
+        // 4-chunk + embed-bin layout: all must be present to count as
+        // downloaded. Missing any piece → fall through to monolithic /
+        // 0.8B layouts below. Embed is a raw .bin, not an mlpackage.
+        let embedBinURL = chunksDir.appendingPathComponent("embed_weight.bin")
+        let embedPresent = fileManager.fileExists(atPath: embedBinURL.path)
+        let requiredChunks = ["chunk_a", "chunk_b", "chunk_c", "chunk_d"]
+        if embedPresent && requiredChunks.allSatisfy(chunkExists) {
+            // Return chunksDir itself (a directory under the model folder)
+            // so callers that do `url.deletingLastPathComponent()` land on
+            // the model folder root — same convention 0.8B follows when
+            // its mlpackage is returned directly. Qwen35Generator resolves
+            // the actual chunk_*.{mlpackage,mlmodelc} + embed_weight.bin
+            // from the folder.
+            return chunksDir
+        }
         for name in ["qwen3_5_0_8b_decode_int8_mseq128.mlpackage",
-                     "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage"] {
+                     "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage",
+                     "qwen3_5_2b_decode_int8_mseq128.mlpackage"] {
             let pkg = dir.appendingPathComponent(name)
             if fileManager.fileExists(atPath: pkg.appendingPathComponent(
                 "Data/com.apple.CoreML/weights/weight.bin").path) {
@@ -666,6 +710,10 @@ public final class ModelDownloader: NSObject {
             buildQwen35FileList()
             return
         }
+        if model.id == "qwen3.5-2b" {
+            buildQwen35_2B_FileList()
+            return
+        }
         // 2K-context shipping model lives at the repo root on HF:
         //   - Decode chunks:  swa/chunk{1-4}.mlmodelc/
         //   - Prefill chunks: prefill/chunk{1-4}.mlmodelc/  (remote name is
@@ -806,6 +854,56 @@ public final class ModelDownloader: NSObject {
                   estimatedSize: 753_000_000),
         ]
         // Sort biggest-first so large weight download starts immediately.
+        pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
+        totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
+        completedBytes = 0
+        nextFileIndex = 0
+    }
+
+    /// Qwen3.5-2B CoreML layout on `mlboydaisuke/qwen3.5-2B-CoreML`.
+    /// 4 INT8 transformer chunks + 1 raw fp16 embed sidecar under
+    /// `qwen3_5_2b_decode_chunks/`:
+    ///   chunk_a..c:       6 layers each (pure transformer body)
+    ///   chunk_d:          6 layers + final_norm + lm_head
+    ///   embed_weight.bin: raw fp16 embed_tokens, Swift mmaps directly
+    /// Embed is NOT an mlpackage so CoreML doesn't dequant its 1 GB
+    /// into CPU-resident memory — the mmap'd file stays in clean
+    /// virtual pages and only the few rows touched per prompt page in.
+    /// Every transformer chunk is ≤ 1 GB fp16, fitting iPhone's ANE
+    /// single-mlprogram compile envelope.
+    private func buildQwen35_2B_FileList() {
+        let root = "qwen3_5_2b_decode_chunks"
+        // Per-chunk weight.bin sizes measured from the INT8 palettized
+        // output. chunk_d carries 1 GB of lm_head; body chunks are just
+        // 6 transformer layers.
+        let sizes: [(String, Int64)] = [
+            ("chunk_a.mlpackage", 340_000_000),  // 6 layers
+            ("chunk_b.mlpackage", 340_000_000),  // 6 layers
+            ("chunk_c.mlpackage", 340_000_000),  // 6 layers
+            ("chunk_d.mlpackage", 850_000_000),  // 6 layers + lm_head
+        ]
+        var files: [DownloadFile] = []
+        for (chunk, weightSize) in sizes {
+            let pkg = "\(root)/\(chunk)"
+            files.append(.init(
+                remotePath: "\(pkg)/Manifest.json",
+                localPath: "\(pkg)/Manifest.json",
+                estimatedSize: 700))
+            files.append(.init(
+                remotePath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
+                localPath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
+                estimatedSize: 900_000))
+            files.append(.init(
+                remotePath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
+                localPath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
+                estimatedSize: weightSize))
+        }
+        // Raw fp16 embed sidecar: 248320 × 2048 × 2 bytes ≈ 1.017 GB.
+        files.append(.init(
+            remotePath: "\(root)/embed_weight.bin",
+            localPath: "\(root)/embed_weight.bin",
+            estimatedSize: 1_017_000_000))
+        pendingFiles = files
         pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
         completedBytes = 0
