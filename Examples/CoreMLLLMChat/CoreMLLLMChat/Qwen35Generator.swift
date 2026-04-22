@@ -129,6 +129,13 @@ final class Qwen35Generator {
     @ObservationIgnored private var decodeHasInGraphArgmax = false
     private var cfg: Config
 
+    /// Reset per-phase profile accumulators. Call between comparable
+    /// measurement runs (e.g., before running the same prompt on a
+    /// different compute backend to compare).
+    func resetProfile() {
+        decodeProfile = PhaseProfile()
+    }
+
     /// Swap compute units at runtime. Since this Generator uses the decode
     /// model for both prefill and decode, only `decode` units take effect;
     /// the `prefill` parameter is accepted for API compat and ignored.
@@ -137,6 +144,8 @@ final class Qwen35Generator {
                       numLayers: cfg.numLayers, rotaryDim: cfg.rotaryDim,
                       prefillUnits: prefill, decodeUnits: decode)
         self.decode = nil
+        // Backend changed — previous profile samples are not comparable.
+        decodeProfile = PhaseProfile()
         status = "Idle (units changed, will reload on next run)"
     }
 
@@ -376,8 +385,13 @@ final class Qwen35Generator {
         // --- 2. Decode loop (with per-phase profiling) ---
         status = "Decoding..."
         var decodeTotal = 0.0
-        var sumInputs = 0.0, sumPredict = 0.0, sumStateCopy = 0.0, sumLogit = 0.0
-        var profileCount = 0
+        // Carry over the previous call's profile so short responses still
+        // contribute data points. `resetProfile()` explicitly zeroes.
+        var sumInputs = decodeProfile.inputsBuild * Double(decodeProfile.count)
+        var sumPredict = decodeProfile.predict * Double(decodeProfile.count)
+        var sumStateCopy = decodeProfile.stateCopy * Double(decodeProfile.count)
+        var sumLogit = decodeProfile.logitRead * Double(decodeProfile.count)
+        var profileCount = decodeProfile.count
         let decodeStart = Date()
         var position = S
         for step in 0..<(maxNewTokens - 1) {
@@ -420,14 +434,15 @@ final class Qwen35Generator {
             }
             let tLogit = CFAbsoluteTimeGetCurrent()
 
-            // Accumulate per-phase timings (skip first 2 as warmup)
-            if step >= 2 {
-                sumInputs    += (tIn1 - tIn0) * 1000
-                sumPredict   += (tPred - tIn1) * 1000
-                sumStateCopy += (tState - tPred) * 1000
-                sumLogit     += (tLogit - tState) * 1000
-                profileCount += 1
-            }
+            // Accumulate per-phase timings for every step. Previously we
+            // skipped step 0-1 as warmup, but that loses signal on short
+            // responses (EOS firing before step 2). The first-call cold
+            // path adds ~1-2ms noise at most, negligible in aggregate.
+            sumInputs    += (tIn1 - tIn0) * 1000
+            sumPredict   += (tPred - tIn1) * 1000
+            sumStateCopy += (tState - tPred) * 1000
+            sumLogit     += (tLogit - tState) * 1000
+            profileCount += 1
 
             generatedIds.append(nextToken)
             onToken?(nextToken)

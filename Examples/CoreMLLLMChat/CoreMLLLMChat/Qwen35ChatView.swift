@@ -157,6 +157,11 @@ struct Qwen35ChatView: View {
                                 Text(String(format: "%.1f tok/s", 1000 / p.total))
                                     .font(.caption.monospaced())
                             }
+                            Button("Reset profile (clear n=\(p.count) samples)") {
+                                generator.resetProfile()
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.red)
                         }
                     }
                 }
