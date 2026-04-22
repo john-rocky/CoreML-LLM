@@ -16,9 +16,46 @@ struct Args {
     var bundleURL: URL?
     var downloadInto: URL?
     var hfToken: String?
-    var prompt: String = "List three kinds of fruit."
+    var prompt: String = "Turn on the flashlight"
     var maxTokens: Int = 128
+    var raw: Bool = false
 }
+
+// Minimal tool list so FunctionGemma has somewhere to send its function calls.
+let demoTools: [[String: Any]] = [
+    [
+        "type": "function",
+        "function": [
+            "name": "toggle_flashlight",
+            "description": "Turn the phone flashlight on or off.",
+            "parameters": ["type": "object", "properties": [:], "required": []],
+        ],
+    ],
+    [
+        "type": "function",
+        "function": [
+            "name": "set_timer",
+            "description": "Set a countdown timer.",
+            "parameters": [
+                "type": "object",
+                "properties": ["minutes": ["type": "integer", "description": "Duration in minutes"]],
+                "required": ["minutes"],
+            ],
+        ],
+    ],
+    [
+        "type": "function",
+        "function": [
+            "name": "get_weather",
+            "description": "Get current weather for a city.",
+            "parameters": [
+                "type": "object",
+                "properties": ["city": ["type": "string", "description": "City name"]],
+                "required": ["city"],
+            ],
+        ],
+    ],
+]
 
 func parseArgs() -> Args {
     var a = Args()
@@ -37,17 +74,25 @@ func parseArgs() -> Args {
             if let v = it.next() { a.prompt = v }
         case "--max":
             if let v = it.next(), let n = Int(v) { a.maxTokens = n }
+        case "--raw":
+            a.raw = true
         case "-h", "--help":
             print("""
             functiongemma-demo — standalone FunctionGemma-270M CLI
 
             Run with an existing bundle:
               --bundle <dir>         Path to output/functiongemma-270m/bundle
-              --prompt "<text>"      Prompt (default: "List three kinds of fruit.")
+              --prompt "<text>"      User request (default: "Turn on the flashlight")
               --max <n>              Max new tokens (default: 128)
+              --raw                  Skip chat template / tools (feeds prompt verbatim)
 
             Download on first use:
               --download --into <dir> [--hf-token hf_...]
+
+            FunctionGemma-270M is fine-tuned for function calling. The default
+            mode wraps --prompt in a chat template + a canonical tool list
+            (flashlight / timer / weather), which is what the model expects.
+            Without this, instruction-style prompts produce nonsense.
             """)
             exit(0)
         default:
@@ -105,20 +150,37 @@ struct Main {
 
         let t1 = Date()
         var count = 0
-        let text = try fg.generate(
-            prompt: args.prompt,
-            maxNewTokens: args.maxTokens,
-            onToken: { piece in
-                FileHandle.standardOutput.write(piece.data(using: .utf8) ?? Data())
-                count += 1
-                return true
-            })
+        let text: String
+        if args.raw {
+            text = try fg.generate(
+                prompt: args.prompt,
+                maxNewTokens: args.maxTokens,
+                onToken: { piece in
+                    FileHandle.standardOutput.write(piece.data(using: .utf8) ?? Data())
+                    count += 1
+                    return true
+                })
+        } else {
+            text = try fg.generate(
+                messages: [["role": "user", "content": args.prompt]],
+                tools: demoTools,
+                maxNewTokens: args.maxTokens,
+                onToken: { piece in
+                    FileHandle.standardOutput.write(piece.data(using: .utf8) ?? Data())
+                    count += 1
+                    return true
+                })
+        }
         FileHandle.standardOutput.write("\n".data(using: .utf8)!)
 
         let dt = Date().timeIntervalSince(t1)
         FileHandle.standardError.write(
             String(format: "\n[%.1fs, %.1f tok/s, %d tokens]\n", dt, Double(count) / dt, count)
                 .data(using: .utf8)!)
-        _ = text
+
+        if let call = fg.extractFunctionCall(from: text) {
+            FileHandle.standardError.write(
+                "function call: \(call)\n".data(using: .utf8)!)
+        }
     }
 }

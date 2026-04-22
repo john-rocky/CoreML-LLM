@@ -133,18 +133,67 @@ public final class FunctionGemma {
 
     // MARK: - Generation
 
-    /// Generate up to `maxNewTokens` tokens after the prompt. Decoding is
-    /// greedy (argmax baked into the model). Stops on any `eos_token_id` or
-    /// when `onToken` returns false.
+    /// Chat-templated generation — the recommended entry point.
+    ///
+    /// FunctionGemma is fine-tuned on its chat format; feeding raw text
+    /// through `generate(prompt:)` gives garbage output (e.g. asking for
+    /// "primary colors" produces a list of metals). This overload applies
+    /// the bundled chat template before decoding, optionally declaring the
+    /// tools the model may emit calls for.
+    ///
+    /// ```swift
+    /// let tools: [[String: Any]] = [[
+    ///   "type": "function",
+    ///   "function": [
+    ///     "name": "toggle_flashlight",
+    ///     "description": "Turn the flashlight on or off",
+    ///     "parameters": ["type": "object", "properties": [:], "required": []]
+    ///   ]
+    /// ]]
+    /// let text = try fg.generate(
+    ///   messages: [["role": "user", "content": "Turn on the flashlight"]],
+    ///   tools: tools)
+    /// // → "<start_function_call>call:toggle_flashlight{}<end_function_call>"
+    /// ```
+    public func generate(
+        messages: [[String: Any]],
+        tools: [[String: Any]]? = nil,
+        maxNewTokens: Int = 256,
+        resetState: Bool = true,
+        onToken: ((String) -> Bool)? = nil
+    ) throws -> String {
+        let ids = try tokenizer.applyChatTemplate(messages: messages, tools: tools)
+        return try generate(promptIds: ids, maxNewTokens: maxNewTokens,
+                            resetState: resetState, onToken: onToken)
+    }
+
+    /// Generate up to `maxNewTokens` tokens after the raw `prompt`. Decoding
+    /// is greedy (argmax baked into the model). Stops on any `eos_token_id`
+    /// or when `onToken` returns false.
+    ///
+    /// **Prefer `generate(messages:tools:…)`** — FunctionGemma's training
+    /// assumes prompts go through its chat template; the raw-text overload
+    /// produces reasonable continuation for completion-style inputs but
+    /// pathological output for instruction-style prompts.
     public func generate(
         prompt: String,
         maxNewTokens: Int = 256,
         resetState: Bool = true,
         onToken: ((String) -> Bool)? = nil
     ) throws -> String {
+        let promptIds = tokenizer.encode(text: prompt)
+        return try generate(promptIds: promptIds, maxNewTokens: maxNewTokens,
+                            resetState: resetState, onToken: onToken)
+    }
+
+    private func generate(
+        promptIds: [Int],
+        maxNewTokens: Int,
+        resetState: Bool,
+        onToken: ((String) -> Bool)?
+    ) throws -> String {
         if resetState { self.resetState() }
 
-        let promptIds = tokenizer.encode(text: prompt)
         guard !promptIds.isEmpty else { return "" }
 
         let ctx = config.contextLength
@@ -182,27 +231,73 @@ public final class FunctionGemma {
         return generatedText
     }
 
-    /// Run `generate` and return the first `<start_function_call>…<end_function_call>`
-    /// payload as a raw string, plus the full generated text. Returns `nil`
-    /// for the payload if no function call was emitted.
+    /// Run `generate(messages:tools:)` and return the first
+    /// `<start_function_call>…<end_function_call>` payload as a raw string,
+    /// plus the full generated text. Returns `nil` for the payload if no
+    /// function call was emitted.
     public func generateFunctionCall(
-        prompt: String,
+        messages: [[String: Any]],
+        tools: [[String: Any]]? = nil,
         maxNewTokens: Int = 256
     ) throws -> (text: String, functionCall: String?) {
-        let text = try generate(prompt: prompt, maxNewTokens: maxNewTokens)
-        let start = config.functionCallStart
-        let end = config.functionCallEnd
-        if let s = text.range(of: start), let e = text.range(of: end, range: s.upperBound..<text.endIndex) {
-            return (text, String(text[s.upperBound..<e.lowerBound]))
-        }
-        return (text, nil)
+        let text = try generate(messages: messages, tools: tools,
+                                maxNewTokens: maxNewTokens)
+        return (text, extractFunctionCall(from: text))
     }
 
-    /// Streaming variant: returns each generated piece as an AsyncStream
-    /// element. Useful for SwiftUI views that want to update incrementally.
-    /// The stream completes on EOS, on `maxNewTokens`, or if the underlying
-    /// prediction throws (in which case the stream finishes without a final
-    /// element — wrap in a `do/try await` to surface errors).
+    /// Convenience wrapper that takes a single user utterance.
+    public func generateFunctionCall(
+        userPrompt: String,
+        tools: [[String: Any]]? = nil,
+        maxNewTokens: Int = 256
+    ) throws -> (text: String, functionCall: String?) {
+        try generateFunctionCall(
+            messages: [["role": "user", "content": userPrompt]],
+            tools: tools, maxNewTokens: maxNewTokens)
+    }
+
+    /// Extract the first `<start_function_call>…<end_function_call>` payload
+    /// from `text`, if present.
+    public func extractFunctionCall(from text: String) -> String? {
+        let start = config.functionCallStart
+        let end = config.functionCallEnd
+        guard let s = text.range(of: start),
+              let e = text.range(of: end, range: s.upperBound..<text.endIndex)
+        else { return nil }
+        return String(text[s.upperBound..<e.lowerBound])
+    }
+
+    /// Streaming variant for chat-templated generation — the recommended
+    /// entry point for SwiftUI views.
+    public func stream(
+        messages: [[String: Any]],
+        tools: [[String: Any]]? = nil,
+        maxNewTokens: Int = 256,
+        resetState: Bool = true
+    ) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            Task.detached { [weak self] in
+                guard let self else { continuation.finish(); return }
+                do {
+                    _ = try self.generate(
+                        messages: messages,
+                        tools: tools,
+                        maxNewTokens: maxNewTokens,
+                        resetState: resetState,
+                        onToken: { piece in
+                            continuation.yield(piece)
+                            return true
+                        })
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Streaming variant for raw-text prompts. Prefer
+    /// `stream(messages:tools:)` — see the note on `generate(prompt:)`.
     public func stream(
         prompt: String,
         maxNewTokens: Int = 256,
