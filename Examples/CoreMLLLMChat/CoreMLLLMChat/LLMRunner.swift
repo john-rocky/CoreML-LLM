@@ -473,8 +473,18 @@ final class LLMRunner {
                             if eosSet.contains(tokenId) { return }
                             accumIds.append(Int(tokenId))
                             // Same accumulate-decode pattern as Qwen3.5 to
-                            // preserve multi-byte UTF-8.
-                            let current = tok.decode(tokens: accumIds)
+                            // preserve multi-byte UTF-8 across BPE token
+                            // splits. Qwen3-VL has vocab=151K (vs Qwen3.5's
+                            // 248K) so emoji/CJK BPE splits are common —
+                            // the trailing token in `current` may be a
+                            // partial UTF-8 sequence that decodes to U+FFFD
+                            // (replacement char `◇`). Drop trailing FFFDs
+                            // before emitting; the next token will complete
+                            // the sequence and we'll emit the full glyph.
+                            var current = tok.decode(tokens: accumIds)
+                            while current.last == "\u{FFFD}" {
+                                current.removeLast()
+                            }
                             if current.count > emittedText.count,
                                current.hasPrefix(emittedText) {
                                 let delta = String(current.dropFirst(emittedText.count))
