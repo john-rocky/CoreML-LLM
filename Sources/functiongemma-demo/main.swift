@@ -71,6 +71,7 @@ struct Main {
                 bundleURL = existing
             } else {
                 print("Downloading FunctionGemma-270M into \(dir.path)...")
+                var lastLine = ""
                 bundleURL = try await Gemma3BundleDownloader.download(
                     .functionGemma270m,
                     into: dir,
@@ -79,8 +80,11 @@ struct Main {
                         let pct = p.bytesTotal > 0
                             ? Int(Double(p.bytesReceived) / Double(p.bytesTotal) * 100)
                             : 0
-                        FileHandle.standardError.write(
-                            "  [\(pct)%] \(p.currentFile)\n".data(using: .utf8)!)
+                        let line = "[\(pct)%] \(p.currentFile)"
+                        if line != lastLine {
+                            lastLine = line
+                            FileHandle.standardError.write("  \(line)\n".data(using: .utf8)!)
+                        }
                     })
                 print("Downloaded to \(bundleURL.path)")
             }
