@@ -266,6 +266,19 @@ def build_bundle(
     model.eval()
     _copy_into_model(model, weights)
 
+    # NOTE on residual-stream stability:
+    # EmbeddingGemma's post-feedforward layernorm has effective weights up to
+    # ~2535 (vs ~150 for FunctionGemma) and the encoder is 24 layers deep
+    # with no `layer_scalar` to dampen growth. PyTorch fp16 trace can be made
+    # to fit in fp16 by pre-scaling embed + post-norms by 1/K (the encoder's
+    # final RMSNorm is scale-invariant, so output direction is preserved).
+    # Empirically though the resulting CoreML mlpackage produces zeros for
+    # *partial* attention masks (works for full=ones masks) on at least
+    # CoreML 8.0 / macOS 26 — this divergence between PyTorch fp16 and CoreML
+    # fp16 has not been root-caused yet. Until that's resolved, ship fp32
+    # activations (below) which are correct end-to-end at the cost of
+    # reduced ANE residency.
+
     print("\n[2/4] Tracing model")
     sample_ids = torch.zeros((1, max_seq_len), dtype=torch.int32)
     sample_mask = torch.ones((1, max_seq_len), dtype=torch.float16)
@@ -273,13 +286,10 @@ def build_bundle(
         traced = torch.jit.trace(model, (sample_ids, sample_mask))
 
     print("\n[3/4] Converting to CoreML (fp32 activations, iOS 18, stateless)")
-    # Why fp32 (not the default fp16): EmbeddingGemma's residual stream grows
-    # past fp16 max (~65504) by layer 7 (no `layer_scalar` to dampen it like
-    # Gemma 4 has). With pure fp16 the encoder produces all-zero embeddings on
-    # ANE and NaN on CPU. fp32 activations keep the math correct at the cost
-    # of a doubled-size .mlpackage and lower ANE residency. Decoder output
-    # (FunctionGemma) tolerates fp16 because argmax discretizes away
-    # saturation; an embedding vector cannot.
+    # See NOTE above. fp32 activations + fp16 weights → encoder works
+    # correctly for any attention_mask, at the cost of ~21% ANE residency
+    # (most ops fall back to CPU). Acceptable for an embed model that's
+    # called once per query, not per-token.
     mlmodel = ct.convert(
         traced,
         inputs=[
