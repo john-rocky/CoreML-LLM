@@ -38,7 +38,7 @@ CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a 
 | ANE placement | — | — | 99.78% | 99.78% | 99.78% | 99.78% | 99.78% | **99.78%** |
 | Memory (`phys_footprint`) | — | — | — | ~1 GB | ~1 GB | ~1 GB | ~1 GB | **~1 GB** |
 
-### Gemma 4 E4B (v0.8.0, new)
+### Gemma 4 E4B (v0.8.0)
 
 | | E2B | **E4B** |
 |---|---:|---:|
@@ -56,9 +56,33 @@ Context length is 2048 on both variants. Extended context (8K) is under active d
 
 Ground-truth ANE placement measured via `MLComputePlan` (E2B: 7,294 / 7,310 dispatched LLM ops on ANE; E4B: 100%). Vision encoder runs on GPU by design.
 
-### Qwen3.5 0.8B (new, v1.0.0)
+### Qwen3.5 2B (new, v1.1.0)
 
-First CoreML port of a hybrid SSM/attention LLM on iPhone. The 24 layers are 18× Gated-DeltaNet linear-attention (SSM) interleaved with 6× full GQA attention. Text-only.
+Scaling the hybrid Gated-DeltaNet stack to a 2B-parameter model while keeping everything on ANE and shipping under a commodity iOS memory budget. 4 INT8 transformer chunks (6 layers each) + a raw fp16 `embed_weight.bin` sidecar that Swift mmaps read-only — the 1 GB embed table lives in clean virtual pages so it never inflates `phys_footprint`.
+
+| | Qwen3.5 2B | Qwen3.5 0.8B |
+|---|---:|---:|
+| Parameters | **~2.0B** | ~0.8B |
+| Architecture | **Gated-DeltaNet SSM + attention** | Gated-DeltaNet SSM + attention |
+| num_hidden_layers | 24 (18 SSM + 6 full-attn) | 24 (18 SSM + 6 full-attn) |
+| hidden_size | **2048** | 1024 |
+| intermediate_size | **6144** | 3072 |
+| Context length | **2048** | 128 |
+| Decode speed (ANE) | **~17 tok/s** | ~20 tok/s |
+| ANE placement (per body chunk) | **90.7% / 91.1% / 90.7% / 90.8%** | 99.9% (single mlpackage) |
+| Bundle size | **2.4 GB** (4 INT8 chunks + 1 GB fp16 embed) | 754 MB (INT8) |
+| `phys_footprint` (inference) | **~200 MB** | ~1 GB |
+| Metal heap (sustained) | **0 GB** | 0 GB |
+
+2B's memory envelope is *smaller* than 0.8B's because embed_tokens is mmap'd (clean pages don't count against resident memory), while all INT8 chunk weights live in ANE's private region and are also excluded from `phys_footprint`.
+
+**Why 4 chunks (not 1 or 2).** iPhone ANE compiles per-mlprogram and budgets against the *fp16-dequantized* weight size, not disk size (INT8 palettization shrinks download, not runtime memory). A 2-chunk 2B split at ~2 GB fp16/chunk tripped `MILCompilerForANE: Couldn't communicate with a helper application` and silently fell back to GPU (3.4 GB Metal, 7 tok/s). 4 chunks at ≤ ~1.7 GB fp16 each match the Gemma 4 E4B envelope that's proven ANE-resident on this hardware. See `docs/RELEASE_v1_1_0.md` for the full autopsy.
+
+**Why the embed sidecar.** Bolting embed onto the first transformer chunk exceeded ANE compile budget; putting it in its own `chunk_embed.mlpackage` compiled fine but landed the gather on CPU, and Core ML dequantized 1 GB of palettized embed weights into process memory (memory spiked from ~200 MB to ~2 GB on the second prompt). Shipping embed as raw fp16 and letting Swift `mmap` + 4 KB per-step `memcpy` handle the lookup keeps it in clean virtual pages.
+
+### Qwen3.5 0.8B (v1.0.0)
+
+First CoreML port of a hybrid SSM/attention LLM on iPhone. Same architecture as 2B above, just the smaller variant. The 24 layers are 18× Gated-DeltaNet linear-attention (SSM) interleaved with 6× full GQA attention. Text-only.
 
 | | Qwen3.5 0.8B |
 |---|---:|
