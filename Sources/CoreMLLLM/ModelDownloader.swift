@@ -90,6 +90,15 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML/resolve/main",
             folderName: "qwen3.5-0.8b")
 
+        /// Qwen3.5 2B — same hybrid SSM/attention architecture as 0.8B,
+        /// just hidden_size doubled (1024→2048) and intermediate
+        /// (3072→6144). INT8 palettized decode. Bigger = higher quality,
+        /// ~half the speed. iPhone 17 Pro: decode ~15-17 tok/s (est).
+        public static let qwen35_2b = ModelInfo(
+            id: "qwen3.5-2b", name: "Qwen3.5 2B (ANE)", size: "1.8 GB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML/resolve/main",
+            folderName: "qwen3.5-2b")
+
         /// Gemma 4 E4B — 42 layers, hidden=2560, 2 KV heads, text-only decoder.
         /// INT4 palettized, ctx=2048. Baseline ~14 tok/s on iPhone 17 Pro.
         /// A local build (`conversion/build_gemma4_bundle.py --model gemma4-e4b`)
@@ -121,7 +130,7 @@ public final class ModelDownloader: NSObject {
             let experimental =
                 ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
                 || UserDefaults.standard.bool(forKey: "showExperimentalModels")
-            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b, qwen35_08b]
+            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b, qwen35_08b, qwen35_2b]
             if experimental {
                 list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
             }
@@ -205,7 +214,8 @@ public final class ModelDownloader: NSObject {
         // ground-truth). Either presence marks this folder as a Qwen3.5
         // model folder.
         for name in ["qwen3_5_0_8b_decode_int8_mseq128.mlpackage",
-                     "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage"] {
+                     "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage",
+                     "qwen3_5_2b_decode_int8_mseq128.mlpackage"] {
             let pkg = dir.appendingPathComponent(name)
             if fileManager.fileExists(atPath: pkg.appendingPathComponent(
                 "Data/com.apple.CoreML/weights/weight.bin").path) {
@@ -650,6 +660,10 @@ public final class ModelDownloader: NSObject {
             buildQwen35FileList()
             return
         }
+        if model.id == "qwen3.5-2b" {
+            buildQwen35_2B_FileList()
+            return
+        }
         // 2K-context shipping model lives at the repo root on HF:
         //   - Decode chunks:  swa/chunk{1-4}.mlmodelc/
         //   - Prefill chunks: prefill/chunk{1-4}.mlmodelc/  (remote name is
@@ -790,6 +804,28 @@ public final class ModelDownloader: NSObject {
                   estimatedSize: 753_000_000),
         ]
         // Sort biggest-first so large weight download starts immediately.
+        pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
+        totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
+        completedBytes = 0
+        nextFileIndex = 0
+    }
+
+    /// Qwen3.5-2B CoreML layout on `mlboydaisuke/qwen3.5-2B-CoreML`.
+    /// INT8 palettized decode (1.8 GB), same mlpackage structure as the
+    /// 0.8B variant — three files under the top-level mlpackage folder.
+    private func buildQwen35_2B_FileList() {
+        let pkg = "qwen3_5_2b_decode_int8_mseq128.mlpackage"
+        pendingFiles = [
+            .init(remotePath: "\(pkg)/Manifest.json",
+                  localPath: "\(pkg)/Manifest.json",
+                  estimatedSize: 700),
+            .init(remotePath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
+                  localPath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
+                  estimatedSize: 1_500_000),
+            .init(remotePath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
+                  localPath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
+                  estimatedSize: 1_878_000_000),
+        ]
         pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
         completedBytes = 0

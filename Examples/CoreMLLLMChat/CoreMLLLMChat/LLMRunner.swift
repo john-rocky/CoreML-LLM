@@ -69,16 +69,15 @@ final class LLMRunner {
 
         // Qwen3.5 detection: the downloaded folder contains the decode
         // mlpackage directly — no `model_config.json` / `hf_model/` layout
-        // that Gemma uses. Accept either the INT8 (default shipping) or
-        // fp16 (legacy / high-precision) variant.
-        let qwen35Int8 = folder.appendingPathComponent(
-            "qwen3_5_0_8b_decode_int8_mseq128.mlpackage")
-        let qwen35Fp16 = folder.appendingPathComponent(
-            "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage")
-        if FileManager.default.fileExists(atPath: qwen35Int8.path) ||
-           FileManager.default.fileExists(atPath: qwen35Fp16.path) {
-            try await loadQwen35(folder: folder)
-            return
+        // that Gemma uses. Accept any of the shipping variants.
+        for mlpkgName in ["qwen3_5_0_8b_decode_int8_mseq128.mlpackage",
+                          "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage",
+                          "qwen3_5_2b_decode_int8_mseq128.mlpackage"] {
+            let path = folder.appendingPathComponent(mlpkgName)
+            if FileManager.default.fileExists(atPath: path.path) {
+                try await loadQwen35(folder: folder)
+                return
+            }
         }
 
         llm = try await CoreMLLLM.load(from: folder) { [weak self] status in
