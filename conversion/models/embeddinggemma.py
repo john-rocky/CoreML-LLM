@@ -64,19 +64,20 @@ class EmbeddingGemmaModel(nn.Module):
         input_ids: torch.Tensor,        # (1, L) int32
         attention_mask: torch.Tensor,   # (1, L) fp16
     ) -> torch.Tensor:
-        # 1) Encoder: (1, L, hidden).
+        # 1) Encoder: (1, L, hidden) in fp32 (Gemma 3 residual stream, see
+        #    gemma3_encoder.py for why).
         hidden_states = self.encoder(input_ids, attention_mask)
 
-        # 2) Mean pooling over valid (non-pad) positions.
-        #    attention_mask: (1, L) → (1, L, 1)
-        mask = attention_mask.to(MODEL_DTYPE).unsqueeze(-1)
+        # 2) Mean pooling over valid (non-pad) positions. Keep pool in fp32
+        #    so overflow-safe; cast down to fp16 right before the dense layers.
+        mask = attention_mask.to(torch.float32).unsqueeze(-1)
         masked = hidden_states * mask
         summed = masked.sum(dim=1, keepdim=False)                 # (1, hidden)
         denom = mask.sum(dim=1, keepdim=False).clamp_min(1.0)     # (1, 1)
         pooled = summed / denom                                    # (1, hidden)
 
         # 3) Two dense projections via Conv2d(1x1) on (1, hidden, 1, 1).
-        x = pooled.unsqueeze(-1).unsqueeze(-1)  # (1, hidden, 1, 1)
+        x = pooled.to(MODEL_DTYPE).unsqueeze(-1).unsqueeze(-1)  # (1, hidden, 1, 1)
         x = self.dense1(x)                      # (1, dense_inter, 1, 1)
         x = self.dense2(x)                      # (1, embed_dim,  1, 1)
         pooled = x.view(1, self.embed_dim)

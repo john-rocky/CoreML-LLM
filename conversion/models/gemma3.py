@@ -36,6 +36,45 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ane_ops import MODEL_DTYPE, ANERMSNorm, InModelArgmax
 
+import torch.nn.functional as F
+
+
+class GemmaRMSNorm(nn.Module):
+    """Gemma-style RMSNorm with the (1 + weight) quirk in fp32 internals.
+
+    Differences from ane_ops.ANERMSNorm:
+    - applies `output * (1.0 + weight)` instead of `output * weight` (Gemma HF
+      uses this form; weights are stored with zero-init and drift from zero,
+      so w≈-1 means zero-out, w≈0 means identity).
+    - runs the LayerNorm trick (cat[x,-x]→layer_norm→chunk) in fp32. Gemma 3
+      norm weights reach up to ~900; fp16 intermediates overflow in the
+      residual stream after a few layers. Gemma 4 E2B stores weights with the
+      +1 already baked and uses the plain ANERMSNorm, which is why it ships.
+    - casts back to the input dtype on exit so the surrounding graph stays
+      fp16-friendly (ANE LayerNorm kernel accepts either precision).
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        # Weight initialised to 0 to match HF (`output * (1 + 0) = output`).
+        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=MODEL_DTYPE))
+        self.eps = eps
+        self.hidden_size = hidden_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        in_dtype = x.dtype
+        x32 = x.to(torch.float32)
+        doubled = torch.cat([x32, -x32], dim=-1)
+        normed = F.layer_norm(
+            doubled,
+            normalized_shape=(2 * self.hidden_size,),
+            weight=None, bias=None,
+            eps=float(self.eps),
+        )
+        normed, _ = torch.chunk(normed, 2, dim=-1)
+        out = normed * (1.0 + self.weight.to(torch.float32))
+        return out.to(in_dtype)
+
 
 class Gemma3Config:
     """Gemma 3 text decoder configuration (read from HuggingFace config.json)."""
@@ -133,8 +172,8 @@ class Gemma3DecoderLayer(nn.Module):
             "k_proj": nn.Conv2d(hidden_size, kv_dim, 1, bias=has_bias, dtype=MODEL_DTYPE),
             "v_proj": nn.Conv2d(hidden_size, kv_dim, 1, bias=has_bias, dtype=MODEL_DTYPE),
             "o_proj": nn.Conv2d(q_dim, hidden_size, 1, bias=False, dtype=MODEL_DTYPE),
-            "q_norm": ANERMSNorm(head_dim, eps=eps),
-            "k_norm": ANERMSNorm(head_dim, eps=eps),
+            "q_norm": GemmaRMSNorm(head_dim, eps=eps),
+            "k_norm": GemmaRMSNorm(head_dim, eps=eps),
         })
 
         # MLP (GELU tanh-approx, matches Gemma 3's `gelu_pytorch_tanh`).
@@ -145,10 +184,10 @@ class Gemma3DecoderLayer(nn.Module):
         })
 
         # Sandwich norms (4 per layer).
-        self.input_layernorm = ANERMSNorm(hidden_size, eps=eps)
-        self.post_attention_layernorm = ANERMSNorm(hidden_size, eps=eps)
-        self.pre_feedforward_layernorm = ANERMSNorm(hidden_size, eps=eps)
-        self.post_feedforward_layernorm = ANERMSNorm(hidden_size, eps=eps)
+        self.input_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
+        self.post_attention_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
+        self.pre_feedforward_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
+        self.post_feedforward_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
 
 
 class Gemma3Model(nn.Module):
@@ -177,7 +216,7 @@ class Gemma3Model(nn.Module):
             self.layers.append(layer)
 
         # Final norm.
-        self.norm = ANERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # LM head (tied to embed_tokens after load).
         self.lm_head = nn.Conv2d(

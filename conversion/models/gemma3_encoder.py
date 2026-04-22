@@ -38,10 +38,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ane_ops import (
     MODEL_DTYPE,
-    ANERMSNorm,
     apply_rotary_pos_emb,
     repeat_kv_ane,
 )
+from .gemma3 import GemmaRMSNorm
 
 
 class EncoderConfig:
@@ -65,6 +65,8 @@ class EncoderConfig:
         self.rope_local_base_freq = kwargs.get(
             "rope_local_base_freq", kwargs.get("rope_local_theta", 10_000.0)
         )
+        # Gemma 3 applies attn_weights *= query_pre_attn_scalar**-0.5 on top of QK norm.
+        self.query_pre_attn_scalar = kwargs.get("query_pre_attn_scalar", None)
 
         self.layer_types = kwargs.get("layer_types", [])
         if not self.layer_types:
@@ -114,22 +116,25 @@ class EncoderLayer(nn.Module):
             "k_proj": nn.Conv2d(hidden, kv_dim, 1, bias=has_bias, dtype=MODEL_DTYPE),
             "v_proj": nn.Conv2d(hidden, kv_dim, 1, bias=has_bias, dtype=MODEL_DTYPE),
             "o_proj": nn.Conv2d(q_dim, hidden, 1, bias=False, dtype=MODEL_DTYPE),
-            "q_norm": ANERMSNorm(head_dim, eps=eps),
-            "k_norm": ANERMSNorm(head_dim, eps=eps),
+            "q_norm": GemmaRMSNorm(head_dim, eps=eps),
+            "k_norm": GemmaRMSNorm(head_dim, eps=eps),
         })
         self.mlp = nn.ModuleDict({
             "gate_proj": nn.Conv2d(hidden, inter, 1, bias=False, dtype=MODEL_DTYPE),
             "up_proj": nn.Conv2d(hidden, inter, 1, bias=False, dtype=MODEL_DTYPE),
             "down_proj": nn.Conv2d(inter, hidden, 1, bias=False, dtype=MODEL_DTYPE),
         })
-        self.input_layernorm = ANERMSNorm(hidden, eps=eps)
-        self.post_attention_layernorm = ANERMSNorm(hidden, eps=eps)
-        self.pre_feedforward_layernorm = ANERMSNorm(hidden, eps=eps)
-        self.post_feedforward_layernorm = ANERMSNorm(hidden, eps=eps)
+        self.input_layernorm = GemmaRMSNorm(hidden, eps=eps)
+        self.post_attention_layernorm = GemmaRMSNorm(hidden, eps=eps)
+        self.pre_feedforward_layernorm = GemmaRMSNorm(hidden, eps=eps)
+        self.post_feedforward_layernorm = GemmaRMSNorm(hidden, eps=eps)
 
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+
+        qpas = config.query_pre_attn_scalar if config.query_pre_attn_scalar is not None else head_dim
+        self.attn_scale = float(qpas) ** -0.5
 
     def forward(
         self,
@@ -168,9 +173,10 @@ class EncoderLayer(nn.Module):
 
         # Attention in fp32 for numerical stability. No causal mask (encoder is
         # bidirectional); only the pad-mask + optional sliding-window mask.
+        # Gemma 3 scales attention by query_pre_attn_scalar**-0.5.
         q_f = q.to(torch.float32)
         k_f = k.to(torch.float32)
-        attn_weights = torch.matmul(q_f, k_f.transpose(-1, -2))  # scale=1.0 (QK norm)
+        attn_weights = torch.matmul(q_f, k_f.transpose(-1, -2)) * self.attn_scale
         attn_weights = attn_weights + attention_mask.to(torch.float32)
         attn_weights = torch.softmax(attn_weights, dim=-1).to(MODEL_DTYPE)
         attn_out = torch.matmul(
@@ -184,7 +190,9 @@ class EncoderLayer(nn.Module):
         ).squeeze(2).permute(0, 2, 1)
 
         attn_out = self.post_attention_layernorm(attn_out)
-        hidden_states = residual + attn_out
+        # fp32 residual add (attn_out is fp16 → upcast). Gemma 3 norm weights
+        # reach ~900; fp16 residuals overflow by layer 7 without this.
+        hidden_states = residual + attn_out.to(torch.float32)
 
         # MLP sandwich: pre_ff_ln → GeGLU → post_ff_ln.
         residual = hidden_states
@@ -195,7 +203,7 @@ class EncoderLayer(nn.Module):
         gate = F.gelu(gate, approximate="tanh")
         mlp_out = self.mlp["down_proj"](gate * up).squeeze(2).permute(0, 2, 1)
         mlp_out = self.post_feedforward_layernorm(mlp_out)
-        hidden_states = residual + mlp_out
+        hidden_states = residual + mlp_out.to(torch.float32)
 
         return hidden_states
 
@@ -219,7 +227,7 @@ class Gemma3Encoder(nn.Module):
         self.layers = nn.ModuleList(
             [EncoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
-        self.norm = ANERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Precompute RoPE for max_seq_len (dual tables: local and global).
         self._build_rope(config)
@@ -283,8 +291,10 @@ class Gemma3Encoder(nn.Module):
         config = self.config
         L = config.max_seq_len
 
-        hidden = self.embed_tokens(input_ids).to(MODEL_DTYPE)
-        hidden = hidden * torch.tensor(config.hidden_size ** 0.5, dtype=MODEL_DTYPE)
+        # Keep residual stream in fp32 (Gemma 3 has no layer_scalar; fp16 would
+        # overflow after ~8 layers — see gemma3_wrapper.py for the same fix).
+        hidden = self.embed_tokens(input_ids).to(torch.float32)
+        hidden = hidden * (config.hidden_size ** 0.5)
 
         # RoPE tables are precomputed for positions 0..L-1 at trace time; view
         # them directly (index_select would be a no-op identity here).

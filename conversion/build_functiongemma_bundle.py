@@ -128,6 +128,10 @@ def _copy_tokenizer(hf_dir: str, bundle_dir: str) -> None:
     so it must travel with the bundle."""
     dst = os.path.join(bundle_dir, "hf_model")
     os.makedirs(dst, exist_ok=True)
+    if os.path.abspath(hf_dir) == os.path.abspath(dst):
+        # hf_model was downloaded in-place; nothing to copy.
+        print("\nTokenizer already under hf_model/ (no copy needed).")
+        return
     patterns = ("config.json", "tokenizer.json", "tokenizer_config.json",
                 "tokenizer.model", "special_tokens_map.json",
                 "chat_template.jinja", "generation_config.json",
@@ -153,6 +157,14 @@ def _write_model_config(bundle_dir: str, text_cfg: dict, ctx_length: int,
         for i in range(num_layers)
     ]
 
+    # eos_token_id may be int or list (FunctionGemma uses [1, 50] for end-of-turn
+    # + function-call close). Preserve whatever HF gave us.
+    eos = text_cfg.get("eos_token_id", 1)
+    if isinstance(eos, list):
+        eos_val = [int(e) for e in eos]
+    else:
+        eos_val = int(eos)
+
     cfg = {
         "model_name": MODEL_NAME,
         "architecture": "gemma3",
@@ -174,9 +186,14 @@ def _write_model_config(bundle_dir: str, text_cfg: dict, ctx_length: int,
             text_cfg.get("rope_local_base_freq",
                          text_cfg.get("rope_local_theta", 10_000.0))
         ),
+        "query_pre_attn_scalar": (
+            float(text_cfg["query_pre_attn_scalar"])
+            if text_cfg.get("query_pre_attn_scalar") is not None
+            else float(text_cfg.get("head_dim", 256))
+        ),
         "rms_norm_eps": float(text_cfg.get("rms_norm_eps", 1e-6)),
         "bos_token_id": int(text_cfg.get("bos_token_id", 2)),
-        "eos_token_id": int(text_cfg.get("eos_token_id", 1)),
+        "eos_token_id": eos_val,
         "tie_word_embeddings": bool(text_cfg.get("tie_word_embeddings", True)),
         "final_logit_softcapping": float(text_cfg.get("final_logit_softcapping") or 0.0),
         "parts": {"model": "model.mlpackage"},

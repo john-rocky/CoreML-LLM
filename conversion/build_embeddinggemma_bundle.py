@@ -108,10 +108,17 @@ def _load_state_dicts(hf_dir: str) -> dict[str, torch.Tensor]:
 
 
 def _map_encoder_weight(hf_name: str) -> str | None:
-    """Map HF Gemma 3 transformer weight name → local encoder param name."""
-    if not hf_name.startswith("model."):
-        return None
-    name = hf_name[len("model."):]
+    """Map HF Gemma 3 transformer weight name → local encoder param name.
+
+    EmbeddingGemma's SentenceTransformer snapshot saves the underlying
+    Gemma3TextModel weights without the `model.` prefix (e.g., `layers.0.…`,
+    `embed_tokens.weight`, `norm.weight`), whereas a standard HF causal LM
+    snapshot uses `model.layers.0.…`. Accept both.
+    """
+    if hf_name.startswith("model."):
+        name = hf_name[len("model."):]
+    else:
+        name = hf_name
 
     if name == "embed_tokens.weight":
         return "encoder.embed_tokens.weight"

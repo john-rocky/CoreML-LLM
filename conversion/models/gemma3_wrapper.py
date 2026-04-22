@@ -52,6 +52,16 @@ class Gemma3MonolithicWrapper(nn.Module):
         self.register_buffer("cos_full", model.cos_full)
         self.register_buffer("sin_full", model.sin_full)
 
+        # Gemma 3 applies query_pre_attn_scalar in addition to QK norm
+        # (transformers/models/gemma3/modeling_gemma3.py Gemma3Attention):
+        #     scale = query_pre_attn_scalar ** -0.5
+        # For Gemma 3 270M this is 256, giving scale = 1/16. Note Gemma 4
+        # uses scale=1.0 despite QK norm — do NOT copy that here.
+        qpas = model.config.query_pre_attn_scalar
+        if qpas is None:
+            qpas = float(model.config.head_dim)
+        self.attn_scale = float(qpas) ** -0.5
+
     def forward(
         self,
         input_ids: torch.Tensor,        # (1, 1) int32
@@ -68,10 +78,14 @@ class Gemma3MonolithicWrapper(nn.Module):
         state_len = config.state_length
 
         # Embedding + √hidden scaling (Gemma 3 matches Gemma 4 here).
-        hidden_states = self.embed_tokens(input_ids).to(MODEL_DTYPE)
-        hidden_states = hidden_states * torch.tensor(
-            config.hidden_size ** 0.5, dtype=MODEL_DTYPE
-        )
+        # Gemma 3 was trained in bf16; converting to fp16 overflows the residual
+        # stream (values hit +inf by layer 7) because there is no `layer_scalar`
+        # to dampen each layer's contribution like Gemma 4 has. We keep the
+        # residual stream in fp32 and only cast down to fp16 inside the sublayer
+        # compute where Conv2d is fp16 for ANE efficiency. HF does the same
+        # (internally upcasts for RMSNorm and residual adds).
+        hidden_states = self.embed_tokens(input_ids).to(torch.float32)
+        hidden_states = hidden_states * (config.hidden_size ** 0.5)
 
         # RoPE lookups via index_select (ANE-safe).
         cos_s = torch.index_select(self.cos_sliding, 0, position_ids).unsqueeze(0).unsqueeze(0)
@@ -84,11 +98,16 @@ class Gemma3MonolithicWrapper(nn.Module):
             is_full = config.is_full_attention(layer_idx)
 
             # ---- Attention block (sandwich: input_ln → attn → post_attention_ln) ----
+            # Residual kept in fp32; pass fp32 directly into the norm — GemmaRMSNorm
+            # does its math in fp32 regardless of input dtype and returns the same
+            # dtype it was given. Casting h to fp16 here would overflow after a
+            # few layers since the residual stream reaches ~100k.
             residual = hidden_states
             normed = layer.input_layernorm(hidden_states)
 
-            # Conv2d layout: (B, hidden, 1, seq=1).
-            x = normed.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
+            # Conv2d layout: (B, hidden, 1, seq=1). normed is fp32; the sublayer
+            # projections are fp16, so cast here where values are bounded (post-norm).
+            x = normed.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
 
             # Q projection + QK norm + RoPE.
             q = layer.self_attn["q_proj"](x).view(1, num_heads, head_dim, 1).permute(0, 1, 3, 2)
@@ -120,10 +139,11 @@ class Gemma3MonolithicWrapper(nn.Module):
             K_expanded = repeat_kv_ane(K_new, n_rep, num_kv_heads, state_len, head_dim)
             V_expanded = repeat_kv_ane(V_new, n_rep, num_kv_heads, state_len, head_dim)
 
-            # Attention in fp32 for numerical stability.
+            # Attention in fp32 for numerical stability. Gemma 3 scales by
+            # query_pre_attn_scalar ** -0.5 even though QK norm is applied.
             q_f = q.to(torch.float32)
             k_f = K_expanded.to(torch.float32)
-            attn_weights = torch.matmul(q_f, k_f.transpose(-1, -2))  # Gemma uses scale=1.0 (QK norm)
+            attn_weights = torch.matmul(q_f, k_f.transpose(-1, -2)) * self.attn_scale
             attn_weights = attn_weights + causal_mask.to(torch.float32)
             attn_weights = torch.softmax(attn_weights, dim=-1).to(MODEL_DTYPE)
             attn_output = torch.matmul(
@@ -137,7 +157,8 @@ class Gemma3MonolithicWrapper(nn.Module):
             ).squeeze(2).permute(0, 2, 1)
 
             attn_output = layer.post_attention_layernorm(attn_output)
-            hidden_states = residual + attn_output
+            # fp32 residual add (attn_output is fp16 → upcast).
+            hidden_states = residual + attn_output.to(torch.float32)
 
             # ---- MLP block (sandwich: pre_ff_ln → GeGLU → post_ff_ln) ----
             residual = hidden_states
@@ -151,9 +172,9 @@ class Gemma3MonolithicWrapper(nn.Module):
             mlp_out = mlp_out.squeeze(2).permute(0, 2, 1)
 
             mlp_out = layer.post_feedforward_layernorm(mlp_out)
-            hidden_states = residual + mlp_out
+            hidden_states = residual + mlp_out.to(torch.float32)
 
-        # Final norm.
+        # Final norm (fp32 in, fp32 out; GemmaRMSNorm handles the precision).
         hidden_states = self.norm(hidden_states)
 
         # LM head → (optional) softcap → argmax.
