@@ -173,8 +173,15 @@ class CoreMLExporter:
         output_dir: str,
         quantize: str | None = "int4",
         compute_units: str = "ALL",
+        compute_precision: str | None = None,
     ) -> None:
-        """Run the full export pipeline."""
+        """Run the full export pipeline.
+
+        compute_precision: None → coremltools default (fp16 for iOS 16+).
+                           "fp32" → force fp32 activations (used by Gemma 3 to
+                           keep its fp32 residual stream alive — fp16 lowering
+                           collapses the casts and the model overflows).
+        """
         os.makedirs(output_dir, exist_ok=True)
 
         print("=" * 60)
@@ -183,14 +190,16 @@ class CoreMLExporter:
         print(f"  Layers: {self.config.num_hidden_layers}")
         print(f"  Context length: {self.config.context_length}")
         print(f"  Quantization: {quantize or 'fp16'}")
+        print(f"  Compute precision: {compute_precision or 'default (fp16)'}")
         print("=" * 60)
 
-        self._export_monolithic(output_dir, quantize)
+        self._export_monolithic(output_dir, quantize, compute_precision)
         self._write_config(output_dir, quantize, compute_units)
 
         print(f"\nExport complete! Files in {output_dir}")
 
-    def _export_monolithic(self, output_dir: str, quantize: str | None) -> None:
+    def _export_monolithic(self, output_dir: str, quantize: str | None,
+                           compute_precision: str | None = None) -> None:
         """Export as a single monolithic CoreML model."""
         print("\nBuilding monolithic wrapper...")
 
@@ -236,8 +245,7 @@ class CoreMLExporter:
         cache_shape = tuple(wrapper.kv_cache_0.shape)
 
         print("Converting to CoreML...")
-        mlmodel = ct.convert(
-            traced,
+        convert_kwargs = dict(
             inputs=[
                 ct.TensorType(name="input_ids", shape=(1, 1), dtype=np.int32),
                 ct.TensorType(name="position_ids", shape=(1,), dtype=np.int32),
@@ -257,6 +265,19 @@ class CoreMLExporter:
             minimum_deployment_target=ct.target.iOS18,
             compute_units=ct.ComputeUnit.ALL,
         )
+        if compute_precision == "fp32":
+            convert_kwargs["compute_precision"] = ct.precision.FLOAT32
+        elif compute_precision == "selective_fp16":
+            # Keep matmul / conv / softmax / gelu in fp16 for ANE speed; force
+            # residual-stream ops (add / layer_norm / mul / sub) to fp32 so the
+            # residual doesn't overflow. Used by Gemma 3 — see
+            # `models/gemma3_wrapper.py` for why fp16 isn't enough.
+            fp32_op_types = {"add", "layer_norm", "mul", "sub", "real_div", "sqrt"}
+            def _keep_op_fp16(op):
+                return op.op_type not in fp32_op_types
+            convert_kwargs["compute_precision"] = ct.transform.FP16ComputePrecision(
+                op_selector=_keep_op_fp16)
+        mlmodel = ct.convert(traced, **convert_kwargs)
 
         if quantize:
             mlmodel = self._quantize_model(mlmodel, quantize)

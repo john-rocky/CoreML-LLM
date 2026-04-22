@@ -272,7 +272,14 @@ def build_bundle(
     with torch.no_grad():
         traced = torch.jit.trace(model, (sample_ids, sample_mask))
 
-    print("\n[3/4] Converting to CoreML (fp16, iOS 18, stateless)")
+    print("\n[3/4] Converting to CoreML (fp32 activations, iOS 18, stateless)")
+    # Why fp32 (not the default fp16): EmbeddingGemma's residual stream grows
+    # past fp16 max (~65504) by layer 7 (no `layer_scalar` to dampen it like
+    # Gemma 4 has). With pure fp16 the encoder produces all-zero embeddings on
+    # ANE and NaN on CPU. fp32 activations keep the math correct at the cost
+    # of a doubled-size .mlpackage and lower ANE residency. Decoder output
+    # (FunctionGemma) tolerates fp16 because argmax discretizes away
+    # saturation; an embedding vector cannot.
     mlmodel = ct.convert(
         traced,
         inputs=[
@@ -284,6 +291,7 @@ def build_bundle(
         ],
         minimum_deployment_target=ct.target.iOS18,
         compute_units=ct.ComputeUnit.ALL,
+        compute_precision=ct.precision.FLOAT32,
     )
 
     if quantize == "int4":
