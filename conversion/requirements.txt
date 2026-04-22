@@ -2,7 +2,7 @@
 # Newer minors usually work but can silently change quantization / tracing
 # behaviour — bump one at a time and re-run verification in convert_audio.py
 # and exporter.py before replacing these.
-coremltools==9.0
+coremltools>=9.0
 torch==2.11.0
 transformers==5.5.0
 safetensors>=0.4.0

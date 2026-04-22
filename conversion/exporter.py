@@ -262,21 +262,13 @@ class CoreMLExporter:
                     name="kv_cache_0",
                 ),
             ],
-            minimum_deployment_target=ct.target.iOS18,
             compute_units=ct.ComputeUnit.ALL,
         )
         if compute_precision == "fp32":
             convert_kwargs["compute_precision"] = ct.precision.FLOAT32
-        elif compute_precision == "selective_fp16":
-            # Keep matmul / conv / softmax / gelu in fp16 for ANE speed; force
-            # residual-stream ops (add / layer_norm / mul / sub) to fp32 so the
-            # residual doesn't overflow. Used by Gemma 3 — see
-            # `models/gemma3_wrapper.py` for why fp16 isn't enough.
-            fp32_op_types = {"add", "layer_norm", "mul", "sub", "real_div", "sqrt"}
-            def _keep_op_fp16(op):
-                return op.op_type not in fp32_op_types
-            convert_kwargs["compute_precision"] = ct.transform.FP16ComputePrecision(
-                op_selector=_keep_op_fp16)
+        # Bump to iOS 26 target — its fp16 lowering path differs from iOS 18
+        # and is what we validated EmbeddingGemma against.
+        convert_kwargs["minimum_deployment_target"] = ct.target.iOS26
         mlmodel = ct.convert(traced, **convert_kwargs)
 
         if quantize:

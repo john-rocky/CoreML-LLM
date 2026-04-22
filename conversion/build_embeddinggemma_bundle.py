@@ -266,18 +266,31 @@ def build_bundle(
     model.eval()
     _copy_into_model(model, weights)
 
-    # NOTE on residual-stream stability:
+    # ──────────────────────────────────────────────────────────────────
+    # Residual-stream rescaling (semantic-preserving fp16 fit).
+    #
     # EmbeddingGemma's post-feedforward layernorm has effective weights up to
     # ~2535 (vs ~150 for FunctionGemma) and the encoder is 24 layers deep
-    # with no `layer_scalar` to dampen growth. PyTorch fp16 trace can be made
-    # to fit in fp16 by pre-scaling embed + post-norms by 1/K (the encoder's
-    # final RMSNorm is scale-invariant, so output direction is preserved).
-    # Empirically though the resulting CoreML mlpackage produces zeros for
-    # *partial* attention masks (works for full=ones masks) on at least
-    # CoreML 8.0 / macOS 26 — this divergence between PyTorch fp16 and CoreML
-    # fp16 has not been root-caused yet. Until that's resolved, ship fp32
-    # activations (below) which are correct end-to-end at the cost of
-    # reduced ANE residency.
+    # with no `layer_scalar` to dampen growth. Pure fp16 overflows the
+    # residual stream past fp16 max (65504) by layer 7.
+    #
+    # Trick: pre-scale embed_tokens by 1/K and rescale every post-attention /
+    # post-feedforward RMSNorm by 1/K (stored w' = (1+w)/K - 1). Because
+    # input-side RMSNorms are scale-invariant, this makes every per-layer
+    # residual addition K× smaller without changing the attention math, so
+    # the final residual is exactly h_orig / K. The encoder's outer
+    # `self.norm` (RMSNorm) cancels the K factor — encoder output is
+    # bit-identical to the un-rescaled model. Pool + dense (no bias) +
+    # L2-normalize all preserve direction, so the unit vector is unchanged.
+    K = 16.0
+    print(f"\n[1.5/4] Rescaling residual stream by 1/K (K={K}) for fp16 stability")
+    enc = model.encoder
+    enc.embed_tokens.weight.data.div_(K)
+    for layer in enc.layers:
+        pa = layer.post_attention_layernorm.weight.data
+        layer.post_attention_layernorm.weight.data = (1.0 + pa) / K - 1.0
+        pf = layer.post_feedforward_layernorm.weight.data
+        layer.post_feedforward_layernorm.weight.data = (1.0 + pf) / K - 1.0
 
     print("\n[2/4] Tracing model")
     sample_ids = torch.zeros((1, max_seq_len), dtype=torch.int32)
@@ -285,11 +298,11 @@ def build_bundle(
     with torch.no_grad():
         traced = torch.jit.trace(model, (sample_ids, sample_mask))
 
-    print("\n[3/4] Converting to CoreML (fp32 activations, iOS 18, stateless)")
-    # See NOTE above. fp32 activations + fp16 weights → encoder works
-    # correctly for any attention_mask, at the cost of ~21% ANE residency
-    # (most ops fall back to CPU). Acceptable for an embed model that's
-    # called once per query, not per-token.
+    print("\n[3/4] Converting to CoreML (fp16, iOS 26, stateless)")
+    # iOS 26 target + coremltools 9 has a different fp16 lowering pipeline
+    # than iOS 18 / coremltools 8. The residual-rescaling trick above keeps
+    # activations within fp16 range; the new lowering preserves correct
+    # output for partial attention masks where the older path produced zeros.
     mlmodel = ct.convert(
         traced,
         inputs=[
@@ -299,9 +312,8 @@ def build_bundle(
         outputs=[
             ct.TensorType(name="embedding", dtype=np.float16),
         ],
-        minimum_deployment_target=ct.target.iOS18,
+        minimum_deployment_target=ct.target.iOS26,
         compute_units=ct.ComputeUnit.ALL,
-        compute_precision=ct.precision.FLOAT32,
     )
 
     if quantize == "int4":

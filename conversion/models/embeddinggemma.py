@@ -83,9 +83,19 @@ class EmbeddingGemmaModel(nn.Module):
         pooled = x.view(1, self.embed_dim)
 
         # 4) L2 normalize (unit-norm embedding).
-        #    Use the concat([x,-x]) LayerNorm trick? No — LayerNorm removes mean.
-        #    Use fp32 for sqrt stability; output cast back to fp16.
-        x32 = pooled.to(torch.float32)
-        norm = torch.sqrt((x32 * x32).sum(dim=-1, keepdim=True).clamp_min(1e-12))
-        normalized = (x32 / norm).to(MODEL_DTYPE)
-        return normalized
+        #
+        # Naïve `sqrt(sum(x²))` overflows fp16 in coremltools' lowering: a
+        # 768-d vector with values up to ~150 produces sum-of-squares ~16M,
+        # which exceeds fp16 max (65504) → sqrt(inf) = inf → x/inf = 0
+        # (even though we cast to fp32 in PyTorch, the cast is collapsed
+        # during fp16 lowering). Workaround: divide by max-abs first so
+        # values land in [-1, 1] before squaring, making sum-of-squares
+        # bounded by D. Mathematically identical to the standard L2 norm.
+        eps_abs = torch.tensor(1.0e-6, dtype=MODEL_DTYPE)
+        abs_max = pooled.abs().max(dim=-1, keepdim=True).values
+        abs_max = torch.maximum(abs_max, eps_abs)
+        scaled = pooled / abs_max                                 # in [-1, 1]
+        sumsq = (scaled * scaled).sum(dim=-1, keepdim=True)       # ≤ D = 768
+        inv_norm = torch.rsqrt(sumsq + 1.0e-12)                   # well-defined
+        normalized = scaled * inv_norm                            # unit vector
+        return normalized.to(MODEL_DTYPE)
