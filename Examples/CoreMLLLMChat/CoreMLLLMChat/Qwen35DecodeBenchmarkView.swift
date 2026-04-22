@@ -37,6 +37,14 @@ struct Qwen35DecodeBenchmarkView: View {
                         statRow("mean cos",      String(format: "%.4f", bench.meanCos))
                         statRow("worst-pos cos", String(format: "%.4f", bench.worstCos))
                         statRow("top-1 match",   String(format: "%.0f%%", bench.top1Rate * 100))
+                        statRow("oracle top-1 in ANE top-3",
+                                String(format: "%.0f%%", bench.top1InTop3Rate * 100))
+                        statRow("oracle top-1 in ANE top-5",
+                                String(format: "%.0f%%", bench.top1InTop5Rate * 100))
+                        statRow("oracle top-1 in ANE top-10",
+                                String(format: "%.0f%%", bench.top1InTop10Rate * 100))
+                        statRow("mean top-5 overlap",
+                                String(format: "%.1f / 5", bench.meanTop5Overlap))
                         statRow("throughput",    String(format: "%.1f tok/s", bench.meanTokPerSec))
                     }
                     Section("Per prompt") {
@@ -51,6 +59,11 @@ struct Qwen35DecodeBenchmarkView: View {
                                         .foregroundStyle(r.lastCos >= 0.99 ? .green : .orange)
                                     Image(systemName: r.top1Match ? "checkmark.circle.fill" : "xmark.circle.fill")
                                         .foregroundStyle(r.top1Match ? .green : .red)
+                                    Text("t3:\(r.top1InTop3 ? "✓" : "✗")")
+                                        .font(.caption2)
+                                        .foregroundStyle(r.top1InTop3 ? .green : .red)
+                                    Text("ovl:\(r.top5Overlap)/5")
+                                        .font(.caption2).foregroundStyle(.secondary)
                                     Text(String(format: "%.1f tok/s", r.tokPerSec))
                                         .font(.caption2).foregroundStyle(.secondary)
                                 }
@@ -61,12 +74,12 @@ struct Qwen35DecodeBenchmarkView: View {
 
                 Section("Notes") {
                     Text(
-                        "Measures the stateful decode mlpackage. Mac M4 reference: "
-                        + "CPU fp16 cos 0.99992 / top-1 100% / ~50 tok/s; "
-                        + "CPU+ANE cos 0.99 / top-1 40% / ~40 tok/s. "
-                        + "States start at zero (no prefill handoff yet); that only affects "
-                        + "token-sequence alignment vs HF oracle, not latency or placement. "
-                        + "LiteRT-LM baseline on iPhone 17 Pro is 56.5 tok/s."
+                        "top-1 = strict argmax match with fp32 oracle (sensitive to "
+                        + "argmax fragility on 248K vocab). top-3 = oracle top-1 "
+                        + "contained in ANE top-3 — measures semantic precision. "
+                        + "Mac M4 ANE: top-1=60%, top-3=100%, top-5=100%, ovl=4.4/5 "
+                        + "→ hidden state cos=0.9998 preserved; argmax flips on "
+                        + "near-tie candidates, candidates themselves are correct."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)

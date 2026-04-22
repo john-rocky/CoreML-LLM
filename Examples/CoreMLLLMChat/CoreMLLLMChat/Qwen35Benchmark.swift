@@ -24,6 +24,10 @@ final class Qwen35Benchmark {
         let S: Int
         let lastCos: Double
         let top1Match: Bool
+        let top1InTop3: Bool
+        let top1InTop5: Bool
+        let top1InTop10: Bool
+        let top5Overlap: Int
         let prefillMs: Double
     }
 
@@ -65,6 +69,10 @@ final class Qwen35Benchmark {
     var meanCos: Double = 0
     var worstCos: Double = 1.0
     var top1Rate: Double = 0
+    var top1InTop3Rate: Double = 0
+    var top1InTop5Rate: Double = 0
+    var top1InTop10Rate: Double = 0
+    var meanTop5Overlap: Double = 0
     var meanPrefillMs: Double = 0
     var tokensPerSecond: Double = 0
     var units: UnitsChoice = .cpuAndNE
@@ -303,24 +311,62 @@ final class Qwen35Benchmark {
             let refFloats = fp16ToFloat32(refBytes, count: vocabSize)
 
             let cos = cosine(lastLogits, refFloats)
-            let pred1 = argmax(lastLogits)
-            let match = (pred1 == rec.top1_id)
+            let aneTop10 = topKIndices(lastLogits, k: 10)
+            let refTop10 = topKIndices(refFloats, k: 10)
+            let aneTop5Set = Set(aneTop10.prefix(5))
+            let refTop5Set = Set(refTop10.prefix(5))
+            let match = (aneTop10[0] == rec.top1_id)
+            let inTop3 = aneTop10.prefix(3).contains(rec.top1_id)
+            let inTop5 = aneTop10.prefix(5).contains(rec.top1_id)
+            let inTop10 = aneTop10.contains(rec.top1_id)
+            let overlap5 = aneTop5Set.intersection(refTop5Set).count
 
             let result = PromptResult(prompt: rec.prompt, S: rec.S_real,
-                                       lastCos: cos, top1Match: match, prefillMs: ms)
+                                       lastCos: cos, top1Match: match,
+                                       top1InTop3: inTop3, top1InTop5: inTop5,
+                                       top1InTop10: inTop10, top5Overlap: overlap5,
+                                       prefillMs: ms)
             collected.append(result)
         }
 
         results = collected
-        meanCos = collected.map { $0.lastCos }.reduce(0, +) / Double(collected.count)
+        let N = Double(collected.count)
+        meanCos = collected.map { $0.lastCos }.reduce(0, +) / N
         worstCos = collected.map { $0.lastCos }.min() ?? 0
-        top1Rate = Double(collected.filter { $0.top1Match }.count) / Double(collected.count)
-        meanPrefillMs = totalMs / Double(collected.count)
+        top1Rate = Double(collected.filter { $0.top1Match }.count) / N
+        top1InTop3Rate = Double(collected.filter { $0.top1InTop3 }.count) / N
+        top1InTop5Rate = Double(collected.filter { $0.top1InTop5 }.count) / N
+        top1InTop10Rate = Double(collected.filter { $0.top1InTop10 }.count) / N
+        meanTop5Overlap = Double(collected.map { $0.top5Overlap }.reduce(0, +)) / N
+        meanPrefillMs = totalMs / N
         tokensPerSecond = Double(totalTokens) / (totalMs / 1000.0)
 
         status = String(format:
-            "Done — mean cos=%.4f  worst=%.4f  top1=%.0f%%  prefill=%.1f ms  tok/s=%.1f",
-            meanCos, worstCos, top1Rate * 100, meanPrefillMs, tokensPerSecond)
+            "Done — top1=%.0f%% top3=%.0f%% top5=%.0f%% ovl5=%.1f/5 cos=%.4f tok/s=%.1f",
+            top1Rate * 100, top1InTop3Rate * 100, top1InTop5Rate * 100,
+            meanTop5Overlap, meanCos, tokensPerSecond)
+    }
+
+    private func topKIndices(_ v: [Float], k: Int) -> [Int] {
+        var topIdx = [Int](); topIdx.reserveCapacity(k)
+        var topVal = [Float](); topVal.reserveCapacity(k)
+        for i in 0..<v.count {
+            let x = v[i]
+            if topIdx.count < k {
+                var pos = 0
+                while pos < topIdx.count && topVal[pos] > x { pos += 1 }
+                topIdx.insert(i, at: pos)
+                topVal.insert(x, at: pos)
+            } else if x > topVal[k - 1] {
+                var pos = 0
+                while pos < k && topVal[pos] > x { pos += 1 }
+                topIdx.insert(i, at: pos)
+                topVal.insert(x, at: pos)
+                topIdx.removeLast()
+                topVal.removeLast()
+            }
+        }
+        return topIdx
     }
 
     // MARK: - Numerics

@@ -80,6 +80,14 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
             folderName: "qwen2.5-0.5b")
 
+        /// Qwen3.5 0.8B — hybrid Gated-DeltaNet SSM + attention, text-only.
+        /// Ships the decode mlpackage (1.4 GB, fp16) — prefill is performed
+        /// via the same model recurrently. Runs on CPU / GPU / ANE.
+        public static let qwen35_08b = ModelInfo(
+            id: "qwen3.5-0.8b", name: "Qwen3.5 0.8B (ANE)", size: "1.4 GB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML/resolve/main",
+            folderName: "qwen3.5-0.8b")
+
         /// Gemma 4 E4B — 42 layers, hidden=2560, 2 KV heads, text-only decoder.
         /// INT4 palettized, ctx=2048. Baseline ~14 tok/s on iPhone 17 Pro.
         /// A local build (`conversion/build_gemma4_bundle.py --model gemma4-e4b`)
@@ -111,7 +119,7 @@ public final class ModelDownloader: NSObject {
             let experimental =
                 ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
                 || UserDefaults.standard.bool(forKey: "showExperimentalModels")
-            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b]
+            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b, qwen35_08b]
             if experimental {
                 list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
             }
@@ -190,12 +198,16 @@ public final class ModelDownloader: NSObject {
 
     public func localModelURL(for model: ModelInfo) -> URL? {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
+        // Qwen3.5 has its own mlpackage name (no `model.mlpackage`). Detect
+        // by checking for the decode mlpackage's weight file.
+        let qwen35Pkg = dir.appendingPathComponent(
+            "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage")
+        if fileManager.fileExists(atPath: qwen35Pkg.appendingPathComponent(
+            "Data/com.apple.CoreML/weights/weight.bin").path) {
+            return qwen35Pkg
+        }
         let chunk1 = dir.appendingPathComponent("chunk1.mlmodelc")
         if fileManager.fileExists(atPath: chunk1.appendingPathComponent("weights/weight.bin").path) {
-            // Invalidate cache if the chunk's declared ctx doesn't match
-            // model_config.json (e.g., v0.6.0/0.6.1 downloaded 8K chunks but
-            // shipped a 2K model_config). This prevents a load-time error
-            // that would otherwise require the user to manually delete.
             if isChunkCtxMismatched(modelDir: dir, chunk1Dir: chunk1) {
                 try? fileManager.removeItem(at: dir)
                 return nil
@@ -628,6 +640,10 @@ public final class ModelDownloader: NSObject {
             buildE4BFileList()
             return
         }
+        if model.id == "qwen3.5-0.8b" {
+            buildQwen35FileList()
+            return
+        }
         // 2K-context shipping model lives at the repo root on HF:
         //   - Decode chunks:  swa/chunk{1-4}.mlmodelc/
         //   - Prefill chunks: prefill/chunk{1-4}.mlmodelc/  (remote name is
@@ -739,6 +755,41 @@ public final class ModelDownloader: NSObject {
     /// decoder with a flat directory tree (no `swa/` or `prefill/` prefixes,
     /// no vision/audio towers). Produced by
     /// `conversion/build_gemma4_bundle.py --model gemma4-e4b`.
+    /// Qwen3.5-0.8B CoreML layout on `mlboydaisuke/qwen3.5-0.8B-CoreML`.
+    /// Ships only the decode mlpackage (1.4 GB fp16). The same model is
+    /// used recurrently for prefill, so no separate prefill artifact is
+    /// needed. Tokenizer is fetched by swift-transformers at runtime from
+    /// `Qwen/Qwen3.5-0.8B` on HF.
+    ///
+    /// mlpackage structure:
+    ///   qwen3_5_0_8b_decode_fp16_mseq128.mlpackage/
+    ///   ├── Manifest.json
+    ///   └── Data/com.apple.CoreML/
+    ///       ├── model.mlmodel
+    ///       └── weights/weight.bin  (1.4 GB)
+    ///
+    /// Local layout after download (under `Models/qwen3.5-0.8b/`):
+    ///   qwen3_5_0_8b_decode_fp16_mseq128.mlpackage/...  (same structure)
+    private func buildQwen35FileList() {
+        let pkg = "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage"
+        pendingFiles = [
+            .init(remotePath: "\(pkg)/Manifest.json",
+                  localPath: "\(pkg)/Manifest.json",
+                  estimatedSize: 700),
+            .init(remotePath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
+                  localPath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
+                  estimatedSize: 601_311),
+            .init(remotePath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
+                  localPath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
+                  estimatedSize: 1_505_342_912),
+        ]
+        // Sort biggest-first so large weight download starts immediately.
+        pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
+        totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
+        completedBytes = 0
+        nextFileIndex = 0
+    }
+
     private func buildE4BFileList() {
         func mlc(_ name: String, weightSize: Int64) -> [DownloadFile] {
             [.init(remotePath: "\(name).mlmodelc/weights/weight.bin",

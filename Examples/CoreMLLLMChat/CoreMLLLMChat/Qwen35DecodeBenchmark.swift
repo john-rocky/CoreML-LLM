@@ -27,6 +27,10 @@ final class Qwen35DecodeBenchmark {
         let S: Int
         let lastCos: Double
         let top1Match: Bool
+        let top1InTop3: Bool
+        let top1InTop5: Bool
+        let top1InTop10: Bool
+        let top5Overlap: Int   // ref top-5 ∩ ANE top-5 (0..5)
         let totalMs: Double
         var tokPerSec: Double { Double(S) / (totalMs / 1000.0) }
     }
@@ -37,6 +41,10 @@ final class Qwen35DecodeBenchmark {
     var meanCos: Double = 0
     var worstCos: Double = 1.0
     var top1Rate: Double = 0
+    var top1InTop3Rate: Double = 0
+    var top1InTop5Rate: Double = 0
+    var top1InTop10Rate: Double = 0
+    var meanTop5Overlap: Double = 0
     var meanTokPerSec: Double = 0
     var units: Qwen35Benchmark.UnitsChoice = .cpuOnly   // CPU is fastest + accurate
 
@@ -92,14 +100,34 @@ final class Qwen35DecodeBenchmark {
 
     // MARK: - Load
 
-    func loadArtifacts() throws {
-        guard let mlcURL = Bundle.main.url(
-            forResource: "qwen3_5_0_8b_decode_fp16_mseq128", withExtension: "mlmodelc"
-        ) else {
-            throw NSError(domain: "Qwen35DecodeBenchmark", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey:
-                              "qwen3_5_0_8b_decode_fp16_mseq128.mlmodelc not found in bundle"])
+    /// Prefer Documents/<name>.mlmodelc (hot-swap via devicectl, avoids
+    /// Xcode bundle caching and stale ANE E5 cache). Falls back to
+    /// Documents/<name>.mlpackage (compile on-device) then app bundle.
+    private func resolveModelURL(_ base: String) throws -> URL {
+        let docs = try FileManager.default.url(
+            for: .documentDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true)
+        let docMLC = docs.appendingPathComponent("\(base).mlmodelc")
+        if FileManager.default.fileExists(atPath: docMLC.path) {
+            print("[Qwen35Decode] loading from Documents (mlmodelc): \(docMLC.path)")
+            return docMLC
         }
+        let docPkg = docs.appendingPathComponent("\(base).mlpackage")
+        if FileManager.default.fileExists(atPath: docPkg.path) {
+            print("[Qwen35Decode] compiling from Documents (mlpackage): \(docPkg.path)")
+            return try MLModel.compileModel(at: docPkg)
+        }
+        if let bundled = Bundle.main.url(forResource: base, withExtension: "mlmodelc") {
+            print("[Qwen35Decode] loading from app bundle: \(bundled.path)")
+            return bundled
+        }
+        throw NSError(domain: "Qwen35DecodeBenchmark", code: 1,
+                      userInfo: [NSLocalizedDescriptionKey:
+                          "\(base) not found in Documents or app bundle"])
+    }
+
+    func loadArtifacts() throws {
+        let mlcURL = try resolveModelURL("qwen3_5_0_8b_decode_fp16_mseq128")
         let cfg = MLModelConfiguration()
         cfg.computeUnits = units.mlComputeUnits
         decode = try MLModel(contentsOf: mlcURL, configuration: cfg)
@@ -232,23 +260,64 @@ final class Qwen35DecodeBenchmark {
             let refBytes = Data(base64Encoded: rec.last_logits_fp16_b64)!
             let ref = fp16BytesToFloat32(refBytes, count: vocab)
             let c = cosine(lastLogits, ref)
-            let top1 = argmax(lastLogits)
-            let match = (top1 == rec.top1_id)
+            let aneTop10 = topKIndices(lastLogits, k: 10)
+            let refTop10 = topKIndices(ref, k: 10)
+            let aneTop5Set = Set(aneTop10.prefix(5))
+            let refTop5Set = Set(refTop10.prefix(5))
+            let match = (aneTop10[0] == rec.top1_id)
+            let inTop3 = aneTop10.prefix(3).contains(rec.top1_id)
+            let inTop5 = aneTop10.prefix(5).contains(rec.top1_id)
+            let inTop10 = aneTop10.contains(rec.top1_id)
+            let overlap5 = aneTop5Set.intersection(refTop5Set).count
             collected.append(PromptResult(prompt: rec.prompt, S: rec.S_real,
-                                           lastCos: c, top1Match: match, totalMs: totalMs))
+                                           lastCos: c, top1Match: match,
+                                           top1InTop3: inTop3, top1InTop5: inTop5,
+                                           top1InTop10: inTop10, top5Overlap: overlap5,
+                                           totalMs: totalMs))
         }
 
         results = collected
         meanCos = collected.map { $0.lastCos }.reduce(0, +) / Double(collected.count)
         worstCos = collected.map { $0.lastCos }.min() ?? 0
-        top1Rate = Double(collected.filter { $0.top1Match }.count) / Double(collected.count)
+        let N = Double(collected.count)
+        top1Rate = Double(collected.filter { $0.top1Match }.count) / N
+        top1InTop3Rate = Double(collected.filter { $0.top1InTop3 }.count) / N
+        top1InTop5Rate = Double(collected.filter { $0.top1InTop5 }.count) / N
+        top1InTop10Rate = Double(collected.filter { $0.top1InTop10 }.count) / N
+        meanTop5Overlap = Double(collected.map { $0.top5Overlap }.reduce(0, +)) / N
         // Exclude first prompt (warmup)
         let throughputs = collected.dropFirst().map { $0.tokPerSec }
         meanTokPerSec = throughputs.isEmpty ? 0 : throughputs.reduce(0, +) / Double(throughputs.count)
 
         status = String(format:
-            "Done — mean cos=%.4f  worst=%.4f  top1=%.0f%%  tok/s=%.1f (units=%@)",
-            meanCos, worstCos, top1Rate * 100, meanTokPerSec, units.rawValue as CVarArg)
+            "Done — top1=%.0f%% top3=%.0f%% top5=%.0f%% ovl5=%.1f/5 cos=%.4f tok/s=%.1f (%@)",
+            top1Rate * 100, top1InTop3Rate * 100, top1InTop5Rate * 100,
+            meanTop5Overlap, meanCos, meanTokPerSec, units.rawValue as CVarArg)
+    }
+
+    private func topKIndices(_ v: [Float], k: Int) -> [Int] {
+        // Partial top-K: single pass maintaining a sorted array of size k.
+        // Sufficient for k=10 and v.count=248320.
+        var topIdx = [Int](); topIdx.reserveCapacity(k)
+        var topVal = [Float](); topVal.reserveCapacity(k)
+        for i in 0..<v.count {
+            let x = v[i]
+            if topIdx.count < k {
+                // Insert sorted
+                var pos = 0
+                while pos < topIdx.count && topVal[pos] > x { pos += 1 }
+                topIdx.insert(i, at: pos)
+                topVal.insert(x, at: pos)
+            } else if x > topVal[k - 1] {
+                var pos = 0
+                while pos < k && topVal[pos] > x { pos += 1 }
+                topIdx.insert(i, at: pos)
+                topVal.insert(x, at: pos)
+                topIdx.removeLast()
+                topVal.removeLast()
+            }
+        }
+        return topIdx
     }
 
     // MARK: - Numerics helpers (duplicated from Qwen35Benchmark for independence)

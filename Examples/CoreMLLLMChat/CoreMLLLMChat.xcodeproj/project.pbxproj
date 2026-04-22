@@ -30,6 +30,7 @@
 		B60E4AB380E7B9E215F1B15E /* Qwen35DecodeBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */; };
 		EA8F4D61A0F517EFB59D74EE /* qwen3_5_0_8b_prefill_stateful_fp16_seq64.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = B14B4DB0BA129FF2001C58F5 /* qwen3_5_0_8b_prefill_stateful_fp16_seq64.mlpackage */; };
 		EF8840D7959C1AB14894FE13 /* Qwen35Benchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = A640406284DC310A703609F0 /* Qwen35Benchmark.swift */; };
+		CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -52,6 +53,7 @@
 		'B3000001' = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CoreMLLLMChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35DecodeBenchmark.swift; path = CoreMLLLMChat/Qwen35DecodeBenchmark.swift; sourceTree = SOURCE_ROOT; };
 		F8714748BF0A5E81B6E3499A /* Qwen35BenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35BenchmarkView.swift; path = CoreMLLLMChat/Qwen35BenchmarkView.swift; sourceTree = SOURCE_ROOT; };
+		DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35ChatView.swift; path = CoreMLLLMChat/Qwen35ChatView.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -84,6 +86,7 @@
 				A83A47DE9322C639B9EFD102 /* Qwen35DecodeBenchmarkView.swift */,
 				4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */,
 				AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */,
+				DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -200,6 +203,7 @@
 				79D8443C9596EB593A5FE1EC /* Qwen35DecodeBenchmarkView.swift in Sources */,
 				3D7B40A686C6B3EA9089FC5A /* Qwen35Generator.swift in Sources */,
 				32404BC1AC91219654BB4034 /* Qwen35GeneratorView.swift in Sources */,
+				CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -443,12 +443,35 @@ def convert_and_audit(model, cfg, rot, max_seq, out_path):
         ct_outputs.append(ct.TensorType(name=f"new_state_{i}_a", dtype=np.float16))
         ct_outputs.append(ct.TensorType(name=f"new_state_{i}_b", dtype=np.float16))
 
+    # Keep the lm_head matmul in fp32. Reason: ANE fp16 hardware accumulates
+    # over the 1024-dim reduction of this projection to a 248320-entry output,
+    # which is where per-step top-1 drift comes from (40% match when all fp16).
+    # Forcing fp32 makes coremltools route THIS op to CPU while the 24 decoder
+    # layers (much smaller matmuls, fp16-safe) stay on ANE. Hybrid
+    # ANE-body + CPU-head aims to preserve ANE speed while keeping lm_head
+    # accuracy.
+    from coremltools.converters.mil.mil.passes.defs.quantization import (
+        FP16ComputePrecision,
+    )
+    VOCAB = cfg.vocab_size
+    def _keep_lm_head_fp32(op):
+        # Return True → cast this op to fp16. False → keep fp32.
+        if op.op_type == "linear":
+            for out in op.outputs:
+                # MIL Operation.outputs[i].shape may be a tuple of ints or a
+                # shape with dynamic dims; guard by length and last-dim equality.
+                shape = getattr(out, "shape", None)
+                if shape is not None and len(shape) >= 1:
+                    last = shape[-1]
+                    if isinstance(last, int) and last == VOCAB:
+                        return False
+        return True
     ct_model = ct.convert(
         traced,
         convert_to="mlprogram",
         inputs=ct_inputs,
         outputs=ct_outputs,
-        compute_precision=ct.precision.FLOAT16,
+        compute_precision=FP16ComputePrecision(op_selector=_keep_lm_head_fp32),
         compute_units=ct.ComputeUnit.CPU_AND_NE,
         minimum_deployment_target=ct.target.iOS18,
     )

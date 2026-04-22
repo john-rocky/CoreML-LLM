@@ -37,6 +37,14 @@ struct Qwen35BenchmarkView: View {
                         statRow("mean cos",     String(format: "%.4f", bench.meanCos))
                         statRow("worst-pos cos", String(format: "%.4f", bench.worstCos))
                         statRow("top-1 match",  String(format: "%.0f%%", bench.top1Rate * 100))
+                        statRow("oracle top-1 in ANE top-3",
+                                String(format: "%.0f%%", bench.top1InTop3Rate * 100))
+                        statRow("oracle top-1 in ANE top-5",
+                                String(format: "%.0f%%", bench.top1InTop5Rate * 100))
+                        statRow("oracle top-1 in ANE top-10",
+                                String(format: "%.0f%%", bench.top1InTop10Rate * 100))
+                        statRow("mean top-5 overlap",
+                                String(format: "%.1f / 5", bench.meanTop5Overlap))
                         statRow("prefill",      String(format: "%.1f ms", bench.meanPrefillMs))
                         statRow("throughput",   String(format: "%.1f tok/s", bench.tokensPerSecond))
                     }
@@ -52,9 +60,13 @@ struct Qwen35BenchmarkView: View {
                                         .foregroundStyle(r.lastCos >= 0.95 ? .green : .orange)
                                     Image(systemName: r.top1Match ? "checkmark.circle.fill" : "xmark.circle.fill")
                                         .foregroundStyle(r.top1Match ? .green : .red)
-                                    Text(String(format: "%.0fms", r.prefillMs))
+                                    Text("t3:\(r.top1InTop3 ? "✓" : "✗")")
                                         .font(.caption2)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(r.top1InTop3 ? .green : .red)
+                                    Text("ovl:\(r.top5Overlap)/5")
+                                        .font(.caption2).foregroundStyle(.secondary)
+                                    Text(String(format: "%.0fms", r.prefillMs))
+                                        .font(.caption2).foregroundStyle(.secondary)
                                 }
                             }
                         }
@@ -63,9 +75,12 @@ struct Qwen35BenchmarkView: View {
 
                 Section("Notes") {
                     Text(
-                        "Mac M4 ANE baseline (reference): mean cos ≈ 0.98, worst-pos ≈ 0.84, top-1 ≈ 80%. "
-                        + "CPU fp16 path on Mac: top-1 100%, worst-pos 0.998. "
-                        + "This screen measures the A18 Pro ANE."
+                        "top-1 alone can be misleading due to argmax fragility on 248K vocab. "
+                        + "top-3/top-5 containment and overlap show whether ANE's distribution "
+                        + "matches the fp32 oracle for sampling-mode generation. "
+                        + "Decode bench reference: iPhone ANE top-1=60% but top-3=100%. "
+                        + "Prefill uses chunked SSM with Neumann iteration — may be more "
+                        + "fp16-sensitive than decode."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)

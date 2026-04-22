@@ -62,23 +62,26 @@ struct ModelPickerView: View {
                     }
                 }
 
-                Section("Research") {
-                    NavigationLink {
-                        Qwen35BenchmarkView()
-                    } label: {
-                        Label("Qwen3.5-0.8B prefill benchmark", systemImage: "stopwatch")
-                    }
-                    NavigationLink {
-                        Qwen35DecodeBenchmarkView()
-                    } label: {
-                        Label("Qwen3.5-0.8B decode benchmark", systemImage: "speedometer")
-                    }
-                    NavigationLink {
-                        Qwen35GeneratorView()
-                    } label: {
-                        Label("Qwen3.5-0.8B end-to-end generate", systemImage: "text.bubble")
-                    }
-                }
+                // Qwen3.5 is now a first-class entry in "Available Models"
+                // above — select "Qwen3.5 0.8B (ANE)" to download and then
+                // chat via the regular ChatView. The standalone research
+                // screens below are preserved in source for direct
+                // debugging but not shown in the picker.
+                //
+                // Section("Qwen3.5-0.8B (ANE) — research") {
+                //     NavigationLink { Qwen35ChatView() } label: {
+                //         Label("Qwen3.5 Chat", systemImage: "bubble.left.and.bubble.right")
+                //     }
+                //     NavigationLink { Qwen35BenchmarkView() } label: {
+                //         Label("Prefill benchmark", systemImage: "stopwatch")
+                //     }
+                //     NavigationLink { Qwen35DecodeBenchmarkView() } label: {
+                //         Label("Decode benchmark", systemImage: "speedometer")
+                //     }
+                //     NavigationLink { Qwen35GeneratorView() } label: {
+                //         Label("End-to-end (token IDs)", systemImage: "text.bubble")
+                //     }
+                // }
 
                 Section("Troubleshooting") {
                     Button(role: .destructive) {
