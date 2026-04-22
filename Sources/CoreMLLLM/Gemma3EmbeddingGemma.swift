@@ -70,6 +70,22 @@ public final class EmbeddingGemma {
         self.config = config
     }
 
+    /// One-call convenience: download from HuggingFace if needed, then load.
+    /// Wrapper-friendly entry point — pass an app-support directory and let
+    /// the package handle caching, then the returned instance is ready for
+    /// `encode(text:)`.
+    public static func downloadAndLoad(
+        modelsDir: URL,
+        hfToken: String? = nil,
+        computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
+        onProgress: ((Gemma3BundleDownloader.Progress) -> Void)? = nil
+    ) async throws -> EmbeddingGemma {
+        let bundleURL = try await Gemma3BundleDownloader.download(
+            .embeddingGemma300m, into: modelsDir,
+            hfToken: hfToken, onProgress: onProgress)
+        return try await load(bundleURL: bundleURL, computeUnits: computeUnits)
+    }
+
     /// Load an EmbeddingGemma bundle. Directory layout:
     ///   <bundle>/encoder.mlpackage  or  encoder.mlmodelc
     ///   <bundle>/model_config.json

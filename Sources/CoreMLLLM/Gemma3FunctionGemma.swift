@@ -106,6 +106,25 @@ public final class FunctionGemma {
                              config: Config.load(from: bundleURL))
     }
 
+    /// One-call convenience for wrapper libraries: download the bundle from
+    /// HuggingFace if not already on disk, then load. Returns a ready-to-use
+    /// FunctionGemma instance.
+    ///
+    /// `modelsDir` is the parent directory; the bundle lives at
+    /// `<modelsDir>/functiongemma-270m/`. Reuses an existing local bundle
+    /// when present (no re-download).
+    public static func downloadAndLoad(
+        modelsDir: URL,
+        hfToken: String? = nil,
+        computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
+        onProgress: ((Gemma3BundleDownloader.Progress) -> Void)? = nil
+    ) async throws -> FunctionGemma {
+        let bundleURL = try await Gemma3BundleDownloader.download(
+            .functionGemma270m, into: modelsDir,
+            hfToken: hfToken, onProgress: onProgress)
+        return try await load(bundleURL: bundleURL, computeUnits: computeUnits)
+    }
+
     /// Reset the stateful KV cache so the next `generate` starts from an
     /// empty context. Call between unrelated prompts.
     public func resetState() {
@@ -177,6 +196,36 @@ public final class FunctionGemma {
             return (text, String(text[s.upperBound..<e.lowerBound]))
         }
         return (text, nil)
+    }
+
+    /// Streaming variant: returns each generated piece as an AsyncStream
+    /// element. Useful for SwiftUI views that want to update incrementally.
+    /// The stream completes on EOS, on `maxNewTokens`, or if the underlying
+    /// prediction throws (in which case the stream finishes without a final
+    /// element — wrap in a `do/try await` to surface errors).
+    public func stream(
+        prompt: String,
+        maxNewTokens: Int = 256,
+        resetState: Bool = true
+    ) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            Task.detached { [weak self] in
+                guard let self else { continuation.finish(); return }
+                do {
+                    _ = try self.generate(
+                        prompt: prompt,
+                        maxNewTokens: maxNewTokens,
+                        resetState: resetState,
+                        onToken: { piece in
+                            continuation.yield(piece)
+                            return true
+                        })
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
     }
 
     // MARK: - Internal prediction
