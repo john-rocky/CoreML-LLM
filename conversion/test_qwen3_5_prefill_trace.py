@@ -128,9 +128,14 @@ class PrefillLinearAttnLayer(nn.Module):
         # Per-chunk cumulative g (the only cumsum — over CS=64)
         g = g.cumsum(dim=-1)                                        # (B,H,NC,CS)
 
-        # decay_mask[i,j] = exp(g_i - g_j) for i>=j within a chunk, else 0
+        # decay_mask[i,j] = exp(g_i - g_j) for i>=j within a chunk, else 0.
+        # Clamp *before* exp to keep the (i<j) upper-triangular portion from
+        # producing Inf in fp16 (cumsum over CS=64 can push g_diff to ~+200
+        # up there, which overflows exp in fp16 and poisons later bmm with
+        # NaN even though tril_mask zeros the visible entries). Clamp value
+        # is safely above exp-max for the (i>=j) cells we actually use.
         g_diff = g.unsqueeze(-1) - g.unsqueeze(-2)                  # (B,H,NC,CS,CS)
-        # Build lower-triangular mask (True on and below diagonal for CS×CS)
+        g_diff = g_diff.clamp(max=10.0)
         tril_mask = torch.tril(torch.ones(CS, CS, dtype=torch.bool, device=q.device))
         decay_mask = torch.where(tril_mask, g_diff.exp(), torch.zeros_like(g_diff))
 
@@ -151,12 +156,29 @@ class PrefillLinearAttnLayer(nn.Module):
         L3 = -torch.bmm(k_beta3, k3.transpose(-1, -2)) * decay_mask.reshape(BN, CS, CS)
         L3 = torch.where(upper_incl_diag, torch.zeros_like(L3), L3)
 
+        # Neumann iteration with fp16-safe clamp: T_{k+1} = clamp(I + L @ T_k).
+        # L is strictly lower triangular so L^CS = 0 and the series terminates
+        # at k=CS-1 with the exact (I - L)^{-1}. Raw Neumann has intermediate
+        # T_k peaks of 10^10-10^16 before collapsing back to <20 (the entries
+        # of the true inverse), overflowing fp16 and poisoning downstream ops
+        # with NaN on CPU / silent drift on ANE. Clamp to ±1e3 bounds the
+        # transient excursion to fp16-safe magnitudes; the math converges
+        # because the final value is well within the clamp range.
+        #
+        # Earlier we used row-by-row forward substitution here, which is also
+        # mathematically safe, but it produces a cumulative-concat chain of
+        # 64 rows × 18 linear_attention layers (~1150 concat ops plus ~2400
+        # slice ops). iPhone A18 Pro Core ML CPU runtime mis-handles this
+        # pattern on iOS 26.1 and returns garbage logits (cos≈0.3, top-1 0%)
+        # even though Mac Core ML on the same mlmodelc gives cos≈1.0. The
+        # clamp-Neumann form stays at ~9900 total ops with no cumulative
+        # concat and works on both platforms.
         eye = self.chunk_eye                                        # (CS, CS)
-        attn3 = eye.expand(BN, CS, CS).contiguous()                 # T_0
-        for _ in range(CS):                                         # converges at k=CS-1
-            attn3 = eye + torch.bmm(L3, attn3)                      # T_{k+1}
+        attn3 = eye.expand(BN, CS, CS).contiguous()
+        for _ in range(CS):
+            attn3 = eye + torch.bmm(L3, attn3)
+            attn3 = attn3.clamp(-1e3, 1e3)
         attn = attn3.reshape(B, H, NC, CS, CS)
-        # attn now equals (I - L)^{-1}, matching HF's `attn + eye` after its for-loop.
 
         # WY products (kept as 3D bmm to stay on ANE)
         value = torch.bmm(attn3, v_beta3).reshape(B, H, NC, CS, Dv)

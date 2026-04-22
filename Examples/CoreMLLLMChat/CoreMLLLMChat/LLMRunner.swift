@@ -1,6 +1,7 @@
 import CoreML
 import CoreMLLLM
 import Foundation
+import Tokenizers
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -32,20 +33,25 @@ final class LLMRunner {
     private var llm: CoreMLLLM?
     private var modelFolderURL: URL?
 
+    // Qwen3.5 path: separate generator + tokenizer, selected when the
+    // downloaded folder contains `qwen3_5_0_8b_decode_fp16_mseq128.mlpackage`.
+    // Not integrated into CoreMLLLM because Qwen3.5 uses a completely
+    // different architecture (hybrid Gated-DeltaNet SSM + attention).
+    private var qwen35Generator: Qwen35Generator?
+    private var qwen35Tokenizer: (any Tokenizer)?
+
     // MARK: - Loading
 
     func loadModel(from url: URL) async throws {
         let folder = url.deletingLastPathComponent()
 
-        // Release the previous model BEFORE allocating the new one — otherwise
-        // the `try await CoreMLLLM.load(...)` call below holds both instances
-        // in memory simultaneously. Peak footprint on a E2B → E4B switch is
-        // ~3 GB + ~5 GB = 8 GB, which OOMs on 8 GB devices and pushes a 12 GB
-        // iPhone 17 Pro into jetsam territory. Setting `llm = nil` triggers
-        // ARC release of ChunkedEngine, which in turn releases every
-        // per-chunk MLModel and unmaps the INT8 embed/PLE data files.
-        if llm != nil {
+        // Release previous engines BEFORE allocating a new one — peak footprint
+        // on model switch would otherwise hold both in memory simultaneously,
+        // OOMing on 8 GB devices.
+        if llm != nil || qwen35Generator != nil {
             llm = nil
+            qwen35Generator = nil
+            qwen35Tokenizer = nil
             isLoaded = false
             modelName = ""
             hasVision = false
@@ -55,12 +61,21 @@ final class LLMRunner {
             crossVocabAcceptanceRate = 0
             crossVocabTokensPerCycle = 0
             loadingStatus = "Releasing previous model..."
-            // Yield so the autorelease pool drains before we start the next load.
             await Task.yield()
         }
 
         modelFolderURL = folder
         loadingStatus = "Loading..."
+
+        // Qwen3.5 detection: the downloaded folder contains the decode
+        // mlpackage directly — no `model_config.json` / `hf_model/` layout
+        // that Gemma uses.
+        let qwen35Pkg = folder.appendingPathComponent(
+            "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage")
+        if FileManager.default.fileExists(atPath: qwen35Pkg.path) {
+            try await loadQwen35(folder: folder)
+            return
+        }
 
         llm = try await CoreMLLLM.load(from: folder) { [weak self] status in
             Task { @MainActor in
@@ -103,6 +118,9 @@ final class LLMRunner {
 
     func generate(messages: [ChatMessage], image: CGImage? = nil,
                   audio: [Float]? = nil) async throws -> AsyncStream<String> {
+        if qwen35Generator != nil {
+            return try await generateQwen35(messages: messages)
+        }
         guard let llm else {
             throw NSError(domain: "LLMRunner", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "Model not loaded"])
@@ -168,6 +186,110 @@ final class LLMRunner {
     func resetConversation() {
         llm?.reset()
         llm?.clearImageCache()
+        // Qwen3.5 is stateless per-call (state is built recurrently from
+        // scratch each generate), so nothing to reset here.
+    }
+
+    // MARK: - Qwen3.5 dispatch
+
+    private func loadQwen35(folder: URL) async throws {
+        loadingStatus = "Loading Qwen tokenizer..."
+        let tok = try await AutoTokenizer.from(pretrained: "Qwen/Qwen3.5-0.8B")
+        loadingStatus = "Compiling decode model (first run only, can take a few minutes on ANE)..."
+        let gen = Qwen35Generator()
+        gen.modelFolderOverride = folder
+        // Trigger compile by calling load — falls back to lazy on first generate.
+        do {
+            try gen.load()
+        } catch {
+            throw NSError(domain: "LLMRunner", code: 20,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Qwen3.5 load failed: \(error.localizedDescription)"])
+        }
+        qwen35Generator = gen
+        qwen35Tokenizer = tok
+        modelName = "Qwen3.5 0.8B"
+        hasVision = false
+        hasAudio = false
+        isLoaded = true
+        loadingStatus = "Ready"
+        print("[LLMRunner] loaded Qwen3.5 from \(folder.lastPathComponent)")
+    }
+
+    private func generateQwen35(messages: [ChatMessage]) async throws -> AsyncStream<String> {
+        guard let gen = qwen35Generator, let tok = qwen35Tokenizer else {
+            throw NSError(domain: "LLMRunner", code: 21,
+                userInfo: [NSLocalizedDescriptionKey: "Qwen3.5 not loaded"])
+        }
+        isGenerating = true
+        tokensPerSecond = 0
+
+        // Apply Qwen's chat template — user/assistant turns wrapped in
+        // <|im_start|>/<|im_end|> delimiters. SYSTEM messages are filtered
+        // out because the app uses them for UI status ("Loading...",
+        // "Model loaded!") — not actual model instructions. Leaving them
+        // in confuses Qwen's instruct alignment and produces degenerate
+        // looping output.
+        let chatMessages: [[String: Any]] = messages.compactMap { m in
+            let role: String
+            switch m.role {
+            case .user: role = "user"
+            case .assistant: role = "assistant"
+            case .system: return nil  // skip UI-status system messages
+            }
+            return ["role": role, "content": m.content]
+        }
+        let inputIds: [Int] = (try? tok.applyChatTemplate(messages: chatMessages))
+            ?? tok.encode(text: messages.last?.content ?? "")
+        let inputIdsInt32 = inputIds.map { Int32($0) }
+
+        // Qwen3.5 decode mlpackage is built with max_seq=128, so total
+        // tokens (prompt + generation) must fit in 128. Compute remaining
+        // budget from the prompt length; cap at a reasonable chat ceiling.
+        // If prompt alone already exceeds the budget, throw a clear error.
+        let maxSeq = 128
+        let remaining = maxSeq - inputIds.count - 1
+        if remaining < 1 {
+            throw NSError(domain: "LLMRunner", code: 22,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Qwen3.5 prompt (\(inputIds.count) tokens) exceeds max_seq=\(maxSeq). Shorten the message or clear the chat history."])
+        }
+        let maxNew = min(remaining, 120)  // soft cap to avoid long hangs
+
+        // EOS: Qwen <|im_end|> is 248046; also respect tokenizer's reported EOS.
+        var eosSet: Set<Int32> = [248046]
+        if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
+
+        let genStart = Date()
+        return AsyncStream { continuation in
+            Task { [weak self] in
+                defer { Task { @MainActor in self?.isGenerating = false } }
+                var tokenCount = 0
+                do {
+                    _ = try await gen.generate(
+                        inputIds: inputIdsInt32, maxNewTokens: maxNew,
+                        temperature: 0.0, topK: 40, repetitionPenalty: 1.0,
+                        eosTokenIds: eosSet,
+                        onToken: { [weak self] tokenId in
+                            tokenCount += 1
+                            let id = Int(tokenId)
+                            // Skip EOS in visible stream
+                            if eosSet.contains(tokenId) { return }
+                            let piece = tok.decode(tokens: [id])
+                            continuation.yield(piece)
+                            let elapsed = Date().timeIntervalSince(genStart)
+                            if elapsed > 0 {
+                                Task { @MainActor in
+                                    self?.tokensPerSecond = Double(tokenCount) / elapsed
+                                }
+                            }
+                        })
+                } catch {
+                    continuation.yield("[Error: \(error.localizedDescription)]")
+                }
+                continuation.finish()
+            }
+        }
     }
 
     // MARK: - Battery / sustained-throughput benchmark

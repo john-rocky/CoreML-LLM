@@ -7,69 +7,108 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		B1000001 /* CoreMLLLMChatApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000001 /* CoreMLLLMChatApp.swift */; };
-		B1000002 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000002 /* ChatView.swift */; };
-		B1000003 /* ChatMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000003 /* ChatMessage.swift */; };
-		B1000004 /* LLMRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000004 /* LLMRunner.swift */; };
-		B1000010 /* CoreMLLLM in Frameworks */ = {isa = PBXBuildFile; productRef = B9000003 /* CoreMLLLM */; };
-		B1000006 /* ModelPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000006 /* ModelPickerView.swift */; };
-		B1000007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B2000007 /* Assets.xcassets */; };
-		B1000008 /* Transformers in Frameworks */ = {isa = PBXBuildFile; productRef = B9000001 /* Transformers */; };
-		B100000A /* AudioRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = B200000A /* AudioRecorder.swift */; };
+		1A4D424E863ADC4ABC353497 /* qwen3_5_0_8b_fp16_seq64.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = 851443F2BBA6DCE16671F9ED /* qwen3_5_0_8b_fp16_seq64.mlpackage */; };
+		A62772C1BCA94C759F3BB958 /* qwen3_5_chunk_a.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = CED87CC5BDD1478D94EFC93F /* qwen3_5_chunk_a.mlpackage */; };
+		6B0CA96CEF724055A34F1464 /* qwen3_5_chunk_b.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = CE1F23FB41B44A0F94B200DB /* qwen3_5_chunk_b.mlpackage */; };
+		CED87CC5BDD1478D94EFC93F /* qwen3_5_chunk_a.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; name = qwen3_5_chunk_a.mlpackage; path = CoreMLLLMChat/qwen3_5_chunk_a.mlpackage; sourceTree = SOURCE_ROOT; };
+		CE1F23FB41B44A0F94B200DB /* qwen3_5_chunk_b.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; name = qwen3_5_chunk_b.mlpackage; path = CoreMLLLMChat/qwen3_5_chunk_b.mlpackage; sourceTree = SOURCE_ROOT; };
+		32404BC1AC91219654BB4034 /* Qwen35GeneratorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */; };
+		370C4C3589D85D9148AED4C9 /* Qwen35BenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8714748BF0A5E81B6E3499A /* Qwen35BenchmarkView.swift */; };
+		3D7B40A686C6B3EA9089FC5A /* Qwen35Generator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */; };
+		72EA4F4B993C82EAA1F18FF1 /* qwen3_5_oracle_ios.json in Resources */ = {isa = PBXBuildFile; fileRef = 96644CCA8CDD9D651ACBD01D /* qwen3_5_oracle_ios.json */; };
+		755341D192E6CA33A7DA0857 /* qwen3_5_0_8b_decode_fp16_mseq128.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = 04014C52A374DE9E3B880786 /* qwen3_5_0_8b_decode_fp16_mseq128.mlpackage */; };
+		79D8443C9596EB593A5FE1EC /* Qwen35DecodeBenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A83A47DE9322C639B9EFD102 /* Qwen35DecodeBenchmarkView.swift */; };
+		'B1000001' = {isa = PBXBuildFile; fileRef = B2000001; };
+		'B1000002' = {isa = PBXBuildFile; fileRef = B2000002; };
+		'B1000003' = {isa = PBXBuildFile; fileRef = B2000003; };
+		'B1000004' = {isa = PBXBuildFile; fileRef = B2000004; };
+		'B1000006' = {isa = PBXBuildFile; fileRef = B2000006; };
+		'B1000007' = {isa = PBXBuildFile; fileRef = B2000007; };
+		'B1000008' = {isa = PBXBuildFile; productRef = B9000001; };
+		'B100000A' = {isa = PBXBuildFile; fileRef = B200000A; };
+		'B1000010' = {isa = PBXBuildFile; productRef = B9000003; };
+		B60E4AB380E7B9E215F1B15E /* Qwen35DecodeBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */; };
+		EA8F4D61A0F517EFB59D74EE /* qwen3_5_0_8b_prefill_stateful_fp16_seq64.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = B14B4DB0BA129FF2001C58F5 /* qwen3_5_0_8b_prefill_stateful_fp16_seq64.mlpackage */; };
+		EF8840D7959C1AB14894FE13 /* Qwen35Benchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = A640406284DC310A703609F0 /* Qwen35Benchmark.swift */; };
+		CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		B2000001 /* CoreMLLLMChatApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreMLLLMChatApp.swift; sourceTree = "<group>"; };
-		B2000002 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
-		B2000003 /* ChatMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessage.swift; sourceTree = "<group>"; };
-		B2000004 /* LLMRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LLMRunner.swift; sourceTree = "<group>"; };
-		B2000006 /* ModelPickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelPickerView.swift; sourceTree = "<group>"; };
-		B2000007 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		B2000009 /* CoreMLLLMChat.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CoreMLLLMChat.entitlements; sourceTree = "<group>"; };
-		B200000A /* AudioRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorder.swift; sourceTree = "<group>"; };
-		B3000001 /* CoreMLLLMChat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CoreMLLLMChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		04014C52A374DE9E3B880786 /* qwen3_5_0_8b_decode_fp16_mseq128.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; name = qwen3_5_0_8b_decode_fp16_mseq128.mlpackage; path = CoreMLLLMChat/qwen3_5_0_8b_decode_fp16_mseq128.mlpackage; sourceTree = SOURCE_ROOT; };
+		4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35Generator.swift; path = CoreMLLLMChat/Qwen35Generator.swift; sourceTree = SOURCE_ROOT; };
+		851443F2BBA6DCE16671F9ED /* qwen3_5_0_8b_fp16_seq64.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; name = qwen3_5_0_8b_fp16_seq64.mlpackage; path = CoreMLLLMChat/qwen3_5_0_8b_fp16_seq64.mlpackage; sourceTree = SOURCE_ROOT; };
+		96644CCA8CDD9D651ACBD01D /* qwen3_5_oracle_ios.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; name = qwen3_5_oracle_ios.json; path = CoreMLLLMChat/qwen3_5_oracle_ios.json; sourceTree = SOURCE_ROOT; };
+		A640406284DC310A703609F0 /* Qwen35Benchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35Benchmark.swift; path = CoreMLLLMChat/Qwen35Benchmark.swift; sourceTree = SOURCE_ROOT; };
+		A83A47DE9322C639B9EFD102 /* Qwen35DecodeBenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35DecodeBenchmarkView.swift; path = CoreMLLLMChat/Qwen35DecodeBenchmarkView.swift; sourceTree = SOURCE_ROOT; };
+		AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35GeneratorView.swift; path = CoreMLLLMChat/Qwen35GeneratorView.swift; sourceTree = SOURCE_ROOT; };
+		B14B4DB0BA129FF2001C58F5 /* qwen3_5_0_8b_prefill_stateful_fp16_seq64.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; name = qwen3_5_0_8b_prefill_stateful_fp16_seq64.mlpackage; path = CoreMLLLMChat/qwen3_5_0_8b_prefill_stateful_fp16_seq64.mlpackage; sourceTree = SOURCE_ROOT; };
+		'B2000001' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreMLLLMChatApp.swift; sourceTree = "<group>"; };
+		'B2000002' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		'B2000003' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessage.swift; sourceTree = "<group>"; };
+		'B2000004' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LLMRunner.swift; sourceTree = "<group>"; };
+		'B2000006' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelPickerView.swift; sourceTree = "<group>"; };
+		'B2000007' = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		'B2000009' = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CoreMLLLMChat.entitlements; sourceTree = "<group>"; };
+		'B200000A' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorder.swift; sourceTree = "<group>"; };
+		'B3000001' = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CoreMLLLMChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35DecodeBenchmark.swift; path = CoreMLLLMChat/Qwen35DecodeBenchmark.swift; sourceTree = SOURCE_ROOT; };
+		F8714748BF0A5E81B6E3499A /* Qwen35BenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35BenchmarkView.swift; path = CoreMLLLMChat/Qwen35BenchmarkView.swift; sourceTree = SOURCE_ROOT; };
+		DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35ChatView.swift; path = CoreMLLLMChat/Qwen35ChatView.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		B4000001 /* Frameworks */ = {
+		'B4000001' = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				B1000008 /* Transformers in Frameworks */,
-				B1000010 /* CoreMLLLM in Frameworks */,
+				B1000008,
+				B1000010,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		B5000001 = {
+		'B5000001' = {
 			isa = PBXGroup;
 			children = (
-				B5000002 /* CoreMLLLMChat */,
-				B5000003 /* Products */,
+				B5000002,
+				B5000003,
+				851443F2BBA6DCE16671F9ED /* qwen3_5_0_8b_fp16_seq64.mlpackage */,
+				CED87CC5BDD1478D94EFC93F /* qwen3_5_chunk_a.mlpackage */,
+				CE1F23FB41B44A0F94B200DB /* qwen3_5_chunk_b.mlpackage */,
+				B14B4DB0BA129FF2001C58F5 /* qwen3_5_0_8b_prefill_stateful_fp16_seq64.mlpackage */,
+				04014C52A374DE9E3B880786 /* qwen3_5_0_8b_decode_fp16_mseq128.mlpackage */,
+				96644CCA8CDD9D651ACBD01D /* qwen3_5_oracle_ios.json */,
+				A640406284DC310A703609F0 /* Qwen35Benchmark.swift */,
+				F8714748BF0A5E81B6E3499A /* Qwen35BenchmarkView.swift */,
+				CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */,
+				A83A47DE9322C639B9EFD102 /* Qwen35DecodeBenchmarkView.swift */,
+				4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */,
+				AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */,
+				DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */,
 			);
 			sourceTree = "<group>";
 		};
-		B5000002 /* CoreMLLLMChat */ = {
+		'B5000002' = {
 			isa = PBXGroup;
 			children = (
-				B2000001 /* CoreMLLLMChatApp.swift */,
-				B2000002 /* ChatView.swift */,
-				B2000003 /* ChatMessage.swift */,
-				B2000004 /* LLMRunner.swift */,
-				B2000006 /* ModelPickerView.swift */,
-				B200000A /* AudioRecorder.swift */,
-				B2000009 /* CoreMLLLMChat.entitlements */,
-				B2000007 /* Assets.xcassets */,
+				B2000001,
+				B2000002,
+				B2000003,
+				B2000004,
+				B2000006,
+				B200000A,
+				B2000009,
+				B2000007,
 			);
 			path = CoreMLLLMChat;
 			sourceTree = "<group>";
 		};
-		B5000003 /* Products */ = {
+		'B5000003' = {
 			isa = PBXGroup;
 			children = (
-				B3000001 /* CoreMLLLMChat.app */,
+				B3000001,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -77,13 +116,13 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		B6000001 /* CoreMLLLMChat */ = {
+		'B6000001' = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = B8000001 /* Build configuration list for PBXNativeTarget "CoreMLLLMChat" */;
+			buildConfigurationList = B8000001;
 			buildPhases = (
-				B7000001 /* Sources */,
-				B4000001 /* Frameworks */,
-				B7000002 /* Resources */,
+				B7000001,
+				B4000001,
+				B7000002,
 			);
 			buildRules = (
 			);
@@ -91,24 +130,24 @@
 			);
 			name = CoreMLLLMChat;
 			packageProductDependencies = (
-				B9000001 /* Transformers */,
-				B9000003 /* CoreMLLLM */,
+				B9000001,
+				B9000003,
 			);
 			productName = CoreMLLLMChat;
-			productReference = B3000001 /* CoreMLLLMChat.app */;
+			productReference = B3000001;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
-		BA000001 /* Project object */ = {
+		'BA000001' = {
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 1600;
 				LastUpgradeCheck = 1600;
 			};
-			buildConfigurationList = B8000002 /* Build configuration list for PBXProject "CoreMLLLMChat" */;
+			buildConfigurationList = B8000002;
 			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -118,47 +157,60 @@
 			);
 			mainGroup = B5000001;
 			packageReferences = (
-				B9000002 /* XCRemoteSwiftPackageReference "swift-transformers" */,
-				B9000004 /* XCLocalSwiftPackageReference "CoreMLLLM" */,
+				B9000002,
+				B9000004,
 			);
-			productRefGroup = B5000003 /* Products */;
+			productRefGroup = B5000003;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				B6000001 /* CoreMLLLMChat */,
+				B6000001,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		B7000002 /* Resources */ = {
+		'B7000002' = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				B1000007 /* Assets.xcassets in Resources */,
+				B1000007,
+				1A4D424E863ADC4ABC353497 /* qwen3_5_0_8b_fp16_seq64.mlpackage in Resources */,
+				A62772C1BCA94C759F3BB958 /* qwen3_5_chunk_a.mlpackage in Resources */,
+				6B0CA96CEF724055A34F1464 /* qwen3_5_chunk_b.mlpackage in Resources */,
+				EA8F4D61A0F517EFB59D74EE /* qwen3_5_0_8b_prefill_stateful_fp16_seq64.mlpackage in Resources */,
+				755341D192E6CA33A7DA0857 /* qwen3_5_0_8b_decode_fp16_mseq128.mlpackage in Resources */,
+				72EA4F4B993C82EAA1F18FF1 /* qwen3_5_oracle_ios.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		B7000001 /* Sources */ = {
+		'B7000001' = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				B1000001 /* CoreMLLLMChatApp.swift in Sources */,
-				B1000002 /* ChatView.swift in Sources */,
-				B1000003 /* ChatMessage.swift in Sources */,
-				B1000004 /* LLMRunner.swift in Sources */,
-				B1000006 /* ModelPickerView.swift in Sources */,
-				B100000A /* AudioRecorder.swift in Sources */,
+				B1000001,
+				B1000002,
+				B1000003,
+				B1000004,
+				B1000006,
+				B100000A,
+				EF8840D7959C1AB14894FE13 /* Qwen35Benchmark.swift in Sources */,
+				370C4C3589D85D9148AED4C9 /* Qwen35BenchmarkView.swift in Sources */,
+				B60E4AB380E7B9E215F1B15E /* Qwen35DecodeBenchmark.swift in Sources */,
+				79D8443C9596EB593A5FE1EC /* Qwen35DecodeBenchmarkView.swift in Sources */,
+				3D7B40A686C6B3EA9089FC5A /* Qwen35Generator.swift in Sources */,
+				32404BC1AC91219654BB4034 /* Qwen35GeneratorView.swift in Sources */,
+				CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
-		BB000001 /* Debug */ = {
+		'BB000001' = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -167,11 +219,11 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = MFN25KNUGJ;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = "CoreMLLLMChat/Info.plist";
-				INFOPLIST_KEY_UIFileSharingEnabled = YES;
+				INFOPLIST_FILE = CoreMLLLMChat/Info.plist;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UIFileSharingEnabled = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
@@ -189,7 +241,7 @@
 			};
 			name = Debug;
 		};
-		BB000002 /* Release */ = {
+		'BB000002' = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -198,11 +250,11 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = MFN25KNUGJ;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = "CoreMLLLMChat/Info.plist";
-				INFOPLIST_KEY_UIFileSharingEnabled = YES;
+				INFOPLIST_FILE = CoreMLLLMChat/Info.plist;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UIFileSharingEnabled = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
@@ -220,7 +272,7 @@
 			};
 			name = Release;
 		};
-		BC000001 /* Debug */ = {
+		'BC000001' = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -248,7 +300,7 @@
 			};
 			name = Debug;
 		};
-		BC000002 /* Release */ = {
+		'BC000002' = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -273,55 +325,55 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		B8000001 /* Build configuration list for PBXNativeTarget "CoreMLLLMChat" */ = {
+		'B8000001' = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				BB000001 /* Debug */,
-				BB000002 /* Release */,
+				BB000001,
+				BB000002,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		B8000002 /* Build configuration list for PBXProject "CoreMLLLMChat" */ = {
+		'B8000002' = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				BC000001 /* Debug */,
-				BC000002 /* Release */,
+				BC000001,
+				BC000002,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
 
-/* Begin XCRemoteSwiftPackageReference section */
-		B9000002 /* XCRemoteSwiftPackageReference "swift-transformers" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/huggingface/swift-transformers";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 0.1.12;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
 /* Begin XCLocalSwiftPackageReference section */
-		B9000004 /* XCLocalSwiftPackageReference "CoreMLLLM" */ = {
+		'B9000004' = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = ../..;
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		'B9000002' = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/huggingface/swift-transformers";
+			requirement = {
+				kind = revision;
+				revision = "main";
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
-		B9000001 /* Transformers */ = {
+		'B9000001' = {
 			isa = XCSwiftPackageProductDependency;
-			package = B9000002 /* XCRemoteSwiftPackageReference "swift-transformers" */;
+			package = B9000002;
 			productName = Transformers;
 		};
-		B9000003 /* CoreMLLLM */ = {
+		'B9000003' = {
 			isa = XCSwiftPackageProductDependency;
 			productName = CoreMLLLM;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
-	rootObject = BA000001 /* Project object */;
+	rootObject = BA000001;
 }
