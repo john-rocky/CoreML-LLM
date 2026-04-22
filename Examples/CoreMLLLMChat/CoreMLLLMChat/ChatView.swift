@@ -229,6 +229,19 @@ struct ChatView: View {
                         .disabled(runner.isGenerating || benchmarkRunning)
                     }
                 }
+                if runner.isLoaded {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Menu("Probe") {
+                            Button("Verify K=8 (25 iter)") {
+                                startVerifyKProbe(iterations: 25)
+                            }
+                            Button("Verify K=8 (50 iter)") {
+                                startVerifyKProbe(iterations: 50)
+                            }
+                        }
+                        .disabled(runner.isGenerating || benchmarkRunning)
+                    }
+                }
                 if runner.hasAudio {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("Test") { runAudioTest() }
@@ -567,6 +580,32 @@ struct ChatView: View {
                 benchmarkRunning = false
                 benchmarkStatus = ""
                 messages.append(ChatMessage(role: .system, content: "[Benchmark] Failed: \(error.localizedDescription)"))
+            }
+        }
+    }
+
+    private func startVerifyKProbe(iterations: Int) {
+        benchmarkStatus = "[Probe] Running verify_qK × \(iterations) iters…"
+        messages.append(ChatMessage(
+            role: .system,
+            content: "[Probe] Starting verify_qK × \(iterations) iters — "
+                + "keep device idle and connected until it completes."))
+        Task.detached(priority: .userInitiated) {
+            do {
+                let result = try await runner.runVerifyKProbe(iterations: iterations)
+                let summary = "[Probe RESULT]\n" + result.summary
+                print(summary)
+                await MainActor.run {
+                    benchmarkStatus = "Probe done. See chat for result."
+                    messages.append(ChatMessage(role: .system, content: summary))
+                }
+            } catch {
+                await MainActor.run {
+                    benchmarkStatus = ""
+                    messages.append(ChatMessage(
+                        role: .system,
+                        content: "[Probe] Failed: \(error.localizedDescription)"))
+                }
             }
         }
     }

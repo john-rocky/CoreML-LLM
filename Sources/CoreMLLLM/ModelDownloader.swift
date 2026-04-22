@@ -113,10 +113,25 @@ public final class ModelDownloader: NSObject {
             downloadURL: "",
             folderName: "gemma4-e2b-eagle3")
 
-        /// Visible in the UI picker. EAGLE-3 variant is hidden unless
-        /// `LLM_SHOW_EXPERIMENTAL=1` is set (or the UserDefaults key
-        /// `showExperimentalModels` is true). Keeps production picker
-        /// clean while letting devs flip the flag for sideload testing.
+        /// Gemma 4 E2B + LookAhead K=8 probe bundle. Same base as gemma4e2b
+        /// but the four chunks are multifunction (decode_q1 + verify_qK=8)
+        /// and a `probe.marker` file asks LLMRunner to auto-enable
+        /// `SPECULATIVE_PROFILE` so verify chunks actually load. Sideloaded
+        /// to `Documents/Models/gemma4-e2b-lookahead-probe/` — keeps the
+        /// production `gemma4-e2b/` bundle untouched so users can flip
+        /// between the two from the model picker. See
+        /// `docs/LOOKAHEAD_PROBE_RESULTS.md` for the workflow.
+        public static let gemma4e2bLookaheadProbe = ModelInfo(
+            id: "gemma4-e2b-lookahead-probe", name: "Gemma 4 E2B + LookAhead (K=8, probe)",
+            size: "5.7 GB",
+            downloadURL: "",
+            folderName: "gemma4-e2b-lookahead-probe")
+
+        /// Visible in the UI picker. EAGLE-3 / LookAhead probe variants are
+        /// hidden unless `LLM_SHOW_EXPERIMENTAL=1` is set (or the
+        /// UserDefaults key `showExperimentalModels` is true). Keeps the
+        /// production picker clean while letting devs flip the flag for
+        /// sideload testing.
         public static var defaults: [ModelInfo] {
             let experimental =
                 ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
@@ -124,6 +139,7 @@ public final class ModelDownloader: NSObject {
             var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b, qwen35_08b]
             if experimental {
                 list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
+                list.insert(gemma4e2bLookaheadProbe, at: 3)  // after EAGLE-3
             }
             return list
         }
