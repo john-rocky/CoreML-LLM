@@ -127,16 +127,6 @@ public final class ModelDownloader: NSObject {
             downloadURL: "",
             folderName: "gemma4-e2b-lookahead-probe")
 
-        /// Gemma 4 E2B LoRA-fine-tuned on D. Carnegie's "How to Win Friends
-        /// and Influence People" 30 principles. Built by the sibling
-        /// `finetune/` pipeline (MLX-LM LoRA → fuse → coreml-llm bundle).
-        /// Sideload-only; app treats folder as "downloaded" when present
-        /// at `Documents/Models/gemma4-e2b-carnegie/`.
-        public static let gemma4e2bCarnegie = ModelInfo(
-            id: "gemma4-e2b-carnegie", name: "Gemma 4 E2B (Carnegie FT)", size: "3.7 GB",
-            downloadURL: "",
-            folderName: "gemma4-e2b-carnegie")
-
         /// Visible in the UI picker. EAGLE-3 / LookAhead probe variants are
         /// hidden unless `LLM_SHOW_EXPERIMENTAL=1` is set (or the
         /// UserDefaults key `showExperimentalModels` is true). Keeps the
@@ -146,10 +136,10 @@ public final class ModelDownloader: NSObject {
             let experimental =
                 ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
                 || UserDefaults.standard.bool(forKey: "showExperimentalModels")
-            var list: [ModelInfo] = [gemma4e2b, gemma4e2bCarnegie, gemma4e4b, qwen25_05b, qwen35_08b]
+            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b, qwen35_08b]
             if experimental {
-                list.insert(gemma4e2bEagle3, at: 3)  // after gemma4e4b
-                list.insert(gemma4e2bLookaheadProbe, at: 4)  // after EAGLE-3
+                list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
+                list.insert(gemma4e2bLookaheadProbe, at: 3)  // after EAGLE-3
             }
             return list
         }
