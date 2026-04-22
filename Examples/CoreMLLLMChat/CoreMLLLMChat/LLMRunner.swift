@@ -285,13 +285,15 @@ final class LLMRunner {
                 var emittedText = ""
                 var tokenCount = 0
                 do {
-                    // rep_penalty 1.1 breaks degenerate loops caused by
-                    // INT8 quantization noise compounding through the SSM
-                    // state recurrence. On fp16 it's a near no-op (fp16
-                    // greedy already converges on EOS for short prompts).
+                    // Plain greedy — Mac ANE bench (INT8 / FP16) shows no
+                    // loops once the full Qwen EOS set is honored
+                    // (248044/248045/248046). rep_penalty previously
+                    // compensated for an EOS miss, not a real loop. Keep
+                    // the path available by upping this arg when
+                    // investigating.
                     _ = try await gen.generate(
                         inputIds: inputIdsInt32, maxNewTokens: maxNew,
-                        temperature: 0.0, topK: 40, repetitionPenalty: 1.1,
+                        temperature: 0.0, topK: 40, repetitionPenalty: 1.0,
                         eosTokenIds: eosSet,
                         onToken: { [weak self] tokenId in
                             tokenCount += 1
