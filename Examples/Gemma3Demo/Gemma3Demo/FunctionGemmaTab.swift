@@ -72,26 +72,38 @@ final class FunctionGemmaModel: ObservableObject {
         ],
     ]
 
-    func load(hfToken: String?) async {
-        state = .downloading(progress: 0, file: "")
+    func load() async {
         do {
             let dir = FileManager.default
                 .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent("Gemma3Demo")
             try FileManager.default.createDirectory(
                 at: dir, withIntermediateDirectories: true)
-            runner = try await FunctionGemma.downloadAndLoad(
-                modelsDir: dir,
-                hfToken: hfToken?.isEmpty == false ? hfToken : nil,
-                onProgress: { [weak self] p in
-                    Task { @MainActor in
-                        let pct = p.bytesTotal > 0
-                            ? Double(p.bytesReceived) / Double(p.bytesTotal)
-                            : 0
-                        self?.state = .downloading(progress: pct, file: p.currentFile)
+
+            // If the bundle is already on disk, skip straight to the loading
+            // phase — otherwise the UI would flash "Downloading 100%" for a
+            // few seconds while the downloader just confirms files exist.
+            let bundleURL: URL
+            if let cached = Gemma3BundleDownloader.localBundle(.functionGemma270m, under: dir) {
+                bundleURL = cached
+            } else {
+                state = .downloading(progress: 0, file: "")
+                bundleURL = try await Gemma3BundleDownloader.download(
+                    .functionGemma270m,
+                    into: dir,
+                    onProgress: { [weak self] p in
+                        Task { @MainActor in
+                            let pct = p.bytesTotal > 0
+                                ? Double(p.bytesReceived) / Double(p.bytesTotal)
+                                : 0
+                            self?.state = .downloading(progress: pct, file: p.currentFile)
+                        }
                     }
-                }
-            )
+                )
+            }
+
+            state = .loading
+            runner = try await FunctionGemma.load(bundleURL: bundleURL)
             state = .ready
         } catch {
             state = .failed(error.localizedDescription)
@@ -128,7 +140,6 @@ struct FunctionGemmaTab: View {
     @StateObject private var m = FunctionGemmaModel()
     @State private var prompt: String = "Turn on the flashlight"
     @State private var maxNew: Double = 80
-    @State private var hfToken: String = ""
 
     private let examples = [
         "Turn on the flashlight",
@@ -195,17 +206,16 @@ struct FunctionGemmaTab: View {
     }
 
     private var loadUI: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            TextField("HF token (only if model is gated)", text: $hfToken)
-                .textFieldStyle(.roundedBorder)
-                .autocapitalization(.none)
-                .disableAutocorrection(true)
-            Button("Download & Load") {
-                Task { await m.load(hfToken: hfToken) }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled({ if case .downloading = m.state { true } else { false } }())
+        Button("Download & Load") {
+            Task { await m.load() }
         }
+        .buttonStyle(.borderedProminent)
+        .disabled({
+            switch m.state {
+            case .downloading, .loading: return true
+            default: return false
+            }
+        }())
     }
 
     private var generateUI: some View {

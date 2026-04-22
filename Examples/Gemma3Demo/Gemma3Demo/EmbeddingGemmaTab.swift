@@ -18,8 +18,7 @@ final class EmbeddingGemmaModel: ObservableObject {
 
     private var runner: EmbeddingGemma?
 
-    func load(hfToken: String?) async {
-        state = .downloading(progress: 0, file: "")
+    func load() async {
         do {
             let dir = FileManager.default
                 .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -27,18 +26,27 @@ final class EmbeddingGemmaModel: ObservableObject {
             try FileManager.default.createDirectory(
                 at: dir, withIntermediateDirectories: true)
 
-            runner = try await EmbeddingGemma.downloadAndLoad(
-                modelsDir: dir,
-                hfToken: hfToken?.isEmpty == false ? hfToken : nil,
-                onProgress: { [weak self] p in
-                    Task { @MainActor in
-                        let pct = p.bytesTotal > 0
-                            ? Double(p.bytesReceived) / Double(p.bytesTotal)
-                            : 0
-                        self?.state = .downloading(progress: pct, file: p.currentFile)
+            let bundleURL: URL
+            if let cached = Gemma3BundleDownloader.localBundle(.embeddingGemma300m, under: dir) {
+                bundleURL = cached
+            } else {
+                state = .downloading(progress: 0, file: "")
+                bundleURL = try await Gemma3BundleDownloader.download(
+                    .embeddingGemma300m,
+                    into: dir,
+                    onProgress: { [weak self] p in
+                        Task { @MainActor in
+                            let pct = p.bytesTotal > 0
+                                ? Double(p.bytesReceived) / Double(p.bytesTotal)
+                                : 0
+                            self?.state = .downloading(progress: pct, file: p.currentFile)
+                        }
                     }
-                }
-            )
+                )
+            }
+
+            state = .loading
+            runner = try await EmbeddingGemma.load(bundleURL: bundleURL)
             state = .ready
         } catch {
             state = .failed(error.localizedDescription)
@@ -74,7 +82,6 @@ struct EmbeddingGemmaTab: View {
     @State private var textA: String = "The cat sat on the mat."
     @State private var textB: String = "A feline rested on the rug."
     @State private var dim: Int = 768
-    @State private var hfToken: String = ""
 
     private let dimOptions = [768, 512, 256, 128]
 
@@ -128,17 +135,16 @@ struct EmbeddingGemmaTab: View {
     }
 
     private var loadUI: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            TextField("HF token (only if model is gated)", text: $hfToken)
-                .textFieldStyle(.roundedBorder)
-                .autocapitalization(.none)
-                .disableAutocorrection(true)
-            Button("Download & Load") {
-                Task { await m.load(hfToken: hfToken) }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled({ if case .downloading = m.state { true } else { false } }())
+        Button("Download & Load") {
+            Task { await m.load() }
         }
+        .buttonStyle(.borderedProminent)
+        .disabled({
+            switch m.state {
+            case .downloading, .loading: return true
+            default: return false
+            }
+        }())
     }
 
     private var compareUI: some View {
