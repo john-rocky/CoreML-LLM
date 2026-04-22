@@ -54,6 +54,20 @@ MODEL_REGISTRY: dict[str, ConversionConfig] = {
         max_context_length=131072,
         description="Gemma 4 E4B Instruct - 4B-effective text decoder (42 layers, hidden=2560, 2 KV heads)",
     ),
+    "functiongemma-270m": ConversionConfig(
+        hf_repo="google/functiongemma-270m-it",
+        architecture="gemma3",
+        default_context_length=2048,
+        max_context_length=32768,
+        description="FunctionGemma 270M - Gemma 3 decoder fine-tuned for function calling",
+    ),
+    "embeddinggemma-300m": ConversionConfig(
+        hf_repo="google/embeddinggemma-300m",
+        architecture="gemma3-embedding",
+        default_context_length=2048,
+        max_context_length=2048,
+        description="EmbeddingGemma 300M - Gemma 3 bidirectional encoder, 768-d sentence embedding (Matryoshka)",
+    ),
 }
 
 

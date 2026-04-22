@@ -195,9 +195,13 @@ class CoreMLExporter:
         print("\nBuilding monolithic wrapper...")
 
         # Use architecture-specific wrapper if available
-        if hasattr(self.model, '__class__') and 'Gemma4' in self.model.__class__.__name__:
+        cls_name = self.model.__class__.__name__
+        if 'Gemma4' in cls_name:
             from models.gemma4_wrapper import Gemma4MonolithicWrapper
             wrapper = Gemma4MonolithicWrapper(self.model)
+        elif 'Gemma3' in cls_name:
+            from models.gemma3_wrapper import Gemma3MonolithicWrapper
+            wrapper = Gemma3MonolithicWrapper(self.model)
         else:
             wrapper = MonolithicWrapper(self.model)
         wrapper.eval()

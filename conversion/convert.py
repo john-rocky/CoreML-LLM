@@ -123,7 +123,19 @@ def main():
     else:
         model_path = download_model(hf_repo, args.output)
 
-    # Load model
+    # EmbeddingGemma uses a dedicated stateless encoder export path.
+    if architecture == "gemma3-embedding":
+        from build_embeddinggemma_bundle import build_bundle
+        build_bundle(
+            model_path=model_path,
+            output_dir=args.output,
+            quantize=quantize,
+            max_seq_len=context_length,
+        )
+        print("\nDone! EmbeddingGemma bundle written to", args.output)
+        return
+
+    # Load model (causal decoder path).
     print(f"\nLoading {architecture} model from {model_path}...")
     model_class = _get_model_class(architecture)
     model = model_class.from_pretrained(model_path, context_length=context_length)
@@ -160,6 +172,10 @@ def _detect_architecture(repo_id: str) -> str:
         return "qwen3"
     if "gemma-4" in repo_lower or "gemma4" in repo_lower:
         return "gemma4"
+    if "embeddinggemma" in repo_lower:
+        return "gemma3-embedding"
+    if "functiongemma" in repo_lower or "gemma-3" in repo_lower or "gemma3" in repo_lower:
+        return "gemma3"
     if "llama" in repo_lower or "smollm" in repo_lower:
         return "llama"
     raise ValueError(
@@ -200,6 +216,15 @@ def _get_model_class(architecture: str):
     if architecture == "gemma4":
         from models.gemma4 import Gemma4Model
         return Gemma4Model
+    if architecture == "gemma3":
+        from models.gemma3 import Gemma3Model
+        return Gemma3Model
+    if architecture == "gemma3-embedding":
+        raise ValueError(
+            "gemma3-embedding (EmbeddingGemma) uses a dedicated export path. "
+            "Run: python conversion/build_embeddinggemma_bundle.py --model-id "
+            "google/embeddinggemma-300m --output output/embeddinggemma-300m"
+        )
     raise ValueError(f"Unsupported architecture: {architecture}")
 
 
