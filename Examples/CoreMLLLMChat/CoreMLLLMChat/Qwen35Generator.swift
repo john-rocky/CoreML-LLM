@@ -479,22 +479,97 @@ final class Qwen35Generator {
     ///   3. fp16 (1.4 GB, ground-truth precision)
     func loadDecodeOnly() throws {
         let dCfg = MLModelConfiguration(); dCfg.computeUnits = cfg.decodeUnits
+        let loadedURL: URL
+        let variant: String
         if let url = try? resolveModelURL("qwen3_5_0_8b_decode_argmax_fp16_mseq128") {
             decode = try MLModel(contentsOf: url, configuration: dCfg)
             decodeHasInGraphArgmax = true
-            status = "Loaded decode-argmax on \(unitsName(cfg.decodeUnits))"
-            return
-        }
-        if let url = try? resolveModelURL("qwen3_5_0_8b_decode_int8_mseq128") {
+            loadedURL = url; variant = "argmax-fp16"
+        } else if let url = try? resolveModelURL("qwen3_5_0_8b_decode_int8_mseq128") {
             decode = try MLModel(contentsOf: url, configuration: dCfg)
             decodeHasInGraphArgmax = false
-            status = "Loaded decode (int8) on \(unitsName(cfg.decodeUnits))"
-            return
+            loadedURL = url; variant = "int8"
+        } else {
+            let dURL = try resolveModelURL("qwen3_5_0_8b_decode_fp16_mseq128")
+            decode = try MLModel(contentsOf: dURL, configuration: dCfg)
+            decodeHasInGraphArgmax = false
+            loadedURL = dURL; variant = "fp16"
         }
-        let dURL = try resolveModelURL("qwen3_5_0_8b_decode_fp16_mseq128")
-        decode = try MLModel(contentsOf: dURL, configuration: dCfg)
-        decodeHasInGraphArgmax = false
-        status = "Loaded decode (fp16) on \(unitsName(cfg.decodeUnits))"
+        status = "Loaded decode (\(variant)) on \(unitsName(cfg.decodeUnits))"
+        // Diagnostic: print ANE op-placement percentage so we can verify
+        // the chosen compute units are actually being honored. Prior bug:
+        // default silently ran on GPU despite being set to ANE, because a
+        // debug override wasn't reverted. Logging here catches that.
+        auditComputePlan(url: loadedURL, requestedUnits: cfg.decodeUnits, variant: variant)
+    }
+
+    private func auditComputePlan(url: URL, requestedUnits: MLComputeUnits, variant: String) {
+        let cfg = MLModelConfiguration(); cfg.computeUnits = requestedUnits
+        Task.detached(priority: .utility) {
+            guard #available(iOS 17.0, *) else { return }
+            do {
+                let plan = try await MLComputePlan.load(contentsOf: url, configuration: cfg)
+                guard case .program(let program) = plan.modelStructure else {
+                    print("[Qwen35] compute plan: structure is not a program")
+                    return
+                }
+                var total = 0, ane = 0, gpu = 0, cpu = 0, other = 0
+                for (_, fn) in program.functions {
+                    Self.walkOps(fn.block, plan: plan,
+                                  total: &total, ane: &ane, gpu: &gpu,
+                                  cpu: &cpu, other: &other)
+                }
+                let compute = max(1, total)
+                print(String(format:
+                    "[Qwen35] compute plan (\(variant), requested=\(Self.unitsLabel(requestedUnits))): total=%d ANE=%d (%.1f%%) GPU=%d (%.1f%%) CPU=%d (%.1f%%)",
+                    total, ane, 100.0*Double(ane)/Double(compute),
+                    gpu, 100.0*Double(gpu)/Double(compute),
+                    cpu, 100.0*Double(cpu)/Double(compute)))
+            } catch {
+                print("[Qwen35] compute plan audit failed: \(error)")
+            }
+        }
+    }
+
+    private static func unitsLabel(_ u: MLComputeUnits) -> String {
+        switch u {
+        case .cpuOnly: return "CPU"
+        case .cpuAndGPU: return "GPU"
+        case .cpuAndNeuralEngine: return "ANE"
+        case .all: return "All"
+        @unknown default: return "?"
+        }
+    }
+
+    @available(iOS 17.0, *)
+    private static func walkOps(_ block: MLModelStructure.Program.Block,
+                                 plan: MLComputePlan,
+                                 total: inout Int, ane: inout Int,
+                                 gpu: inout Int, cpu: inout Int,
+                                 other: inout Int) {
+        let constOps: Set<String> = [
+            "const", "constexpr_lut_to_dense", "constexpr_affine_dequantize",
+            "constexpr_blockwise_shift_scale", "constexpr_sparse_to_dense",
+            "constexpr_cast",
+        ]
+        for op in block.operations {
+            if constOps.contains(op.operatorName) {
+                for inner in op.blocks { walkOps(inner, plan: plan,
+                    total: &total, ane: &ane, gpu: &gpu, cpu: &cpu, other: &other) }
+                continue
+            }
+            total += 1
+            let dev = plan.deviceUsage(for: op)?.preferred
+            if dev is MLNeuralEngineComputeDevice { ane += 1 }
+            else if dev is MLGPUComputeDevice     { gpu += 1 }
+            else if dev is MLCPUComputeDevice     { cpu += 1 }
+            else                                  { other += 1 }
+            for inner in op.blocks {
+                walkOps(inner, plan: plan,
+                        total: &total, ane: &ane, gpu: &gpu,
+                        cpu: &cpu, other: &other)
+            }
+        }
     }
 
     /// Build zero-initialized state tensors matching the decode inputs.
