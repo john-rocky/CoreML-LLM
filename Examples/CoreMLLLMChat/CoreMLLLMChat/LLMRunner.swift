@@ -260,8 +260,14 @@ final class LLMRunner {
         }
         let maxNew = min(remaining, 120)  // soft cap to avoid long hangs
 
-        // EOS: Qwen <|im_end|> is 248046; also respect tokenizer's reported EOS.
-        var eosSet: Set<Int32> = [248046]
+        // Qwen3.5 has multiple stop tokens that all legitimately end a
+        // turn. Stopping on any of them prevents the model from leaking
+        // the text of a special token (e.g. "<|endoftext|>") into the
+        // visible stream and then fabricating a new "Human:" turn.
+        //   248044 = <|endoftext|>
+        //   248045 = <|im_start|>   (start of next turn — we should stop)
+        //   248046 = <|im_end|>     (end of current turn)
+        var eosSet: Set<Int32> = [248044, 248045, 248046]
         if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
 
         let genStart = Date()
