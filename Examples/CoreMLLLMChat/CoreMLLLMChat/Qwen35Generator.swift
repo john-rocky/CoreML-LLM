@@ -481,19 +481,25 @@ final class Qwen35Generator {
         let dCfg = MLModelConfiguration(); dCfg.computeUnits = cfg.decodeUnits
         let loadedURL: URL
         let variant: String
-        if let url = try? resolveModelURL("qwen3_5_0_8b_decode_argmax_fp16_mseq128") {
+        // 2B INT8 preferred when present (opt-in via Documents/ push);
+        // falls back to 0.8B variants otherwise.
+        if let url = try? resolveModelURL("qwen3_5_2b_decode_int8_mseq128") {
+            decode = try MLModel(contentsOf: url, configuration: dCfg)
+            decodeHasInGraphArgmax = false
+            loadedURL = url; variant = "2B-int8"
+        } else if let url = try? resolveModelURL("qwen3_5_0_8b_decode_argmax_fp16_mseq128") {
             decode = try MLModel(contentsOf: url, configuration: dCfg)
             decodeHasInGraphArgmax = true
-            loadedURL = url; variant = "argmax-fp16"
+            loadedURL = url; variant = "0.8B-argmax-fp16"
         } else if let url = try? resolveModelURL("qwen3_5_0_8b_decode_int8_mseq128") {
             decode = try MLModel(contentsOf: url, configuration: dCfg)
             decodeHasInGraphArgmax = false
-            loadedURL = url; variant = "int8"
+            loadedURL = url; variant = "0.8B-int8"
         } else {
             let dURL = try resolveModelURL("qwen3_5_0_8b_decode_fp16_mseq128")
             decode = try MLModel(contentsOf: dURL, configuration: dCfg)
             decodeHasInGraphArgmax = false
-            loadedURL = dURL; variant = "fp16"
+            loadedURL = dURL; variant = "0.8B-fp16"
         }
         status = "Loaded decode (\(variant)) on \(unitsName(cfg.decodeUnits))"
         // Diagnostic: print ANE op-placement percentage so we can verify
