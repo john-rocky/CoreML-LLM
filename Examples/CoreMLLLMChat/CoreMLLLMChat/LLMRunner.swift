@@ -63,13 +63,16 @@ final class LLMRunner {
         loadingStatus = "Loading..."
 
         // LookAhead K=8 probe bundles ship a `probe.marker` file so the runner
-        // can enable verify-chunk loading without requiring the user to set
-        // SPECULATIVE_PROFILE in the Xcode scheme. Normal bundles don't have
-        // this file, so their load path is unchanged.
+        // can enable verify-chunk loading AND auto-route decode through
+        // LookaheadEngine without requiring the user to set env vars in the
+        // Xcode scheme. Normal bundles don't have this file, so their load
+        // path is unchanged.
         let probeMarker = folder.appendingPathComponent("probe.marker")
-        if FileManager.default.fileExists(atPath: probeMarker.path) {
+        let isProbeBundle = FileManager.default.fileExists(atPath: probeMarker.path)
+        if isProbeBundle {
             setenv("SPECULATIVE_PROFILE", "1", 1)
-            print("[LLMRunner] probe.marker detected — SPECULATIVE_PROFILE=1 forced for verify loading")
+            setenv("LLM_LOOKAHEAD_ENABLE", "1", 1)
+            print("[LLMRunner] probe.marker detected — SPECULATIVE_PROFILE=1 + LLM_LOOKAHEAD_ENABLE=1 forced")
         }
 
         llm = try await CoreMLLLM.load(from: folder) { [weak self] status in
