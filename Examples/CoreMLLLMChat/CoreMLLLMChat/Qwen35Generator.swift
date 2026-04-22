@@ -559,11 +559,15 @@ final class Qwen35Generator {
                 continue
             }
             total += 1
-            let dev = plan.deviceUsage(for: op)?.preferred
-            if dev is MLNeuralEngineComputeDevice { ane += 1 }
-            else if dev is MLGPUComputeDevice     { gpu += 1 }
-            else if dev is MLCPUComputeDevice     { cpu += 1 }
-            else                                  { other += 1 }
+            // MLComputeDevice is an enum in iOS 18+; the `is SomeDevice`
+            // type check we used first doesn't match — all ops fell into
+            // `other`. Use pattern matching on the enum cases.
+            switch plan.deviceUsage(for: op)?.preferred {
+            case .cpu:          cpu += 1
+            case .gpu:          gpu += 1
+            case .neuralEngine: ane += 1
+            default:            other += 1
+            }
             for inner in op.blocks {
                 walkOps(inner, plan: plan,
                         total: &total, ane: &ane, gpu: &gpu,
@@ -791,11 +795,22 @@ final class Qwen35Generator {
                                  rng: inout SystemRandomNumberGenerator) -> Int32 {
         // Fast path: argmax directly on the MLMultiArray without allocating
         // a 248K Float buffer. Single pass, stride-safe fp16 read, no
-        // intermediate NaN-filtered copy. Requires rep_penalty == 1.0
-        // (no-op); otherwise we need the full logits buffer to apply
-        // the penalty on recent tokens before picking the max.
-        if temperature <= 0 && repetitionPenalty <= 1.0 {
-            return fastArgmax(arr, position: position, vocab: vocab)
+        // intermediate NaN-filtered copy.
+        //  - No rep_penalty → plain fastArgmax.
+        //  - With rep_penalty in greedy mode → single-pass argmax that
+        //    also tracks the best "non-recent" token, so if the global
+        //    argmax is in the recent window we can fall back to the
+        //    non-recent best without a second scan or a 1MB Float buffer.
+        if temperature <= 0 {
+            if repetitionPenalty <= 1.0 {
+                return fastArgmax(arr, position: position, vocab: vocab)
+            }
+            let start = max(0, priorTokens.count - recentN)
+            var recent = Set<Int32>()
+            recent.reserveCapacity(priorTokens.count - start)
+            for i in start..<priorTokens.count { recent.insert(priorTokens[i]) }
+            return fastArgmaxAvoidingRecent(arr, position: position,
+                                              vocab: vocab, recent: recent)
         }
         // Sampling / rep-penalty path reuses the pre-allocated logitsBuffer
         // to avoid 1 MB heap allocation every decode step.
@@ -863,6 +878,52 @@ final class Qwen35Generator {
             if r < acc { return Int32(topIdx[i]) }
         }
         return Int32(topIdx[topIdx.count - 1])
+    }
+
+    /// Greedy argmax that rejects the best token if it's in `recent`,
+    /// returning the next-best non-recent token instead. Single pass
+    /// over the 248K vocab in fp16 without any intermediate buffer —
+    /// same cost as `fastArgmax` plus a Set lookup per iteration.
+    ///
+    /// This is the loop-breaking path used when rep_penalty > 1.0 on
+    /// greedy decode: INT8 quantization noise compounding the SSM state
+    /// can pin the argmax onto a repeating token; rejecting it once per
+    /// step is enough to escape.
+    private func fastArgmaxAvoidingRecent(_ arr: MLMultiArray, position: Int,
+                                           vocab: Int, recent: Set<Int32>) -> Int32 {
+        let strides = arr.strides.map(\.intValue)
+        let reportedV = strides.last ?? 0
+        let reportedP = strides.count >= 2 ? strides[strides.count - 2] : 0
+        let vStride = (reportedV >= 1 && reportedP >= vocab) ? reportedV : 1
+        let pStride = (reportedV >= 1 && reportedP >= vocab) ? reportedP : vocab
+        let offset = position * pStride
+        var bestIdx = 0
+        var bestV: Float16 = -.infinity
+        var bestAltIdx = 0
+        var bestAltV: Float16 = -.infinity
+        if arr.dataType == .float16, vStride == 1 {
+            let p = arr.dataPointer.assumingMemoryBound(to: Float16.self).advanced(by: offset)
+            for v in 0..<vocab {
+                let x = p[v]
+                if x > bestV { bestV = x; bestIdx = v }
+                if !recent.contains(Int32(v)) && x > bestAltV {
+                    bestAltV = x; bestAltIdx = v
+                }
+            }
+        } else {
+            // Fallback: stride-aware or fp32 via general path
+            let logits = copyLogits(arr, position: position, vocab: vocab)
+            var bestF: Float = -.infinity
+            var bestAltF: Float = -.infinity
+            for v in 0..<vocab {
+                let x = logits[v]
+                if x > bestF { bestF = x; bestIdx = v }
+                if !recent.contains(Int32(v)) && x > bestAltF {
+                    bestAltF = x; bestAltIdx = v
+                }
+            }
+        }
+        return recent.contains(Int32(bestIdx)) ? Int32(bestAltIdx) : Int32(bestIdx)
     }
 
     private func argmaxAtPosition(_ arr: MLMultiArray, position: Int, vocab: Int) -> Int32 {
