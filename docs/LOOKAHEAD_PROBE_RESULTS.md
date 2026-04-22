@@ -46,27 +46,39 @@ Copies `coreml-llm-artifacts/backup-iphone-2k/` as base (no drafter artefacts,
 bundles at `backup-iphone-2k/` and on-device `Documents/Models/gemma4-e2b/`
 are NOT modified.
 
-**iPhone (sideload — back up first per `docs/USB_MODEL_SIDELOAD.md`):**
+**iPhone (sideload — sibling folder, production bundle preserved):**
+
+The probe bundle is pushed to `Documents/Models/gemma4-e2b-lookahead-probe/`
+so the existing `Documents/Models/gemma4-e2b/` (2K production) bundle is
+NOT touched. ModelDownloader exposes both in the picker when
+`LLM_SHOW_EXPERIMENTAL=1` is set (Xcode scheme → Run → Environment).
+
 ```bash
 DEVICE=$(xcrun devicectl list devices | awk '/connected/{print $3}' | head -1)
 
-# 1. Backup current device bundle
-xcrun devicectl device copy from \
-  --device "$DEVICE" \
-  --domain-type appDataContainer \
-  --domain-identifier com.example.CoreMLLLMChat \
-  --source Documents/Models/gemma4-e2b \
-  --destination ~/Downloads/coreml-llm-artifacts/backup-pre-k8-probe-$(date +%Y%m%d-%H%M)
-
-# 2. Push probe bundle
+# No backup needed — this writes to a NEW folder. Existing gemma4-e2b/ stays.
 xcrun devicectl device copy to \
   --device "$DEVICE" \
   --domain-type appDataContainer \
   --domain-identifier com.example.CoreMLLLMChat \
   --source /Users/majimadaisuke/Downloads/device_deploy_lookahead_probe \
-  --destination Documents/Models/gemma4-e2b \
-  --remove-existing-content true
+  --destination Documents/Models/gemma4-e2b-lookahead-probe
+
+# Verify both bundles are present:
+xcrun devicectl device info files \
+  --device "$DEVICE" \
+  --domain-type appDataContainer \
+  --domain-identifier com.example.CoreMLLLMChat \
+  --subdirectory Documents/Models
 ```
+
+On the app side:
+1. Add `LLM_SHOW_EXPERIMENTAL=1` to the Xcode scheme's Run → Environment
+   (picker shows "Gemma 4 E2B + LookAhead (K=8, probe)" entry).
+2. Launch app → `Switch` → select the probe entry → Load.
+3. `Probe → Verify K=8 (25 iter)` → verdict appears in chat.
+4. (Optional) `Switch` back to `Gemma 4 E2B` to return to the 2K production
+   bundle — both sit side-by-side on device.
 
 **iPhone (measurement):**
 Build `verify-k8-probe` for iOS (add to CoreMLLLMChat app or run via Xcode

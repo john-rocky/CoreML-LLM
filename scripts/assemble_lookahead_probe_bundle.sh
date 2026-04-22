@@ -57,18 +57,21 @@ if [[ -f "$META" ]]; then
 fi
 
 echo "[bundle] done. Probe bundle at: $DEST"
-echo "[bundle] deploy with:"
+echo "[bundle] Deploy to a SIBLING directory on device so the existing"
+echo "[bundle] gemma4-e2b (2K production) bundle is preserved. ModelDownloader"
+echo "[bundle] exposes both as separate picker entries when LLM_SHOW_EXPERIMENTAL=1"
+echo "[bundle] is set in the Xcode scheme."
 cat <<EOF
   DEVICE=\$(xcrun devicectl list devices | awk '/connected/{print \$3}' | head -1)
-  xcrun devicectl device copy from --device "\$DEVICE" \\
-      --domain-type appDataContainer \\
-      --domain-identifier com.example.CoreMLLLMChat \\
-      --source Documents/Models/gemma4-e2b \\
-      --destination ~/Downloads/coreml-llm-artifacts/backup-pre-k8-probe-\$(date +%Y%m%d-%H%M)
+  # No backup needed — we write to a NEW folder. Existing gemma4-e2b/ stays.
   xcrun devicectl device copy to --device "\$DEVICE" \\
       --domain-type appDataContainer \\
       --domain-identifier com.example.CoreMLLLMChat \\
       --source $DEST \\
-      --destination Documents/Models/gemma4-e2b \\
-      --remove-existing-content true
+      --destination Documents/Models/gemma4-e2b-lookahead-probe
+  # Verify the existing bundle is still there:
+  xcrun devicectl device info files --device "\$DEVICE" \\
+      --domain-type appDataContainer \\
+      --domain-identifier com.example.CoreMLLLMChat \\
+      --subdirectory Documents/Models
 EOF
