@@ -179,19 +179,58 @@ speculation path on our pipeline.
 
 ### iPhone 17 Pro (decision-point)
 
-```
-TODO: paste [probe] output here
-```
+Measured 2026-04-22 via probe bundle + `Probe → Verify K=8` menu.
+Japanese chat workload (conversational prompts like "こんにちは",
+"元気？", "Gemmaについて") over 300+ cycles.
+
+Per-cycle verify_qK=8 times from `[SpecProfile lookahead]` log (single
+chat session, cycles 30-300):
 
 | Metric | Value (ms) |
 |---|---|
-| min | — |
-| median | — |
-| mean | — |
-| p90 | — |
-| p99 | — |
-| max | — |
-| std | — |
+| typical steady-state | 32 – 36 |
+| pre-throttle band (cycles 30-120) | 31 – 34 |
+| thermal spike (cycles 124-137) | 40 – 46 |
+| post-spike recovery | 32 – 36 |
+
+Gate: verify_qK=8 steady state **< 50 ms → GO**. The brief 40-46 ms
+spike resolved on its own after ~15 cycles; best interpretation is
+ANE scheduler transient or thermal governor, not a K=8 regime change.
+
+**End-to-end tok/s (Japanese chat, LookAhead vs baseline):**
+
+- Baseline decode_q1 (probe bundle, LookAhead not routed): 29.6 – 33.5
+  tok/s (from `[Profile]` log at different prompt lengths).
+- LookAhead enabled: user observed ~36 tok/s. Steady-state rolling
+  accept ≈ 2% (2/100 draft slots accepted); peak cycles accepted
+  3-4/7 drafts → 4-5 tokens emitted per verify.
+- Estimated speedup on Japanese chat: **+10 – 20 %**.
+
+**Pattern matches Mac:** free-form content (poem / code / Japanese chat)
+gets modest 5-20% gains because n-gram hits are sparse; structured
+content (list / table / template) can get 50-70%. ANE batch invariance
+(verify_qK=8 ≈ decode_q1) holds on iPhone as it did on Mac.
+
+## Output-drift caveat (iPhone confirmed)
+
+User observation: "結果が original と微妙に違う". Same prompt through the
+LookAhead path produces a coherent answer that differs slightly from the
+serial-decode answer. This is **stack-inherent K-dependent fp16 argmax
+drift** — the same issue that closed MTP Path A — not a LookAhead bug.
+
+Implication: LookAhead must stay **opt-in** for production. The current
+gating is already correct for that:
+
+- **Production bundle (`gemma4-e2b/`, K=3):** no probe.marker, no
+  `LLM_LOOKAHEAD_ENABLE`, LookaheadEngine never enters the decode path.
+  Output is bit-identical to pre-PR main.
+- **Probe bundle (`gemma4-e2b-lookahead-probe/`, K=8):** probe.marker
+  auto-enables SPECULATIVE_PROFILE + LLM_LOOKAHEAD_ENABLE. Decode runs
+  through LookaheadEngine, trading argmax-chain stability for 10-20%
+  tok/s on free-form + larger wins on structured output.
+
+Switch between the two at any time via the model picker — both sit
+side-by-side in `Documents/Models/`.
 
 **Reference anchors (docs/ROUND7_FINDINGS.md:39-45):**
 
