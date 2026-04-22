@@ -226,7 +226,8 @@ def _write_model_config(out_dir: str, model_name: str, text_cfg: dict, ctx_lengt
     print(f"Wrote {path}")
 
 
-def _run_chunks_build(model_name: str, ctx: int, out_dir: str) -> None:
+def _run_chunks_build(model_name: str, ctx: int, out_dir: str,
+                      hf_dir: str | None = None) -> None:
     print(f"\nBuilding 4 chunks via build_verify_chunks.py --model {model_name} --ctx {ctx}")
     cmd = [
         sys.executable, os.path.join(ROOT, "build_verify_chunks.py"),
@@ -234,6 +235,8 @@ def _run_chunks_build(model_name: str, ctx: int, out_dir: str) -> None:
         "--ctx", str(ctx),
         "--output", out_dir,
     ]
+    if hf_dir:
+        cmd.extend(["--hf-dir", hf_dir])
     subprocess.check_call(cmd)
 
 
@@ -301,7 +304,7 @@ def main():
 
     chunks_dir = os.path.join(args.output, "chunks")
     if not args.skip_chunks:
-        _run_chunks_build(args.model, args.ctx, chunks_dir)
+        _run_chunks_build(args.model, args.ctx, chunks_dir, hf_dir=hf_dir)
     else:
         if not os.path.isdir(chunks_dir):
             raise SystemExit(f"--skip-chunks set but {chunks_dir} does not exist")
