@@ -264,6 +264,15 @@ final class LLMRunner {
         return AsyncStream { continuation in
             Task { [weak self] in
                 defer { Task { @MainActor in self?.isGenerating = false } }
+                // Accumulated-decode streaming. Qwen BPE often splits multi-
+                // byte UTF-8 (emoji, CJK glyphs) across multiple tokens —
+                // decoding each token individually yields broken UTF-8 that
+                // renders as mojibake (U+FFFD replacement characters). Keep
+                // a growing buffer of token IDs, decode the full sequence
+                // each step, and emit only the delta string. Cost is O(N²)
+                // in decode bytes but negligible at chat token rates.
+                var accumIds: [Int] = []
+                var emittedText = ""
                 var tokenCount = 0
                 do {
                     _ = try await gen.generate(
@@ -272,11 +281,15 @@ final class LLMRunner {
                         eosTokenIds: eosSet,
                         onToken: { [weak self] tokenId in
                             tokenCount += 1
-                            let id = Int(tokenId)
-                            // Skip EOS in visible stream
                             if eosSet.contains(tokenId) { return }
-                            let piece = tok.decode(tokens: [id])
-                            continuation.yield(piece)
+                            accumIds.append(Int(tokenId))
+                            let current = tok.decode(tokens: accumIds)
+                            if current.count > emittedText.count,
+                               current.hasPrefix(emittedText) {
+                                let delta = String(current.dropFirst(emittedText.count))
+                                continuation.yield(delta)
+                                emittedText = current
+                            }
                             let elapsed = Date().timeIntervalSince(genStart)
                             if elapsed > 0 {
                                 Task { @MainActor in
