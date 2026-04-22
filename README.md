@@ -1,10 +1,11 @@
 # CoreML-LLM
 
-**On-device LLMs on Apple Neural Engine** — Run **Gemma 4 E2B / E4B** on iPhone with CoreML, ANE-optimized, no server.
+**On-device LLMs on Apple Neural Engine** — Run **Gemma 4 E2B / E4B** and **Qwen3.5 0.8B** on iPhone with CoreML, ANE-optimized, no server.
 
 CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a good fit for always-on, battery-friendly inference. [MLX Swift](https://github.com/ml-explore/mlx-swift) is the best choice when you want maximum throughput from the GPU; CoreML-LLM is the answer when you want the LLM to live on the ANE so the GPU stays free.
 
-> **v0.8.0** — **Gemma 4 E4B** (42 layers, hidden=2560, ~14 tok/s on iPhone 17 Pro, 100% ANE). Second model option alongside E2B; swap in the Models picker. See [What's new](#whats-new).
+> **v1.0.0** — **Qwen3.5 0.8B** (hybrid Gated-DeltaNet SSM + attention, ~20 tok/s decode on iPhone 17 Pro, 99.9% ANE, 0 GB sustained Metal heap). First hybrid SSM/attention LLM shipped on CoreML. See [Qwen3.5 performance](#qwen35-08b-new-v100).
+> **v0.8.0** — **Gemma 4 E4B** (42 layers, hidden=2560, ~14 tok/s on iPhone 17 Pro, 100% ANE). Second model option alongside E2B; swap in the Models picker.
 > **v0.7.0** — Video multimodal: native video vision encoder (64 tokens/frame), uniform frame sampling with per-frame thumbnails, `<|video|>` placeholder + bidirectional vision group attention.
 
 <table>
@@ -54,6 +55,28 @@ Context length is 2048 on both variants. Extended context (8K) is under active d
 
 Ground-truth ANE placement measured via `MLComputePlan` (E2B: 7,294 / 7,310 dispatched LLM ops on ANE; E4B: 100%). Vision encoder runs on GPU by design.
 
+### Qwen3.5 0.8B (new, v1.0.0)
+
+First CoreML port of a hybrid SSM/attention LLM on iPhone. The 24 layers are 18× Gated-DeltaNet linear-attention (SSM) interleaved with 6× full GQA attention. Text-only.
+
+| | Qwen3.5 0.8B |
+|---|---:|
+| Parameters | ~0.8B |
+| Architecture | **Gated-DeltaNet SSM + attention (hybrid)** |
+| num_hidden_layers | 24 (18 SSM + 6 full-attn) |
+| hidden_size | 1024 |
+| Context length | 128 (decode mlpackage mseq) |
+| Decode speed (ANE) | **~20 tok/s** |
+| Decode speed (GPU) | ~22 tok/s (bit-exact) |
+| Prefill (ANE, non-stateful chunks) | ~170 tok/s (3× LiteRT-LM baseline) |
+| ANE placement | 99.9% |
+| Bundle size (fp16) | 1.4 GB |
+| Metal heap (ANE mode, sustained) | **0 GB** |
+
+Qwen3.5 is instruct-tuned — the app automatically wraps input in the chat template (`<|im_start|>`/`<|im_end|>`). On ANE, strict argmax-vs-fp32 top-1 match is 60% (argmax-fragility on 248K vocab), but oracle top-1 is in ANE top-3 for 100% of positions: sampling-mode generation is indistinguishable from fp32.
+
+First load triggers a ~4 min on-device ANE E5 compile; subsequent loads are cached.
+
 > **Memory:** ~1 GB `phys_footprint` (the iOS jetsam basis), measured via `task_vm_info`. Previous versions of this README quoted ~250 MB from Xcode's memory gauge, which underreports when CoreML loads INT4 palettized weights. The actual number is ~873 MB after load, ~981 MB during inference. `os_proc_available` remains ~5 GB on iPhone 17 Pro (8 GB RAM).
 
 ## Pre-converted Models
@@ -61,10 +84,16 @@ Ground-truth ANE placement measured via `MLComputePlan` (E2B: 7,294 / 7,310 disp
 | Model | Size | Multimodal | Download |
 |-------|------|------------|----------|
 | **Gemma 4 E2B** | 3.1 GB | Image + Video + Audio + Text | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
-| **Gemma 4 E4B** (new, v0.8.0) | 5.5 GB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml) |
+| **Gemma 4 E4B** (v0.8.0) | 5.5 GB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml) |
+| **Qwen3.5 0.8B** (new, v1.0.0) | 1.4 GB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML) |
 | Qwen2.5-0.5B | 302 MB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen2.5-0.5b-coreml) |
 
 The iOS sample app downloads models automatically. You can also convert your own.
+
+**Which model to pick?**
+- **Multimodal (image / video / audio)** → Gemma 4 E2B
+- **Text-only, maximum quality** → Gemma 4 E4B (~4B effective params)
+- **Text-only, minimum memory + zero GPU heap** → Qwen3.5 0.8B
 
 ## Quick Start
 
@@ -176,7 +205,14 @@ python convert.py --list
 
 ## What's new
 
-Current release: **v0.8.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases/tag/v0.8.0)).
+Current release: **v1.0.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases/tag/v1.0.0)).
+
+### v1.0.0 — Qwen3.5 0.8B (hybrid SSM + attention)
+
+- **Qwen3.5 0.8B on ANE** — hybrid Gated-DeltaNet SSM + attention model, 24 layers (18 linear-attention + 6 full-attention), 99.9% ANE operator placement. ~20 tok/s decode and ~170 tok/s prefill on iPhone 17 Pro. First CoreML port of a hybrid SSM/attention LLM we're aware of. Bundle at [`mlboydaisuke/qwen3.5-0.8B-CoreML`](https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML).
+- **Zero sustained Metal heap** — decode + recurrent prefill run entirely on ANE; GPU stays free for the rest of the app. Total memory ~1.6 GB (mostly the fp16 weight mmap).
+- **Integrated into the regular ChatView** — Qwen3.5 shows up in the main Models picker alongside Gemma; chat template is applied automatically (instruct-tuned model).
+- **Swift marshaling optimizations** — 1.5× decode throughput vs the naive Core ML call pattern. Custom `MLFeatureProvider` delegates state handoff zero-copy, reusable `MLMultiArray` pool for per-step inputs, single-pass native Float16 argmax (NEON-accelerated). Applies to Gemma as well via the same runner.
 
 ### v0.8.0 — Gemma 4 E4B
 
