@@ -72,6 +72,74 @@ private final class Qwen35DecodeFeatures: NSObject, MLFeatureProvider {
     }
 }
 
+/// Minimal feature provider used as the `aOut` argument to
+/// `Qwen35ChunkBFeatures` for the FIRST body chunk in the mmap-embed
+/// path. Holds a single pre-wrapped `hidden` feature value whose
+/// underlying MLMultiArray buffer is written per-step by
+/// `Qwen35Generator.embedLookup`. Lets the first body chunk reuse the
+/// same zero-copy feature-provider machinery as subsequent chunks.
+private final class Qwen35EmbedHiddenProvider: NSObject, MLFeatureProvider {
+    let fvHidden: MLFeatureValue
+    let featureNames: Set<String> = ["hidden"]
+    init(fvHidden: MLFeatureValue) {
+        self.fvHidden = fvHidden
+        super.init()
+    }
+    func featureValue(for featureName: String) -> MLFeatureValue? {
+        featureName == "hidden" ? fvHidden : nil
+    }
+}
+
+/// Chunked-path counterpart to `Qwen35DecodeFeatures` for chunk B.
+/// Reads `hidden_in` from the CURRENT step's chunk-A output (`aOut`) by
+/// forwarding its "hidden" feature value. State plumbing follows the same
+/// zero-copy rename trick: chunk-B's `state_X_Y` inputs map to the PREVIOUS
+/// chunk-B call's `new_state_X_Y` outputs. chunk-A and chunk-B state slices
+/// are independent; each provider only touches its own layer range.
+private final class Qwen35ChunkBFeatures: NSObject, MLFeatureProvider {
+    private let aOut: MLFeatureProvider  // current chunk-A call (carries "hidden")
+    private let fvInpPos: MLFeatureValue
+    private let fvCos: MLFeatureValue
+    private let fvSin: MLFeatureValue
+    private let prevOut: MLFeatureProvider?
+    private let initialStateFVs: [String: MLFeatureValue]?
+    private let stateRename: [String: String]
+    let featureNames: Set<String>
+
+    init(aOut: MLFeatureProvider,
+         pos: MLFeatureValue, cos: MLFeatureValue, sin: MLFeatureValue,
+         prevOut: MLFeatureProvider?,
+         initialStateFVs: [String: MLFeatureValue]?,
+         stateInputNames: [String], stateOutputNames: [String]) {
+        self.aOut = aOut
+        self.fvInpPos = pos; self.fvCos = cos; self.fvSin = sin
+        self.prevOut = prevOut
+        self.initialStateFVs = initialStateFVs
+        var rename: [String: String] = [:]
+        rename.reserveCapacity(stateInputNames.count)
+        for (a, b) in zip(stateInputNames, stateOutputNames) { rename[a] = b }
+        self.stateRename = rename
+        var names: Set<String> = ["hidden_in", "position", "cos", "sin"]
+        for n in stateInputNames { names.insert(n) }
+        self.featureNames = names
+        super.init()
+    }
+
+    func featureValue(for featureName: String) -> MLFeatureValue? {
+        switch featureName {
+        case "hidden_in":   return aOut.featureValue(for: "hidden")
+        case "position":    return fvInpPos
+        case "cos":         return fvCos
+        case "sin":         return fvSin
+        default:
+            if let prev = prevOut, let outName = stateRename[featureName] {
+                return prev.featureValue(for: outName)
+            }
+            return initialStateFVs?[featureName]
+        }
+    }
+}
+
 @Observable
 final class Qwen35Generator {
     struct Config {
@@ -93,7 +161,7 @@ final class Qwen35Generator {
         /// (status reflects "Compiling decode model..."); cached after that.
         /// Switch to `.cpuAndGPU` for bit-exact output (22 tok/s, ~3 GB
         /// Metal) or `.cpuOnly` for no accelerator usage.
-        static let `default` = Config(seqLen: 64, maxSeq: 128, vocab: 248320,
+        static let `default` = Config(seqLen: 64, maxSeq: 2048, vocab: 248320,
                                       numLayers: 24, rotaryDim: 64,
                                       prefillUnits: .cpuAndNeuralEngine,
                                       decodeUnits: .cpuAndNeuralEngine)
@@ -124,6 +192,28 @@ final class Qwen35Generator {
     var decodeProfile = PhaseProfile()
 
     private var decode: MLModel?
+    /// N+1-chunk INT8 shipping path for 2B. Inspired by the Gemma 4 E4B
+    /// pattern (per-chunk fp16 size kept under iPhone ANE single-mlprogram
+    /// compile envelope). Layout:
+    ///   decodeChunks[0]: chunk_embed (input_token → hidden, no state)
+    ///   decodeChunks[1]: chunk_a     (layers  0..5,  hidden in/out)
+    ///   decodeChunks[2]: chunk_b     (layers  6..11, hidden in/out)
+    ///   decodeChunks[3]: chunk_c     (layers 12..17, hidden in/out)
+    ///   decodeChunks[4]: chunk_d     (layers 18..23 + final_norm
+    ///                                 + lm_head, hidden → logits)
+    /// Splitting embed into its own chunk dropped the head chunk from
+    /// ~1.8 GB fp16 (failed iPhone ANE compile: MILCompilerForANE
+    /// helper crash) to ~0.6 GB fp16 (compiles cleanly). Per-step decode
+    /// chains all 5 chunks with fp16 hidden handoff.
+    /// When chunked, `decode` is nil and `decodeChunks` is populated.
+    @ObservationIgnored private var decodeChunks: [MLModel] = []
+    @ObservationIgnored private var decodeIsChunked: Bool = false
+    /// Layer range [start, end) covered by each BODY chunk (excludes the
+    /// embed chunk, which has no transformer state). For 2B @ 4 body
+    /// chunks: [(0,6), (6,12), (12,18), (18,24)]. Must match the
+    /// boundaries emitted by `conversion/build_qwen35_2b_decode_chunks.py`.
+    @ObservationIgnored private let chunkBoundaries: [(Int, Int)] =
+        [(0, 6), (6, 12), (12, 18), (18, 24)]
     /// True when the loaded decode model emits `next_token` directly
     /// (in-graph argmax). Skips the 248K-logit CPU transfer per step.
     @ObservationIgnored private var decodeHasInGraphArgmax = false
@@ -143,7 +233,11 @@ final class Qwen35Generator {
         cfg = Config(seqLen: cfg.seqLen, maxSeq: cfg.maxSeq, vocab: cfg.vocab,
                       numLayers: cfg.numLayers, rotaryDim: cfg.rotaryDim,
                       prefillUnits: prefill, decodeUnits: decode)
+        // Drop all back-ends so the next generate() reloads with new units.
         self.decode = nil
+        self.decodeChunks = []
+        self.decodeIsChunked = false
+        releaseEmbedMmap()
         // Backend changed — previous profile samples are not comparable.
         decodeProfile = PhaseProfile()
         status = "Idle (units changed, will reload on next run)"
@@ -161,6 +255,10 @@ final class Qwen35Generator {
     /// string interpolation 48 times per decode step.
     @ObservationIgnored private var stateInputNames: [String] = []    // "state_0_a", "state_0_b", ...
     @ObservationIgnored private var stateOutputNames: [String] = []   // "new_state_0_a", "new_state_0_b", ...
+    /// Per-chunk state name slices for the chunked path. Each inner array
+    /// covers that chunk's layer range [start, end) × 2 states per layer.
+    @ObservationIgnored private var chunkStateInputNames: [[String]] = []
+    @ObservationIgnored private var chunkStateOutputNames: [[String]] = []
 
     /// Reusable MLMultiArrays for the 4 scalar/small inputs that change
     /// every decode step. Allocated once, data pointer written per step.
@@ -188,10 +286,29 @@ final class Qwen35Generator {
         }
         self.stateInputNames = inNames
         self.stateOutputNames = outNames
+        // Per-chunk state name slices, derived from chunkBoundaries.
+        var perChunkIn: [[String]] = []
+        var perChunkOut: [[String]] = []
+        for (start, end) in chunkBoundaries {
+            var inS: [String] = []; inS.reserveCapacity((end - start) * 2)
+            var outS: [String] = []; outS.reserveCapacity((end - start) * 2)
+            for i in start..<end {
+                inS.append("state_\(i)_a"); inS.append("state_\(i)_b")
+                outS.append("new_state_\(i)_a"); outS.append("new_state_\(i)_b")
+            }
+            perChunkIn.append(inS); perChunkOut.append(outS)
+        }
+        self.chunkStateInputNames = perChunkIn
+        self.chunkStateOutputNames = perChunkOut
         // Pre-allocate the 4 per-step input arrays + their feature wrappers.
         // Data pointer is rewritten each decode step; no alloc churn.
         self.reusableInpTok = try! MLMultiArray(shape: [1, 1], dataType: .int32)
         self.reusableInpPos = try! MLMultiArray(shape: [1], dataType: .float32)
+        // 2B hidden size is 2048; matches chunk input spec.
+        self.reusableHidden = try! MLMultiArray(
+            shape: [1, 1, 2048], dataType: .float16)
+        self.fvHidden = MLFeatureValue(multiArray: reusableHidden)
+        self.embedHiddenProvider = Qwen35EmbedHiddenProvider(fvHidden: fvHidden)
         self.reusableCos = try! MLMultiArray(
             shape: [1, 1, NSNumber(value: cfg.rotaryDim)], dataType: .float16)
         self.reusableSin = try! MLMultiArray(
@@ -263,6 +380,147 @@ final class Qwen35Generator {
                 "\(base) not found in \(modelFolderOverride?.path ?? "-") / Documents / app bundle"])
     }
 
+    /// Chunk names ordered body → ... → tail. 1:1 with `chunkBoundaries`.
+    /// Token embedding is NOT a chunk here — it lives in a sidecar raw
+    /// fp16 file (`embed_weight.bin`) that Swift mmaps directly.
+    @ObservationIgnored private let chunkNames: [String] =
+        ["chunk_a", "chunk_b", "chunk_c", "chunk_d"]
+
+    // MARK: - Token embed (mmap'd fp16 sidecar)
+
+    /// mmap'd `embed_weight.bin` base pointer. Stored as UInt16 because
+    /// Float16 directly via UnsafePointer is awkward on iOS — we index
+    /// as UInt16 bits and reinterpret when reading / writing.
+    @ObservationIgnored private var embedMmapPtr: UnsafePointer<UInt16>?
+    @ObservationIgnored private var embedMmapBase: UnsafeMutableRawPointer?
+    @ObservationIgnored private var embedMmapLen: Int = 0
+    @ObservationIgnored private var embedMmapFD: Int32 = -1
+    /// Per-step reusable (1, 1, hidden_size) fp16 buffer for the hidden
+    /// that the embed lookup writes into. Fed to the first body chunk
+    /// as `hidden_in` via `Qwen35EmbedHiddenProvider`.
+    @ObservationIgnored private var reusableHidden: MLMultiArray!
+    @ObservationIgnored private var fvHidden: MLFeatureValue!
+    /// Provider wrapping `fvHidden` — satisfies
+    /// `Qwen35ChunkBFeatures.aOut.featureValue(for: "hidden")` so the
+    /// first body chunk goes through the same zero-copy provider path
+    /// as middle/tail chunks.
+    @ObservationIgnored private var embedHiddenProvider: Qwen35EmbedHiddenProvider!
+
+    /// Locate the chunked 2B decode bundle. Returns (chunk URLs in
+    /// `chunkNames` order, embed_weight.bin URL) ready for loading.
+    /// Layout on disk (under the first folder that contains it):
+    ///   qwen3_5_2b_decode_chunks/chunk_a.mlpackage
+    ///   qwen3_5_2b_decode_chunks/chunk_b.mlpackage
+    ///   qwen3_5_2b_decode_chunks/chunk_c.mlpackage
+    ///   qwen3_5_2b_decode_chunks/chunk_d.mlpackage
+    ///   qwen3_5_2b_decode_chunks/embed_weight.bin
+    /// Both `.mlpackage` and `.mlmodelc` are accepted per chunk. ALL
+    /// chunks PLUS the embed bin must be present for this to return
+    /// non-nil.
+    private func resolveChunkedDecodeURLs() -> (chunks: [URL], embed: URL)? {
+        let subdir = "qwen3_5_2b_decode_chunks"
+        let embedBinName = "embed_weight.bin"
+        let fm = FileManager.default
+
+        func resolve(_ base: URL) -> (chunks: [URL], embed: URL)? {
+            let dir = base.appendingPathComponent(subdir)
+            let embedURL = dir.appendingPathComponent(embedBinName)
+            guard fm.fileExists(atPath: embedURL.path) else { return nil }
+            var urls: [URL] = []
+            urls.reserveCapacity(chunkNames.count)
+            for name in chunkNames {
+                let pkg = dir.appendingPathComponent("\(name).mlpackage")
+                let mlc = dir.appendingPathComponent("\(name).mlmodelc")
+                let u: URL?
+                if fm.fileExists(atPath: mlc.path) {
+                    u = mlc
+                } else if fm.fileExists(atPath: pkg.path) {
+                    u = try? MLModel.compileModel(at: pkg)
+                } else {
+                    u = nil
+                }
+                guard let resolved = u else { return nil }
+                urls.append(resolved)
+            }
+            return (urls, embedURL)
+        }
+
+        if let folder = modelFolderOverride, let r = resolve(folder) { return r }
+        if let docs = try? fm.url(for: .documentDirectory, in: .userDomainMask,
+                                  appropriateFor: nil, create: false),
+           let r = resolve(docs) { return r }
+        return nil
+    }
+
+    /// mmap the embed_weight.bin file read-only. Clean pages (never
+    /// dirtied) aren't counted against app phys_footprint, so the 1 GB
+    /// weight lives in virtual memory only — touched rows (4 KB per
+    /// token) page in on demand and stay resident only as long as iOS
+    /// doesn't evict them. Replaces a CoreML chunk_embed mlpackage that
+    /// would otherwise dequantize the full 1 GB into process memory.
+    private func mmapEmbedWeight(url: URL) throws {
+        releaseEmbedMmap()  // clean any prior state
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else {
+            throw NSError(domain: "Qwen35Generator", code: 30,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "failed to open embed_weight.bin at \(url.path)"])
+        }
+        var st = stat()
+        guard fstat(fd, &st) == 0 else {
+            close(fd)
+            throw NSError(domain: "Qwen35Generator", code: 31,
+                userInfo: [NSLocalizedDescriptionKey: "fstat failed"])
+        }
+        let size = Int(st.st_size)
+        guard let base = mmap(nil, size, PROT_READ, MAP_PRIVATE, fd, 0),
+              base != MAP_FAILED else {
+            close(fd)
+            throw NSError(domain: "Qwen35Generator", code: 32,
+                userInfo: [NSLocalizedDescriptionKey: "mmap failed"])
+        }
+        embedMmapBase = base
+        embedMmapLen = size
+        embedMmapFD = fd
+        // mmap returns UnsafeMutableRawPointer; we only ever read from
+        // the embed table, so downgrade to UnsafePointer<UInt16> to
+        // advertise the read-only contract (mmap was opened PROT_READ).
+        embedMmapPtr = UnsafePointer(base.assumingMemoryBound(to: UInt16.self))
+        // Hint the kernel this is a random-access (per-token gather)
+        // pattern so it doesn't prefetch large runs we don't need.
+        madvise(base, size, MADV_RANDOM)
+    }
+
+    /// Release mmap'd embed weights (called on setComputeUnits /
+    /// deinit). Safe to call multiple times.
+    private func releaseEmbedMmap() {
+        if let base = embedMmapBase, embedMmapLen > 0 {
+            munmap(base, embedMmapLen)
+        }
+        if embedMmapFD >= 0 { close(embedMmapFD) }
+        embedMmapBase = nil
+        embedMmapPtr = nil
+        embedMmapLen = 0
+        embedMmapFD = -1
+    }
+
+    /// Copy one row of the fp16 embed table into `reusableHidden`. Each
+    /// row is `hiddenSize` fp16 values = `hiddenSize * 2` bytes.
+    /// Equivalent to `F.embedding(input_token, embed_w)` in PyTorch.
+    private func embedLookup(token: Int32) {
+        guard let ptr = embedMmapPtr else {
+            return  // no embed loaded; callers must validate before stepPredict
+        }
+        let hiddenSize = 2048
+        let src = ptr + Int(token) * hiddenSize
+        let dst = reusableHidden.dataPointer.assumingMemoryBound(to: UInt16.self)
+        memcpy(dst, src, hiddenSize * 2)
+    }
+
+    deinit {
+        releaseEmbedMmap()
+    }
+
     /// Deprecated — retained for API compat. `generate(...)` now calls
     /// `loadDecodeOnly()` directly. Kept so external callers don't break.
     func load() throws {
@@ -276,6 +534,79 @@ final class Qwen35Generator {
         case .cpuAndGPU: return "CPU+GPU"
         case .all: return "All"
         @unknown default: return "?"
+        }
+    }
+
+    // MARK: - Per-call state (decode loop scratch)
+
+    /// Holds the mutable scratch state threaded through one generate() call.
+    /// Using a class (reference type) lets us mutate from within
+    /// `stepPredict` without passing `inout` tuples across async suspensions,
+    /// which is awkward in Swift 5's concurrency model.
+    /// Only the `mono` or the `(a, b)` set is populated per call — the
+    /// loaded variant decides which.
+    private final class DecodeCallState {
+        var lastMonoOut: MLFeatureProvider? = nil
+        var initialMonoFVs: [String: MLFeatureValue]? = nil
+        /// Per-chunk last output (for state plumbing across steps).
+        /// Indexed by chunk number matching `decodeChunks`.
+        var lastChunkOuts: [MLFeatureProvider?] = []
+        var initialChunkFVs: [[String: MLFeatureValue]?] = []
+    }
+
+    /// Run one decode step against whichever back-end is loaded. Returns
+    /// the feature provider that carries the logits / state outputs for
+    /// post-step consumption. Scalar inputs are written into the reusable
+    /// MLMultiArrays before either branch.
+    /// - Throws: when the chunked back-end is active but a chunk model is
+    ///   missing (shouldn't happen — `loadDecodeOnly` guarantees both).
+    private func stepPredict(token: Int32, position: Int,
+                             state: DecodeCallState
+                             ) async throws -> MLFeatureProvider {
+        writeDecodeScalars(token: token, position: position)
+        if decodeIsChunked {
+            guard !decodeChunks.isEmpty else {
+                throw NSError(domain: "Qwen35Generator", code: 11,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "chunked decode marked active but chunk models are empty"])
+            }
+            // Token embedding lives outside CoreML: a per-step memcpy
+            // from the mmap'd embed_weight.bin into reusableHidden.
+            // Then decodeChunks[0..n] = body/tail chunks all take
+            // `hidden_in` via Qwen35ChunkBFeatures — chunks[0] reads
+            // hidden from the embed-lookup buffer; chunks[i>0] read it
+            // from the previous chunk's output.
+            embedLookup(token: token)
+            var lastStepOut: MLFeatureProvider = embedHiddenProvider
+            for ci in 0..<decodeChunks.count {
+                let features = Qwen35ChunkBFeatures(
+                    aOut: lastStepOut,
+                    pos: fvInpPos, cos: fvCos, sin: fvSin,
+                    prevOut: state.lastChunkOuts[ci],
+                    initialStateFVs: state.initialChunkFVs[ci],
+                    stateInputNames: chunkStateInputNames[ci],
+                    stateOutputNames: chunkStateOutputNames[ci])
+                let out = try await decodeChunks[ci].prediction(from: features)
+                state.lastChunkOuts[ci] = out
+                state.initialChunkFVs[ci] = nil
+                lastStepOut = out
+            }
+            return lastStepOut  // last chunk carries logits
+        } else {
+            guard let decode else {
+                throw NSError(domain: "Qwen35Generator", code: 12,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "monolithic decode marked active but model is nil"])
+            }
+            let features = Qwen35DecodeFeatures(
+                tok: fvInpTok, pos: fvInpPos, cos: fvCos, sin: fvSin,
+                prevOut: state.lastMonoOut, initialStateFVs: state.initialMonoFVs,
+                stateInputNames: stateInputNames,
+                stateOutputNames: stateOutputNames)
+            let dOut = try await decode.prediction(from: features)
+            state.lastMonoOut = dOut
+            state.initialMonoFVs = nil
+            return dOut
         }
     }
 
@@ -304,8 +635,8 @@ final class Qwen35Generator {
         defer { running = false }
         generatedIds.removeAll()
 
-        if decode == nil { try loadDecodeOnly() }
-        guard let decode else { return [] }
+        if decode == nil && decodeChunks.isEmpty { try loadDecodeOnly() }
+        guard decodeIsChunked || decode != nil else { return [] }
 
         let S = inputIds.count
         guard S > 0, S <= cfg.maxSeq - 1 else {
@@ -314,18 +645,32 @@ final class Qwen35Generator {
                     "input length \(S) must be in (0, \(cfg.maxSeq - 1)]"])
         }
 
-        // Zero-init state tensors (24 layers × 2 states each)
-        let states: [String: MLMultiArray] = try makeZeroStates()
-        var initialStateFVs: [String: MLFeatureValue]? = {
+        // Zero-init state tensors. Chunked path allocates one dict per
+        // body/tail chunk (1:1 with chunkBoundaries). Token embed is
+        // handled via mmap and doesn't appear as a chunk here.
+        // Monolithic path allocates one combined dict (all 24 layers).
+        let callState = DecodeCallState()
+        if decodeIsChunked {
+            let n = decodeChunks.count
+            callState.lastChunkOuts = [MLFeatureProvider?](repeating: nil, count: n)
+            var initial: [[String: MLFeatureValue]?] = []
+            initial.reserveCapacity(n)
+            for slice in 0..<n {
+                let (s, e) = chunkBoundaries[slice]
+                let states = try makeZeroStatesInRange(s..<e)
+                var fvs: [String: MLFeatureValue] = [:]
+                fvs.reserveCapacity(states.count)
+                for (k, v) in states { fvs[k] = MLFeatureValue(multiArray: v) }
+                initial.append(fvs)
+            }
+            callState.initialChunkFVs = initial
+        } else {
+            let states = try makeZeroStates()
             var d: [String: MLFeatureValue] = [:]
             d.reserveCapacity(states.count)
             for (k, v) in states { d[k] = MLFeatureValue(multiArray: v) }
-            return d
-        }()
-        /// Last predict output — used as the state source for the next call.
-        /// Avoids 48 MLFeatureValue wraps per step by delegating feature
-        /// lookup to the output provider (which already holds MLFeatureValues).
-        var lastOutput: MLFeatureProvider? = nil
+            callState.initialMonoFVs = d
+        }
 
         // --- 1. Recurrent prefill (feed prompt through decode step by step) ---
         status = "Prefill (recurrent via decode)..."
@@ -333,15 +678,7 @@ final class Qwen35Generator {
         var lastLogits: MLMultiArray?
         var lastNextToken: Int32 = 0
         for (t, tok) in inputIds.enumerated() {
-            writeDecodeScalars(token: tok, position: t)
-            let features = Qwen35DecodeFeatures(
-                tok: fvInpTok, pos: fvInpPos, cos: fvCos, sin: fvSin,
-                prevOut: lastOutput, initialStateFVs: initialStateFVs,
-                stateInputNames: stateInputNames,
-                stateOutputNames: stateOutputNames)
-            let dOut = try await decode.prediction(from: features)
-            lastOutput = dOut
-            initialStateFVs = nil  // zeros only needed on first call
+            let dOut = try await stepPredict(token: tok, position: t, state: callState)
             if t == S - 1 {
                 if decodeHasInGraphArgmax {
                     if let ntArr = dOut.featureValue(for: "next_token")?.multiArrayValue {
@@ -399,21 +736,18 @@ final class Qwen35Generator {
             let stepStart = CFAbsoluteTimeGetCurrent()
 
             let tIn0 = CFAbsoluteTimeGetCurrent()
-            writeDecodeScalars(token: nextToken, position: position)
-            let features = Qwen35DecodeFeatures(
-                tok: fvInpTok, pos: fvInpPos, cos: fvCos, sin: fvSin,
-                prevOut: lastOutput, initialStateFVs: nil,
-                stateInputNames: stateInputNames,
-                stateOutputNames: stateOutputNames)
-            let tIn1 = CFAbsoluteTimeGetCurrent()
+            // Scalar-write + feature-provider build are now inside stepPredict;
+            // tIn1 is captured just before predict returns so inputsBuild
+            // effectively measures pre-predict wire-up + the enclosing await.
+            let tIn1 = tIn0
 
-            let dOut = try await decode.prediction(from: features)
+            let dOut = try await stepPredict(token: nextToken, position: position,
+                                             state: callState)
             let tPred = CFAbsoluteTimeGetCurrent()
 
-            // State plumbing: just retain the output — its new_state_X_Y
-            // features are mapped on-the-fly in Qwen35DecodeFeatures.
-            lastOutput = dOut
-            let tState = CFAbsoluteTimeGetCurrent()
+            // State plumbing is owned by callState — no per-step dict
+            // building here.
+            let tState = tPred
 
             let stepEnd = tState  // logit read happens after; split below
             decodeTotal += (stepEnd - stepStart) * 1000
@@ -473,34 +807,61 @@ final class Qwen35Generator {
         return generatedIds
     }
 
-    /// Load only the decode model. Preference order:
-    ///   1. argmax-in-graph fp16 (`next_token` int32 output) — not shipped
-    ///   2. INT8 palettized (754 MB, same parity as fp16, preferred default)
-    ///   3. fp16 (1.4 GB, ground-truth precision)
+    /// Load decode model(s). Preference order:
+    ///   1. 2B chunked INT8 (chunk_a + chunk_b, iPhone shipping path)
+    ///   2. 2B monolithic INT8 (Mac fallback; fails ANE budget on iPhone)
+    ///   3. 0.8B argmax-in-graph fp16 (`next_token` int32 output) — experimental
+    ///   4. 0.8B INT8 palettized (754 MB, same parity as fp16, default 0.8B)
+    ///   5. 0.8B fp16 (1.4 GB, ground-truth precision)
     func loadDecodeOnly() throws {
         let dCfg = MLModelConfiguration(); dCfg.computeUnits = cfg.decodeUnits
-        let loadedURL: URL
+        let loadedURLs: [URL]
         let variant: String
-        if let url = try? resolveModelURL("qwen3_5_0_8b_decode_argmax_fp16_mseq128") {
+        // Reset all possible back-ends so a second load into a different variant
+        // doesn't leave a stale chunked (or monolithic) model live alongside.
+        decode = nil
+        decodeChunks = []
+        decodeIsChunked = false
+        if let resolved = resolveChunkedDecodeURLs() {
+            try mmapEmbedWeight(url: resolved.embed)
+            decodeChunks = try resolved.chunks.map {
+                try MLModel(contentsOf: $0, configuration: dCfg)
+            }
+            decodeIsChunked = true
+            decodeHasInGraphArgmax = false
+            loadedURLs = resolved.chunks
+            variant = "2B-chunked-int8"
+        } else if let url = try? resolveModelURL("qwen3_5_2b_decode_int8_mseq128") {
+            decode = try MLModel(contentsOf: url, configuration: dCfg)
+            decodeHasInGraphArgmax = false
+            loadedURLs = [url]
+            variant = "2B-int8-monolithic"
+        } else if let url = try? resolveModelURL("qwen3_5_0_8b_decode_argmax_fp16_mseq128") {
             decode = try MLModel(contentsOf: url, configuration: dCfg)
             decodeHasInGraphArgmax = true
-            loadedURL = url; variant = "argmax-fp16"
+            loadedURLs = [url]
+            variant = "0.8B-argmax-fp16"
         } else if let url = try? resolveModelURL("qwen3_5_0_8b_decode_int8_mseq128") {
             decode = try MLModel(contentsOf: url, configuration: dCfg)
             decodeHasInGraphArgmax = false
-            loadedURL = url; variant = "int8"
+            loadedURLs = [url]
+            variant = "0.8B-int8"
         } else {
             let dURL = try resolveModelURL("qwen3_5_0_8b_decode_fp16_mseq128")
             decode = try MLModel(contentsOf: dURL, configuration: dCfg)
             decodeHasInGraphArgmax = false
-            loadedURL = dURL; variant = "fp16"
+            loadedURLs = [dURL]
+            variant = "0.8B-fp16"
         }
         status = "Loaded decode (\(variant)) on \(unitsName(cfg.decodeUnits))"
-        // Diagnostic: print ANE op-placement percentage so we can verify
-        // the chosen compute units are actually being honored. Prior bug:
-        // default silently ran on GPU despite being set to ANE, because a
-        // debug override wasn't reverted. Logging here catches that.
-        auditComputePlan(url: loadedURL, requestedUnits: cfg.decodeUnits, variant: variant)
+        // Diagnostic: print ANE op-placement percentage per model so we can
+        // verify the chosen compute units are actually being honored. Prior
+        // bug: default silently ran on GPU despite being set to ANE, because
+        // a debug override wasn't reverted. Logging here catches that.
+        for (idx, url) in loadedURLs.enumerated() {
+            let label = loadedURLs.count > 1 ? "\(variant)#\(idx)" : variant
+            auditComputePlan(url: url, requestedUnits: cfg.decodeUnits, variant: label)
+        }
     }
 
     private func auditComputePlan(url: URL, requestedUnits: MLComputeUnits, variant: String) {
@@ -582,17 +943,27 @@ final class Qwen35Generator {
     /// state produces garbage logits (seen in the wild as "!!!!" degenerate
     /// output with sampling).
     private func makeZeroStates() throws -> [String: MLMultiArray] {
+        try makeZeroStatesInRange(0..<cfg.numLayers)
+    }
+
+    /// Build zero-initialized state tensors for a specific layer range.
+    /// Chunked path calls this once per chunk (passing that chunk's
+    /// layer range from `chunkBoundaries`); monolithic path passes the
+    /// full layer range. State shapes are determined purely by layer
+    /// type (linear_attention vs full_attention) and are IDENTICAL
+    /// between 0.8B and 2B — hidden-size doubling affects only MLP /
+    /// attention projection weights, not state tensors.
+    private func makeZeroStatesInRange(_ range: Range<Int>) throws -> [String: MLMultiArray] {
         var dict: [String: MLMultiArray] = [:]
         let linearConvShape: [NSNumber] = [1, 6144, 4]
         let linearRecShape:  [NSNumber] = [1, 16, 128, 128]
         let fullKvShape:     [NSNumber] = [1, 2, NSNumber(value: cfg.maxSeq), 256]
-        for i in 0..<cfg.numLayers {
+        for i in range {
             let isLinear = (i % 4 != 3)
             let shapeA = isLinear ? linearConvShape : fullKvShape
             let shapeB = isLinear ? linearRecShape  : fullKvShape
             let a = try MLMultiArray(shape: shapeA, dataType: .float16)
             let b = try MLMultiArray(shape: shapeB, dataType: .float16)
-            // Explicitly zero the fp16 buffer
             memset(a.dataPointer, 0, a.count * 2)
             memset(b.dataPointer, 0, b.count * 2)
             dict["state_\(i)_a"] = a
