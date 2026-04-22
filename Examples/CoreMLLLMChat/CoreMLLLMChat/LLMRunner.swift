@@ -224,17 +224,19 @@ final class LLMRunner {
         isGenerating = true
         tokensPerSecond = 0
 
-        // Apply Qwen's chat template — system/user/assistant turns wrapped
-        // in <|im_start|>/<|im_end|> delimiters. Without this the instruct
-        // model would respond in completion mode (degenerate loops).
+        // Apply Qwen's chat template — user/assistant turns wrapped in
+        // <|im_start|>/<|im_end|> delimiters. SYSTEM messages are filtered
+        // out because the app uses them for UI status ("Loading...",
+        // "Model loaded!") — not actual model instructions. Leaving them
+        // in confuses Qwen's instruct alignment and produces degenerate
+        // looping output.
         let chatMessages: [[String: Any]] = messages.compactMap { m in
-            let role: String?
+            let role: String
             switch m.role {
             case .user: role = "user"
             case .assistant: role = "assistant"
-            case .system: role = "system"
+            case .system: return nil  // skip UI-status system messages
             }
-            guard let role else { return nil }
             return ["role": role, "content": m.content]
         }
         let inputIds: [Int] = (try? tok.applyChatTemplate(messages: chatMessages))
