@@ -88,10 +88,15 @@ final class Qwen35Generator {
         /// Compute units for decode. ANE is validated (top-3 = 100% vs
         /// fp32 oracle, 22 tok/s on iPhone 17 Pro, zero Metal heap).
         let decodeUnits: MLComputeUnits
+        /// ANE-first by default — zero sustained Metal heap, 20 tok/s on
+        /// iPhone 17 Pro. First load triggers ~4 min on-device E5 compile
+        /// (status reflects "Compiling decode model..."); cached after that.
+        /// Switch to `.cpuAndGPU` for bit-exact output (22 tok/s, ~3 GB
+        /// Metal) or `.cpuOnly` for no accelerator usage.
         static let `default` = Config(seqLen: 64, maxSeq: 128, vocab: 248320,
                                       numLayers: 24, rotaryDim: 64,
-                                      prefillUnits: .cpuAndGPU,
-                                      decodeUnits: .cpuAndGPU)
+                                      prefillUnits: .cpuAndNeuralEngine,
+                                      decodeUnits: .cpuAndNeuralEngine)
     }
 
     var status = "Idle"
