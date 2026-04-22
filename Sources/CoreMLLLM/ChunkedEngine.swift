@@ -678,7 +678,35 @@ final class ChunkedEngine {
         self.kSliding2 = kSliding2; self.vSliding2 = vSliding2
         self.kFull2 = kFull2; self.vFull2 = vFull2
         self.config = config; self.prefillN = prefillN
+        // Phase 0e+: pre-wrap stable MLMultiArrays (KV caches + scratch
+        // masks) in MLFeatureValue once. During decode, `copyBack` mutates
+        // the backing buffer in place — the MLMultiArray reference stays
+        // the same, so the MLFeatureValue wrapper stays valid across
+        // calls. Saves 11 ObjC-bridge wraps per decode step.
+        self.fvKSliding1 = MLFeatureValue(multiArray: kSliding1)
+        self.fvVSliding1 = MLFeatureValue(multiArray: vSliding1)
+        self.fvKFull1 = MLFeatureValue(multiArray: kFull1)
+        self.fvVFull1 = MLFeatureValue(multiArray: vFull1)
+        self.fvKSliding2 = MLFeatureValue(multiArray: kSliding2)
+        self.fvVSliding2 = MLFeatureValue(multiArray: vSliding2)
+        self.fvKFull2 = MLFeatureValue(multiArray: kFull2)
+        self.fvVFull2 = MLFeatureValue(multiArray: vFull2)
     }
+
+    // Pre-wrapped MLFeatureValues for the 8 stable KV buffers. Initialized
+    // in init(); scratch-mask wrappers are lazy because their backing
+    // MLMultiArrays are lazy.
+    private let fvKSliding1: MLFeatureValue
+    private let fvVSliding1: MLFeatureValue
+    private let fvKFull1: MLFeatureValue
+    private let fvVFull1: MLFeatureValue
+    private let fvKSliding2: MLFeatureValue
+    private let fvVSliding2: MLFeatureValue
+    private let fvKFull2: MLFeatureValue
+    private let fvVFull2: MLFeatureValue
+    private lazy var fvMaskFull: MLFeatureValue = MLFeatureValue(multiArray: scratchMaskFull)
+    private lazy var fvMaskSliding: MLFeatureValue = MLFeatureValue(multiArray: scratchMaskSliding)
+    private lazy var fvUpdateMask: MLFeatureValue = MLFeatureValue(multiArray: scratchUpdateMask)
 
     // MARK: - Prefix cache (LLM_PREFIX_CACHE=1)
 
@@ -805,20 +833,28 @@ final class ChunkedEngine {
         let tMask = CFAbsoluteTimeGetCurrent()
         profileMask += (tMask - t1)
 
-        // Chunk 1
+        // Chunk 1 — reuse cached MLFeatureValues for mask+KV (stable
+        // MLMultiArrays, wrapper stays valid across calls). Only
+        // hidden_states/per_layer_raw/cos/sin change per step.
         let tC1Start = CFAbsoluteTimeGetCurrent()
+        let fvMaskF = (maskFull === scratchMaskFull) ? fvMaskFull
+            : MLFeatureValue(multiArray: maskFull)
+        let fvMaskS = (maskSliding === scratchMaskSliding) ? fvMaskSliding
+            : MLFeatureValue(multiArray: maskSliding)
+        let fvUmask = (umask === scratchUpdateMask) ? fvUpdateMask
+            : MLFeatureValue(multiArray: umask)
         let in1 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: hiddenIn),
-            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
-            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
-            "update_mask": MLFeatureValue(multiArray: umask),
+            "causal_mask_full": fvMaskF,
+            "causal_mask_sliding": fvMaskS,
+            "update_mask": fvUmask,
             "per_layer_raw": MLFeatureValue(multiArray: plRaw),
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
-            "K_sliding_in": MLFeatureValue(multiArray: kSliding1),
-            "V_sliding_in": MLFeatureValue(multiArray: vSliding1),
-            "K_full_in": MLFeatureValue(multiArray: kFull1),
-            "V_full_in": MLFeatureValue(multiArray: vFull1),
+            "K_sliding_in": fvKSliding1,
+            "V_sliding_in": fvVSliding1,
+            "K_full_in": fvKFull1,
+            "V_full_in": fvVFull1,
         ])
         let tC1Wait0 = CFAbsoluteTimeGetCurrent()
         let out1 = try chunk1.prediction(from: in1)
@@ -835,20 +871,20 @@ final class ChunkedEngine {
         profileCopyBack += (tC1End - tC1Cb0)
         profileC1 += (tC1End - tC1Start)
 
-        // Chunk 2
+        // Chunk 2 — same mask/KV FV reuse pattern as chunk 1.
         let tC2Start = CFAbsoluteTimeGetCurrent()
         let in2 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h1),
-            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
-            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
-            "update_mask": MLFeatureValue(multiArray: umask),
+            "causal_mask_full": fvMaskF,
+            "causal_mask_sliding": fvMaskS,
+            "update_mask": fvUmask,
             "per_layer_combined": MLFeatureValue(multiArray: plc),
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
-            "K_sliding_in": MLFeatureValue(multiArray: kSliding2),
-            "V_sliding_in": MLFeatureValue(multiArray: vSliding2),
-            "K_full_in": MLFeatureValue(multiArray: kFull2),
-            "V_full_in": MLFeatureValue(multiArray: vFull2),
+            "K_sliding_in": fvKSliding2,
+            "V_sliding_in": fvVSliding2,
+            "K_full_in": fvKFull2,
+            "V_full_in": fvVFull2,
         ])
         let tC2Wait0 = CFAbsoluteTimeGetCurrent()
         let out2 = try chunk2.prediction(from: in2)
@@ -874,9 +910,9 @@ final class ChunkedEngine {
         profileC2 += (tC2End - tC2Start)
 
         let shared: [String: MLFeatureValue] = [
-            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
-            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
-            "update_mask": MLFeatureValue(multiArray: umask),
+            "causal_mask_full": fvMaskF,
+            "causal_mask_sliding": fvMaskS,
+            "update_mask": fvUmask,
             "per_layer_combined": MLFeatureValue(multiArray: plc),
             "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
