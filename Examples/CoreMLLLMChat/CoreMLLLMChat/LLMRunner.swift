@@ -40,6 +40,14 @@ final class LLMRunner {
     private var qwen35Generator: Qwen35Generator?
     private var qwen35Tokenizer: (any Tokenizer)?
 
+    // Qwen3-VL 4B path: separate generator + tokenizer, selected when
+    // the downloaded folder contains `qwen3_vl_4b_decode_chunks/`.
+    // Plain GQA architecture (not the Qwen3.5 hybrid SSM), so it gets
+    // its own runtime — Qwen3VL4BGenerator hardcodes head_dim=128,
+    // num_kv_heads=8, 6 body chunks + head + mmap embed sidecar.
+    private var qwen3vl4bGenerator: Qwen3VL4BGenerator?
+    private var qwen3vl4bTokenizer: (any Tokenizer)?
+
     // MARK: - Loading
 
     func loadModel(from url: URL) async throws {
@@ -48,10 +56,12 @@ final class LLMRunner {
         // Release previous engines BEFORE allocating a new one — peak footprint
         // on model switch would otherwise hold both in memory simultaneously,
         // OOMing on 8 GB devices.
-        if llm != nil || qwen35Generator != nil {
+        if llm != nil || qwen35Generator != nil || qwen3vl4bGenerator != nil {
             llm = nil
             qwen35Generator = nil
             qwen35Tokenizer = nil
+            qwen3vl4bGenerator = nil
+            qwen3vl4bTokenizer = nil
             isLoaded = false
             modelName = ""
             hasVision = false
@@ -94,6 +104,22 @@ final class LLMRunner {
                 try await loadQwen35(folder: folder)
                 return
             }
+        }
+
+        // Qwen3-VL 4B detection: 6 body chunks + chunk_head + embed
+        // sidecar, all under qwen3_vl_4b_decode_chunks/.
+        let vl4bDir = folder.appendingPathComponent("qwen3_vl_4b_decode_chunks")
+        func vl4bChunkPresent(_ base: String) -> Bool {
+            fm.fileExists(atPath: vl4bDir.appendingPathComponent("\(base).mlpackage").path)
+                || fm.fileExists(atPath: vl4bDir.appendingPathComponent("\(base).mlmodelc").path)
+        }
+        let vl4bEmbedPresent = fm.fileExists(atPath:
+            vl4bDir.appendingPathComponent("embed_weight.bin").path)
+        let vl4bAllChunks = (0..<6).allSatisfy { vl4bChunkPresent("chunk_\($0)") }
+            && vl4bChunkPresent("chunk_head")
+        if vl4bEmbedPresent && vl4bAllChunks {
+            try await loadQwen3VL4B(folder: folder)
+            return
         }
 
         // LookAhead K=8 probe bundles ship a `probe.marker` file so the runner
@@ -152,6 +178,9 @@ final class LLMRunner {
                   audio: [Float]? = nil) async throws -> AsyncStream<String> {
         if qwen35Generator != nil {
             return try await generateQwen35(messages: messages)
+        }
+        if qwen3vl4bGenerator != nil {
+            return try await generateQwen3VL4B(messages: messages)
         }
         guard let llm else {
             throw NSError(domain: "LLMRunner", code: 1,
@@ -346,6 +375,105 @@ final class LLMRunner {
                             tokenCount += 1
                             if eosSet.contains(tokenId) { return }
                             accumIds.append(Int(tokenId))
+                            let current = tok.decode(tokens: accumIds)
+                            if current.count > emittedText.count,
+                               current.hasPrefix(emittedText) {
+                                let delta = String(current.dropFirst(emittedText.count))
+                                continuation.yield(delta)
+                                emittedText = current
+                            }
+                            let elapsed = Date().timeIntervalSince(genStart)
+                            if elapsed > 0 {
+                                Task { @MainActor in
+                                    self?.tokensPerSecond = Double(tokenCount) / elapsed
+                                }
+                            }
+                        })
+                } catch {
+                    continuation.yield("[Error: \(error.localizedDescription)]")
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    // MARK: - Qwen3-VL 4B dispatch
+
+    private func loadQwen3VL4B(folder: URL) async throws {
+        loadingStatus = "Loading Qwen3-VL tokenizer..."
+        let tok = try await AutoTokenizer.from(pretrained: "Qwen/Qwen3-VL-4B-Instruct")
+        loadingStatus = "Compiling Qwen3-VL 4B chunks (first run only, can take 15+ minutes on ANE)..."
+        let gen = Qwen3VL4BGenerator()
+        gen.modelFolderOverride = folder
+        do {
+            try gen.load()
+        } catch {
+            throw NSError(domain: "LLMRunner", code: 30,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Qwen3-VL 4B load failed: \(error.localizedDescription)"])
+        }
+        qwen3vl4bGenerator = gen
+        qwen3vl4bTokenizer = tok
+        modelName = "Qwen3-VL 4B (text)"
+        hasVision = false  // Phase 2 will enable
+        hasAudio = false
+        isLoaded = true
+        loadingStatus = "Ready"
+        print("[LLMRunner] loaded Qwen3-VL 4B from \(folder.lastPathComponent)")
+    }
+
+    private func generateQwen3VL4B(messages: [ChatMessage]) async throws -> AsyncStream<String> {
+        guard let gen = qwen3vl4bGenerator, let tok = qwen3vl4bTokenizer else {
+            throw NSError(domain: "LLMRunner", code: 31,
+                userInfo: [NSLocalizedDescriptionKey: "Qwen3-VL 4B not loaded"])
+        }
+        isGenerating = true
+        tokensPerSecond = 0
+
+        let chatMessages: [[String: Any]] = messages.compactMap { m in
+            let role: String
+            switch m.role {
+            case .user: role = "user"
+            case .assistant: role = "assistant"
+            case .system: return nil  // skip UI status messages
+            }
+            return ["role": role, "content": m.content]
+        }
+        let inputIds: [Int] = (try? tok.applyChatTemplate(messages: chatMessages))
+            ?? tok.encode(text: messages.last?.content ?? "")
+        let inputIdsInt32 = inputIds.map { Int32($0) }
+
+        let maxSeq = 2048
+        let remaining = maxSeq - inputIds.count - 1
+        if remaining < 1 {
+            throw NSError(domain: "LLMRunner", code: 32,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Qwen3-VL 4B prompt (\(inputIds.count) tokens) exceeds max_seq=\(maxSeq). Shorten the message or clear the chat history."])
+        }
+        let maxNew = min(remaining, 1024)
+
+        // Qwen3-VL EOS set: <|endoftext|>=151643, <|im_end|>=151645,
+        // <|im_start|>=151644 (next-turn marker → also a stop).
+        var eosSet: Set<Int32> = [151643, 151644, 151645]
+        if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
+
+        let genStart = Date()
+        return AsyncStream { continuation in
+            Task { [weak self] in
+                defer { Task { @MainActor in self?.isGenerating = false } }
+                var accumIds: [Int] = []
+                var emittedText = ""
+                var tokenCount = 0
+                do {
+                    _ = try await gen.generate(
+                        inputIds: inputIdsInt32, maxNewTokens: maxNew,
+                        temperature: 0.0, eosTokenIds: eosSet,
+                        onToken: { [weak self] tokenId in
+                            tokenCount += 1
+                            if eosSet.contains(tokenId) { return }
+                            accumIds.append(Int(tokenId))
+                            // Same accumulate-decode pattern as Qwen3.5 to
+                            // preserve multi-byte UTF-8.
                             let current = tok.decode(tokens: accumIds)
                             if current.count > emittedText.count,
                                current.hasPrefix(emittedText) {
