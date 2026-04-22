@@ -129,6 +129,13 @@ final class Qwen35Generator {
     @ObservationIgnored private var decodeHasInGraphArgmax = false
     private var cfg: Config
 
+    /// Reset per-phase profile accumulators. Call between comparable
+    /// measurement runs (e.g., before running the same prompt on a
+    /// different compute backend to compare).
+    func resetProfile() {
+        decodeProfile = PhaseProfile()
+    }
+
     /// Swap compute units at runtime. Since this Generator uses the decode
     /// model for both prefill and decode, only `decode` units take effect;
     /// the `prefill` parameter is accepted for API compat and ignored.
@@ -137,6 +144,8 @@ final class Qwen35Generator {
                       numLayers: cfg.numLayers, rotaryDim: cfg.rotaryDim,
                       prefillUnits: prefill, decodeUnits: decode)
         self.decode = nil
+        // Backend changed — previous profile samples are not comparable.
+        decodeProfile = PhaseProfile()
         status = "Idle (units changed, will reload on next run)"
     }
 
@@ -376,8 +385,13 @@ final class Qwen35Generator {
         // --- 2. Decode loop (with per-phase profiling) ---
         status = "Decoding..."
         var decodeTotal = 0.0
-        var sumInputs = 0.0, sumPredict = 0.0, sumStateCopy = 0.0, sumLogit = 0.0
-        var profileCount = 0
+        // Carry over the previous call's profile so short responses still
+        // contribute data points. `resetProfile()` explicitly zeroes.
+        var sumInputs = decodeProfile.inputsBuild * Double(decodeProfile.count)
+        var sumPredict = decodeProfile.predict * Double(decodeProfile.count)
+        var sumStateCopy = decodeProfile.stateCopy * Double(decodeProfile.count)
+        var sumLogit = decodeProfile.logitRead * Double(decodeProfile.count)
+        var profileCount = decodeProfile.count
         let decodeStart = Date()
         var position = S
         for step in 0..<(maxNewTokens - 1) {
@@ -420,14 +434,15 @@ final class Qwen35Generator {
             }
             let tLogit = CFAbsoluteTimeGetCurrent()
 
-            // Accumulate per-phase timings (skip first 2 as warmup)
-            if step >= 2 {
-                sumInputs    += (tIn1 - tIn0) * 1000
-                sumPredict   += (tPred - tIn1) * 1000
-                sumStateCopy += (tState - tPred) * 1000
-                sumLogit     += (tLogit - tState) * 1000
-                profileCount += 1
-            }
+            // Accumulate per-phase timings for every step. Previously we
+            // skipped step 0-1 as warmup, but that loses signal on short
+            // responses (EOS firing before step 2). The first-call cold
+            // path adds ~1-2ms noise at most, negligible in aggregate.
+            sumInputs    += (tIn1 - tIn0) * 1000
+            sumPredict   += (tPred - tIn1) * 1000
+            sumStateCopy += (tState - tPred) * 1000
+            sumLogit     += (tLogit - tState) * 1000
+            profileCount += 1
 
             generatedIds.append(nextToken)
             onToken?(nextToken)
@@ -458,22 +473,107 @@ final class Qwen35Generator {
         return generatedIds
     }
 
-    /// Load only the decode model. Prefers the in-graph argmax variant
-    /// (`next_token` int32 output, ~500 KB / step less CPU transfer) if
-    /// present; otherwise falls back to the full-logits variant and
-    /// performs argmax/sampling in Swift.
+    /// Load only the decode model. Preference order:
+    ///   1. argmax-in-graph fp16 (`next_token` int32 output) — not shipped
+    ///   2. INT8 palettized (754 MB, same parity as fp16, preferred default)
+    ///   3. fp16 (1.4 GB, ground-truth precision)
     func loadDecodeOnly() throws {
         let dCfg = MLModelConfiguration(); dCfg.computeUnits = cfg.decodeUnits
+        let loadedURL: URL
+        let variant: String
         if let url = try? resolveModelURL("qwen3_5_0_8b_decode_argmax_fp16_mseq128") {
             decode = try MLModel(contentsOf: url, configuration: dCfg)
             decodeHasInGraphArgmax = true
-            status = "Loaded decode-argmax on \(unitsName(cfg.decodeUnits))"
-            return
+            loadedURL = url; variant = "argmax-fp16"
+        } else if let url = try? resolveModelURL("qwen3_5_0_8b_decode_int8_mseq128") {
+            decode = try MLModel(contentsOf: url, configuration: dCfg)
+            decodeHasInGraphArgmax = false
+            loadedURL = url; variant = "int8"
+        } else {
+            let dURL = try resolveModelURL("qwen3_5_0_8b_decode_fp16_mseq128")
+            decode = try MLModel(contentsOf: dURL, configuration: dCfg)
+            decodeHasInGraphArgmax = false
+            loadedURL = dURL; variant = "fp16"
         }
-        let dURL = try resolveModelURL("qwen3_5_0_8b_decode_fp16_mseq128")
-        decode = try MLModel(contentsOf: dURL, configuration: dCfg)
-        decodeHasInGraphArgmax = false
-        status = "Loaded decode (logits) on \(unitsName(cfg.decodeUnits))"
+        status = "Loaded decode (\(variant)) on \(unitsName(cfg.decodeUnits))"
+        // Diagnostic: print ANE op-placement percentage so we can verify
+        // the chosen compute units are actually being honored. Prior bug:
+        // default silently ran on GPU despite being set to ANE, because a
+        // debug override wasn't reverted. Logging here catches that.
+        auditComputePlan(url: loadedURL, requestedUnits: cfg.decodeUnits, variant: variant)
+    }
+
+    private func auditComputePlan(url: URL, requestedUnits: MLComputeUnits, variant: String) {
+        let cfg = MLModelConfiguration(); cfg.computeUnits = requestedUnits
+        Task.detached(priority: .utility) {
+            guard #available(iOS 17.0, *) else { return }
+            do {
+                let plan = try await MLComputePlan.load(contentsOf: url, configuration: cfg)
+                guard case .program(let program) = plan.modelStructure else {
+                    print("[Qwen35] compute plan: structure is not a program")
+                    return
+                }
+                var total = 0, ane = 0, gpu = 0, cpu = 0, other = 0
+                for (_, fn) in program.functions {
+                    Self.walkOps(fn.block, plan: plan,
+                                  total: &total, ane: &ane, gpu: &gpu,
+                                  cpu: &cpu, other: &other)
+                }
+                let compute = max(1, total)
+                print(String(format:
+                    "[Qwen35] compute plan (\(variant), requested=\(Self.unitsLabel(requestedUnits))): total=%d ANE=%d (%.1f%%) GPU=%d (%.1f%%) CPU=%d (%.1f%%)",
+                    total, ane, 100.0*Double(ane)/Double(compute),
+                    gpu, 100.0*Double(gpu)/Double(compute),
+                    cpu, 100.0*Double(cpu)/Double(compute)))
+            } catch {
+                print("[Qwen35] compute plan audit failed: \(error)")
+            }
+        }
+    }
+
+    private static func unitsLabel(_ u: MLComputeUnits) -> String {
+        switch u {
+        case .cpuOnly: return "CPU"
+        case .cpuAndGPU: return "GPU"
+        case .cpuAndNeuralEngine: return "ANE"
+        case .all: return "All"
+        @unknown default: return "?"
+        }
+    }
+
+    @available(iOS 17.0, *)
+    private static func walkOps(_ block: MLModelStructure.Program.Block,
+                                 plan: MLComputePlan,
+                                 total: inout Int, ane: inout Int,
+                                 gpu: inout Int, cpu: inout Int,
+                                 other: inout Int) {
+        let constOps: Set<String> = [
+            "const", "constexpr_lut_to_dense", "constexpr_affine_dequantize",
+            "constexpr_blockwise_shift_scale", "constexpr_sparse_to_dense",
+            "constexpr_cast",
+        ]
+        for op in block.operations {
+            if constOps.contains(op.operatorName) {
+                for inner in op.blocks { walkOps(inner, plan: plan,
+                    total: &total, ane: &ane, gpu: &gpu, cpu: &cpu, other: &other) }
+                continue
+            }
+            total += 1
+            // MLComputeDevice is an enum in iOS 18+; the `is SomeDevice`
+            // type check we used first doesn't match — all ops fell into
+            // `other`. Use pattern matching on the enum cases.
+            switch plan.deviceUsage(for: op)?.preferred {
+            case .cpu:          cpu += 1
+            case .gpu:          gpu += 1
+            case .neuralEngine: ane += 1
+            default:            other += 1
+            }
+            for inner in op.blocks {
+                walkOps(inner, plan: plan,
+                        total: &total, ane: &ane, gpu: &gpu,
+                        cpu: &cpu, other: &other)
+            }
+        }
     }
 
     /// Build zero-initialized state tensors matching the decode inputs.
@@ -696,11 +796,24 @@ final class Qwen35Generator {
         // Fast path: argmax directly on the MLMultiArray without allocating
         // a 248K Float buffer. Single pass, stride-safe fp16 read, no
         // intermediate NaN-filtered copy.
+        //  - No rep_penalty → plain fastArgmax.
+        //  - With rep_penalty in greedy mode → single-pass argmax that
+        //    also tracks the best "non-recent" token, so if the global
+        //    argmax is in the recent window we can fall back to the
+        //    non-recent best without a second scan or a 1MB Float buffer.
         if temperature <= 0 {
-            return fastArgmax(arr, position: position, vocab: vocab)
+            if repetitionPenalty <= 1.0 {
+                return fastArgmax(arr, position: position, vocab: vocab)
+            }
+            let start = max(0, priorTokens.count - recentN)
+            var recent = Set<Int32>()
+            recent.reserveCapacity(priorTokens.count - start)
+            for i in start..<priorTokens.count { recent.insert(priorTokens[i]) }
+            return fastArgmaxAvoidingRecent(arr, position: position,
+                                              vocab: vocab, recent: recent)
         }
-        // Sampling path reuses the pre-allocated logitsBuffer to avoid
-        // 1 MB heap allocation every decode step.
+        // Sampling / rep-penalty path reuses the pre-allocated logitsBuffer
+        // to avoid 1 MB heap allocation every decode step.
         copyLogitsInto(&logitsBuffer, arr: arr, position: position, vocab: vocab)
         var logits = logitsBuffer
         // Repetition penalty on recent tokens (small set, scalar loop is fine)
@@ -714,6 +827,14 @@ final class Qwen35Generator {
                 if logits[idx] > 0 { logits[idx] /= repetitionPenalty }
                 else                 { logits[idx] *= repetitionPenalty }
             }
+        }
+        // Greedy-with-rep-penalty: pick argmax on adjusted logits
+        // without entering the softmax sampling path. This is what loop-
+        // breaking mode wants: deterministic but not locked-in.
+        if temperature <= 0 {
+            var best = 0; var bv: Float = -.infinity
+            for v in 0..<vocab { if logits[v] > bv { bv = logits[v]; best = v } }
+            return Int32(best)
         }
         // Temperature scaling via SIMD
         if temperature != 1.0 {
@@ -757,6 +878,52 @@ final class Qwen35Generator {
             if r < acc { return Int32(topIdx[i]) }
         }
         return Int32(topIdx[topIdx.count - 1])
+    }
+
+    /// Greedy argmax that rejects the best token if it's in `recent`,
+    /// returning the next-best non-recent token instead. Single pass
+    /// over the 248K vocab in fp16 without any intermediate buffer —
+    /// same cost as `fastArgmax` plus a Set lookup per iteration.
+    ///
+    /// This is the loop-breaking path used when rep_penalty > 1.0 on
+    /// greedy decode: INT8 quantization noise compounding the SSM state
+    /// can pin the argmax onto a repeating token; rejecting it once per
+    /// step is enough to escape.
+    private func fastArgmaxAvoidingRecent(_ arr: MLMultiArray, position: Int,
+                                           vocab: Int, recent: Set<Int32>) -> Int32 {
+        let strides = arr.strides.map(\.intValue)
+        let reportedV = strides.last ?? 0
+        let reportedP = strides.count >= 2 ? strides[strides.count - 2] : 0
+        let vStride = (reportedV >= 1 && reportedP >= vocab) ? reportedV : 1
+        let pStride = (reportedV >= 1 && reportedP >= vocab) ? reportedP : vocab
+        let offset = position * pStride
+        var bestIdx = 0
+        var bestV: Float16 = -.infinity
+        var bestAltIdx = 0
+        var bestAltV: Float16 = -.infinity
+        if arr.dataType == .float16, vStride == 1 {
+            let p = arr.dataPointer.assumingMemoryBound(to: Float16.self).advanced(by: offset)
+            for v in 0..<vocab {
+                let x = p[v]
+                if x > bestV { bestV = x; bestIdx = v }
+                if !recent.contains(Int32(v)) && x > bestAltV {
+                    bestAltV = x; bestAltIdx = v
+                }
+            }
+        } else {
+            // Fallback: stride-aware or fp32 via general path
+            let logits = copyLogits(arr, position: position, vocab: vocab)
+            var bestF: Float = -.infinity
+            var bestAltF: Float = -.infinity
+            for v in 0..<vocab {
+                let x = logits[v]
+                if x > bestF { bestF = x; bestIdx = v }
+                if !recent.contains(Int32(v)) && x > bestAltF {
+                    bestAltF = x; bestAltIdx = v
+                }
+            }
+        }
+        return recent.contains(Int32(bestIdx)) ? Int32(bestAltIdx) : Int32(bestIdx)
     }
 
     private func argmaxAtPosition(_ arr: MLMultiArray, position: Int, vocab: Int) -> Int32 {

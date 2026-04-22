@@ -81,10 +81,12 @@ public final class ModelDownloader: NSObject {
             folderName: "qwen2.5-0.5b")
 
         /// Qwen3.5 0.8B — hybrid Gated-DeltaNet SSM + attention, text-only.
-        /// Ships the decode mlpackage (1.4 GB, fp16) — prefill is performed
-        /// via the same model recurrently. Runs on CPU / GPU / ANE.
+        /// Ships the INT8 palettized decode mlpackage (754 MB) — same
+        /// semantic precision as fp16 (top-3 = 100% parity vs fp32 oracle),
+        /// half the bundle size. Prefill is performed via the same model
+        /// recurrently. Runs on CPU / GPU / ANE.
         public static let qwen35_08b = ModelInfo(
-            id: "qwen3.5-0.8b", name: "Qwen3.5 0.8B (ANE)", size: "1.4 GB",
+            id: "qwen3.5-0.8b", name: "Qwen3.5 0.8B (ANE)", size: "754 MB",
             downloadURL: "https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML/resolve/main",
             folderName: "qwen3.5-0.8b")
 
@@ -198,13 +200,17 @@ public final class ModelDownloader: NSObject {
 
     public func localModelURL(for model: ModelInfo) -> URL? {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
-        // Qwen3.5 has its own mlpackage name (no `model.mlpackage`). Detect
-        // by checking for the decode mlpackage's weight file.
-        let qwen35Pkg = dir.appendingPathComponent(
-            "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage")
-        if fileManager.fileExists(atPath: qwen35Pkg.appendingPathComponent(
-            "Data/com.apple.CoreML/weights/weight.bin").path) {
-            return qwen35Pkg
+        // Qwen3.5 has its own mlpackage names (no `model.mlpackage`).
+        // Check INT8 first (default shipping variant), then fp16 (legacy /
+        // ground-truth). Either presence marks this folder as a Qwen3.5
+        // model folder.
+        for name in ["qwen3_5_0_8b_decode_int8_mseq128.mlpackage",
+                     "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage"] {
+            let pkg = dir.appendingPathComponent(name)
+            if fileManager.fileExists(atPath: pkg.appendingPathComponent(
+                "Data/com.apple.CoreML/weights/weight.bin").path) {
+                return pkg
+            }
         }
         let chunk1 = dir.appendingPathComponent("chunk1.mlmodelc")
         if fileManager.fileExists(atPath: chunk1.appendingPathComponent("weights/weight.bin").path) {
@@ -756,32 +762,32 @@ public final class ModelDownloader: NSObject {
     /// no vision/audio towers). Produced by
     /// `conversion/build_gemma4_bundle.py --model gemma4-e4b`.
     /// Qwen3.5-0.8B CoreML layout on `mlboydaisuke/qwen3.5-0.8B-CoreML`.
-    /// Ships only the decode mlpackage (1.4 GB fp16). The same model is
-    /// used recurrently for prefill, so no separate prefill artifact is
-    /// needed. Tokenizer is fetched by swift-transformers at runtime from
+    /// Default ships the INT8 palettized decode (754 MB, same semantic
+    /// precision as fp16 — top-3 parity vs fp32 oracle preserved).
+    /// Tokenizer is fetched by swift-transformers at runtime from
     /// `Qwen/Qwen3.5-0.8B` on HF.
     ///
     /// mlpackage structure:
-    ///   qwen3_5_0_8b_decode_fp16_mseq128.mlpackage/
+    ///   qwen3_5_0_8b_decode_int8_mseq128.mlpackage/
     ///   ├── Manifest.json
     ///   └── Data/com.apple.CoreML/
     ///       ├── model.mlmodel
-    ///       └── weights/weight.bin  (1.4 GB)
+    ///       └── weights/weight.bin  (753 MB)
     ///
     /// Local layout after download (under `Models/qwen3.5-0.8b/`):
-    ///   qwen3_5_0_8b_decode_fp16_mseq128.mlpackage/...  (same structure)
+    ///   qwen3_5_0_8b_decode_int8_mseq128.mlpackage/...  (same structure)
     private func buildQwen35FileList() {
-        let pkg = "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage"
+        let pkg = "qwen3_5_0_8b_decode_int8_mseq128.mlpackage"
         pendingFiles = [
             .init(remotePath: "\(pkg)/Manifest.json",
                   localPath: "\(pkg)/Manifest.json",
                   estimatedSize: 700),
             .init(remotePath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
                   localPath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
-                  estimatedSize: 601_311),
+                  estimatedSize: 645_000),
             .init(remotePath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
                   localPath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
-                  estimatedSize: 1_505_342_912),
+                  estimatedSize: 753_000_000),
         ]
         // Sort biggest-first so large weight download starts immediately.
         pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }

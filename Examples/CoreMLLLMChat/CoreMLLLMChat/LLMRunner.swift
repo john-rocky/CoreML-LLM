@@ -69,10 +69,14 @@ final class LLMRunner {
 
         // Qwen3.5 detection: the downloaded folder contains the decode
         // mlpackage directly — no `model_config.json` / `hf_model/` layout
-        // that Gemma uses.
-        let qwen35Pkg = folder.appendingPathComponent(
+        // that Gemma uses. Accept either the INT8 (default shipping) or
+        // fp16 (legacy / high-precision) variant.
+        let qwen35Int8 = folder.appendingPathComponent(
+            "qwen3_5_0_8b_decode_int8_mseq128.mlpackage")
+        let qwen35Fp16 = folder.appendingPathComponent(
             "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage")
-        if FileManager.default.fileExists(atPath: qwen35Pkg.path) {
+        if FileManager.default.fileExists(atPath: qwen35Int8.path) ||
+           FileManager.default.fileExists(atPath: qwen35Fp16.path) {
             try await loadQwen35(folder: folder)
             return
         }
@@ -256,8 +260,14 @@ final class LLMRunner {
         }
         let maxNew = min(remaining, 120)  // soft cap to avoid long hangs
 
-        // EOS: Qwen <|im_end|> is 248046; also respect tokenizer's reported EOS.
-        var eosSet: Set<Int32> = [248046]
+        // Qwen3.5 has multiple stop tokens that all legitimately end a
+        // turn. Stopping on any of them prevents the model from leaking
+        // the text of a special token (e.g. "<|endoftext|>") into the
+        // visible stream and then fabricating a new "Human:" turn.
+        //   248044 = <|endoftext|>
+        //   248045 = <|im_start|>   (start of next turn — we should stop)
+        //   248046 = <|im_end|>     (end of current turn)
+        var eosSet: Set<Int32> = [248044, 248045, 248046]
         if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
 
         let genStart = Date()
@@ -275,6 +285,12 @@ final class LLMRunner {
                 var emittedText = ""
                 var tokenCount = 0
                 do {
+                    // Plain greedy — Mac ANE bench (INT8 / FP16) shows no
+                    // loops once the full Qwen EOS set is honored
+                    // (248044/248045/248046). rep_penalty previously
+                    // compensated for an EOS miss, not a real loop. Keep
+                    // the path available by upping this arg when
+                    // investigating.
                     _ = try await gen.generate(
                         inputIds: inputIdsInt32, maxNewTokens: maxNew,
                         temperature: 0.0, topK: 40, repetitionPenalty: 1.0,
