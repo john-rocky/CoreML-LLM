@@ -970,7 +970,7 @@ public final class ModelDownloader: NSObject {
     // MARK: - ZIP
 
     private func unzipFile(_ zipURL: URL, to destDir: URL) throws {
-        #if targetEnvironment(simulator) || os(macOS)
+        #if os(macOS)
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
         proc.arguments = ["-xk", zipURL.path, destDir.path]
@@ -979,11 +979,16 @@ public final class ModelDownloader: NSObject {
         try proc.run()
         proc.waitUntilExit()
         #else
+        // iOS (device + simulator), visionOS, tvOS, watchOS — Foundation's
+        // `Process` is macOS-only, so unzip ourselves via the ZIP central
+        // directory. Previously this branch used `#if targetEnvironment(simulator)
+        // || os(macOS)` which broke iOS Simulator builds with "cannot find
+        // 'Process' in scope".
         try extractZipNative(from: zipURL, to: destDir)
         #endif
     }
 
-    #if !targetEnvironment(simulator) && !os(macOS)
+    #if !os(macOS)
     private func extractZipNative(from zipURL: URL, to destDir: URL) throws {
         let data = try Data(contentsOf: zipURL)
         guard data.count > 22 else { throw DownloadError.extractionFailed }
