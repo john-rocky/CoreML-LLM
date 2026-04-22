@@ -1,6 +1,11 @@
 # Qwen3.5-0.8B Integration Roadmap
 
-Long-running effort to add `Qwen/Qwen3.5-0.8B` to the CoreML-LLM collection. Kicked off 2026-04-20. This doc is the source of truth; update as Phase checkpoints land.
+Long-running effort to add `Qwen/Qwen3.5-0.8B` to the CoreML-LLM collection. Kicked off 2026-04-20. **SHIPPED in v1.0.3 (2026-04-22).**
+
+> **Consolidated knowledge base** (all lessons from the ship, applicable to any hybrid SSM/attention model on ANE): `docs/QWEN35_LESSONS.md`
+> **2B continuation** (2-chunk INT8 for iPhone): `docs/QWEN35_2B_CHUNKED_HANDOFF.md`
+
+This doc is the original Phase-0 research scaffolding, preserved as historical record.
 
 ## What we're actually building
 
