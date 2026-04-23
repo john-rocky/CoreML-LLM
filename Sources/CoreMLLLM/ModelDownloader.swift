@@ -71,7 +71,11 @@ public final class ModelDownloader: NSObject {
         /// no longer sits in the video path.
         public static let gemma4e2b = ModelInfo(
             id: "gemma4-e2b", name: "Gemma 4 E2B", size: "3.1 GB",
-            downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
+            // n1024 branch ships the N=1024 batched prefill that pairs with
+            // the Swift SWA write fix (a878c44). Old clones still point at
+            // `main` and keep downloading N=512, which is safe with the
+            // unfixed Swift binary.
+            downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/n1024",
             folderName: "gemma4-e2b")
 
         /// Qwen2.5 0.5B — text only, 309 MB.
