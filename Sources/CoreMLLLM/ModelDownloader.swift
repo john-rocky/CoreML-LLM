@@ -114,7 +114,7 @@ public final class ModelDownloader: NSObject {
         /// release; Phase 2 will add it via a separate vision_video
         /// mlpackage + DeepStack layer-tap injection.
         public static let qwen3vl_2b = ModelInfo(
-            id: "qwen3-vl-2b", name: "Qwen3-VL 2B (text + vision, ANE)", size: "2.9 GB",
+            id: "qwen3-vl-2b", name: "Qwen3-VL 2B (text + vision, ANE)", size: "4.7 GB",
             downloadURL: "https://huggingface.co/mlboydaisuke/qwen3-vl-2b-coreml/resolve/main",
             folderName: "qwen3-vl-2b")
 
@@ -127,6 +127,21 @@ public final class ModelDownloader: NSObject {
             id: "gemma4-e4b", name: "Gemma 4 E4B", size: "5.5 GB",
             downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml/resolve/main",
             folderName: "gemma4-e4b")
+
+        /// Gemma 4 E2B Fashion — MB dress/casual theory vision advisor.
+        /// Local PEFT LoRA (rank=16, alpha=32) fine-tune on 598 Unsplash/Pexels
+        /// outfit photos labelled by Claude Vision, merged into the E2B base
+        /// and rebuilt via `build_gemma4_bundle.py --hf-dir <merged>`. Vision
+        /// tower is the stock `vision_video.mlmodelc` (64 tok/frame) grafted
+        /// from the production gemma4-e2b bundle — LoRA targets language_model
+        /// only, so vision weights are bit-identical to the base. Sideload-only
+        /// under `Documents/Models/gemma4-e2b-fashion/`; outputs a fixed JSON
+        /// schema (items, overall_dress_ratio, tpo_assumption, verdict, advice).
+        public static let gemma4e2bFashion = ModelInfo(
+            id: "gemma4-e2b-fashion", name: "Gemma 4 E2B Fashion (MB)",
+            size: "4.0 GB",
+            downloadURL: "",
+            folderName: "gemma4-e2b-fashion")
 
         /// Gemma 4 E2B + EAGLE-3 speculative — same 4.6B E2B base but with
         /// decode chunks that emit `hidden_at_L{8,17,34}` taps plus three
@@ -164,7 +179,7 @@ public final class ModelDownloader: NSObject {
             let experimental =
                 ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
                 || UserDefaults.standard.bool(forKey: "showExperimentalModels")
-            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b, qwen35_08b, qwen35_2b, qwen3vl_2b]
+            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, gemma4e2bFashion, qwen25_05b, qwen35_08b, qwen35_2b, qwen3vl_2b]
             if experimental {
                 list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
                 list.insert(gemma4e2bLookaheadProbe, at: 3)  // after EAGLE-3
@@ -970,6 +985,14 @@ public final class ModelDownloader: NSObject {
         // same weight footprint as chunk_0 (353 MB). Shipped alongside
         // the regular chunk_0 so vision can be toggled on per-prompt.
         sizes.append(("chunk_0_vision.mlpackage", 353_000_000))
+        // Batched-prefill chunks (T=32) — optional, enables ~10× TTFT
+        // improvement for image prompts. Same per-layer weight budget
+        // as the decode chunks (they share backbone params just with a
+        // T-axis added to the activations), INT8-palettized.
+        for i in 0..<4 {
+            sizes.append(("prefill_chunk_\(i).mlpackage", 353_000_000))
+        }
+        sizes.append(("prefill_chunk_0_vision.mlpackage", 353_000_000))
         var files: [DownloadFile] = []
         for (chunk, weightSize) in sizes {
             let pkg = "\(root)/\(chunk)"
