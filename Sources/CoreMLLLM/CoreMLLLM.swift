@@ -239,13 +239,19 @@ public final class CoreMLLLM: @unchecked Sendable {
             await ComputePlanAudit.run(modelDirectory: directory,
                                        computeUnits: computeUnits)
 
-            // Optional disk-backed prefix cache (LLM_PREFIX_CACHE=1).
+            // Disk-backed prefix cache. Default on — the 2026-04-23 iPhone
+            // ANE bench showed compute scales with real_len (not N), so
+            // every cached prefix token skipped is real seconds saved
+            // (see docs/IPHONE_ANE_SPARSITY_FINDING.md).
+            //
             // Cache directory is namespaced by model directory's last
             // path component (e.g. "gemma4-e2b") so multiple models
             // don't collide. Capacity defaults to 256 MB which fits
             // 3-7 snapshots at 2K context (more at 8K = fewer entries).
-            if let engine = llm.chunkedEngine,
-               ProcessInfo.processInfo.environment["LLM_PREFIX_CACHE"] == "1" {
+            // Opt-out: LLM_PREFIX_CACHE=0. Override capacity: LLM_PREFIX_CACHE_MB=<N>.
+            let prefixCacheEnabled = ProcessInfo.processInfo
+                .environment["LLM_PREFIX_CACHE"] != "0"
+            if let engine = llm.chunkedEngine, prefixCacheEnabled {
                 do {
                     let cachesDir = try FileManager.default.url(
                         for: .cachesDirectory, in: .userDomainMask,
