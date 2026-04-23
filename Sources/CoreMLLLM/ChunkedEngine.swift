@@ -34,21 +34,6 @@ final class ChunkedEngine {
     private var _prefillChunk4: MLModel?
     private var _prefillLoadTask: Task<Void, Error>?
 
-    /// One multifunction prefill variant — a 4-chunk tuple at a specific
-    /// static batch size N. Built when the prefill_chunk*.mlpackage exposes
-    /// multiple `prefill_b<N>` functions. See `conversion/build_prefill_multifunction.py`.
-    struct PrefillSet {
-        let size: Int
-        let c1: MLModel
-        let c2: MLModel
-        let c3: MLModel
-        let c4: MLModel
-    }
-    /// Sorted ascending by size. Populated only when LLM_PREFILL_MULTIFUNCTION=1
-    /// and the mlpackage has the corresponding `prefill_b<N>` functions.
-    /// Read/written under `prefillLock`.
-    private var _prefillVariants: [PrefillSet] = []
-
     private var prefillChunk1: MLModel? {
         prefillLock.lock(); defer { prefillLock.unlock() }
         return _prefillChunk1
@@ -142,30 +127,6 @@ final class ChunkedEngine {
         _prefillChunk1 = p1; _prefillChunk2 = p2
         _prefillChunk3 = p3; _prefillChunk4 = p4
         prefillLock.unlock()
-    }
-
-    /// Attach a multifunction variant (S1 router). Called by the variant
-    /// discovery pass when it successfully loads all 4 chunks at a given
-    /// static batch size via `functionName = "prefill_b<N>"`.
-    func attachPrefillVariant(_ set: PrefillSet) {
-        prefillLock.lock()
-        _prefillVariants.append(set)
-        _prefillVariants.sort { $0.size < $1.size }
-        prefillLock.unlock()
-    }
-
-    /// Pick the smallest loaded variant whose static batch size ≥ `realLen`.
-    /// Returns nil when no variants are loaded or none fits — the caller
-    /// falls back to the default prefillChunk1..4 (size = `prefillN`).
-    func pickPrefillSet(realLen: Int) -> PrefillSet? {
-        prefillLock.lock(); defer { prefillLock.unlock() }
-        return _prefillVariants.first(where: { $0.size >= realLen })
-    }
-
-    /// All currently loaded variant sizes (for logging / tests).
-    var prefillVariantSizes: [Int] {
-        prefillLock.lock(); defer { prefillLock.unlock() }
-        return _prefillVariants.map { $0.size }
     }
 
     /// Token handle for the background prefill load (if any). Callers can
@@ -413,20 +374,6 @@ final class ChunkedEngine {
         let deferPrefill = ProcessInfo.processInfo.environment["LLM_DEFER_PREFILL"] == "1"
         if deferPrefill && hasPrefillFiles {
             print("[Load] LLM_DEFER_PREFILL=1 — decode chunks foreground, prefill chunks background")
-        }
-
-        // LLM_PREFILL_MULTIFUNCTION=1 — after the default prefill chunks
-        // load, try to also load `functionName = "prefill_b<N>"` for
-        // N ∈ {64, 128, 256}. Adds multifunction variants used by the
-        // S1 router in runPrefill. 512 is already the default function
-        // (loaded by the default path) so no need to re-load it.
-        // Requires prefill_chunk*.mlpackage built by
-        // `conversion/build_prefill_multifunction.py`.
-        let enableMultifunction = ProcessInfo.processInfo.environment["LLM_PREFILL_MULTIFUNCTION"] == "1"
-        let multifunctionSizes = [64, 128, 256]
-        if enableMultifunction && hasPrefillFiles {
-            print("[Load] LLM_PREFILL_MULTIFUNCTION=1 — will discover variants " +
-                  "\(multifunctionSizes.map { "b\($0)" }.joined(separator: ","))")
         }
         var chunkWork: [(String, MLModelConfiguration)] = [
             ("chunk1", mlConfig), ("chunk2", mlConfig),
@@ -761,36 +708,6 @@ final class ChunkedEngine {
         engine.reset()
         print("[Load] ANE prewarm (4 steps) done in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - warmT0))s")
 
-        // S1 variant discovery (sync path). Try to load additional
-        // multifunction prefill variants by specifying functionName on
-        // the same mlpackages. Non-multifunction mlpackages will fail
-        // the load cleanly — we swallow the error and skip that size.
-        if enableMultifunction && hasPrefillFiles && !deferPrefill {
-            for size in multifunctionSizes {
-                let vT0 = CFAbsoluteTimeGetCurrent()
-                do {
-                    let vCfg = MLModelConfiguration()
-                    vCfg.computeUnits = prefillConfig.computeUnits
-                    vCfg.functionName = "prefill_b\(size)"
-                    applyHints(vCfg)
-                    guard let u1 = findModel("prefill_chunk1"),
-                          let u2 = findModel("prefill_chunk2"),
-                          let u3 = findModel("prefill_chunk3"),
-                          let u4 = findModel("prefill_chunk4") else { break }
-                    let v1 = try MLModel(contentsOf: u1, configuration: vCfg)
-                    let v2 = try MLModel(contentsOf: u2, configuration: vCfg)
-                    let v3 = try MLModel(contentsOf: u3, configuration: vCfg)
-                    let v4 = try MLModel(contentsOf: u4, configuration: vCfg)
-                    engine.attachPrefillVariant(PrefillSet(
-                        size: size, c1: v1, c2: v2, c3: v3, c4: v4))
-                    print("[Load] prefill variant b\(size) loaded in " +
-                          "\(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - vT0))s")
-                } catch {
-                    print("[Load] prefill variant b\(size) not available: \(error.localizedDescription)")
-                }
-            }
-        }
-
         // Deferred prefill: load the 4 prefill chunks in the background and
         // attach them once done. Callers can `await engine.prefillLoadTask?.value`
         // to block on completion. Most code paths instead gate on `hasPrefill`,
@@ -799,9 +716,6 @@ final class ChunkedEngine {
         if deferPrefill && hasPrefillFiles {
             let directoryCopy = directory
             let prefillConfigCopy = prefillConfig
-            let multifunctionInBg = enableMultifunction
-            let bgSizes = multifunctionSizes
-            let bgFastPred = fastPredictionEnabled
             let task = Task.detached(priority: .utility) { [weak engine] () throws -> Void in
                 let bgT0 = CFAbsoluteTimeGetCurrent()
                 func bgFind(_ name: String) -> URL? {
@@ -828,40 +742,7 @@ final class ChunkedEngine {
                 guard let engine else { return }
                 engine.attachPrefill(bp1, bp2, bp3, bp4)
                 let bgDt = CFAbsoluteTimeGetCurrent() - bgT0
-                print("[Load/bg] all 4 prefill chunks ready in \(String(format: "%.1f", bgDt))s")
-
-                // S1 variant discovery (deferred path).
-                if multifunctionInBg {
-                    for size in bgSizes {
-                        let vT0 = CFAbsoluteTimeGetCurrent()
-                        do {
-                            let vCfg = MLModelConfiguration()
-                            vCfg.computeUnits = prefillConfigCopy.computeUnits
-                            vCfg.functionName = "prefill_b\(size)"
-                            if bgFastPred, #available(iOS 18.0, macOS 15.0, *) {
-                                var hints = MLOptimizationHints()
-                                hints.specializationStrategy = .fastPrediction
-                                vCfg.optimizationHints = hints
-                            }
-                            guard let u1 = bgFind("prefill_chunk1"),
-                                  let u2 = bgFind("prefill_chunk2"),
-                                  let u3 = bgFind("prefill_chunk3"),
-                                  let u4 = bgFind("prefill_chunk4") else { break }
-                            let v1 = try MLModel(contentsOf: u1, configuration: vCfg)
-                            let v2 = try MLModel(contentsOf: u2, configuration: vCfg)
-                            let v3 = try MLModel(contentsOf: u3, configuration: vCfg)
-                            let v4 = try MLModel(contentsOf: u4, configuration: vCfg)
-                            engine.attachPrefillVariant(PrefillSet(
-                                size: size, c1: v1, c2: v2, c3: v3, c4: v4))
-                            print("[Load/bg] prefill variant b\(size) loaded in " +
-                                  "\(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - vT0))s")
-                        } catch {
-                            print("[Load/bg] prefill variant b\(size) not available: \(error.localizedDescription)")
-                        }
-                    }
-                }
-
-                print("[Load/bg] warming")
+                print("[Load/bg] all 4 prefill chunks ready in \(String(format: "%.1f", bgDt))s — warming")
                 try? engine.warmPrefillOnly()
             }
             engine.setPrefillLoadTask(task)
@@ -1226,21 +1107,12 @@ final class ChunkedEngine {
     func runPrefill(tokenIDs: [Int], imageFeatures: MLMultiArray? = nil,
                     imageNumTokens: Int = 256,
                     audioFeatures: MLMultiArray? = nil, audioNumTokens: Int = 50) throws -> Int {
-        let realLen = tokenIDs.count
-        // S1 router: prefer the smallest multifunction variant ≥ realLen.
-        // Falls back to the default prefillChunk1..4 (size = prefillN) when
-        // no variants are loaded or none fits. A 50-token chat turn via a
-        // b64 variant spends ~8× less ANE time than via b512 padding.
-        let p1: MLModel, p2: MLModel, p3: MLModel, p4: MLModel
-        let N: Int
-        if let v = pickPrefillSet(realLen: realLen) {
-            p1 = v.c1; p2 = v.c2; p3 = v.c3; p4 = v.c4; N = v.size
-        } else if let d1 = prefillChunk1, let d2 = prefillChunk2,
-                  let d3 = prefillChunk3, let d4 = prefillChunk4 {
-            p1 = d1; p2 = d2; p3 = d3; p4 = d4; N = prefillN
-        } else {
+        guard let p1 = prefillChunk1, let p2 = prefillChunk2,
+              let p3 = prefillChunk3, let p4 = prefillChunk4 else {
             throw CoreMLLLMError.prefillNotAvailable
         }
+        let N = prefillN
+        let realLen = tokenIDs.count
         precondition(realLen > 0 && realLen <= N)
 
         // ---- Prefix cache lookup (text-only) -----------------------------
