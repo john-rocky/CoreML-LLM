@@ -110,7 +110,7 @@ public final class ModelDownloader: NSObject {
         /// release; Phase 2 will add it via a separate vision_video
         /// mlpackage + DeepStack layer-tap injection.
         public static let qwen3vl_2b = ModelInfo(
-            id: "qwen3-vl-2b", name: "Qwen3-VL 2B (text, ANE)", size: "2.1 GB",
+            id: "qwen3-vl-2b", name: "Qwen3-VL 2B (text + vision, ANE)", size: "2.9 GB",
             downloadURL: "https://huggingface.co/mlboydaisuke/qwen3-vl-2b-coreml/resolve/main",
             folderName: "qwen3-vl-2b")
 
@@ -962,6 +962,10 @@ public final class ModelDownloader: NSObject {
             ("chunk_\(i).mlpackage", Int64(353_000_000))  // 7 layers each
         }
         sizes.append(("chunk_head.mlpackage", 311_000_000))  // final_norm + lm_head
+        // DeepStack-aware chunk_0 replacement for the vision path —
+        // same weight footprint as chunk_0 (353 MB). Shipped alongside
+        // the regular chunk_0 so vision can be toggled on per-prompt.
+        sizes.append(("chunk_0_vision.mlpackage", 353_000_000))
         var files: [DownloadFile] = []
         for (chunk, weightSize) in sizes {
             let pkg = "\(root)/\(chunk)"
@@ -983,6 +987,22 @@ public final class ModelDownloader: NSObject {
             remotePath: "\(root)/embed_weight.bin",
             localPath: "\(root)/embed_weight.bin",
             estimatedSize: 622_000_000))
+        // Vision encoder (ships alongside the decode chunks).
+        // Input: pixel_values (3, 2, 448, 448) fp16, output: merger
+        // hidden + 3 DeepStack slices. ~388 MB INT8 palettized.
+        let visionPkg = "qwen3_vl_2b_vision/vision.mlpackage"
+        files.append(.init(
+            remotePath: "\(visionPkg)/Manifest.json",
+            localPath: "\(visionPkg)/Manifest.json",
+            estimatedSize: 700))
+        files.append(.init(
+            remotePath: "\(visionPkg)/Data/com.apple.CoreML/model.mlmodel",
+            localPath: "\(visionPkg)/Data/com.apple.CoreML/model.mlmodel",
+            estimatedSize: 400_000))
+        files.append(.init(
+            remotePath: "\(visionPkg)/Data/com.apple.CoreML/weights/weight.bin",
+            localPath: "\(visionPkg)/Data/com.apple.CoreML/weights/weight.bin",
+            estimatedSize: 406_000_000))
         pendingFiles = files
         pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }

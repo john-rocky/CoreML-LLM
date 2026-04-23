@@ -90,6 +90,43 @@ private final class VL2BHiddenProvider: NSObject, MLFeatureProvider {
     }
 }
 
+/// Feature provider for the DeepStack-aware chunk_0_vision. Adds
+/// `ds_0`, `ds_1`, `ds_2`, and `visual_active` on top of the regular
+/// body-chunk inputs. DeepStack and gate feature values are caller-
+/// owned so the generator can swap them per step without reallocating.
+private final class VL2BVisionChunk0Features: NSObject, MLFeatureProvider {
+    private let base: VL2BBodyFeatures
+    private let fvDs0: MLFeatureValue
+    private let fvDs1: MLFeatureValue
+    private let fvDs2: MLFeatureValue
+    private let fvGate: MLFeatureValue
+    let featureNames: Set<String>
+
+    init(base: VL2BBodyFeatures,
+         ds0: MLFeatureValue, ds1: MLFeatureValue, ds2: MLFeatureValue,
+         gate: MLFeatureValue) {
+        self.base = base
+        self.fvDs0 = ds0; self.fvDs1 = ds1; self.fvDs2 = ds2
+        self.fvGate = gate
+        var names = base.featureNames
+        names.insert("ds_0"); names.insert("ds_1"); names.insert("ds_2")
+        names.insert("visual_active")
+        self.featureNames = names
+        super.init()
+    }
+
+    func featureValue(for featureName: String) -> MLFeatureValue? {
+        switch featureName {
+        case "ds_0":          return fvDs0
+        case "ds_1":          return fvDs1
+        case "ds_2":          return fvDs2
+        case "visual_active": return fvGate
+        default:              return base.featureValue(for: featureName)
+        }
+    }
+}
+
+
 @Observable
 final class Qwen3VL2BGenerator {
     struct Config {
@@ -125,6 +162,15 @@ final class Qwen3VL2BGenerator {
     @ObservationIgnored private var bodyChunks: [MLModel] = []
     @ObservationIgnored private var headChunk: MLModel?
 
+    /// DeepStack-aware replacement for chunk_0, used when the generator
+    /// is invoked with a `VisionFeatures` (image-conditioned prefill).
+    /// Exposes the same K/V slots as chunk_0 plus `ds_0..ds_2` and a
+    /// `visual_active` scalar gate.
+    @ObservationIgnored private var chunk0Vision: MLModel?
+    /// Whether chunk_0_vision is available on disk. Vision generation
+    /// requires both the vision encoder AND this chunk.
+    var hasVisionChunk0: Bool { chunk0Vision != nil }
+
     /// mmap'd embed_weight.bin
     @ObservationIgnored private var embedMmapPtr: UnsafePointer<UInt16>?
     @ObservationIgnored private var embedMmapBase: UnsafeMutableRawPointer?
@@ -156,6 +202,20 @@ final class Qwen3VL2BGenerator {
 
     /// Reusable Float buffer for logits — avoids 600 KB heap alloc per step.
     @ObservationIgnored private var logitsBuffer: [Float] = []
+
+    /// Reusable DeepStack slot buffers + gate scalar wrappers. Each ds
+    /// slot holds one 2048-fp16 row (4 KB) that is either memcpy'd from
+    /// the vision encoder output on image-pad steps or zeroed otherwise.
+    /// `fvGateOff` / `fvGateOn` are constant scalars flipped per step to
+    /// disable / enable the in-graph DeepStack add.
+    @ObservationIgnored private var reusableDs0: MLMultiArray!
+    @ObservationIgnored private var reusableDs1: MLMultiArray!
+    @ObservationIgnored private var reusableDs2: MLMultiArray!
+    @ObservationIgnored private var fvDs0: MLFeatureValue!
+    @ObservationIgnored private var fvDs1: MLFeatureValue!
+    @ObservationIgnored private var fvDs2: MLFeatureValue!
+    @ObservationIgnored private var fvGateOff: MLFeatureValue!
+    @ObservationIgnored private var fvGateOn: MLFeatureValue!
 
     init(cfg: Config = .default) {
         self.cfg = cfg
@@ -191,6 +251,27 @@ final class Qwen3VL2BGenerator {
         self.fvCos = MLFeatureValue(multiArray: reusableCos)
         self.fvSin = MLFeatureValue(multiArray: reusableSin)
         self.hiddenProvider = VL2BHiddenProvider(fvHidden: fvHidden)
+
+        // DeepStack slots + gate scalars for the vision path. Allocated
+        // unconditionally (~12 KB total) so stepPredict can swap them in
+        // without a branch-time alloc; text-only generate() simply never
+        // routes through chunk_0_vision and leaves these buffers unused.
+        let dsShape: [NSNumber] = [1, 1, NSNumber(value: cfg.hiddenSize)]
+        self.reusableDs0 = try! MLMultiArray(shape: dsShape, dataType: .float16)
+        self.reusableDs1 = try! MLMultiArray(shape: dsShape, dataType: .float16)
+        self.reusableDs2 = try! MLMultiArray(shape: dsShape, dataType: .float16)
+        memset(reusableDs0.dataPointer, 0, reusableDs0.count * 2)
+        memset(reusableDs1.dataPointer, 0, reusableDs1.count * 2)
+        memset(reusableDs2.dataPointer, 0, reusableDs2.count * 2)
+        self.fvDs0 = MLFeatureValue(multiArray: reusableDs0)
+        self.fvDs1 = MLFeatureValue(multiArray: reusableDs1)
+        self.fvDs2 = MLFeatureValue(multiArray: reusableDs2)
+        let gateOff = try! MLMultiArray(shape: [1], dataType: .float32)
+        let gateOn  = try! MLMultiArray(shape: [1], dataType: .float32)
+        gateOff.dataPointer.assumingMemoryBound(to: Float.self)[0] = 0.0
+        gateOn.dataPointer.assumingMemoryBound(to: Float.self)[0]  = 1.0
+        self.fvGateOff = MLFeatureValue(multiArray: gateOff)
+        self.fvGateOn  = MLFeatureValue(multiArray: gateOn)
     }
 
     /// 1D RoPE table builder. For text-only Qwen3-VL the mRoPE
@@ -221,7 +302,7 @@ final class Qwen3VL2BGenerator {
     /// Honors both `.mlpackage` (HF download) and `.mlmodelc`
     /// (devicectl sideload).
     private func resolveDecodeURLs()
-        -> (body: [URL], head: URL, embed: URL)? {
+        -> (body: [URL], head: URL, embed: URL, chunk0Vision: URL?)? {
         let subdir = "qwen3_vl_2b_decode_chunks"
         let embedBinName = "embed_weight.bin"
         let fm = FileManager.default
@@ -236,7 +317,7 @@ final class Qwen3VL2BGenerator {
             return nil
         }
 
-        func resolve(_ base: URL) -> (body: [URL], head: URL, embed: URL)? {
+        func resolve(_ base: URL) -> (body: [URL], head: URL, embed: URL, chunk0Vision: URL?)? {
             let dir = base.appendingPathComponent(subdir)
             let embedURL = dir.appendingPathComponent(embedBinName)
             guard fm.fileExists(atPath: embedURL.path) else { return nil }
@@ -246,7 +327,9 @@ final class Qwen3VL2BGenerator {
                 bodies.append(u)
             }
             guard let head = resolveOne(dir, "chunk_head") else { return nil }
-            return (bodies, head, embedURL)
+            // Optional: DeepStack-aware chunk_0 for vision prompts.
+            let vis = resolveOne(dir, "chunk_0_vision")
+            return (bodies, head, embedURL, vis)
         }
 
         if let folder = modelFolderOverride, let r = resolve(folder) { return r }
@@ -323,6 +406,7 @@ final class Qwen3VL2BGenerator {
             ropeTheta: cfg.ropeTheta, decodeUnits: units)
         bodyChunks = []
         headChunk = nil
+        chunk0Vision = nil
         releaseEmbedMmap()
         status = "Idle (units changed, will reload on next run)"
     }
@@ -339,7 +423,15 @@ final class Qwen3VL2BGenerator {
             try MLModel(contentsOf: $0, configuration: dCfg)
         }
         headChunk = try MLModel(contentsOf: resolved.head, configuration: dCfg)
-        status = "Loaded VL2B (\(cfg.numBodyChunks) body + head) on \(unitsName(cfg.decodeUnits))"
+        if let vurl = resolved.chunk0Vision {
+            chunk0Vision = try MLModel(contentsOf: vurl, configuration: dCfg)
+            auditComputePlan(url: vurl, requestedUnits: cfg.decodeUnits,
+                             variant: "VL2B-chunk0_vision")
+        } else {
+            chunk0Vision = nil
+        }
+        let visTag = chunk0Vision == nil ? "text" : "text+vision"
+        status = "Loaded VL2B (\(cfg.numBodyChunks) body + head, \(visTag)) on \(unitsName(cfg.decodeUnits))"
         // Diagnostic: per-chunk compute plan audit. Same pattern as
         // Qwen35Generator — async, doesn't block prediction.
         for (idx, url) in resolved.body.enumerated() {
@@ -456,25 +548,95 @@ final class Qwen3VL2BGenerator {
 
     /// Holds per-call mutable scratch threaded through the decode loop.
     /// One last-output slot per body chunk; the head is stateless.
+    /// When `vision` is non-nil the generator routes chunk[0] through
+    /// `chunk0Vision` and overrides the embed lookup on image-pad steps.
     private final class CallState {
         var lastBodyOuts: [MLFeatureProvider?] = []
         var initialKVFVs: [[String: MLFeatureValue]?] = []
+        var vision: VisionState?
+    }
+
+    /// Per-generate vision state. `imageTokenIdx` counts consumed
+    /// image-pad tokens so ds_0..ds_2 / the merger hidden row can be
+    /// indexed in order.
+    final class VisionState {
+        let features: Qwen3VL2BVisionFeatures
+        let imagePadTokenId: Int32
+        var imageTokenIdx: Int = 0
+        init(features: Qwen3VL2BVisionFeatures, imagePadTokenId: Int32) {
+            self.features = features
+            self.imagePadTokenId = imagePadTokenId
+        }
+    }
+
+    /// Copy one row (2048 fp16) from a (N, hidden) fp16 MLMultiArray
+    /// into the given destination pointer.
+    private func copyRow(from src: MLMultiArray, row: Int,
+                          into dst: UnsafeMutablePointer<UInt16>) {
+        let hidden = cfg.hiddenSize
+        let p = src.dataPointer.assumingMemoryBound(to: UInt16.self)
+        memcpy(dst, p.advanced(by: row * hidden), hidden * 2)
     }
 
     private func stepPredict(token: Int32, position: Int,
                               state: CallState) async throws -> MLFeatureProvider {
-        embedLookup(token: token)
+        // --- 1) hidden_in for chunk 0 ---
+        // Image-pad tokens read the corresponding merger-output row from
+        // the vision encoder instead of the text embed table. This is
+        // the same contract HF uses internally (hidden_states gets
+        // scatter-filled at image-token positions from image_features).
+        let useVisionChunk0: Bool
+        var visualActiveOn = false
+        if let vs = state.vision, token == vs.imagePadTokenId,
+           vs.imageTokenIdx < vs.features.count {
+            let dst = reusableHidden.dataPointer
+                .assumingMemoryBound(to: UInt16.self)
+            copyRow(from: vs.features.hidden, row: vs.imageTokenIdx, into: dst)
+            // Load ds_0..ds_2 for this image token.
+            copyRow(from: vs.features.deepstack[0], row: vs.imageTokenIdx,
+                    into: reusableDs0.dataPointer
+                        .assumingMemoryBound(to: UInt16.self))
+            copyRow(from: vs.features.deepstack[1], row: vs.imageTokenIdx,
+                    into: reusableDs1.dataPointer
+                        .assumingMemoryBound(to: UInt16.self))
+            copyRow(from: vs.features.deepstack[2], row: vs.imageTokenIdx,
+                    into: reusableDs2.dataPointer
+                        .assumingMemoryBound(to: UInt16.self))
+            vs.imageTokenIdx += 1
+            visualActiveOn = true
+            useVisionChunk0 = true
+        } else {
+            embedLookup(token: token)
+            // DeepStack inputs are still fed as zeroed arrays on non-
+            // image steps — chunk_0_vision gates the add on visual_active,
+            // but some CoreML frontends require every declared input to
+            // be present regardless.
+            useVisionChunk0 = state.vision != nil && chunk0Vision != nil
+        }
         writeDecodeScalars(token: token, position: position)
+
         var lastStepOut: MLFeatureProvider = hiddenProvider
         for ci in 0..<bodyChunks.count {
-            let features = VL2BBodyFeatures(
+            let base = VL2BBodyFeatures(
                 hiddenSource: lastStepOut,
                 pos: fvPos, cos: fvCos, sin: fvSin,
                 prevOut: state.lastBodyOuts[ci],
                 initialKVFVs: state.initialKVFVs[ci],
                 kvInputNames: kvInputNames[ci],
                 kvOutputNames: kvOutputNames[ci])
-            let out = try await bodyChunks[ci].prediction(from: features)
+            let runChunk: MLModel
+            let features: MLFeatureProvider
+            if ci == 0, useVisionChunk0, let c0v = chunk0Vision {
+                features = VL2BVisionChunk0Features(
+                    base: base,
+                    ds0: fvDs0, ds1: fvDs1, ds2: fvDs2,
+                    gate: visualActiveOn ? fvGateOn : fvGateOff)
+                runChunk = c0v
+            } else {
+                features = base
+                runChunk = bodyChunks[ci]
+            }
+            let out = try await runChunk.prediction(from: features)
             state.lastBodyOuts[ci] = out
             state.initialKVFVs[ci] = nil
             lastStepOut = out
@@ -498,6 +660,8 @@ final class Qwen3VL2BGenerator {
     func generate(inputIds: [Int32], maxNewTokens: Int = 64,
                    temperature: Float = 0.0,
                    eosTokenIds: Set<Int32> = [],
+                   visionFeatures: Qwen3VL2BVisionFeatures? = nil,
+                   imagePadTokenId: Int32 = 151655,
                    onToken: ((Int32) -> Void)? = nil) async throws -> [Int32] {
         running = true
         defer { running = false }
@@ -511,11 +675,20 @@ final class Qwen3VL2BGenerator {
                 userInfo: [NSLocalizedDescriptionKey:
                     "input length \(S) must be in (0, \(cfg.maxSeq - 1)]"])
         }
+        if visionFeatures != nil && chunk0Vision == nil {
+            throw NSError(domain: "Qwen3VL2BGenerator", code: 4,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "vision prompt supplied but chunk_0_vision.mlpackage is missing from the model folder"])
+        }
 
         // Per-chunk zero KV cache (initial state)
         let callState = CallState()
         callState.lastBodyOuts = [MLFeatureProvider?](
             repeating: nil, count: cfg.numBodyChunks)
+        if let feats = visionFeatures {
+            callState.vision = VisionState(
+                features: feats, imagePadTokenId: imagePadTokenId)
+        }
         var initial: [[String: MLFeatureValue]?] = []
         initial.reserveCapacity(cfg.numBodyChunks)
         for ci in 0..<cfg.numBodyChunks {

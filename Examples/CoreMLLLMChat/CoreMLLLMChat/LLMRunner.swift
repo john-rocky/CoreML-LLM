@@ -47,6 +47,10 @@ final class LLMRunner {
     // num_kv_heads=8, 6 body chunks + head + mmap embed sidecar.
     private var qwen3vl2bGenerator: Qwen3VL2BGenerator?
     private var qwen3vl2bTokenizer: (any Tokenizer)?
+    /// Optional vision encoder paired with the VL2B decode chunks.
+    /// Allocated alongside the generator when `vision.mlmodelc` /
+    /// `vision.mlpackage` is present in the model folder.
+    private var qwen3vl2bVisionEncoder: Qwen3VL2BVisionEncoder?
 
     // MARK: - Loading
 
@@ -62,6 +66,7 @@ final class LLMRunner {
             qwen35Tokenizer = nil
             qwen3vl2bGenerator = nil
             qwen3vl2bTokenizer = nil
+            qwen3vl2bVisionEncoder = nil
             isLoaded = false
             modelName = ""
             hasVision = false
@@ -180,7 +185,7 @@ final class LLMRunner {
             return try await generateQwen35(messages: messages)
         }
         if qwen3vl2bGenerator != nil {
-            return try await generateQwen3VL2B(messages: messages)
+            return try await generateQwen3VL2B(messages: messages, image: image)
         }
         guard let llm else {
             throw NSError(domain: "LLMRunner", code: 1,
@@ -414,15 +419,36 @@ final class LLMRunner {
         }
         qwen3vl2bGenerator = gen
         qwen3vl2bTokenizer = tok
-        modelName = "Qwen3-VL 2B (text)"
-        hasVision = false  // Phase 2 will enable
+
+        // Optional vision encoder (Phase 2c/2d ship). chunk_0_vision must
+        // also be present for the end-to-end vision path to work; the
+        // generator throws at generate() time if only one half of the
+        // vision bundle is present.
+        var visionTag = ""
+        if let visionURL = Qwen3VL2BVisionEncoder.resolveModel(folder: folder) {
+            let enc = Qwen3VL2BVisionEncoder()
+            do {
+                try enc.load(modelURL: visionURL)
+                qwen3vl2bVisionEncoder = enc
+                visionTag = gen.hasVisionChunk0 ? " + vision" : " (vision encoder only, no chunk_0_vision)"
+            } catch {
+                print("[LLMRunner] Qwen3-VL 2B vision encoder load failed: \(error)")
+            }
+        }
+
+        modelName = "Qwen3-VL 2B\(visionTag)"
+        // The chat UI enables its image picker on hasVision — we only
+        // flip it true when BOTH the encoder and chunk_0_vision are
+        // loaded so the picker isn't a dead end.
+        hasVision = qwen3vl2bVisionEncoder != nil && gen.hasVisionChunk0
         hasAudio = false
         isLoaded = true
         loadingStatus = "Ready"
-        print("[LLMRunner] loaded Qwen3-VL 2B from \(folder.lastPathComponent)")
+        print("[LLMRunner] loaded Qwen3-VL 2B\(visionTag) from \(folder.lastPathComponent)")
     }
 
-    private func generateQwen3VL2B(messages: [ChatMessage]) async throws -> AsyncStream<String> {
+    private func generateQwen3VL2B(messages: [ChatMessage],
+                                    image: CGImage? = nil) async throws -> AsyncStream<String> {
         guard let gen = qwen3vl2bGenerator, let tok = qwen3vl2bTokenizer else {
             throw NSError(domain: "LLMRunner", code: 31,
                 userInfo: [NSLocalizedDescriptionKey: "Qwen3-VL 2B not loaded"])
@@ -430,18 +456,34 @@ final class LLMRunner {
         isGenerating = true
         tokensPerSecond = 0
 
-        let chatMessages: [[String: Any]] = messages.compactMap { m in
-            let role: String
-            switch m.role {
-            case .user: role = "user"
-            case .assistant: role = "assistant"
-            case .system: return nil  // skip UI status messages
+        // ---- Build input IDs ----
+        // Text-only path uses the stock chat template. Vision path
+        // requires a `<|vision_start|><|image_pad|>×196<|vision_end|>`
+        // block spliced in before the latest user message; we do this
+        // by stringly building the prompt with the Qwen3-VL special
+        // tokens, which the tokenizer encodes to their reserved IDs
+        // (151652 / 151655 / 151653).
+        let inputIdsInt32: [Int32]
+        var visionFeatures: Qwen3VL2BVisionFeatures?
+        if let image, let encoder = qwen3vl2bVisionEncoder {
+            visionFeatures = try await encoder.encode(image)
+            inputIdsInt32 = try buildQwen3VLVisionPromptIds(
+                tokenizer: tok, history: messages)
+        } else {
+            let chatMessages: [[String: Any]] = messages.compactMap { m in
+                let role: String
+                switch m.role {
+                case .user: role = "user"
+                case .assistant: role = "assistant"
+                case .system: return nil  // skip UI status messages
+                }
+                return ["role": role, "content": m.content]
             }
-            return ["role": role, "content": m.content]
+            let ids: [Int] = (try? tok.applyChatTemplate(messages: chatMessages))
+                ?? tok.encode(text: messages.last?.content ?? "")
+            inputIdsInt32 = ids.map { Int32($0) }
         }
-        let inputIds: [Int] = (try? tok.applyChatTemplate(messages: chatMessages))
-            ?? tok.encode(text: messages.last?.content ?? "")
-        let inputIdsInt32 = inputIds.map { Int32($0) }
+        let inputIds = inputIdsInt32.map { Int($0) }
 
         // Qwen3-VL 2B chunks are built with max_seq=1024 and 3 body
         // chunks (12 layers each). Trades some tok/s vs the 512-ctx
@@ -472,6 +514,7 @@ final class LLMRunner {
                     _ = try await gen.generate(
                         inputIds: inputIdsInt32, maxNewTokens: maxNew,
                         temperature: 0.0, eosTokenIds: eosSet,
+                        visionFeatures: visionFeatures,
                         onToken: { [weak self] tokenId in
                             tokenCount += 1
                             if eosSet.contains(tokenId) { return }
@@ -508,6 +551,63 @@ final class LLMRunner {
                 continuation.finish()
             }
         }
+    }
+
+    /// Build the token ID sequence for a vision-augmented Qwen3-VL 2B
+    /// prompt. Emits the same prefix the HF processor would produce for
+    /// `[{role:"user", content:[{type:"image"},{type:"text", text:...}]}]`
+    /// by wrapping 196 `<|image_pad|>` markers between
+    /// `<|vision_start|>` / `<|vision_end|>` before the user's text.
+    ///
+    /// Special tokens (151644/151645/151652/151653/151655) are spliced
+    /// in as raw IDs so we don't depend on the tokenizer recognizing
+    /// them from a literal "<|…|>" string.
+    private func buildQwen3VLVisionPromptIds(
+        tokenizer tok: any Tokenizer,
+        history: [ChatMessage]
+    ) throws -> [Int32] {
+        let imStart: Int32 = 151644
+        let imEnd:   Int32 = 151645
+        let visionStart: Int32 = 151652
+        let visionEnd:   Int32 = 151653
+        let imagePad:    Int32 = 151655
+        let newline: [Int32] = tok.encode(text: "\n").map { Int32($0) }
+        let userRole:      [Int32] = tok.encode(text: "user").map { Int32($0) }
+        let assistantRole: [Int32] = tok.encode(text: "assistant").map { Int32($0) }
+
+        var ids: [Int32] = []
+        // Replay prior turns as plain text (no images attached to past
+        // messages — the UI only ships the freshest selected image).
+        for m in history.dropLast() {
+            let role: [Int32]
+            switch m.role {
+            case .user:       role = userRole
+            case .assistant:  role = assistantRole
+            case .system:     continue
+            }
+            ids.append(imStart)
+            ids += role
+            ids += newline
+            ids += tok.encode(text: m.content).map { Int32($0) }
+            ids.append(imEnd)
+            ids += newline
+        }
+        // Latest user turn, injected with the vision block.
+        let userText = history.last(where: { $0.role == .user })?.content ?? ""
+        ids.append(imStart)
+        ids += userRole
+        ids += newline
+        ids.append(visionStart)
+        ids.append(contentsOf: Array(repeating: imagePad, count: 196))
+        ids.append(visionEnd)
+        ids += tok.encode(text: userText).map { Int32($0) }
+        ids.append(imEnd)
+        ids += newline
+        // Assistant preamble (no content yet — the model fills it in).
+        ids.append(imStart)
+        ids += assistantRole
+        ids += newline
+        return ids
     }
 
     // MARK: - Battery / sustained-throughput benchmark
