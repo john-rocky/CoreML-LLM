@@ -22,6 +22,9 @@ CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a 
   <tr>
     <td align="center" colspan="2"><b>Audio (v0.6)</b><br><video src="https://github.com/user-attachments/assets/e8deb6d0-d8b0-4210-885c-5d7a7ddc7ad3" controls></video></td>
   </tr>
+  <tr>
+    <td align="center" colspan="2"><b>Image (Qwen3-VL 2B, v1.2.0)</b><br><video src="https://github.com/user-attachments/assets/f9a257cf-cf10-4968-8964-b979b0a352d1" controls></video></td>
+  </tr>
 </table>
 
 ## Performance (iPhone 17 Pro)
