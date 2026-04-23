@@ -235,6 +235,23 @@ def export_chunk_multifunction(base: Gemma4Model, chunk_idx: int, sizes: list[in
     # Restore default in case any other import references it.
     _pc_mod.PREFILL_N = 512
 
+    # Single-variant short-circuit: skip the multifunction wrapper. The
+    # wrapper carries a ~3x cold-load penalty on iPhone ANE even when only
+    # one function is active (see docs/SESSION_2026_04_23.md §multifunction
+    # prefill variants), so a one-size build should produce a plain
+    # single-function mlpackage instead.
+    if len(per_variant_paths) == 1:
+        N, tmp_path = per_variant_paths[0]
+        out_path = out_dir / f"prefill_chunk{chunk_idx}.mlpackage"
+        if out_path.exists():
+            shutil.rmtree(out_path)
+        shutil.move(tmp_path, out_path)
+        size_mb = sum(os.path.getsize(os.path.join(r, f))
+                      for r, _, fs in os.walk(out_path) for f in fs) / 1024 / 1024
+        print(f"    single-variant (N={N}): skipped save_multifunction wrap")
+        print(f"    size: {size_mb:.1f}MB  → {out_path}")
+        return
+
     print(f"\n--- merging chunk{chunk_idx} variants into multifunction mlpackage ---")
     desc = MultiFunctionDescriptor()
     for N, path in per_variant_paths:

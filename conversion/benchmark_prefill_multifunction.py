@@ -102,6 +102,10 @@ def main():
     ap.add_argument("--real-len", type=int, default=None,
                     help="Set causal mask to simulate real_len tokens valid; "
                          "positions >= real_len masked to -inf. Default: real_len = N (full).")
+    ap.add_argument("--function-name", type=str, default=None,
+                    help="Override function_name when loading (e.g. pass empty/None for "
+                         "single-variant mlpackages where the default `main` is used). "
+                         "When set, the same name is reused for every --sizes entry.")
     args = ap.parse_args()
 
     cu = {
@@ -121,7 +125,8 @@ def main():
     for N in args.sizes:
         rl = args.real_len if args.real_len is not None else N
         rl = min(rl, N)  # clip to N
-        r = time_variant(args.mlpackage, f"prefill_b{N}", N,
+        fn = args.function_name if args.function_name is not None else f"prefill_b{N}"
+        r = time_variant(args.mlpackage, fn, N,
                           args.iterations, args.warmup, cu,
                           real_len=rl)
         results.append(r)

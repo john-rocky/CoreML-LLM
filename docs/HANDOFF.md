@@ -1,11 +1,11 @@
 # Next-session handoff
 
-**Last updated:** 2026-04-23 (iPhone ANE sparsity-aware finding +
-multifunction-variants revert).
+**Last updated:** 2026-04-24 (N=1024 prefill attempt + latent KV-write
+bug discovered + rolled back).
 
-**Most recent session summary:** `docs/SESSION_2026_04_23.md` — read
-that first. Supersedes the "next steps" below for TTFT levers; decode
-optimization items still apply.
+**Most recent session summary:** `docs/SESSION_2026_04_24.md` — read
+that first, then `SESSION_2026_04_23.md`. Supersedes the "next steps"
+below for TTFT levers; decode optimization items still apply.
 
 ---
 
