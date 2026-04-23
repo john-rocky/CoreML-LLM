@@ -107,23 +107,16 @@ whether an INT4 path is viable. Affects load time / RAM, not TTFT.
    sum 15.8MB, **merged 7.9MB** (1.00x of larger, perfect dedup). Both
    functions load via `function_name=`. Clears the gate on multi-prefill
    lengths — graph-only delta is below measurement granularity at this scale.
-4. ✅ **Multifunction prefill builder + Swift router implemented**:
-   - `conversion/build_prefill_multifunction.py` — produces one
-     `prefill_chunk{1..4}.mlpackage` each containing functions
-     `prefill_b64`, `prefill_b128`, `prefill_b256`, `prefill_b512`
-     with weights deduped. Default function = `prefill_b512`
-     (backward compatible with existing single-variant shape).
-   - `gemma4_prefill_chunks.py` cherry-pick: `N = hidden_states.shape[1]`
-     so per-variant traces get their own size (was blocked by global
-     `PREFILL_N = 512`).
-   - `ChunkedEngine.swift` S1 router: `PrefillSet` struct,
-     `pickPrefillSet(realLen:)` picks smallest-fit, falls back to
-     default prefill chunks if no variant or none fit. Opt-in via
-     `LLM_PREFILL_MULTIFUNCTION=1`. Works with `LLM_DEFER_PREFILL=1`.
-5. ⏳ **ANE on-device multifunction load test** — build real Gemma 4 E2B
-   multifunction mlpackage with the new builder, ship to iPhone,
-   confirm ANE executes function-selected paths. Only hard unknown left.
-   Once verified: measure short-prompt TTFT against current b512 baseline.
+4. ❌ **Multifunction prefill variants — reverted (2026-04-23).**
+   Swift router reverted in commit 557e71b. On-device bench
+   revealed iPhone ANE does real_len-aware compute already (padded
+   positions are ~free), so b64/b128/b256 variants gave no iPhone
+   gain and loading 4 variants regressed the default b512 path
+   2.2× on long prompts via ANE state contention. Full write-up:
+   `docs/IPHONE_ANE_SPARSITY_FINDING.md`. Research artifacts kept:
+   `conversion/build_prefill_multifunction.py`,
+   `conversion/benchmark_prefill_multifunction.py`,
+   `conversion/spikes/multifunction_prefill_spike.py`.
 5. ✅ **Deferred prefill chunk load** (`LLM_DEFER_PREFILL=1`). Existing
    device bench (see `ChunkedEngine.swift:324`) shows parallel load is
    *slower* than sequential because ANECompilerService serializes
