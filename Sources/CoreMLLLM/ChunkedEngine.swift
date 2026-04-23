@@ -365,15 +365,17 @@ final class ChunkedEngine {
                   "(override default sequential load)")
         }
 
-        // LLM_DEFER_PREFILL=1 — load decode chunks synchronously, then kick
-        // off prefill chunks in a background task so the engine is usable
-        // for decode-only as soon as c1-c4 are ready. The first user prompt
-        // during the load window falls back to per-token decode (slower but
-        // interactive) via the `hasPrefill` gate at call sites. Cuts
-        // time-to-usable roughly in half (64s → ~35s on iPhone 17 Pro).
-        let deferPrefill = ProcessInfo.processInfo.environment["LLM_DEFER_PREFILL"] == "1"
+        // Default-on: load decode chunks synchronously, then kick off prefill
+        // chunks in a background task so the engine is usable for decode-only
+        // as soon as c1-c4 are ready. The first user prompt during the load
+        // window falls back to per-token decode (slower but interactive) via
+        // the `hasPrefill` gate at call sites. Cuts time-to-usable roughly in
+        // half (~80s → ~35s on iPhone 17 Pro). Opt-out with LLM_DEFER_PREFILL=0.
+        let deferEnv = ProcessInfo.processInfo.environment["LLM_DEFER_PREFILL"]
+        let deferPrefill = (deferEnv != "0")
         if deferPrefill && hasPrefillFiles {
-            print("[Load] LLM_DEFER_PREFILL=1 — decode chunks foreground, prefill chunks background")
+            let origin = (deferEnv == "1") ? "env=1" : "default"
+            print("[Load] deferred prefill load (\(origin)) — decode chunks foreground, prefill chunks background")
         }
         var chunkWork: [(String, MLModelConfiguration)] = [
             ("chunk1", mlConfig), ("chunk2", mlConfig),
