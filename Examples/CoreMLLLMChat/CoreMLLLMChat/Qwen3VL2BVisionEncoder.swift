@@ -62,9 +62,20 @@ final class Qwen3VL2BVisionEncoder {
 
     init(cfg: Config = .default) {
         self.cfg = cfg
-        let s = NSNumber(value: cfg.imageSize)
+        // Pre-patchified layout: (num_patches, patch_flat) = (784, 1536).
+        // num_patches = (grid_h * grid_w) = 28 * 28 with grid_t = 1
+        // patch_flat  = C * T_p * P * P   = 3 * 2 * 16 * 16
+        // Doing the HF patchify permutation on CPU (~1 ms per image)
+        // keeps the in-graph reshape rank 5, which A18 Pro ANE
+        // compiles cleanly. The earlier raw (3, 2, 448, 448) layout
+        // forced a rank-10 permute inside the model that faulted
+        // iPhone's ANE compiler with EXC_BAD_ACCESS at MLModel init
+        // (Mac Studio ANE handled it; A18 did not).
+        let numPatches = (cfg.imageSize / 16) * (cfg.imageSize / 16)
+        let patchFlat = 3 * 2 * 16 * 16
         self.pixelBuffer = try! MLMultiArray(
-            shape: [3, 2, s, s], dataType: .float16)
+            shape: [NSNumber(value: numPatches), NSNumber(value: patchFlat)],
+            dataType: .float16)
         self.pixelFV = MLFeatureValue(multiArray: pixelBuffer)
     }
 
@@ -112,33 +123,34 @@ final class Qwen3VL2BVisionEncoder {
             hidden: hidden, deepstack: [d0, d1, d2])
     }
 
-    /// CGImage → (3, 2, 448, 448) fp16 in `pixelBuffer`.
-    /// Fills T=0 and T=1 with the same normalized frame (temporal patch=2
-    /// for single-image inputs). Uses `pixelBuffer.strides` rather than
-    /// assuming contiguous storage — CoreML occasionally pads fp16 arrays
-    /// for IOSurface alignment, and a silent stride mismatch writes the
-    /// pixels to wrong offsets, producing the "horizontal-band signal
-    /// corruption" the model reports.
+    /// CGImage → pre-patchified (784, 1536) fp16 in `pixelBuffer`,
+    /// matching HF's `Qwen2VLImageProcessor._preprocess` layout
+    /// exactly so the Core ML graph's `patch_embed` sees the same
+    /// patches HF would.
+    ///
+    /// The HF processor iterates merged 2×2 blocks as the outer axis
+    /// and packs `(C, T_p, P_h, P_w)` into each row's 1536 elements,
+    /// via the permutation `(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)` over the
+    /// 10-axis view `(B, grid_t, T_p, C, gh_m, m, P, gw_m, m, P)`.
+    /// We apply the inverse-order scan in Swift directly rather than
+    /// materializing the 10-axis intermediate.
     private func preprocess(_ cgImage: CGImage) {
-        let size = cfg.imageSize
+        let size = cfg.imageSize                     // 448
+        let P = 16                                    // patch_size
+        let merge = 2                                 // spatial_merge_size
+        let gridH = size / P                          // 28
+        let gridW = size / P                          // 28
+        let ghM = gridH / merge                       // 14
+        let gwM = gridW / merge                       // 14
         let count = size * size
-        // 1) Resize to imageSize × imageSize. iOS `UIImage(data:)` may
-        //    hand us a CGImage whose raw pixels are stored in the
-        //    pre-EXIF-rotated orientation (e.g. iPhone portrait JPEGs
-        //    are landscape pixels + a rotate-90 EXIF tag). Using
-        //    `CIImage.oriented(forExifOrientation:)` is not available
-        //    from a bare CGImage, so we always redraw into a fresh
-        //    448×448 RGBA device-RGB context. The CGContext's
-        //    flipped y-axis draws images "upright" if the caller
-        //    handed us a CIImage-derived CGImage, but on a plain
-        //    CGImage we must flip the transform back to match pixel
-        //    orientation — we skip this because the app's picker
-        //    normalizes orientation for the CGImage we receive.
+        let patchFlat = 3 * 2 * P * P                 // 1536
+
+        // 1) Decode + resize to size × size RGBA (device RGB).
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bytesPerRow = size * 4
         let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
             | CGBitmapInfo.byteOrder32Big.rawValue
-        var rgba = [UInt8](repeating: 0, count: size * size * 4)
+        var rgba = [UInt8](repeating: 0, count: count * 4)
         rgba.withUnsafeMutableBytes { buf in
             guard let ctx = CGContext(
                 data: buf.baseAddress, width: size, height: size,
@@ -147,74 +159,64 @@ final class Qwen3VL2BVisionEncoder {
             ctx.interpolationQuality = .high
             ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: size, height: size))
         }
-        // 2) Split channels + normalize to fp32 planes, then cast to
-        //    fp16 into pixelBuffer at both T=0 and T=1 using the
-        //    multi-array's reported strides. Strides are in elements
-        //    (not bytes) — for fp16 that's UInt16 counts, which is
-        //    exactly the type the dataPointer is bound to.
-        let dst = pixelBuffer.dataPointer
-            .assumingMemoryBound(to: UInt16.self)
-        let strides = pixelBuffer.strides.map { $0.intValue }
-        // Expected shape (3, 2, 448, 448). If Core ML ever reshapes or
-        // adds padding, this guard catches it before we write garbage.
-        precondition(pixelBuffer.shape.count == 4,
-                      "pixel_values must be 4D (C, T, H, W)")
-        let sC = strides[0]
-        let sT = strides[1]
-        let sH = strides[2]
-        let sW = strides[3]
-        // Fast path requires a contiguous H row (sW == 1) so vImage can
-        // do a single bulk fp32→fp16 convert over H*W elements.
-        let rowContig = (sW == 1 && sH == size)
-        var plane = [Float](repeating: 0, count: count)
+        // 2) Normalize per channel into a (C, H, W) fp32 plane.
+        //    Qwen3-VL: mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5).
+        var plane = [Float](repeating: 0, count: 3 * count)
         for c in 0..<3 {
             let mean = Self.imageMean[c]
-            let std  = Self.imageStd[c]
-            let invStd = 1.0 / std
+            let invStd = 1.0 / Self.imageStd[c]
+            let base = c * count
             for i in 0..<count {
-                let v = Float(rgba[i * 4 + c]) / 255.0
-                plane[i] = (v - mean) * invStd
+                plane[base + i] = (Float(rgba[i * 4 + c]) / 255.0 - mean) * invStd
             }
-            let baseT0 = c * sC + 0 * sT
-            let baseT1 = c * sC + 1 * sT
-            if rowContig {
-                var srcBuf = plane
-                srcBuf.withUnsafeMutableBufferPointer { sp in
-                    var srcBuffer = vImage_Buffer(
-                        data: sp.baseAddress,
-                        height: 1,
-                        width: vImagePixelCount(count),
-                        rowBytes: count * MemoryLayout<Float>.size)
-                    var dst0 = vImage_Buffer(
-                        data: dst.advanced(by: baseT0),
-                        height: 1,
-                        width: vImagePixelCount(count),
-                        rowBytes: count * MemoryLayout<UInt16>.size)
-                    var dst1 = vImage_Buffer(
-                        data: dst.advanced(by: baseT1),
-                        height: 1,
-                        width: vImagePixelCount(count),
-                        rowBytes: count * MemoryLayout<UInt16>.size)
-                    _ = vImageConvert_PlanarFtoPlanar16F(&srcBuffer, &dst0, 0)
-                    _ = vImageConvert_PlanarFtoPlanar16F(&srcBuffer, &dst1, 0)
-                }
-            } else {
-                // Fallback: per-row casts, respecting sH (e.g. padded).
-                for y in 0..<size {
-                    for x in 0..<size {
-                        let v = Float16(plane[y * size + x]).bitPattern
-                        dst[baseT0 + y * sH + x * sW] = v
-                        dst[baseT1 + y * sH + x * sW] = v
+        }
+        // 3) Patchify + cast to fp16 directly into pixelBuffer in HF
+        //    processor order. For merged-block (i, j) in
+        //    [0, ghM) × [0, gwM) and inner-offset (mi, mj) in
+        //    [0, merge) × [0, merge) the token index is:
+        //        row = (i * gwM + j) * merge*merge + mi * merge + mj
+        //    The token's 1536 elements pack (C, T_p, P_h, P_w) in
+        //    row-major order; T_p=2 duplicates the frame for still
+        //    images. Source pixel coords:
+        //        h = (i * merge + mi) * P + ph
+        //        w = (j * merge + mj) * P + pw
+        precondition(pixelBuffer.shape[0].intValue == ghM * gwM * merge * merge
+                     && pixelBuffer.shape[1].intValue == patchFlat,
+                     "pixel_values must be (num_patches, patch_flat)")
+        let dst = pixelBuffer.dataPointer
+            .assumingMemoryBound(to: UInt16.self)
+        let patchPixels = P * P
+        for i in 0..<ghM {
+            for j in 0..<gwM {
+                for mi in 0..<merge {
+                    for mj in 0..<merge {
+                        let row = ((i * gwM + j) * merge + mi) * merge + mj
+                        let rowBase = row * patchFlat
+                        // (C, T_p, P, P) inside the patch row.
+                        let hBase = (i * merge + mi) * P
+                        let wBase = (j * merge + mj) * P
+                        for c in 0..<3 {
+                            let planeBase = c * count
+                            let outCBase = rowBase + c * 2 * patchPixels
+                            for tp in 0..<2 {
+                                let outBase = outCBase + tp * patchPixels
+                                for ph in 0..<P {
+                                    let srcRow = (hBase + ph) * size + wBase
+                                    var k = 0
+                                    while k < P {
+                                        let v = Float16(plane[planeBase + srcRow + k]).bitPattern
+                                        dst[outBase + ph * P + k] = v
+                                        k += 1
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        if !rowContig {
-            // Only log on the unexpected branch to avoid per-frame spam.
-            print("[VL2BVisionEncoder] non-contiguous pixel_values strides: \(strides)")
-        } else if ProcessInfo.processInfo.environment["VL2B_VISION_DEBUG"] != nil {
-            // One-time strides print under env flag for parity tests.
-            print("[VL2BVisionEncoder] strides=\(strides) sample px c0[0]=\(plane[0])")
+        if ProcessInfo.processInfo.environment["VL2B_VISION_DEBUG"] != nil {
+            print("[VL2BVisionEncoder] patchified \(ghM * gwM * merge * merge) patches × \(patchFlat) values")
         }
     }
 }

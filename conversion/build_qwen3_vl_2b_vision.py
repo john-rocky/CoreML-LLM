@@ -124,44 +124,33 @@ class FixedGridVisionModel(nn.Module):
 
     def forward(self, pixel_values):
         """
-        pixel_values: (3, 2, IMAGE_SIZE, IMAGE_SIZE) fp16 — one image,
-        temporal_patch=2 (single frame duplicated across the T axis).
+        pixel_values: `(num_patches=784, C*T_p*P*P=1536)` fp16 — the
+        same layout HF's `Qwen2VLImageProcessor` produces.
 
-        Earlier versions of this converter fed `pixel_values` directly
-        to `patch_embed`, relying on its internal
-        `.view(-1, C, T_p, P, P)` to "do the right thing." That reshape
-        only produces valid patches if the input is *already
-        patchified* in HF's processor layout
-        `(num_patches, C*T_p*P*P)` — feeding raw pixel layout silently
-        emits the first 1536 sequential bytes as "patch 0", which
-        reorders spatial structure into something the encoder can't
-        interpret (cos_sim ≈ 0.47 vs HF features on a checker image).
+        Earlier revisions tried two other input shapes:
+          (a) Raw `(3, 2, 448, 448)` fed directly to
+              `patch_embed`. The internal `.view(-1, C, T_p, P, P)`
+              only extracts valid patches when the input is already
+              patchified; on raw pixel layout the first 1536 sequential
+              bytes become "patch 0", collapsing spatial structure
+              (cos_sim ≈ 0.47 vs HF on a checker image).
+          (b) In-graph patchify from raw `(3, 2, 448, 448)` via a
+              rank-10 `view + permute(0,1,4,7,5,8,3,2,6,9)`. Correct
+              numerically, but the A18 Pro / iOS 26 ANE compiler
+              faults during `MLModel` init with EXC_BAD_ACCESS on that
+              reshape pattern (Mac Studio ANE handles it fine; the
+              iPhone compiler does not).
 
-        Fix: patchify in-graph so the Core ML input stays raw
-        `(3, 2, 448, 448)` — matching what the Swift preprocessor
-        produces — but the downstream patch_embed sees the same
-        `(784, 1536)` layout HF's processor would feed it.
+        Fix: keep the input as the pre-patchified `(784, 1536)`
+        tensor. The Swift preprocessor does the HF patchify permutation
+        on CPU (~1 ms, 1.2 M fp16 elements per frame) and hands this
+        tensor to the Core ML model. The only reshape left inside the
+        model is `patch_embed`'s own rank-5 `.view`, which ANE
+        compiles cleanly.
         """
-        C, T, H, W = 3, 2, pixel_values.shape[-2], pixel_values.shape[-1]
-        P = self.patch_size
-        merge = self.spatial_merge_size
-        grid_t = 1
-        grid_h = H // P
-        grid_w = W // P
-        # Mirror `Qwen2VLImageProcessor._preprocess` patchify ordering:
-        #   (B, T, C, H, W) → view (B, grid_t, T_p, C, gh_m, m, P, gw_m, m, P)
-        #   → permute (0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
-        #   → reshape (B, grid_t*grid_h*grid_w, C*T_p*P*P)
-        # This makes 2×2 merged blocks contiguous in the patch sequence,
-        # which is what `merger` / `deepstack_merger_list` expect.
-        x = pixel_values.unsqueeze(0)                    # (1, C, T, H, W)
-        x = x.permute(0, 2, 1, 3, 4).contiguous()        # (1, T, C, H, W)
-        x = x.view(1, grid_t, T, C,
-                   grid_h // merge, merge, P,
-                   grid_w // merge, merge, P)
-        x = x.permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9).contiguous()
-        x = x.view(-1, C * T * P * P)                    # (784, 1536)
-        hidden_states = self.patch_embed(x)              # (seq, hidden)
+        # hidden_states enters as (784, 1536); patch_embed reshapes to
+        # (784, 3, 2, 16, 16) internally and emits (784, 1024).
+        hidden_states = self.patch_embed(pixel_values)   # (seq, hidden)
         hidden_states = hidden_states + self.pos_embed_fixed
 
         # cu_seqlens for a single image = [0, seq_len] — attention
@@ -241,8 +230,13 @@ def main():
           f"→ spatial_merge={model.spatial_merge_size} "
           f"→ {model.seq_len // (model.spatial_merge_size ** 2)} vision tokens")
 
-    # Example input: (3, 2, H, W) patch_embed expects C, T, H, W
-    example = torch.zeros(3, 2, args.image_size, args.image_size, dtype=torch.float32)
+    # Input: pre-patchified (num_patches, C*T_p*P*P) — matches HF's
+    # Qwen2VLImageProcessor output exactly. num_patches = (grid_t=1)
+    # × grid_h × grid_w = 1 × 28 × 28 = 784; patch_flat =
+    # 3 × 2 × 16 × 16 = 1536.
+    patch_flat = 3 * 2 * model.patch_size * model.patch_size
+    num_patches = model.grid_h * model.grid_w  # grid_t=1 for single image
+    example = torch.zeros(num_patches, patch_flat, dtype=torch.float32)
     t0 = time.time()
     traced = torch.jit.trace(model, example, strict=False)
     print(f"  traced in {time.time()-t0:.1f}s")
@@ -252,7 +246,7 @@ def main():
 
     ct_inputs = [ct.TensorType(
         name="pixel_values",
-        shape=(3, 2, args.image_size, args.image_size),
+        shape=(num_patches, patch_flat),
         dtype=np.float16,
     )]
     # Merger output: (seq_len / spatial_merge², out_hidden)
