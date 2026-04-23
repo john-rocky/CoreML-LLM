@@ -2056,9 +2056,14 @@ final class ChunkedEngine {
         let slotStride = 1 * W * maxHd
         let dst = cache.dataPointer.bindMemory(to: UInt16.self, capacity: cache.count)
         let s = srcArr.dataPointer.bindMemory(to: UInt16.self, capacity: srcArr.count)
-        let startCachePos = W - realLen
-        for p in 0..<realLen {
-            let srcOff = p * hd
+        // SWA cache is right-aligned (see makeSlidingCausalMask): valid tokens
+        // live in cache[W-valid..W-1]. When realLen > W, only the last W
+        // source positions fit in the window.
+        let writeCount = min(realLen, W)
+        let sourceStart = realLen - writeCount
+        let startCachePos = W - writeCount
+        for p in 0..<writeCount {
+            let srcOff = (sourceStart + p) * hd
             let dstOff = slot * slotStride + (startCachePos + p) * maxHd
             for j in 0..<hd { dst[dstOff + j] = s[srcOff + j] }
         }
