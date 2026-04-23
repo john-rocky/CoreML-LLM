@@ -106,6 +106,18 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML/resolve/main",
             folderName: "qwen3.5-2b")
 
+        /// Qwen3-VL 2B — text backbone of the multimodal Qwen3-VL
+        /// model. 36-layer plain GQA (head_dim=128, 8 KV heads,
+        /// hidden=2560), shipped as 6 INT8 body chunks (6 layers each)
+        /// + a tail (final_norm + lm_head) + raw fp16 embed sidecar
+        /// that Swift mmaps. Vision tower is dropped in this Phase 1
+        /// release; Phase 2 will add it via a separate vision_video
+        /// mlpackage + DeepStack layer-tap injection.
+        public static let qwen3vl_2b = ModelInfo(
+            id: "qwen3-vl-2b", name: "Qwen3-VL 2B (text + vision, ANE)", size: "2.9 GB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/qwen3-vl-2b-coreml/resolve/main",
+            folderName: "qwen3-vl-2b")
+
         /// Gemma 4 E4B — 42 layers, hidden=2560, 2 KV heads, text-only decoder.
         /// INT4 palettized, ctx=2048. Baseline ~14 tok/s on iPhone 17 Pro.
         /// A local build (`conversion/build_gemma4_bundle.py --model gemma4-e4b`)
@@ -152,7 +164,7 @@ public final class ModelDownloader: NSObject {
             let experimental =
                 ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
                 || UserDefaults.standard.bool(forKey: "showExperimentalModels")
-            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b, qwen35_08b, qwen35_2b]
+            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b, qwen35_08b, qwen35_2b, qwen3vl_2b]
             if experimental {
                 list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
                 list.insert(gemma4e2bLookaheadProbe, at: 3)  // after EAGLE-3
@@ -275,6 +287,27 @@ public final class ModelDownloader: NSObject {
                 "Data/com.apple.CoreML/weights/weight.bin").path) {
                 return pkg
             }
+        }
+
+        // Qwen3-VL 2B: 4 body chunks + chunk_head + embed_weight.bin
+        // under qwen3_vl_2b_decode_chunks/. All-or-nothing.
+        let vl2bDir = dir.appendingPathComponent("qwen3_vl_2b_decode_chunks")
+        func vl2bChunkExists(_ base: String) -> Bool {
+            let pkgWeights = vl2bDir
+                .appendingPathComponent("\(base).mlpackage")
+                .appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")
+            if fileManager.fileExists(atPath: pkgWeights.path) { return true }
+            let mlcWeights = vl2bDir
+                .appendingPathComponent("\(base).mlmodelc")
+                .appendingPathComponent("weights/weight.bin")
+            return fileManager.fileExists(atPath: mlcWeights.path)
+        }
+        let vl2bEmbedURL = vl2bDir.appendingPathComponent("embed_weight.bin")
+        let vl2bEmbedPresent = fileManager.fileExists(atPath: vl2bEmbedURL.path)
+        let vl2bAll = (0..<4).allSatisfy { vl2bChunkExists("chunk_\($0)") }
+            && vl2bChunkExists("chunk_head")
+        if vl2bEmbedPresent && vl2bAll {
+            return vl2bDir
         }
         let chunk1 = dir.appendingPathComponent("chunk1.mlmodelc")
         if fileManager.fileExists(atPath: chunk1.appendingPathComponent("weights/weight.bin").path) {
@@ -718,6 +751,10 @@ public final class ModelDownloader: NSObject {
             buildQwen35_2B_FileList()
             return
         }
+        if model.id == "qwen3-vl-2b" {
+            buildQwen3VL2BFileList()
+            return
+        }
         // 2K-context shipping model lives at the repo root on HF:
         //   - Decode chunks:  swa/chunk{1-4}.mlmodelc/
         //   - Prefill chunks: prefill/chunk{1-4}.mlmodelc/  (remote name is
@@ -907,6 +944,69 @@ public final class ModelDownloader: NSObject {
             remotePath: "\(root)/embed_weight.bin",
             localPath: "\(root)/embed_weight.bin",
             estimatedSize: 1_017_000_000))
+        pendingFiles = files
+        pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
+        totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
+        completedBytes = 0
+        nextFileIndex = 0
+    }
+
+    /// Qwen3-VL 2B (text-only) CoreML layout on
+    /// `mlboydaisuke/qwen3-vl-2b-coreml`. 4 INT8 body chunks
+    /// (6 layers each) + chunk_head (final_norm + lm_head) + raw fp16
+    /// embed_weight.bin sidecar under `qwen3_vl_2b_decode_chunks/`.
+    /// Same shape contract as Qwen3.5 2B v1.1.0 — Swift mmaps the
+    /// embed sidecar to keep its 778 MB out of phys_footprint.
+    private func buildQwen3VL2BFileList() {
+        let root = "qwen3_vl_2b_decode_chunks"
+        // 2B is 28 layers split into 4 body chunks × 7 layers each
+        // (vs 4B's 36 layers / 6 chunks / 6 each). Per-chunk weight.bin
+        // sizes measured from the INT8 palettized output.
+        var sizes: [(String, Int64)] = (0..<4).map { i in
+            ("chunk_\(i).mlpackage", Int64(353_000_000))  // 7 layers each
+        }
+        sizes.append(("chunk_head.mlpackage", 311_000_000))  // final_norm + lm_head
+        // DeepStack-aware chunk_0 replacement for the vision path —
+        // same weight footprint as chunk_0 (353 MB). Shipped alongside
+        // the regular chunk_0 so vision can be toggled on per-prompt.
+        sizes.append(("chunk_0_vision.mlpackage", 353_000_000))
+        var files: [DownloadFile] = []
+        for (chunk, weightSize) in sizes {
+            let pkg = "\(root)/\(chunk)"
+            files.append(.init(
+                remotePath: "\(pkg)/Manifest.json",
+                localPath: "\(pkg)/Manifest.json",
+                estimatedSize: 700))
+            files.append(.init(
+                remotePath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
+                localPath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
+                estimatedSize: 900_000))
+            files.append(.init(
+                remotePath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
+                localPath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
+                estimatedSize: weightSize))
+        }
+        // Raw fp16 embed sidecar: 151936 × 2048 × 2 bytes ≈ 622 MB.
+        files.append(.init(
+            remotePath: "\(root)/embed_weight.bin",
+            localPath: "\(root)/embed_weight.bin",
+            estimatedSize: 622_000_000))
+        // Vision encoder (ships alongside the decode chunks).
+        // Input: pixel_values (3, 2, 448, 448) fp16, output: merger
+        // hidden + 3 DeepStack slices. ~388 MB INT8 palettized.
+        let visionPkg = "qwen3_vl_2b_vision/vision.mlpackage"
+        files.append(.init(
+            remotePath: "\(visionPkg)/Manifest.json",
+            localPath: "\(visionPkg)/Manifest.json",
+            estimatedSize: 700))
+        files.append(.init(
+            remotePath: "\(visionPkg)/Data/com.apple.CoreML/model.mlmodel",
+            localPath: "\(visionPkg)/Data/com.apple.CoreML/model.mlmodel",
+            estimatedSize: 400_000))
+        files.append(.init(
+            remotePath: "\(visionPkg)/Data/com.apple.CoreML/weights/weight.bin",
+            localPath: "\(visionPkg)/Data/com.apple.CoreML/weights/weight.bin",
+            estimatedSize: 406_000_000))
         pendingFiles = files
         pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
