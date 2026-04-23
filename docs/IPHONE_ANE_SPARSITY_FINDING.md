@@ -73,12 +73,41 @@ Net: iPhone multifunction was **negative** value. Reverted.
   with generous N (e.g., 1024) without paying compute cost on short
   prompts. Only the few-MB weight footprint changes. Coverage of
   medium-length prompts (256-1024 tokens) improves without runtime cost.
-- **Prefix caching (PrefixCache, LLM_PREFIX_CACHE=1) becomes the
-  dominant TTFT lever** — since compute scales with real_len, not N,
-  every cached token is a real second saved. Already shipped.
 - **Decode-side optimization takes priority** over prefill. iPhone
   decode at 30 tok/s is the steady-state bottleneck, and prefill
   already hits 621 tok/s on long prompts.
+
+### Things this also invalidates — PrefixCache stays opt-in
+
+Naively PrefixCache would look better after this finding — "every cached
+token is a real ANE second saved." But the cache's restore path runs
+**per-token decode** (33 ms/tok on iPhone) over the delta tokens, not
+batched prefill. On iPhone the marginal prefill cost is ~1.4 ms/tok, so:
+
+- Fresh prefill:  60 + 1.43 × realLen  ms
+- Cache restore:  5 + 33 × delta  ms
+- Break-even:     delta < (55 + 1.43 × realLen) / 33
+
+| realLen | max delta for cache to win |
+|---|---|
+|   50 |   3.8 tok |
+|  100 |   6.0 tok |
+|  500 |    23 tok |
+| 1000 |    45 tok |
+| 2000 |    88 tok |
+
+Ratio rule of thumb: matchLen/realLen ≥ 0.95 for iPhone ANE to win.
+For short conversational chat (realLen 30-100), the delta is usually
+bigger than this allows → cache loses. PrefixCache was briefly flipped
+to default-on (commit fe0f4a9) and then reverted (commit d471a7f) once
+this math was redone. It remains a useful opt-in for workloads with
+very long prompts and tiny per-turn deltas (agent loops, long system
+prompts with short user content), but is not a universal default.
+
+Long-term fix: batched-prefill the delta tokens after restore instead
+of per-token decode. Would change break-even from `33 × delta` to
+`1.43 × delta` — cache would win for virtually any match >= 20% of
+realLen. Requires a variable-start-position prefill graph.
 
 ### Open questions (not answered here)
 
