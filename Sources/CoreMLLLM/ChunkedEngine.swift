@@ -650,9 +650,20 @@ final class ChunkedEngine {
             let dummy: [Int32] = Array(repeating: 0, count: verifyK)
             _ = try? verifyCandidates(tokens: dummy, startPosition: 0)
         }
+        // Transition warmup: the first decode after a populated-KV prefill
+        // is still cold even with prefill+decode already warmed above
+        // (~63ms vs 36ms steady on iPhone 17 Pro, v0.8.0). Simulate the
+        // runtime prefill→decode handoff one extra time to pre-pay that
+        // per-configuration setup cost.
+        if hasPrefill {
+            _ = try? runPrefill(tokenIDs: [0])
+            for i in 1...2 {
+                _ = try? predictStep(tokenID: 0, position: i)
+            }
+        }
         reset()
         let dt = CFAbsoluteTimeGetCurrent() - t0
-        print("[Load] Final prewarm (prefill + 8 decode + verify) done in \(String(format: "%.2f", dt))s")
+        print("[Load] Final prewarm (prefill + decode + verify + transition) done in \(String(format: "%.2f", dt))s")
     }
 
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
