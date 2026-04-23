@@ -1,23 +1,25 @@
-// End-to-end Qwen3-VL 4B (text-only) generation on device.
+// End-to-end Qwen3-VL 2B (text-only) generation on device.
 //
-// Layout on disk (under the model folder, e.g. Documents/Models/qwen3-vl-4b/):
-//   qwen3_vl_4b_decode_chunks/
+// Layout on disk (under the model folder, e.g. Documents/Models/qwen3-vl-2b/):
+//   qwen3_vl_2b_decode_chunks/
 //     embed_weight.bin            (raw fp16, Swift mmap'd)
-//     chunk_0.mlpackage..chunk_5  (6 layers each)
+//     chunk_0.mlpackage..chunk_3  (7 layers each, 28 total)
 //     chunk_head.mlpackage        (final_norm + lm_head)
 //
 // Per-step decode:
-//   embed lookup (mmap, 1 row memcpy) → chunk_0 → ... → chunk_5 → chunk_head → logits
+//   embed lookup (mmap, 1 row memcpy) → chunk_0..chunk_3 → chunk_head → next_token
 //
-// Architecture (Qwen3-VL 4B text backbone):
-//   hidden=2560, layers=36 (6 chunks × 6), num_attention_heads=32,
-//   num_key_value_heads=8 (GQA 4:1), head_dim=128, vocab=151936,
+// Architecture (Qwen3-VL 2B text backbone):
+//   hidden=2048, layers=28 (4 chunks × 7), num_attention_heads=16,
+//   num_key_value_heads=8 (GQA 2:1), head_dim=128, vocab=151936,
 //   tie_word_embeddings=True, rope_theta=5_000_000.
 //   For text-only inputs the mRoPE [24,20,20] interleave collapses to
 //   standard 1D RoPE over the full head_dim.
 //
-// State: per-layer KV caches, (1, num_kv_heads=8, max_seq=2048, head_dim=128) × 2.
-// Total state per chunk: 6 layers × 2 × 2 × 8 × 2048 × 128 × 2 bytes = 100 MB.
+// 4B was tried first and shipped at 1.7-6 tok/s on iPhone — too slow;
+// 3-chunk merge crashed with OOM. 2B is ~48% params of 4B with the
+// same vision tower wired later; Mac bench 7 tok/s at max_seq=2048,
+// iPhone 10-15 tok/s expected with Swift zero-copy KV marshal.
 
 import Accelerate
 import CoreML
@@ -29,7 +31,7 @@ import Foundation
 /// allocating fresh MLFeatureValue wrappers per step. Forwards
 /// `hidden_in` from the previous step's predecessor (chunk[i-1] output
 /// or the embed lookup buffer for chunk[0]).
-private final class VL4BBodyFeatures: NSObject, MLFeatureProvider {
+private final class VL2BBodyFeatures: NSObject, MLFeatureProvider {
     private let hiddenSource: MLFeatureProvider  // carries "hidden" feature
     private let fvPos: MLFeatureValue
     private let fvCos: MLFeatureValue
@@ -76,7 +78,7 @@ private final class VL4BBodyFeatures: NSObject, MLFeatureProvider {
 /// Trivial provider that wraps the embed-lookup MLMultiArray as
 /// `hidden`, so chunk[0] reads it through the same path as chunks[i>0]
 /// reading from the previous chunk's output.
-private final class VL4BHiddenProvider: NSObject, MLFeatureProvider {
+private final class VL2BHiddenProvider: NSObject, MLFeatureProvider {
     let fvHidden: MLFeatureValue
     let featureNames: Set<String> = ["hidden"]
     init(fvHidden: MLFeatureValue) {
@@ -89,7 +91,7 @@ private final class VL4BHiddenProvider: NSObject, MLFeatureProvider {
 }
 
 @Observable
-final class Qwen3VL4BGenerator {
+final class Qwen3VL2BGenerator {
     struct Config {
         let maxSeq: Int          // 2048
         let vocab: Int           // 151936
@@ -103,8 +105,8 @@ final class Qwen3VL4BGenerator {
         let decodeUnits: MLComputeUnits
 
         static let `default` = Config(
-            maxSeq: 512, vocab: 151936, hiddenSize: 2560, numLayers: 36,
-            numKVHeads: 8, headDim: 128, numBodyChunks: 6, layersPerChunk: 6,
+            maxSeq: 2048, vocab: 151936, hiddenSize: 2048, numLayers: 28,
+            numKVHeads: 8, headDim: 128, numBodyChunks: 4, layersPerChunk: 7,
             ropeTheta: 5_000_000.0,
             decodeUnits: .cpuAndNeuralEngine)
     }
@@ -119,7 +121,7 @@ final class Qwen3VL4BGenerator {
 
     private var cfg: Config
 
-    /// Body chunk models in order chunk_0..chunk_5.
+    /// Body chunk models in order chunk_0..chunk_3 (7 layers each).
     @ObservationIgnored private var bodyChunks: [MLModel] = []
     @ObservationIgnored private var headChunk: MLModel?
 
@@ -138,7 +140,7 @@ final class Qwen3VL4BGenerator {
     @ObservationIgnored private var fvPos: MLFeatureValue!
     @ObservationIgnored private var fvCos: MLFeatureValue!
     @ObservationIgnored private var fvSin: MLFeatureValue!
-    @ObservationIgnored private var hiddenProvider: VL4BHiddenProvider!
+    @ObservationIgnored private var hiddenProvider: VL2BHiddenProvider!
 
     /// Per-chunk KV-cache name slices (k_X / v_X / new_k_X / new_v_X).
     /// Outer index = chunk; inner array = 12 names per chunk
@@ -188,7 +190,7 @@ final class Qwen3VL4BGenerator {
         self.fvPos = MLFeatureValue(multiArray: reusablePos)
         self.fvCos = MLFeatureValue(multiArray: reusableCos)
         self.fvSin = MLFeatureValue(multiArray: reusableSin)
-        self.hiddenProvider = VL4BHiddenProvider(fvHidden: fvHidden)
+        self.hiddenProvider = VL2BHiddenProvider(fvHidden: fvHidden)
     }
 
     /// 1D RoPE table builder. For text-only Qwen3-VL the mRoPE
@@ -214,13 +216,13 @@ final class Qwen3VL4BGenerator {
 
     var modelFolderOverride: URL?
 
-    /// Locate VL4B chunks + embed sidecar. Returns
+    /// Locate VL2B chunks + embed sidecar. Returns
     /// (bodyURLs, headURL, embedURL) or nil if any piece is missing.
     /// Honors both `.mlpackage` (HF download) and `.mlmodelc`
     /// (devicectl sideload).
     private func resolveDecodeURLs()
         -> (body: [URL], head: URL, embed: URL)? {
-        let subdir = "qwen3_vl_4b_decode_chunks"
+        let subdir = "qwen3_vl_2b_decode_chunks"
         let embedBinName = "embed_weight.bin"
         let fm = FileManager.default
 
@@ -261,21 +263,21 @@ final class Qwen3VL4BGenerator {
         releaseEmbedMmap()
         let fd = open(url.path, O_RDONLY)
         guard fd >= 0 else {
-            throw NSError(domain: "Qwen3VL4BGenerator", code: 30,
+            throw NSError(domain: "Qwen3VL2BGenerator", code: 30,
                 userInfo: [NSLocalizedDescriptionKey:
                     "failed to open embed_weight.bin at \(url.path)"])
         }
         var st = stat()
         guard fstat(fd, &st) == 0 else {
             close(fd)
-            throw NSError(domain: "Qwen3VL4BGenerator", code: 31,
+            throw NSError(domain: "Qwen3VL2BGenerator", code: 31,
                 userInfo: [NSLocalizedDescriptionKey: "fstat failed"])
         }
         let size = Int(st.st_size)
         guard let base = mmap(nil, size, PROT_READ, MAP_PRIVATE, fd, 0),
               base != MAP_FAILED else {
             close(fd)
-            throw NSError(domain: "Qwen3VL4BGenerator", code: 32,
+            throw NSError(domain: "Qwen3VL2BGenerator", code: 32,
                 userInfo: [NSLocalizedDescriptionKey: "mmap failed"])
         }
         embedMmapBase = base
@@ -328,24 +330,24 @@ final class Qwen3VL4BGenerator {
     func load() throws {
         let dCfg = MLModelConfiguration(); dCfg.computeUnits = cfg.decodeUnits
         guard let resolved = resolveDecodeURLs() else {
-            throw NSError(domain: "Qwen3VL4BGenerator", code: 40,
+            throw NSError(domain: "Qwen3VL2BGenerator", code: 40,
                 userInfo: [NSLocalizedDescriptionKey:
-                    "qwen3_vl_4b_decode_chunks/{embed_weight.bin, chunk_0..5, chunk_head} not found"])
+                    "qwen3_vl_2b_decode_chunks/{embed_weight.bin, chunk_0..3, chunk_head} not found"])
         }
         try mmapEmbedWeight(url: resolved.embed)
         bodyChunks = try resolved.body.map {
             try MLModel(contentsOf: $0, configuration: dCfg)
         }
         headChunk = try MLModel(contentsOf: resolved.head, configuration: dCfg)
-        status = "Loaded VL4B (\(cfg.numBodyChunks) body + head) on \(unitsName(cfg.decodeUnits))"
+        status = "Loaded VL2B (\(cfg.numBodyChunks) body + head) on \(unitsName(cfg.decodeUnits))"
         // Diagnostic: per-chunk compute plan audit. Same pattern as
         // Qwen35Generator — async, doesn't block prediction.
         for (idx, url) in resolved.body.enumerated() {
             auditComputePlan(url: url, requestedUnits: cfg.decodeUnits,
-                              variant: "VL4B-body#\(idx)")
+                              variant: "VL2B-body#\(idx)")
         }
         auditComputePlan(url: resolved.head, requestedUnits: cfg.decodeUnits,
-                          variant: "VL4B-head")
+                          variant: "VL2B-head")
     }
 
     private func unitsName(_ u: MLComputeUnits) -> String {
@@ -373,12 +375,12 @@ final class Qwen3VL4BGenerator {
                 }
                 let compute = max(1, total)
                 print(String(format:
-                    "[Qwen3VL4B] compute plan (\(variant)): total=%d ANE=%d (%.1f%%) GPU=%d (%.1f%%) CPU=%d (%.1f%%)",
+                    "[Qwen3VL2B] compute plan (\(variant)): total=%d ANE=%d (%.1f%%) GPU=%d (%.1f%%) CPU=%d (%.1f%%)",
                     total, ane, 100.0*Double(ane)/Double(compute),
                     gpu, 100.0*Double(gpu)/Double(compute),
                     cpu, 100.0*Double(cpu)/Double(compute)))
             } catch {
-                print("[Qwen3VL4B] compute plan audit failed: \(error)")
+                print("[Qwen3VL2B] compute plan audit failed: \(error)")
             }
         }
     }
@@ -465,7 +467,7 @@ final class Qwen3VL4BGenerator {
         writeDecodeScalars(token: token, position: position)
         var lastStepOut: MLFeatureProvider = hiddenProvider
         for ci in 0..<bodyChunks.count {
-            let features = VL4BBodyFeatures(
+            let features = VL2BBodyFeatures(
                 hiddenSource: lastStepOut,
                 pos: fvPos, cos: fvCos, sin: fvSin,
                 prevOut: state.lastBodyOuts[ci],
@@ -479,7 +481,7 @@ final class Qwen3VL4BGenerator {
         }
         // Head: takes the final hidden, returns logits.
         guard let head = headChunk else {
-            throw NSError(domain: "Qwen3VL4BGenerator", code: 50,
+            throw NSError(domain: "Qwen3VL2BGenerator", code: 50,
                 userInfo: [NSLocalizedDescriptionKey: "head chunk not loaded"])
         }
         let headIn = try MLDictionaryFeatureProvider(dictionary: [
@@ -505,7 +507,7 @@ final class Qwen3VL4BGenerator {
 
         let S = inputIds.count
         guard S > 0, S <= cfg.maxSeq - 1 else {
-            throw NSError(domain: "Qwen3VL4BGenerator", code: 3,
+            throw NSError(domain: "Qwen3VL2BGenerator", code: 3,
                 userInfo: [NSLocalizedDescriptionKey:
                     "input length \(S) must be in (0, \(cfg.maxSeq - 1)]"])
         }

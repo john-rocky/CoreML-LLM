@@ -102,17 +102,17 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML/resolve/main",
             folderName: "qwen3.5-2b")
 
-        /// Qwen3-VL 4B — text backbone of the multimodal Qwen3-VL
+        /// Qwen3-VL 2B — text backbone of the multimodal Qwen3-VL
         /// model. 36-layer plain GQA (head_dim=128, 8 KV heads,
         /// hidden=2560), shipped as 6 INT8 body chunks (6 layers each)
         /// + a tail (final_norm + lm_head) + raw fp16 embed sidecar
         /// that Swift mmaps. Vision tower is dropped in this Phase 1
         /// release; Phase 2 will add it via a separate vision_video
         /// mlpackage + DeepStack layer-tap injection.
-        public static let qwen3vl_4b = ModelInfo(
-            id: "qwen3-vl-4b", name: "Qwen3-VL 4B (text, ANE)", size: "4.5 GB",
-            downloadURL: "https://huggingface.co/mlboydaisuke/qwen3-vl-4b-coreml/resolve/main",
-            folderName: "qwen3-vl-4b")
+        public static let qwen3vl_2b = ModelInfo(
+            id: "qwen3-vl-2b", name: "Qwen3-VL 2B (text, ANE)", size: "2.1 GB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/qwen3-vl-2b-coreml/resolve/main",
+            folderName: "qwen3-vl-2b")
 
         /// Gemma 4 E4B — 42 layers, hidden=2560, 2 KV heads, text-only decoder.
         /// INT4 palettized, ctx=2048. Baseline ~14 tok/s on iPhone 17 Pro.
@@ -160,7 +160,7 @@ public final class ModelDownloader: NSObject {
             let experimental =
                 ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
                 || UserDefaults.standard.bool(forKey: "showExperimentalModels")
-            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b, qwen35_08b, qwen35_2b, qwen3vl_4b]
+            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, qwen25_05b, qwen35_08b, qwen35_2b, qwen3vl_2b]
             if experimental {
                 list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
                 list.insert(gemma4e2bLookaheadProbe, at: 3)  // after EAGLE-3
@@ -285,26 +285,25 @@ public final class ModelDownloader: NSObject {
             }
         }
 
-        // Qwen3-VL 4B: 6 body chunks + chunk_head + embed_weight.bin
-        // under qwen3_vl_4b_decode_chunks/. Same all-or-nothing rule as
-        // 2B's 4-chunk layout.
-        let vl4bDir = dir.appendingPathComponent("qwen3_vl_4b_decode_chunks")
-        func vl4bChunkExists(_ base: String) -> Bool {
-            let pkgWeights = vl4bDir
+        // Qwen3-VL 2B: 4 body chunks + chunk_head + embed_weight.bin
+        // under qwen3_vl_2b_decode_chunks/. All-or-nothing.
+        let vl2bDir = dir.appendingPathComponent("qwen3_vl_2b_decode_chunks")
+        func vl2bChunkExists(_ base: String) -> Bool {
+            let pkgWeights = vl2bDir
                 .appendingPathComponent("\(base).mlpackage")
                 .appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")
             if fileManager.fileExists(atPath: pkgWeights.path) { return true }
-            let mlcWeights = vl4bDir
+            let mlcWeights = vl2bDir
                 .appendingPathComponent("\(base).mlmodelc")
                 .appendingPathComponent("weights/weight.bin")
             return fileManager.fileExists(atPath: mlcWeights.path)
         }
-        let vl4bEmbedURL = vl4bDir.appendingPathComponent("embed_weight.bin")
-        let vl4bEmbedPresent = fileManager.fileExists(atPath: vl4bEmbedURL.path)
-        let vl4bAll = (0..<6).allSatisfy { vl4bChunkExists("chunk_\($0)") }
-            && vl4bChunkExists("chunk_head")
-        if vl4bEmbedPresent && vl4bAll {
-            return vl4bDir
+        let vl2bEmbedURL = vl2bDir.appendingPathComponent("embed_weight.bin")
+        let vl2bEmbedPresent = fileManager.fileExists(atPath: vl2bEmbedURL.path)
+        let vl2bAll = (0..<4).allSatisfy { vl2bChunkExists("chunk_\($0)") }
+            && vl2bChunkExists("chunk_head")
+        if vl2bEmbedPresent && vl2bAll {
+            return vl2bDir
         }
         let chunk1 = dir.appendingPathComponent("chunk1.mlmodelc")
         if fileManager.fileExists(atPath: chunk1.appendingPathComponent("weights/weight.bin").path) {
@@ -748,8 +747,8 @@ public final class ModelDownloader: NSObject {
             buildQwen35_2B_FileList()
             return
         }
-        if model.id == "qwen3-vl-4b" {
-            buildQwen3VL4BFileList()
+        if model.id == "qwen3-vl-2b" {
+            buildQwen3VL2BFileList()
             return
         }
         // 2K-context shipping model lives at the repo root on HF:
@@ -948,20 +947,21 @@ public final class ModelDownloader: NSObject {
         nextFileIndex = 0
     }
 
-    /// Qwen3-VL 4B (text-only) CoreML layout on
-    /// `mlboydaisuke/qwen3-vl-4b-coreml`. 6 INT8 body chunks
+    /// Qwen3-VL 2B (text-only) CoreML layout on
+    /// `mlboydaisuke/qwen3-vl-2b-coreml`. 4 INT8 body chunks
     /// (6 layers each) + chunk_head (final_norm + lm_head) + raw fp16
-    /// embed_weight.bin sidecar under `qwen3_vl_4b_decode_chunks/`.
+    /// embed_weight.bin sidecar under `qwen3_vl_2b_decode_chunks/`.
     /// Same shape contract as Qwen3.5 2B v1.1.0 — Swift mmaps the
     /// embed sidecar to keep its 778 MB out of phys_footprint.
-    private func buildQwen3VL4BFileList() {
-        let root = "qwen3_vl_4b_decode_chunks"
-        // Per-chunk weight.bin sizes measured from the INT8 palettized
-        // output. chunk_head carries 778 MB of lm_head.
-        var sizes: [(String, Int64)] = (0..<6).map { i in
-            ("chunk_\(i).mlpackage", Int64(606_000_000))  // 6 layers each
+    private func buildQwen3VL2BFileList() {
+        let root = "qwen3_vl_2b_decode_chunks"
+        // 2B is 28 layers split into 4 body chunks × 7 layers each
+        // (vs 4B's 36 layers / 6 chunks / 6 each). Per-chunk weight.bin
+        // sizes measured from the INT8 palettized output.
+        var sizes: [(String, Int64)] = (0..<4).map { i in
+            ("chunk_\(i).mlpackage", Int64(353_000_000))  // 7 layers each
         }
-        sizes.append(("chunk_head.mlpackage", 389_000_000))  // final_norm + lm_head
+        sizes.append(("chunk_head.mlpackage", 311_000_000))  // final_norm + lm_head
         var files: [DownloadFile] = []
         for (chunk, weightSize) in sizes {
             let pkg = "\(root)/\(chunk)"
@@ -978,11 +978,11 @@ public final class ModelDownloader: NSObject {
                 localPath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
                 estimatedSize: weightSize))
         }
-        // Raw fp16 embed sidecar: 151936 × 2560 × 2 bytes ≈ 778 MB.
+        // Raw fp16 embed sidecar: 151936 × 2048 × 2 bytes ≈ 622 MB.
         files.append(.init(
             remotePath: "\(root)/embed_weight.bin",
             localPath: "\(root)/embed_weight.bin",
-            estimatedSize: 778_000_000))
+            estimatedSize: 622_000_000))
         pendingFiles = files
         pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
