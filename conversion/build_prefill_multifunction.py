@@ -45,7 +45,9 @@ from models.gemma4 import Gemma4Model
 from models import gemma4_prefill_chunks as _pc_mod
 from models.gemma4_prefill_chunks import (
     PrefillChunk1, PrefillChunk2, PrefillChunk3, PrefillChunk4,
+    chunk_kv_layout, chunk_output_names,
 )
+from models.gemma4_swa_chunks import compute_chunk_boundaries
 
 fp16 = ct.converters.mil.mil.types.fp16
 
@@ -83,16 +85,27 @@ def convert_variant(model, sample_inputs, input_specs, output_names,
     mlmodel.save(save_path)
 
 
-def _chunk1_specs(N: int, hidden: int, total_pld: int):
-    shapes = (
+def _rope_shapes(N: int, hd: int, ghd: int):
+    """RoPE input shapes common to every chunk."""
+    return (
+        torch.zeros(1, 1, N, hd,  dtype=torch.float16),  # cos_s
+        torch.zeros(1, 1, N, hd,  dtype=torch.float16),  # sin_s
+        torch.zeros(1, 1, N, ghd, dtype=torch.float16),  # cos_f
+        torch.zeros(1, 1, N, ghd, dtype=torch.float16),  # sin_f
+    )
+
+
+def _chunk1_specs(N: int, hidden: int, total_pld: int, config,
+                   start: int, end: int):
+    hd = config.head_dim
+    ghd = config.global_head_dim
+    shapes_core = (
         torch.zeros(1, N, hidden, dtype=torch.float16),
         torch.zeros(1, 1, N, N, dtype=torch.float16),
         torch.zeros(1, N, total_pld, dtype=torch.float16),
-        torch.zeros(1, 1, N, 256, dtype=torch.float16),
-        torch.zeros(1, 1, N, 256, dtype=torch.float16),
-        torch.zeros(1, 1, N, 512, dtype=torch.float16),
-        torch.zeros(1, 1, N, 512, dtype=torch.float16),
     )
+    rope = _rope_shapes(N, hd, ghd)
+    shapes = shapes_core + rope
     inputs = [
         ct.TensorType(name="hidden_states", shape=shapes[0].shape, dtype=fp16),
         ct.TensorType(name="causal_mask",   shape=shapes[1].shape, dtype=fp16),
@@ -102,24 +115,21 @@ def _chunk1_specs(N: int, hidden: int, total_pld: int):
         ct.TensorType(name="cos_f",         shape=shapes[5].shape, dtype=fp16),
         ct.TensorType(name="sin_f",         shape=shapes[6].shape, dtype=fp16),
     ]
-    outputs = [
-        "hidden_states_out", "per_layer_combined_out",
-        "K0", "V0", "K1", "V1", "K2", "V2", "K3", "V3",
-        "K4", "V4", "K5", "V5", "K6", "V6", "K7", "V7",
-    ]
+    outputs = chunk_output_names(1, start, end, config)
     return shapes, inputs, outputs
 
 
-def _chunk2_specs(N: int, hidden: int, total_pld: int):
-    shapes = (
+def _chunk2_specs(N: int, hidden: int, total_pld: int, config,
+                   start: int, end: int):
+    hd = config.head_dim
+    ghd = config.global_head_dim
+    shapes_core = (
         torch.zeros(1, N, hidden, dtype=torch.float16),
         torch.zeros(1, 1, N, N, dtype=torch.float16),
         torch.zeros(1, N, total_pld, dtype=torch.float16),
-        torch.zeros(1, 1, N, 256, dtype=torch.float16),
-        torch.zeros(1, 1, N, 256, dtype=torch.float16),
-        torch.zeros(1, 1, N, 512, dtype=torch.float16),
-        torch.zeros(1, 1, N, 512, dtype=torch.float16),
     )
+    rope = _rope_shapes(N, hd, ghd)
+    shapes = shapes_core + rope
     inputs = [
         ct.TensorType(name="hidden_states",      shape=shapes[0].shape, dtype=fp16),
         ct.TensorType(name="causal_mask",        shape=shapes[1].shape, dtype=fp16),
@@ -129,27 +139,27 @@ def _chunk2_specs(N: int, hidden: int, total_pld: int):
         ct.TensorType(name="cos_f",              shape=shapes[5].shape, dtype=fp16),
         ct.TensorType(name="sin_f",              shape=shapes[6].shape, dtype=fp16),
     ]
-    outputs = [
-        "hidden_states_out",
-        "K0", "V0", "K1", "V1", "K2", "V2", "K3", "V3", "K4", "V4",
-        "kv13_k", "kv13_v", "kv14_k", "kv14_v",
-    ]
+    outputs = chunk_output_names(2, start, end, config)
     return shapes, inputs, outputs
 
 
-def _chunk3_specs(N: int, hidden: int, total_pld: int):
+def _chunk3_specs(N: int, hidden: int, total_pld: int, config,
+                   start: int, end: int):
+    hd = config.head_dim
+    ghd = config.global_head_dim
+    nkv = config.num_key_value_heads
     shapes = (
         torch.zeros(1, N, hidden, dtype=torch.float16),
         torch.zeros(1, 1, N, N, dtype=torch.float16),
         torch.zeros(1, N, total_pld, dtype=torch.float16),
-        torch.zeros(1, 1, N, 256, dtype=torch.float16),
-        torch.zeros(1, 1, N, 256, dtype=torch.float16),
-        torch.zeros(1, 1, N, 512, dtype=torch.float16),
-        torch.zeros(1, 1, N, 512, dtype=torch.float16),
-        torch.zeros(1, 1, N, 256, dtype=torch.float16),
-        torch.zeros(1, 1, N, 256, dtype=torch.float16),
-        torch.zeros(1, 1, N, 512, dtype=torch.float16),
-        torch.zeros(1, 1, N, 512, dtype=torch.float16),
+        torch.zeros(1, 1, N, hd,  dtype=torch.float16),  # cos_s
+        torch.zeros(1, 1, N, hd,  dtype=torch.float16),  # sin_s
+        torch.zeros(1, 1, N, ghd, dtype=torch.float16),  # cos_f
+        torch.zeros(1, 1, N, ghd, dtype=torch.float16),  # sin_f
+        torch.zeros(1, nkv, N, hd,  dtype=torch.float16),  # kv13_k
+        torch.zeros(1, nkv, N, hd,  dtype=torch.float16),  # kv13_v
+        torch.zeros(1, nkv, N, ghd, dtype=torch.float16),  # kv14_k
+        torch.zeros(1, nkv, N, ghd, dtype=torch.float16),  # kv14_v
     )
     inputs = [
         ct.TensorType(name="hidden_states",      shape=shapes[0].shape,  dtype=fp16),
@@ -164,23 +174,27 @@ def _chunk3_specs(N: int, hidden: int, total_pld: int):
         ct.TensorType(name="kv14_k",             shape=shapes[9].shape,  dtype=fp16),
         ct.TensorType(name="kv14_v",             shape=shapes[10].shape, dtype=fp16),
     ]
-    outputs = ["hidden_states_out"]
+    outputs = chunk_output_names(3, start, end, config)
     return shapes, inputs, outputs
 
 
-def _chunk4_specs(N: int, hidden: int, total_pld: int):
+def _chunk4_specs(N: int, hidden: int, total_pld: int, config,
+                   start: int, end: int):
+    hd = config.head_dim
+    ghd = config.global_head_dim
+    nkv = config.num_key_value_heads
     shapes = (
         torch.zeros(1, N, hidden, dtype=torch.float16),
         torch.zeros(1, 1, N, N, dtype=torch.float16),
         torch.zeros(1, N, total_pld, dtype=torch.float16),
-        torch.zeros(1, 1, N, 256, dtype=torch.float16),
-        torch.zeros(1, 1, N, 256, dtype=torch.float16),
-        torch.zeros(1, 1, N, 512, dtype=torch.float16),
-        torch.zeros(1, 1, N, 512, dtype=torch.float16),
-        torch.zeros(1, 1, N, 256, dtype=torch.float16),
-        torch.zeros(1, 1, N, 256, dtype=torch.float16),
-        torch.zeros(1, 1, N, 512, dtype=torch.float16),
-        torch.zeros(1, 1, N, 512, dtype=torch.float16),
+        torch.zeros(1, 1, N, hd,  dtype=torch.float16),  # cos_s
+        torch.zeros(1, 1, N, hd,  dtype=torch.float16),  # sin_s
+        torch.zeros(1, 1, N, ghd, dtype=torch.float16),  # cos_f
+        torch.zeros(1, 1, N, ghd, dtype=torch.float16),  # sin_f
+        torch.zeros(1, nkv, N, hd,  dtype=torch.float16),  # kv13_k
+        torch.zeros(1, nkv, N, hd,  dtype=torch.float16),  # kv13_v
+        torch.zeros(1, nkv, N, ghd, dtype=torch.float16),  # kv14_k
+        torch.zeros(1, nkv, N, ghd, dtype=torch.float16),  # kv14_v
         torch.zeros(1, N, 1, dtype=torch.float16),
     )
     inputs = [
@@ -197,7 +211,7 @@ def _chunk4_specs(N: int, hidden: int, total_pld: int):
         ct.TensorType(name="kv14_v",             shape=shapes[10].shape, dtype=fp16),
         ct.TensorType(name="last_position_mask", shape=shapes[11].shape, dtype=fp16),
     ]
-    outputs = ["token_id", "token_logit"]
+    outputs = chunk_output_names(4, start, end, config)
     return shapes, inputs, outputs
 
 
@@ -218,16 +232,19 @@ def export_chunk_multifunction(base: Gemma4Model, chunk_idx: int, sizes: list[in
     cfg = base.config
     hidden = cfg.hidden_size
     total_pld = cfg.num_hidden_layers * cfg.hidden_size_per_layer_input
+    boundaries = compute_chunk_boundaries(cfg)
+    start, end = boundaries[chunk_idx - 1]
 
     per_variant_paths: list[tuple[int, str]] = []
     for N in sizes:
-        print(f"\n--- chunk{chunk_idx} N={N} ---")
+        print(f"\n--- chunk{chunk_idx} L{start}-{end-1} N={N} ---")
         # The chunk modules pick up N from the module-level PREFILL_N
         # constant (needed as a Python int so tensor.view()'s dim args
         # stay static across tracing). Flip it per variant.
         _pc_mod.PREFILL_N = N
-        module = cls(base).eval()
-        sample, inputs, outputs = spec_fn(N, hidden, total_pld)
+        module = cls(base, start=start, end=end).eval()
+        sample, inputs, outputs = spec_fn(N, hidden, total_pld, cfg,
+                                           start=start, end=end)
         tmp_path = tmp_dir / f"_tmp_chunk{chunk_idx}_b{N}.mlpackage"
         convert_variant(module, sample, inputs, outputs, str(tmp_path), quantize)
         per_variant_paths.append((N, str(tmp_path)))

@@ -194,11 +194,21 @@ def _copy_tokenizer(hf_dir: str, out_dir: str) -> None:
 def _write_model_config(out_dir: str, model_name: str, text_cfg: dict, ctx_length: int) -> None:
     hidden = int(text_cfg["hidden_size"])
     per_layer_dim = int(text_cfg.get("hidden_size_per_layer_input", 256))
+    num_layers = int(text_cfg["num_hidden_layers"])
+    # Derive default layer_types (Gemma 4's "every 5th is full") only if the
+    # HF config doesn't list them explicitly. Swift relies on this field to
+    # route KV writes per chunk at prefill time.
+    layer_types = text_cfg.get("layer_types")
+    if not layer_types:
+        layer_types = [
+            "full_attention" if (i + 1) % 5 == 0 else "sliding_attention"
+            for i in range(num_layers)
+        ]
     cfg = {
         "model_name": model_name,
         "architecture": "gemma4",
         "hidden_size": hidden,
-        "num_hidden_layers": int(text_cfg["num_hidden_layers"]),
+        "num_hidden_layers": num_layers,
         "num_attention_heads": int(text_cfg.get("num_attention_heads", 8)),
         "num_key_value_heads": int(text_cfg.get("num_key_value_heads", 1)),
         "head_dim": int(text_cfg.get("head_dim", 256)),
@@ -207,7 +217,9 @@ def _write_model_config(out_dir: str, model_name: str, text_cfg: dict, ctx_lengt
         "context_length": ctx_length,
         "sliding_window": int(text_cfg.get("sliding_window", 512)),
         "per_layer_dim": per_layer_dim,
-        "num_layers": int(text_cfg["num_hidden_layers"]),
+        "num_layers": num_layers,
+        "num_kv_shared_layers": int(text_cfg.get("num_kv_shared_layers", 20)),
+        "layer_types": layer_types,
         "embed_scale": math.sqrt(hidden),
         "per_layer_embed_scale": math.sqrt(per_layer_dim),
         "per_layer_model_projection_scale": 1.0 / math.sqrt(hidden),
@@ -237,6 +249,28 @@ def _run_chunks_build(model_name: str, ctx: int, out_dir: str,
     ]
     if hf_dir:
         cmd.extend(["--hf-dir", hf_dir])
+    subprocess.check_call(cmd)
+
+
+def _run_prefill_build(hf_dir: str, ctx: int, out_dir: str,
+                       sizes: list[int]) -> None:
+    """Build prefill_chunk{1..4}.mlpackage via build_prefill_multifunction.py.
+
+    Single-variant builds (one size) skip the multifunction wrapper and
+    produce a plain single-function mlpackage — same on-disk shape as
+    the existing ship artifacts, so Swift needs no load-path change.
+    """
+    print(f"\nBuilding prefill chunks via build_prefill_multifunction.py"
+          f" sizes={sizes} ctx={ctx}")
+    cmd = [
+        sys.executable, os.path.join(ROOT, "build_prefill_multifunction.py"),
+        "--hf-dir", hf_dir,
+        "--output", out_dir,
+        "--context-length", str(ctx),
+        "--sizes", *[str(s) for s in sizes],
+    ]
+    # Default size = largest requested: matches v1.2.0 E2B (N=1024).
+    cmd.extend(["--default-size", str(max(sizes))])
     subprocess.check_call(cmd)
 
 
@@ -283,6 +317,11 @@ def main():
                         help="Reuse existing chunks in <output>/chunks/ instead of rebuilding")
     parser.add_argument("--skip-compile", action="store_true",
                         help="Leave .mlpackage uncompiled (Mac-only step)")
+    parser.add_argument("--skip-prefill", action="store_true",
+                        help="Skip building prefill chunks (decode-only bundle)")
+    parser.add_argument("--prefill-sizes", type=int, nargs="+",
+                        default=[1024],
+                        help="Prefill N sizes (default: 1024, matches v1.2.0 E2B ship config)")
     args = parser.parse_args()
 
     if args.ctx is None:
@@ -313,6 +352,17 @@ def main():
         _compile_all_chunks(chunks_dir, args.output)
     else:
         print("\n--skip-compile set; leaving .mlpackage files in place.")
+
+    if not args.skip_prefill:
+        prefill_dir = os.path.join(args.output, "prefill")
+        os.makedirs(prefill_dir, exist_ok=True)
+        _run_prefill_build(hf_dir, args.ctx, prefill_dir, args.prefill_sizes)
+        if not args.skip_compile:
+            _compile_all_chunks(prefill_dir, args.output)
+        else:
+            print("\n--skip-compile: prefill chunks left as .mlpackage")
+    else:
+        print("\n--skip-prefill set; bundle will be decode-only.")
 
     _extract_embeddings(hf_dir, args.output)
     _extract_per_layer_projection(hf_dir, args.output)

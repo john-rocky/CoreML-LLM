@@ -98,7 +98,11 @@ final class ChunkedEngine {
     }()
 
     let config: ModelConfig
-    let prefillN: Int
+    /// Batch width for the prefill graph (e.g. 1024 for v1.2.0+ ships). Read
+    /// from the prefill_chunk1 input shape at init when prefill is eagerly
+    /// loaded; when LLM_DEFER_PREFILL=1 is active (default) p1 is nil at init
+    /// and this stays at its fallback until `attachPrefill` updates it.
+    private(set) var prefillN: Int
     var currentPosition: Int = 0
 
     // EAGLE-3 speculative decoding state (Phase 2B).
@@ -121,11 +125,25 @@ final class ChunkedEngine {
 
     /// Attach prefill chunks after engine construction (LLM_DEFER_PREFILL path).
     /// Set all four at once under lock so `hasPrefill` never observes
-    /// a partial attachment.
+    /// a partial attachment. Reads the real `prefillN` from p1's hidden_states
+    /// input shape — during init in the deferred-load path p1 is nil, so
+    /// `prefillN` held its fallback default and would mismatch the model if
+    /// the ship graph is wider than that (e.g. v1.2.0+ N=1024 bundles).
     func attachPrefill(_ p1: MLModel, _ p2: MLModel, _ p3: MLModel, _ p4: MLModel) {
         prefillLock.lock()
         _prefillChunk1 = p1; _prefillChunk2 = p2
         _prefillChunk3 = p3; _prefillChunk4 = p4
+        if let hs = p1.modelDescription.inputDescriptionsByName["hidden_states"],
+           let constraint = hs.multiArrayConstraint {
+            let shape = constraint.shape.map { $0.intValue }
+            if shape.count >= 2 {
+                let detected = shape[1]
+                if detected != prefillN {
+                    print("[Load] prefillN updated via attachPrefill: \(prefillN) → \(detected)")
+                    prefillN = detected
+                }
+            }
+        }
         prefillLock.unlock()
     }
 
@@ -598,7 +616,12 @@ final class ChunkedEngine {
         let sinF = try? Data(contentsOf: directory.appendingPathComponent("sin_full.npy"), options: .mappedIfSafe)
 
         // Prefill N: read from model input shape or default 512
-        var prefillN = 512
+        // Fallback default matches v1.2.0+ ship (PREFILL_N=1024). Older
+        // bundles export at the shape their graph was traced at; the probe
+        // below overrides whenever p1 is available. When LLM_DEFER_PREFILL=1
+        // is active and p1 is still nil at init, this fallback is the value
+        // held until `attachPrefill` re-reads the real shape.
+        var prefillN = 1024
         if let p1 {
             if let desc = p1.modelDescription.inputDescriptionsByName["hidden_states"],
                let constraint = desc.multiArrayConstraint {
@@ -2052,10 +2075,14 @@ final class ChunkedEngine {
         guard let srcArr = src.featureValue(for: name)?.multiArrayValue else {
             throw CoreMLLLMError.predictionFailed
         }
-        let W = config.slidingWindow
+        // cache shape: (slots, nkv, W, maxHd). Prefill output: (1, nkv, N, hd).
         let shape = cache.shape.map { $0.intValue }
-        let maxHd = shape[3]
-        let slotStride = 1 * W * maxHd
+        let nkv = shape[1]; let W = shape[2]; let maxHd = shape[3]
+        let slotStride = nkv * W * maxHd
+        let nkvStrideDst = W * maxHd
+        let srcShape = srcArr.shape.map { $0.intValue }
+        let N = srcShape[2]
+        let nkvStrideSrc = N * hd
         let dst = cache.dataPointer.bindMemory(to: UInt16.self, capacity: cache.count)
         let s = srcArr.dataPointer.bindMemory(to: UInt16.self, capacity: srcArr.count)
         // SWA cache is right-aligned (see makeSlidingCausalMask): valid tokens
@@ -2064,10 +2091,12 @@ final class ChunkedEngine {
         let writeCount = min(realLen, W)
         let sourceStart = realLen - writeCount
         let startCachePos = W - writeCount
-        for p in 0..<writeCount {
-            let srcOff = (sourceStart + p) * hd
-            let dstOff = slot * slotStride + (startCachePos + p) * maxHd
-            for j in 0..<hd { dst[dstOff + j] = s[srcOff + j] }
+        for head in 0..<nkv {
+            for p in 0..<writeCount {
+                let srcOff = head * nkvStrideSrc + (sourceStart + p) * hd
+                let dstOff = slot * slotStride + head * nkvStrideDst + (startCachePos + p) * maxHd
+                for j in 0..<hd { dst[dstOff + j] = s[srcOff + j] }
+            }
         }
     }
 
@@ -2078,44 +2107,97 @@ final class ChunkedEngine {
             throw CoreMLLLMError.predictionFailed
         }
         let shape = cache.shape.map { $0.intValue }
-        let ctx = shape[2]; let maxHd = shape[3]
-        let slotStride = 1 * ctx * maxHd
+        let nkv = shape[1]; let ctx = shape[2]; let maxHd = shape[3]
+        let slotStride = nkv * ctx * maxHd
+        let nkvStrideDst = ctx * maxHd
+        let srcShape = srcArr.shape.map { $0.intValue }
+        let N = srcShape[2]
+        let nkvStrideSrc = N * hd
         let dst = cache.dataPointer.bindMemory(to: UInt16.self, capacity: cache.count)
         let s = srcArr.dataPointer.bindMemory(to: UInt16.self, capacity: srcArr.count)
-        for p in 0..<realLen {
-            let srcOff = p * hd
-            let dstOff = slot * slotStride + p * maxHd
-            for j in 0..<hd { dst[dstOff + j] = s[srcOff + j] }
+        for head in 0..<nkv {
+            for p in 0..<realLen {
+                let srcOff = head * nkvStrideSrc + p * hd
+                let dstOff = slot * slotStride + head * nkvStrideDst + p * maxHd
+                for j in 0..<hd { dst[dstOff + j] = s[srcOff + j] }
+            }
         }
     }
 
-    // KV slot mapping: chunk1 outputs K0..K7/V0..V7
-    // Sliding slots: L0→0, L1→1, L2→2, L3→3, L5→4, L6→5, L7→6 (skip L4 = full)
-    // Full slots: L4→0
-    private func kvMapChunk1Sliding() -> [(String, Int, MLMultiArray, Int)] {
-        [("K0",0,kSliding1,256),("V0",0,vSliding1,256),
-         ("K1",1,kSliding1,256),("V1",1,vSliding1,256),
-         ("K2",2,kSliding1,256),("V2",2,vSliding1,256),
-         ("K3",3,kSliding1,256),("V3",3,vSliding1,256),
-         ("K5",4,kSliding1,256),("V5",4,vSliding1,256),
-         ("K6",5,kSliding1,256),("V6",5,vSliding1,256),
-         ("K7",6,kSliding1,256),("V7",6,vSliding1,256)]
-    }
-    private func kvMapChunk1Full() -> [(String, Int, MLMultiArray, Int)] {
-        [("K4",0,kFull1,512),("V4",0,vFull1,512)]
+    // KV slot mapping — config-driven for E2B (35 layers) and E4B (42 layers).
+    //
+    // Each prefill chunk emits one K{local}/V{local} pair per own-KV
+    // non-producer layer in its [start, end) range (local index = position
+    // within the chunk's non-producer list, matches Python's
+    // `chunk_output_names` ordering). Producer layers emit kv13_* (sliding
+    // producer) and kv14_* (full producer) aliases instead.
+    //
+    // Decode-side slot assignment follows `_layer_kv_map` in
+    // gemma4_swa_chunks.py: within a chunk, sliding slots count up
+    // per-sliding-layer, full slots count up per-full-layer. The Swift map
+    // below must agree, so slots are computed by the same iteration order.
+    private enum KVKind { case sliding, full }
+
+    private struct KVSlotMap {
+        let sliding: [(String, Int, MLMultiArray, Int)]
+        let full: [(String, Int, MLMultiArray, Int)]
     }
 
-    // Chunk2: L8→sliding0, L9→full0, L10→s1, L11→s2, L12→s3, L13→s4, L14→full1
+    private func buildKVSlotMap(chunkIdx: Int) -> KVSlotMap {
+        let hd = 256   // sliding head_dim (Gemma 4 both variants)
+        let ghd = 512  // full head_dim
+        let boundaries = config.chunkBoundaries
+        let (start, end) = boundaries[chunkIdx - 1]
+        let kS: MLMultiArray = (chunkIdx == 1) ? kSliding1 : kSliding2
+        let vS: MLMultiArray = (chunkIdx == 1) ? vSliding1 : vSliding2
+        let kF: MLMultiArray = (chunkIdx == 1) ? kFull1    : kFull2
+        let vF: MLMultiArray = (chunkIdx == 1) ? vFull1    : vFull2
+
+        var sliding: [(String, Int, MLMultiArray, Int)] = []
+        var full: [(String, Int, MLMultiArray, Int)] = []
+        var localNonProd = 0
+        var slidingSlot = 0
+        var fullSlot = 0
+        let slidingProducer = config.kvSlidingProducer
+        let fullProducer = config.kvFullProducer
+
+        for layerIdx in start..<end {
+            if config.isKvShared(layerIdx) { continue }
+            let isFull = config.isFullAttention(layerIdx)
+            // Resolve the output-name pair for this layer.
+            let name: (String, String)
+            if layerIdx == slidingProducer {
+                name = ("kv13_k", "kv13_v")
+            } else if layerIdx == fullProducer {
+                name = ("kv14_k", "kv14_v")
+            } else {
+                name = ("K\(localNonProd)", "V\(localNonProd)")
+                localNonProd += 1
+            }
+            if isFull {
+                full.append((name.0, fullSlot, kF, ghd))
+                full.append((name.1, fullSlot, vF, ghd))
+                fullSlot += 1
+            } else {
+                sliding.append((name.0, slidingSlot, kS, hd))
+                sliding.append((name.1, slidingSlot, vS, hd))
+                slidingSlot += 1
+            }
+        }
+        return KVSlotMap(sliding: sliding, full: full)
+    }
+
+    private func kvMapChunk1Sliding() -> [(String, Int, MLMultiArray, Int)] {
+        buildKVSlotMap(chunkIdx: 1).sliding
+    }
+    private func kvMapChunk1Full() -> [(String, Int, MLMultiArray, Int)] {
+        buildKVSlotMap(chunkIdx: 1).full
+    }
     private func kvMapChunk2Sliding() -> [(String, Int, MLMultiArray, Int)] {
-        [("K0",0,kSliding2,256),("V0",0,vSliding2,256),
-         ("K2",1,kSliding2,256),("V2",1,vSliding2,256),
-         ("K3",2,kSliding2,256),("V3",2,vSliding2,256),
-         ("K4",3,kSliding2,256),("V4",3,vSliding2,256),
-         ("kv13_k",4,kSliding2,256),("kv13_v",4,vSliding2,256)]
+        buildKVSlotMap(chunkIdx: 2).sliding
     }
     private func kvMapChunk2Full() -> [(String, Int, MLMultiArray, Int)] {
-        [("K1",0,kFull2,512),("V1",0,vFull2,512),
-         ("kv14_k",1,kFull2,512),("kv14_v",1,vFull2,512)]
+        buildKVSlotMap(chunkIdx: 2).full
     }
 
     /// Slice a single feature vector from vision encoder output.
