@@ -587,16 +587,11 @@ final class Qwen3VL4BGenerator {
     /// (fp32 logits) still work with this generator.
     private func readNextToken(from out: MLFeatureProvider) -> Int32 {
         if let ntArr = out.featureValue(for: "next_token")?.multiArrayValue {
-            switch ntArr.dataType {
-            case .int32:
+            // MLMultiArrayDataType only exposes .int32 (+ fp/double);
+            // the head chunk is built to return int32 directly.
+            if ntArr.dataType == .int32 {
                 return ntArr.dataPointer
                     .assumingMemoryBound(to: Int32.self)[0]
-            case .int64:
-                let v = ntArr.dataPointer
-                    .assumingMemoryBound(to: Int64.self)[0]
-                return Int32(truncatingIfNeeded: v)
-            default:
-                break
             }
         }
         if let logits = out.featureValue(for: "logits")?.multiArrayValue {
