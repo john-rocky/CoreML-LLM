@@ -429,8 +429,13 @@ final class ChunkedEngine {
         case 1:  loadMode = "sequential"
         default: loadMode = "cap=\(loadMaxParallel)"
         }
-        print("[Load] All \(hasPrefillFiles ? 8 : 4) chunks loaded in " +
-              "\(String(format: "%.1f", loadDt))s (\(loadMode))")
+        let loadedCount = chunkWork.count
+        let totalCount = hasPrefillFiles ? 8 : 4
+        let deferredSuffix = (deferPrefill && hasPrefillFiles)
+            ? " (\(totalCount - loadedCount) prefill deferred to bg)"
+            : ""
+        print("[Load] \(loadedCount)/\(totalCount) chunks loaded in " +
+              "\(String(format: "%.1f", loadDt))s (\(loadMode))\(deferredSuffix)")
 
         // Load verify functions from multi-function chunks (if available).
         // Multi-function chunks have a "verify_qK" function alongside the
