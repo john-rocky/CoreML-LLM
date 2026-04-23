@@ -1,6 +1,11 @@
 # Next-session handoff
 
-**Last updated:** 2026-04-16 (full docs audit + coremltools 9 findings).
+**Last updated:** 2026-04-23 (iPhone ANE sparsity-aware finding +
+multifunction-variants revert).
+
+**Most recent session summary:** `docs/SESSION_2026_04_23.md` — read
+that first. Supersedes the "next steps" below for TTFT levers; decode
+optimization items still apply.
 
 ---
 
