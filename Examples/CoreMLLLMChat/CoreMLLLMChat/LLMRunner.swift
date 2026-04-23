@@ -443,14 +443,18 @@ final class LLMRunner {
             ?? tok.encode(text: messages.last?.content ?? "")
         let inputIdsInt32 = inputIds.map { Int32($0) }
 
-        let maxSeq = 2048
+        // Qwen3-VL 4B chunks are built with max_seq=512 (was 2048).
+        // Smaller KV cache + shorter SDPA scan → ~2.3× tok/s on Mac.
+        // One chat turn can still run ~400 generated tokens after the
+        // chat template overhead.
+        let maxSeq = 512
         let remaining = maxSeq - inputIds.count - 1
         if remaining < 1 {
             throw NSError(domain: "LLMRunner", code: 32,
                 userInfo: [NSLocalizedDescriptionKey:
                     "Qwen3-VL 4B prompt (\(inputIds.count) tokens) exceeds max_seq=\(maxSeq). Shorten the message or clear the chat history."])
         }
-        let maxNew = min(remaining, 1024)
+        let maxNew = min(remaining, 480)
 
         // Qwen3-VL EOS set: <|endoftext|>=151643, <|im_end|>=151645,
         // <|im_start|>=151644 (next-turn marker → also a stop).

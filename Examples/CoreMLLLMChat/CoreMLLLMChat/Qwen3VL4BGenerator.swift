@@ -103,7 +103,7 @@ final class Qwen3VL4BGenerator {
         let decodeUnits: MLComputeUnits
 
         static let `default` = Config(
-            maxSeq: 2048, vocab: 151936, hiddenSize: 2560, numLayers: 36,
+            maxSeq: 512, vocab: 151936, hiddenSize: 2560, numLayers: 36,
             numKVHeads: 8, headDim: 128, numBodyChunks: 6, layersPerChunk: 6,
             ropeTheta: 5_000_000.0,
             decodeUnits: .cpuAndNeuralEngine)
