@@ -125,13 +125,43 @@ class FixedGridVisionModel(nn.Module):
     def forward(self, pixel_values):
         """
         pixel_values: (3, 2, IMAGE_SIZE, IMAGE_SIZE) fp16 — one image,
-        temporal_patch=2 (repeat frame twice to satisfy Conv3d kernel).
-        The HF patch_embed expects shape (in_channels, T, H, W).
+        temporal_patch=2 (single frame duplicated across the T axis).
+
+        Earlier versions of this converter fed `pixel_values` directly
+        to `patch_embed`, relying on its internal
+        `.view(-1, C, T_p, P, P)` to "do the right thing." That reshape
+        only produces valid patches if the input is *already
+        patchified* in HF's processor layout
+        `(num_patches, C*T_p*P*P)` — feeding raw pixel layout silently
+        emits the first 1536 sequential bytes as "patch 0", which
+        reorders spatial structure into something the encoder can't
+        interpret (cos_sim ≈ 0.47 vs HF features on a checker image).
+
+        Fix: patchify in-graph so the Core ML input stays raw
+        `(3, 2, 448, 448)` — matching what the Swift preprocessor
+        produces — but the downstream patch_embed sees the same
+        `(784, 1536)` layout HF's processor would feed it.
         """
-        # HF PatchEmbed.forward flattens the temporal patches internally.
-        # pixel_values shape coming in: (1, 3, 2, 448, 448) — we squeeze
-        # batch here to match HF's expected (C, T, H, W) after reshape.
-        hidden_states = self.patch_embed(pixel_values)  # (seq, hidden)
+        C, T, H, W = 3, 2, pixel_values.shape[-2], pixel_values.shape[-1]
+        P = self.patch_size
+        merge = self.spatial_merge_size
+        grid_t = 1
+        grid_h = H // P
+        grid_w = W // P
+        # Mirror `Qwen2VLImageProcessor._preprocess` patchify ordering:
+        #   (B, T, C, H, W) → view (B, grid_t, T_p, C, gh_m, m, P, gw_m, m, P)
+        #   → permute (0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+        #   → reshape (B, grid_t*grid_h*grid_w, C*T_p*P*P)
+        # This makes 2×2 merged blocks contiguous in the patch sequence,
+        # which is what `merger` / `deepstack_merger_list` expect.
+        x = pixel_values.unsqueeze(0)                    # (1, C, T, H, W)
+        x = x.permute(0, 2, 1, 3, 4).contiguous()        # (1, T, C, H, W)
+        x = x.view(1, grid_t, T, C,
+                   grid_h // merge, merge, P,
+                   grid_w // merge, merge, P)
+        x = x.permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9).contiguous()
+        x = x.view(-1, C * T * P * P)                    # (784, 1536)
+        hidden_states = self.patch_embed(x)              # (seq, hidden)
         hidden_states = hidden_states + self.pos_embed_fixed
 
         # cu_seqlens for a single image = [0, seq_len] — attention

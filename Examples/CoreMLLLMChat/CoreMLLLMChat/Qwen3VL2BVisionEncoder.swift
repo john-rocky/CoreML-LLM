@@ -47,9 +47,18 @@ final class Qwen3VL2BVisionEncoder {
     @ObservationIgnored private var pixelBuffer: MLMultiArray!
     @ObservationIgnored private var pixelFV: MLFeatureValue!
 
-    // CLIP / Qwen3-VL normalization constants.
-    private static let imageMean: [Float] = [0.48145466, 0.4578275, 0.40821073]
-    private static let imageStd:  [Float] = [0.26862954, 0.26130258, 0.27577711]
+    // Qwen3-VL normalization constants. The Qwen3-VL image processor
+    // uses mean=(0.5, 0.5, 0.5) / std=(0.5, 0.5, 0.5) — i.e. rescale
+    // to [-1, 1] — **not** the CLIP values [0.48145, 0.45783, 0.40821]
+    // / [0.26863, 0.26130, 0.27578] that Qwen2-VL and most vision
+    // LMs inherit. A previous revision of this file used the CLIP
+    // values by inheritance from a Gemma/LLaVA-style pipeline, which
+    // offset every pixel by a per-channel bias and shrunk the std by
+    // ~2×, dropping on-device vision-feature cosine parity vs HF from
+    // 0.96 to 0.47 — the model saw "digital corruption, horizontal
+    // streaks" instead of the image content.
+    private static let imageMean: [Float] = [0.5, 0.5, 0.5]
+    private static let imageStd:  [Float] = [0.5, 0.5, 0.5]
 
     init(cfg: Config = .default) {
         self.cfg = cfg
