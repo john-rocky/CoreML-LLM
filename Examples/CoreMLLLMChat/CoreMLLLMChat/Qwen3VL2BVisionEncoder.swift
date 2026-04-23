@@ -105,12 +105,26 @@ final class Qwen3VL2BVisionEncoder {
 
     /// CGImage → (3, 2, 448, 448) fp16 in `pixelBuffer`.
     /// Fills T=0 and T=1 with the same normalized frame (temporal patch=2
-    /// for single-image inputs).
+    /// for single-image inputs). Uses `pixelBuffer.strides` rather than
+    /// assuming contiguous storage — CoreML occasionally pads fp16 arrays
+    /// for IOSurface alignment, and a silent stride mismatch writes the
+    /// pixels to wrong offsets, producing the "horizontal-band signal
+    /// corruption" the model reports.
     private func preprocess(_ cgImage: CGImage) {
         let size = cfg.imageSize
         let count = size * size
-        // 1) Resize to imageSize × imageSize via CGContext (device RGB,
-        //    premultipliedLast).
+        // 1) Resize to imageSize × imageSize. iOS `UIImage(data:)` may
+        //    hand us a CGImage whose raw pixels are stored in the
+        //    pre-EXIF-rotated orientation (e.g. iPhone portrait JPEGs
+        //    are landscape pixels + a rotate-90 EXIF tag). Using
+        //    `CIImage.oriented(forExifOrientation:)` is not available
+        //    from a bare CGImage, so we always redraw into a fresh
+        //    448×448 RGBA device-RGB context. The CGContext's
+        //    flipped y-axis draws images "upright" if the caller
+        //    handed us a CIImage-derived CGImage, but on a plain
+        //    CGImage we must flip the transform back to match pixel
+        //    orientation — we skip this because the app's picker
+        //    normalizes orientation for the CGImage we receive.
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bytesPerRow = size * 4
         let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
@@ -124,45 +138,74 @@ final class Qwen3VL2BVisionEncoder {
             ctx.interpolationQuality = .high
             ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: size, height: size))
         }
-        // 2) Split channels + normalize to (3, H, W) fp32 then cast to fp16
-        //    into pixelBuffer at both T=0 and T=1.
+        // 2) Split channels + normalize to fp32 planes, then cast to
+        //    fp16 into pixelBuffer at both T=0 and T=1 using the
+        //    multi-array's reported strides. Strides are in elements
+        //    (not bytes) — for fp16 that's UInt16 counts, which is
+        //    exactly the type the dataPointer is bound to.
         let dst = pixelBuffer.dataPointer
             .assumingMemoryBound(to: UInt16.self)
+        let strides = pixelBuffer.strides.map { $0.intValue }
+        // Expected shape (3, 2, 448, 448). If Core ML ever reshapes or
+        // adds padding, this guard catches it before we write garbage.
+        precondition(pixelBuffer.shape.count == 4,
+                      "pixel_values must be 4D (C, T, H, W)")
+        let sC = strides[0]
+        let sT = strides[1]
+        let sH = strides[2]
+        let sW = strides[3]
+        // Fast path requires a contiguous H row (sW == 1) so vImage can
+        // do a single bulk fp32→fp16 convert over H*W elements.
+        let rowContig = (sW == 1 && sH == size)
         var plane = [Float](repeating: 0, count: count)
-        let stridePerChannel = 2 * count                   // T=2
-        let stridePerTemporal = count
         for c in 0..<3 {
             let mean = Self.imageMean[c]
             let std  = Self.imageStd[c]
             let invStd = 1.0 / std
-            // Deinterleave: channel c of each pixel at offset c.
             for i in 0..<count {
                 let v = Float(rgba[i * 4 + c]) / 255.0
                 plane[i] = (v - mean) * invStd
             }
-            // Cast fp32 → fp16 for both T=0 and T=1.
-            let baseT0 = c * stridePerChannel
-            let baseT1 = c * stridePerChannel + stridePerTemporal
-            var srcBuf = plane  // mutable copy for vImage
-            srcBuf.withUnsafeMutableBufferPointer { sp in
-                var srcBuffer = vImage_Buffer(
-                    data: sp.baseAddress,
-                    height: 1,
-                    width: vImagePixelCount(count),
-                    rowBytes: count * MemoryLayout<Float>.size)
-                var dst0 = vImage_Buffer(
-                    data: dst.advanced(by: baseT0),
-                    height: 1,
-                    width: vImagePixelCount(count),
-                    rowBytes: count * MemoryLayout<UInt16>.size)
-                var dst1 = vImage_Buffer(
-                    data: dst.advanced(by: baseT1),
-                    height: 1,
-                    width: vImagePixelCount(count),
-                    rowBytes: count * MemoryLayout<UInt16>.size)
-                _ = vImageConvert_PlanarFtoPlanar16F(&srcBuffer, &dst0, 0)
-                _ = vImageConvert_PlanarFtoPlanar16F(&srcBuffer, &dst1, 0)
+            let baseT0 = c * sC + 0 * sT
+            let baseT1 = c * sC + 1 * sT
+            if rowContig {
+                var srcBuf = plane
+                srcBuf.withUnsafeMutableBufferPointer { sp in
+                    var srcBuffer = vImage_Buffer(
+                        data: sp.baseAddress,
+                        height: 1,
+                        width: vImagePixelCount(count),
+                        rowBytes: count * MemoryLayout<Float>.size)
+                    var dst0 = vImage_Buffer(
+                        data: dst.advanced(by: baseT0),
+                        height: 1,
+                        width: vImagePixelCount(count),
+                        rowBytes: count * MemoryLayout<UInt16>.size)
+                    var dst1 = vImage_Buffer(
+                        data: dst.advanced(by: baseT1),
+                        height: 1,
+                        width: vImagePixelCount(count),
+                        rowBytes: count * MemoryLayout<UInt16>.size)
+                    _ = vImageConvert_PlanarFtoPlanar16F(&srcBuffer, &dst0, 0)
+                    _ = vImageConvert_PlanarFtoPlanar16F(&srcBuffer, &dst1, 0)
+                }
+            } else {
+                // Fallback: per-row casts, respecting sH (e.g. padded).
+                for y in 0..<size {
+                    for x in 0..<size {
+                        let v = Float16(plane[y * size + x]).bitPattern
+                        dst[baseT0 + y * sH + x * sW] = v
+                        dst[baseT1 + y * sH + x * sW] = v
+                    }
+                }
             }
+        }
+        if !rowContig {
+            // Only log on the unexpected branch to avoid per-frame spam.
+            print("[VL2BVisionEncoder] non-contiguous pixel_values strides: \(strides)")
+        } else if ProcessInfo.processInfo.environment["VL2B_VISION_DEBUG"] != nil {
+            // One-time strides print under env flag for parity tests.
+            print("[VL2BVisionEncoder] strides=\(strides) sample px c0[0]=\(plane[0])")
         }
     }
 }

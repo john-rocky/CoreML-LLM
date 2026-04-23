@@ -200,6 +200,11 @@ final class Qwen3VL2BGenerator {
     @ObservationIgnored private var cosTable: [Float] = []
     @ObservationIgnored private var sinTable: [Float] = []
 
+    /// Per-dim base frequencies (half_head_dim elements) for mRoPE —
+    /// freq[i] = 1 / theta^(2i / head_dim). Reused when synthesizing
+    /// vision cos/sin with proper (T, H, W) coordinates.
+    @ObservationIgnored private var baseFreqs: [Float] = []
+
     /// Reusable Float buffer for logits — avoids 600 KB heap alloc per step.
     @ObservationIgnored private var logitsBuffer: [Float] = []
 
@@ -221,6 +226,14 @@ final class Qwen3VL2BGenerator {
         self.cfg = cfg
         self.cosTable = buildRope(isCos: true)
         self.sinTable = buildRope(isCos: false)
+        // Per-dim base RoPE frequencies (used to synthesize mRoPE
+        // cos/sin for image tokens).
+        let half = cfg.headDim / 2
+        var f = [Float](repeating: 0, count: half)
+        for i in 0..<half {
+            f[i] = 1.0 / powf(cfg.ropeTheta, Float(2 * i) / Float(cfg.headDim))
+        }
+        self.baseFreqs = f
         self.logitsBuffer = [Float](repeating: 0, count: cfg.vocab)
         // Per-chunk KV input/output name slices
         var inSlices: [[String]] = []
@@ -546,6 +559,63 @@ final class Qwen3VL2BGenerator {
         }
     }
 
+    /// Decoupled variant: KV slot `position` + separate RoPE position
+    /// `ropePos`. Used for text tokens after a vision span so they can
+    /// keep sequential KV slots while getting the HF-matching
+    /// position-ID bump in their RoPE rotation.
+    private func writeDecodeScalarsWithRopePos(position: Int, ropePos: Int) {
+        reusablePos.dataPointer.assumingMemoryBound(to: Float.self)[0] = Float(position)
+        let d = cfg.headDim
+        let cp = reusableCos.dataPointer.assumingMemoryBound(to: UInt16.self)
+        let sp = reusableSin.dataPointer.assumingMemoryBound(to: UInt16.self)
+        let clamped = min(max(ropePos, 0), cfg.maxSeq - 1)
+        for i in 0..<d {
+            cp[i] = Float16(cosTable[clamped * d + i]).bitPattern
+            sp[i] = Float16(sinTable[clamped * d + i]).bitPattern
+        }
+    }
+
+    /// Write interleaved mRoPE cos/sin for an image token at 3D
+    /// coordinate (T, H, W). `position` is the sequential KV-cache
+    /// slot (unaffected by the 3D coords).
+    ///
+    /// Layout on half head_dim (=64) following Qwen3-VL's
+    /// `mrope_section=[24, 20, 20]` + `mrope_interleaved=True`:
+    ///   dims [0, 60): cyclic T / H / W / T / H / W …
+    ///   dims [60, 64): T (leftover — section sum=60 < 64)
+    /// Full head_dim is the half concatenated twice (standard RoPE
+    /// `cat(freqs, freqs)`), so the same pattern repeats in
+    /// [64, 128). For text tokens T=H=W=position this reduces to 1D
+    /// RoPE, matching the existing `writeDecodeScalars` path.
+    private func writeVisionRopeScalars(position: Int,
+                                         T: Float, H: Float, W: Float) {
+        reusablePos.dataPointer.assumingMemoryBound(to: Float.self)[0] = Float(position)
+        let d = cfg.headDim
+        let half = d / 2
+        let cp = reusableCos.dataPointer.assumingMemoryBound(to: UInt16.self)
+        let sp = reusableSin.dataPointer.assumingMemoryBound(to: UInt16.self)
+        // First 60 dims: T / H / W cycle. Last 4 dims (60..64): T.
+        for i in 0..<half {
+            let pos: Float
+            if i < 60 {
+                switch i % 3 {
+                case 0:  pos = T
+                case 1:  pos = H
+                default: pos = W
+                }
+            } else {
+                pos = T
+            }
+            let a = pos * baseFreqs[i]
+            let c = Float16(cosf(a)).bitPattern
+            let s = Float16(sinf(a)).bitPattern
+            cp[i]        = c
+            cp[i + half] = c
+            sp[i]        = s
+            sp[i + half] = s
+        }
+    }
+
     /// Holds per-call mutable scratch threaded through the decode loop.
     /// One last-output slot per body chunk; the head is stateless.
     /// When `vision` is non-nil the generator routes chunk[0] through
@@ -558,15 +628,31 @@ final class Qwen3VL2BGenerator {
 
     /// Per-generate vision state. `imageTokenIdx` counts consumed
     /// image-pad tokens so ds_0..ds_2 / the merger hidden row can be
-    /// indexed in order.
+    /// indexed in order. `imageStartSeqPos` + `gridH`/`gridW` enable
+    /// interleaved mRoPE: image tokens carry 2D (H, W) coords in their
+    /// RoPE rotation, and text tokens *after* the image span have
+    /// their RoPE position shifted to match HF's get_rope_index bump
+    /// (next text pos = image_start + max(gridH, gridW), not
+    /// image_start + 196).
     final class VisionState {
         let features: Qwen3VL2BVisionFeatures
         let imagePadTokenId: Int32
+        let imageStartSeqPos: Int
+        let gridH: Int
+        let gridW: Int
         var imageTokenIdx: Int = 0
-        init(features: Qwen3VL2BVisionFeatures, imagePadTokenId: Int32) {
+        init(features: Qwen3VL2BVisionFeatures,
+             imagePadTokenId: Int32,
+             imageStartSeqPos: Int,
+             gridH: Int = 14, gridW: Int = 14) {
             self.features = features
             self.imagePadTokenId = imagePadTokenId
+            self.imageStartSeqPos = imageStartSeqPos
+            self.gridH = gridH
+            self.gridW = gridW
         }
+        /// Number of image tokens in the vision span (= features.count).
+        var imageSpan: Int { gridH * gridW }
     }
 
     /// Copy one row (2048 fp16) from a (N, hidden) fp16 MLMultiArray
@@ -613,7 +699,34 @@ final class Qwen3VL2BGenerator {
             // be present regardless.
             useVisionChunk0 = state.vision != nil && chunk0Vision != nil
         }
-        writeDecodeScalars(token: token, position: position)
+        // --- 2) RoPE cos/sin + position scalar ---
+        // Text-only path uses 1D RoPE (writeDecodeScalars). With a
+        // VisionState, image tokens carry 3D (T, H, W) coords through
+        // the interleaved mRoPE section pattern, and text tokens after
+        // the image span get their RoPE position shifted to match HF's
+        // `get_rope_index` — otherwise the text-after-image block sees
+        // positions 196 ahead of where the model was trained to expect
+        // them, and attention over the image degenerates into noise.
+        if let vs = state.vision {
+            let start = vs.imageStartSeqPos
+            let span = vs.imageSpan
+            if position < start {
+                writeDecodeScalars(token: token, position: position)
+            } else if position < start + span {
+                let k = position - start
+                let T = Float(start)
+                let H = Float(start + k / vs.gridW)
+                let W = Float(start + k % vs.gridW)
+                writeVisionRopeScalars(position: position, T: T, H: H, W: W)
+            } else {
+                // Bump: next text pos after image = start + max(gridH, gridW).
+                let shift = span - max(vs.gridH, vs.gridW)
+                let ropePos = position - shift
+                writeDecodeScalarsWithRopePos(position: position, ropePos: ropePos)
+            }
+        } else {
+            writeDecodeScalars(token: token, position: position)
+        }
 
         var lastStepOut: MLFeatureProvider = hiddenProvider
         for ci in 0..<bodyChunks.count {
@@ -686,8 +799,21 @@ final class Qwen3VL2BGenerator {
         callState.lastBodyOuts = [MLFeatureProvider?](
             repeating: nil, count: cfg.numBodyChunks)
         if let feats = visionFeatures {
+            // Locate the first <|image_pad|> token in the prompt — used
+            // as the mRoPE base (T index for all image tokens, and the
+            // anchor for per-patch H/W offsets). If the prompt does not
+            // actually contain image_pad tokens (e.g., caller forgot to
+            // splice them in), we surface that as an error rather than
+            // silently running with a zero base position.
+            guard let start = inputIds.firstIndex(of: imagePadTokenId) else {
+                throw NSError(domain: "Qwen3VL2BGenerator", code: 5,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "visionFeatures provided but no <|image_pad|> (\(imagePadTokenId)) token present in inputIds"])
+            }
             callState.vision = VisionState(
-                features: feats, imagePadTokenId: imagePadTokenId)
+                features: feats,
+                imagePadTokenId: imagePadTokenId,
+                imageStartSeqPos: start)
         }
         var initial: [[String: MLFeatureValue]?] = []
         initial.reserveCapacity(cfg.numBodyChunks)
