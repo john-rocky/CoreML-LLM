@@ -234,6 +234,42 @@ final class ChunkedEngine {
 
     // MARK: - Loading
 
+    /// Replace each `prefill_chunk{i}.mlmodelc/weights/weight.bin` that lives
+    /// on a different inode from the matching decode weight with a hard link
+    /// to the decode file. Idempotent: skips when the two paths are already
+    /// the same inode, when sizes differ (treats that as "different content,
+    /// don't touch"), or when either side is missing.
+    private static func consolidatePrefillWeights(in directory: URL) {
+        let fm = FileManager.default
+        for i in 1...4 {
+            let src = directory.appendingPathComponent("chunk\(i).mlmodelc/weights/weight.bin")
+            let dst = directory.appendingPathComponent("prefill_chunk\(i).mlmodelc/weights/weight.bin")
+            guard fm.fileExists(atPath: src.path), fm.fileExists(atPath: dst.path) else { continue }
+
+            let sa = try? fm.attributesOfItem(atPath: src.path)
+            let da = try? fm.attributesOfItem(atPath: dst.path)
+            guard let sIno = sa?[.systemFileNumber] as? UInt64,
+                  let dIno = da?[.systemFileNumber] as? UInt64,
+                  let sSz  = sa?[.size] as? Int64,
+                  let dSz  = da?[.size] as? Int64 else { continue }
+            if sIno == dIno { continue }              // already linked
+            if sSz != dSz { continue }                // sizes differ — don't risk it
+
+            let tmp = dst.appendingPathExtension("relink.tmp")
+            try? fm.removeItem(at: tmp)
+            do {
+                try fm.linkItem(at: src, to: tmp)
+                _ = try fm.replaceItemAt(dst, withItemAt: tmp)
+                print("[Load] consolidated prefill_chunk\(i) weights → hard link " +
+                      "(reclaimed ~\(sSz / 1_000_000) MB)")
+            } catch {
+                try? fm.removeItem(at: tmp)
+                print("[Load] consolidate prefill_chunk\(i) skipped: " +
+                      "\(error.localizedDescription)")
+            }
+        }
+    }
+
     static func load(from directory: URL, config: ModelConfig,
                      computeUnits: MLComputeUnits) async throws -> ChunkedEngine {
         // iOS 18+ MLOptimizationHints.specializationStrategy = .fastPrediction
@@ -322,6 +358,13 @@ final class ChunkedEngine {
                 try? fm.removeItem(at: prefillDir)
             }
         }
+
+        // One-time migration for models downloaded by an older build that
+        // physically copied weight.bin into prefill_chunk{i}/. We replace the
+        // copy with a hard link to the decode weight file — same APFS inode →
+        // single page-cache entry → both MLModel instances mmap the same
+        // physical pages (~half disk + half resident weight footprint).
+        consolidatePrefillWeights(in: directory)
 
         func findModel(_ name: String) -> URL? {
             // For .mlmodelc we require coremldata.bin alongside the directory

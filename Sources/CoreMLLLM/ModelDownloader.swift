@@ -637,6 +637,11 @@ public final class ModelDownloader: NSObject {
         // ship prefill (e.g. gemma4-e4b) would otherwise get half-populated
         // prefill_chunk{i}.mlmodelc directories — just weights, no
         // coremldata.bin — which CoreML rejects at load time.
+        //
+        // Hard-link instead of copy: same APFS inode → single page-cache entry,
+        // so the two MLModel mmaps share physical memory and the file blob
+        // exists once on disk (~half disk + half resident weight footprint).
+        // Falls back to copy if linking is unsupported (e.g. cross-volume).
         for i in 1...4 {
             let src = dest.appendingPathComponent("chunk\(i).mlmodelc/weights/weight.bin")
             let prefillDir = dest.appendingPathComponent("prefill_chunk\(i).mlmodelc")
@@ -647,7 +652,11 @@ public final class ModelDownloader: NSObject {
                   !fileManager.fileExists(atPath: dst.path) else { continue }
             try? fileManager.createDirectory(at: dst.deletingLastPathComponent(),
                                               withIntermediateDirectories: true)
-            try? fileManager.copyItem(at: src, to: dst)
+            do {
+                try fileManager.linkItem(at: src, to: dst)
+            } catch {
+                try? fileManager.copyItem(at: src, to: dst)
+            }
         }
 
         // Clean up any stray prefill directories that lack the required
