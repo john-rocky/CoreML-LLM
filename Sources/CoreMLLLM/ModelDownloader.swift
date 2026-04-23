@@ -71,7 +71,11 @@ public final class ModelDownloader: NSObject {
         /// no longer sits in the video path.
         public static let gemma4e2b = ModelInfo(
             id: "gemma4-e2b", name: "Gemma 4 E2B", size: "3.1 GB",
-            downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
+            // n1024 branch ships the N=1024 batched prefill that pairs with
+            // the Swift SWA write fix (a878c44). Old clones still point at
+            // `main` and keep downloading N=512, which is safe with the
+            // unfixed Swift binary.
+            downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/n1024",
             folderName: "gemma4-e2b")
 
         /// Qwen2.5 0.5B — text only, 309 MB.
@@ -1070,7 +1074,7 @@ public final class ModelDownloader: NSObject {
     // MARK: - ZIP
 
     private func unzipFile(_ zipURL: URL, to destDir: URL) throws {
-        #if targetEnvironment(simulator) || os(macOS)
+        #if os(macOS)
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
         proc.arguments = ["-xk", zipURL.path, destDir.path]
@@ -1079,11 +1083,16 @@ public final class ModelDownloader: NSObject {
         try proc.run()
         proc.waitUntilExit()
         #else
+        // iOS (device + simulator), visionOS, tvOS, watchOS — Foundation's
+        // `Process` is macOS-only, so unzip ourselves via the ZIP central
+        // directory. Previously this branch used `#if targetEnvironment(simulator)
+        // || os(macOS)` which broke iOS Simulator builds with "cannot find
+        // 'Process' in scope".
         try extractZipNative(from: zipURL, to: destDir)
         #endif
     }
 
-    #if !targetEnvironment(simulator) && !os(macOS)
+    #if !os(macOS)
     private func extractZipNative(from zipURL: URL, to destDir: URL) throws {
         let data = try Data(contentsOf: zipURL)
         guard data.count > 22 else { throw DownloadError.extractionFailed }

@@ -578,7 +578,6 @@ struct ChatView: View {
         }
     }
 
-
     private func verifyANE() {
         messages.append(ChatMessage(role: .system, content: "Checking MLComputePlan device placement..."))
         Task.detached(priority: .userInitiated) {

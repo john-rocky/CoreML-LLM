@@ -1,10 +1,11 @@
 # CoreML-LLM
 
-**On-device LLMs on Apple Neural Engine** — Run **Gemma 4 E2B / E4B**, **Qwen3.5 0.8B / 2B**, and **Qwen3-VL 2B** on iPhone with CoreML, ANE-optimized, no server.
+**On-device LLMs on Apple Neural Engine** — Run **Gemma 4 E2B / E4B**, **Qwen3.5 0.8B / 2B**, **Qwen3-VL 2B** (text + vision), **FunctionGemma-270M** (function calling), and **EmbeddingGemma-300M** (sentence embeddings) on iPhone with CoreML, ANE-optimized, no server.
 
 CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a good fit for always-on, battery-friendly inference. [MLX Swift](https://github.com/ml-explore/mlx-swift) is the best choice when you want maximum throughput from the GPU; CoreML-LLM is the answer when you want the LLM to live on the ANE so the GPU stays free.
 
-> **v1.2.0** — **Qwen3-VL 2B** (text + vision on ANE: 28-layer GQA backbone + DeepStack-injected vision tower, 196 image tokens/picture, ~7.5 tok/s text decode on iPhone 17 Pro, image-conditioned prefill via DeepStack-aware chunk_0_vision).
+> **v1.3.0** — **Qwen3-VL 2B** (text + vision on ANE: 28-layer GQA backbone + DeepStack-injected vision tower, 196 image tokens/picture, ~7.5 tok/s text decode on iPhone 17 Pro, image-conditioned prefill via DeepStack-aware `chunk_0_vision` and interleaved mRoPE for 3D image-token coords).
+> **v1.2.0** — **FunctionGemma-270M** (function-calling, 99% ANE, batched prefill for 3× faster prompt ingestion) and **EmbeddingGemma-300M** (bidirectional encoder, 99.8% ANE, 768-d Matryoshka sentence embeddings). Both ship as INT8 CoreML bundles with a minimal Swift API (`FunctionGemma.generate(messages:tools:)`, `EmbeddingGemma.encode(text:task:dim:)`) — drop-in pieces for on-device function calling + RAG, no Gemma 4 dependency.
 > **v1.1.0** — **Qwen3.5 2B** (hybrid SSM + attention, ~17 tok/s decode on iPhone 17 Pro, 4 transformer chunks all on ANE, mmap'd fp16 embed sidecar keeps the app at ~200 MB phys_footprint while the 2B-param model runs).
 > **v1.0.0** — **Qwen3.5 0.8B** (hybrid Gated-DeltaNet SSM + attention, ~20 tok/s decode on iPhone 17 Pro, 99.9% ANE, 0 GB sustained Metal heap). First hybrid SSM/attention LLM shipped on CoreML. See [Qwen3.5 performance](#qwen35-08b-new-v100).
 > **v0.8.0** — **Gemma 4 E4B** (42 layers, hidden=2560, ~14 tok/s on iPhone 17 Pro, 100% ANE). Second model option alongside E2B; swap in the Models picker.
@@ -42,7 +43,7 @@ CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a 
 | ANE placement | — | — | 99.78% | 99.78% | 99.78% | 99.78% | 99.78% | **99.78%** |
 | Memory (`phys_footprint`) | — | — | — | ~1 GB | ~1 GB | ~1 GB | ~1 GB | **~1 GB** |
 
-### Gemma 4 E4B (v0.8.0, new)
+### Gemma 4 E4B (v0.8.0)
 
 | | E2B | **E4B** |
 |---|---:|---:|
@@ -60,9 +61,33 @@ Context length is 2048 on both variants. Extended context (8K) is under active d
 
 Ground-truth ANE placement measured via `MLComputePlan` (E2B: 7,294 / 7,310 dispatched LLM ops on ANE; E4B: 100%). Vision encoder runs on GPU by design.
 
-### Qwen3.5 0.8B (new, v1.0.0)
+### Qwen3.5 2B (new, v1.1.0)
 
-First CoreML port of a hybrid SSM/attention LLM on iPhone. The 24 layers are 18× Gated-DeltaNet linear-attention (SSM) interleaved with 6× full GQA attention. Text-only.
+Scaling the hybrid Gated-DeltaNet stack to a 2B-parameter model while keeping everything on ANE and shipping under a commodity iOS memory budget. 4 INT8 transformer chunks (6 layers each) + a raw fp16 `embed_weight.bin` sidecar that Swift mmaps read-only — the 1 GB embed table lives in clean virtual pages so it never inflates `phys_footprint`.
+
+| | Qwen3.5 2B | Qwen3.5 0.8B |
+|---|---:|---:|
+| Parameters | **~2.0B** | ~0.8B |
+| Architecture | **Gated-DeltaNet SSM + attention** | Gated-DeltaNet SSM + attention |
+| num_hidden_layers | 24 (18 SSM + 6 full-attn) | 24 (18 SSM + 6 full-attn) |
+| hidden_size | **2048** | 1024 |
+| intermediate_size | **6144** | 3072 |
+| Context length | **2048** | 128 |
+| Decode speed (ANE) | **~17 tok/s** | ~20 tok/s |
+| ANE placement (per body chunk) | **90.7% / 91.1% / 90.7% / 90.8%** | 99.9% (single mlpackage) |
+| Bundle size | **2.4 GB** (4 INT8 chunks + 1 GB fp16 embed) | 754 MB (INT8) |
+| `phys_footprint` (inference) | **~200 MB** | ~1 GB |
+| Metal heap (sustained) | **0 GB** | 0 GB |
+
+2B's memory envelope is *smaller* than 0.8B's because embed_tokens is mmap'd (clean pages don't count against resident memory), while all INT8 chunk weights live in ANE's private region and are also excluded from `phys_footprint`.
+
+**Why 4 chunks (not 1 or 2).** iPhone ANE compiles per-mlprogram and budgets against the *fp16-dequantized* weight size, not disk size (INT8 palettization shrinks download, not runtime memory). A 2-chunk 2B split at ~2 GB fp16/chunk tripped `MILCompilerForANE: Couldn't communicate with a helper application` and silently fell back to GPU (3.4 GB Metal, 7 tok/s). 4 chunks at ≤ ~1.7 GB fp16 each match the Gemma 4 E4B envelope that's proven ANE-resident on this hardware. See `docs/RELEASE_v1_1_0.md` for the full autopsy.
+
+**Why the embed sidecar.** Bolting embed onto the first transformer chunk exceeded ANE compile budget; putting it in its own `chunk_embed.mlpackage` compiled fine but landed the gather on CPU, and Core ML dequantized 1 GB of palettized embed weights into process memory (memory spiked from ~200 MB to ~2 GB on the second prompt). Shipping embed as raw fp16 and letting Swift `mmap` + 4 KB per-step `memcpy` handle the lookup keeps it in clean virtual pages.
+
+### Qwen3.5 0.8B (v1.0.0)
+
+First CoreML port of a hybrid SSM/attention LLM on iPhone. Same architecture as 2B above, just the smaller variant. The 24 layers are 18× Gated-DeltaNet linear-attention (SSM) interleaved with 6× full GQA attention. Text-only.
 
 | | Qwen3.5 0.8B |
 |---|---:|
@@ -86,14 +111,16 @@ First load triggers a ~4 min on-device ANE E5 compile; subsequent loads are cach
 
 ## Pre-converted Models
 
-| Model | Size | Multimodal | Download |
-|-------|------|------------|----------|
-| **Qwen3-VL 2B** (new, v1.2.0) | 2.9 GB | Image + Text | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-coreml) |
-| **Gemma 4 E2B** | 3.1 GB | Image + Video + Audio + Text | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
-| **Gemma 4 E4B** (v0.8.0) | 5.5 GB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml) |
-| **Qwen3.5 2B** (v1.1.0) | 2.4 GB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML) |
-| **Qwen3.5 0.8B** (v1.0.0) | 1.4 GB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML) |
-| Qwen2.5-0.5B | 302 MB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen2.5-0.5b-coreml) |
+| Model | Size | Task | Download |
+|-------|------|------|----------|
+| **Qwen3-VL 2B** (new, v1.3.0) | 2.9 GB | Multimodal chat (image + text) | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-coreml) |
+| **Gemma 4 E2B** | 3.1 GB | Multimodal chat (image + video + audio + text) | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
+| **Gemma 4 E4B** (v0.8.0) | 5.5 GB | Text chat | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml) |
+| **Qwen3.5 2B** (v1.1.0) | 2.4 GB | Text chat | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML) |
+| **Qwen3.5 0.8B** (v1.0.0) | 1.4 GB | Text chat | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML) |
+| **FunctionGemma-270M** (v1.2.0) | 850 MB | Function calling | [HuggingFace](https://huggingface.co/mlboydaisuke/functiongemma-270m-coreml) |
+| **EmbeddingGemma-300M** (v1.2.0) | 295 MB | Sentence embeddings (Matryoshka 768/512/256/128) | [HuggingFace](https://huggingface.co/mlboydaisuke/embeddinggemma-300m-coreml) |
+| Qwen2.5-0.5B | 302 MB | Text chat | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen2.5-0.5b-coreml) |
 
 The iOS sample app downloads models automatically. You can also convert your own.
 
@@ -102,6 +129,8 @@ The iOS sample app downloads models automatically. You can also convert your own
 - **Text-only, maximum quality on ≤3 GB** → Qwen3.5 2B (17 tok/s, ~200 MB phys_footprint)
 - **Text-only, maximum quality** → Gemma 4 E4B (~4B effective params)
 - **Text-only, fastest + smallest** → Qwen3.5 0.8B (20 tok/s, 754 MB bundle)
+- **Function / tool calling** → FunctionGemma-270M (99% ANE, INT8, batched-prefill bundle)
+- **Sentence embeddings / RAG** → EmbeddingGemma-300M (99.8% ANE, Matryoshka 768 → 128)
 
 ## Quick Start
 
@@ -190,6 +219,63 @@ Downloads continue in the background via `URLSessionConfiguration.background`. R
 
 Auto-detects model layout: chunked SWA (Gemma 4 E2B) or monolithic (Qwen2.5).
 
+### FunctionGemma-270M & EmbeddingGemma-300M (v1.2.0)
+
+Separate from the chat runner — these are small specialists with their own one-class Swift APIs, designed to be composed by a wrapper library (e.g. a future LocalAIKit) with Gemma 4 for RAG + tool calling.
+
+```swift
+import CoreMLLLM
+
+let modelsDir = FileManager.default
+    .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+
+// --- Function calling (~850 MB, 99% ANE) ---------------------------------
+let fg = try await FunctionGemma.downloadAndLoad(modelsDir: modelsDir)
+
+let tools: [[String: Any]] = [[
+    "type": "function",
+    "function": [
+        "name": "toggle_flashlight",
+        "description": "Turn the phone flashlight on or off.",
+        "parameters": ["type": "object", "properties": [:], "required": []],
+    ],
+]]
+
+let (text, call) = try fg.generateFunctionCall(
+    userPrompt: "Turn on the flashlight",
+    tools: tools)
+// call = "call:toggle_flashlight{}"
+
+// Streaming variant for SwiftUI:
+for try await piece in fg.stream(
+    messages: [["role": "user", "content": "Set a timer for 5 minutes"]],
+    tools: tools,
+    maxNewTokens: 64)
+{
+    print(piece, terminator: "")
+}
+
+// --- Sentence embeddings (~295 MB, 99.8% ANE) ----------------------------
+let eg = try await EmbeddingGemma.downloadAndLoad(modelsDir: modelsDir)
+
+let vec = try eg.encode(
+    text: "How do cats behave?",
+    task: .retrievalQuery,
+    dim: 768)  // or 512 / 256 / 128 — Matryoshka truncation is baked in
+```
+
+Batched prefill (T=32) is enabled automatically when a `prefill_t32.mlmodelc` is present in the downloaded bundle — **3× faster prompt ingestion** for function-calling prompts (tool schema + chat template ≈ 300 tokens). The shipping bundle on HF includes it; bundle authors can opt out with `build_functiongemma_bundle.py --prefill-t 0`.
+
+### Standalone iOS sample — `Examples/Gemma3Demo/`
+
+A minimal SwiftUI app that imports `CoreMLLLM` and exercises both models via their public APIs (no Gemma 4 dependency). Two tabs — **Function** for streaming generation with a parsed call card, **Embed** for cosine similarity + Matryoshka dim picker. Proves the API is self-contained and ready for wrapper consumers.
+
+```bash
+open Examples/Gemma3Demo/Gemma3Demo.xcodeproj
+```
+
+See [`docs/FUNCTIONGEMMA.md`](docs/FUNCTIONGEMMA.md) and [`docs/EMBEDDINGGEMMA.md`](docs/EMBEDDINGGEMMA.md) for the full I/O contract, Matryoshka recipe, and task-prefix conventions.
+
 ### Convert a Model
 
 ```bash
@@ -207,20 +293,37 @@ python convert.py --model gemma4-e2b --output ./output/gemma4-e2b
 # tokenizer + model_config.json, ready for USB sideload or HF upload)
 python build_gemma4_bundle.py --model gemma4-e4b --ctx 2048
 
+# FunctionGemma-270M — INT8 decode + batched prefill (T=32) mlpackages
+python build_functiongemma_bundle.py --ctx 2048 --quantize int8 --prefill-t 32
+
+# EmbeddingGemma-300M — bidirectional encoder bundle
+python build_embeddinggemma_bundle.py --max-seq-len 128 --quantize int8
+
 # List available models
 python convert.py --list
 ```
 
 ## What's new
 
-Current release: **v1.2.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases/tag/v1.2.0)).
+Current release: **v1.3.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases/tag/v1.3.0)).
 
-### v1.2.0 — Qwen3-VL 2B (text + vision on ANE)
+### v1.3.0 — Qwen3-VL 2B (text + vision on ANE)
 
 - **Qwen3-VL 2B on iPhone ANE** — 28-layer GQA backbone (hidden=2048, 16 heads / 8 KV heads, head_dim=128, vocab=151936) split into 4 INT8 body chunks + chunk_head. ~7.5 tok/s text decode at max_seq=2048 on iPhone 17 Pro. mmap'd fp16 `embed_weight.bin` keeps app ~200 MB phys_footprint. Bundle at [`mlboydaisuke/qwen3-vl-2b-coreml`](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-coreml).
-- **DeepStack-aware vision on ANE** — fixed-grid 448×448 vision encoder (196 image tokens / image) ships as a separate `vision.mlpackage` alongside a `chunk_0_vision.mlpackage` that injects the 3 DeepStack residual slices at text layers 0 / 1 / 2. On image-pad token steps the generator memcpy's the merger row into `hidden_in` and flips a `visual_active=1.0` gate; all other steps feed zeroed DeepStack buffers with the gate off so the graph stays static.
+- **DeepStack-aware vision on ANE** — fixed-grid 448×448 vision encoder (196 image tokens / image) ships as a separate `vision.mlpackage` alongside a `chunk_0_vision.mlpackage` that injects the 3 DeepStack residual slices at text layers 0 / 1 / 2. On image-pad token steps the generator memcpy's the merger row into `hidden_in` and flips a `visual_active=1.0` gate; all other steps feed zeroed DeepStack buffers with the gate off so the graph stays static. 93% ANE placement per body chunk; vision encoder loads and runs on A18 Pro ANE.
+- **Interleaved mRoPE for image tokens** — text tokens collapse to 1D RoPE (T=H=W=position), but image tokens need real 3D `(T, H, W)` coordinates through Qwen3-VL's `mrope_section=[24, 20, 20]` interleaved layout (dims [0, 60) cycle T/H/W, dims [60, 64) stay T). Swift synthesizes the per-image cos/sin directly; text tokens after the image span get their RoPE position shifted by `(span − max(gridH, gridW))` to match HF's `get_rope_index` bump.
+- **Swift-side HF-processor patchify** — the vision Core ML input is `(num_patches=784, patch_flat=1536)` rather than raw `(3, 2, 448, 448)`. The Swift preprocessor does the HF `Qwen2VLImageProcessor` permutation on CPU (~1 ms/image) so the in-graph reshape stays rank 5; an earlier rank-10 in-graph permute compiled on Mac Studio ANE but faulted iPhone A18 Pro ANE with EXC_BAD_ACCESS at `MLModel(contentsOf:)`.
 - **Chat template built as IDs** — vision prompts splice `<|vision_start|>` + 196 × `<|image_pad|>` + `<|vision_end|>` into the user turn as raw token IDs (151652 / 151655 / 151653) instead of relying on the tokenizer to round-trip the special strings.
 - **2B pivot from VL4B** — the 4B path shipped at 1.7–6 tok/s on iPhone and OOM'd when merged to 3 chunks; 2B is 48% of the parameters on the same vision tower and fits the same 4-chunk × 7-layer ANE envelope that Qwen3.5 2B proved shippable in v1.1.0.
+
+### v1.2.0 — FunctionGemma-270M + EmbeddingGemma-300M
+
+- **FunctionGemma-270M on ANE** — Gemma 3 270M fine-tuned for function calling. INT8 decode + batched prefill (T=32) mlpackages, both ≥ 92% ANE placement on iPhone 17 Pro. Chat-templated `generate(messages:tools:)` returns the parsed call payload (e.g. `"Turn on the flashlight"` → `call:toggle_flashlight{}`). Bundle at [`mlboydaisuke/functiongemma-270m-coreml`](https://huggingface.co/mlboydaisuke/functiongemma-270m-coreml).
+- **EmbeddingGemma-300M on ANE** — Gemma 3 bidirectional encoder + mean pool + 2 dense + L2 normalize. **99.80% ANE** (1950/1954 dispatched ops). 768-d unit-norm output, Matryoshka-truncatable to 512 / 256 / 128 with post-hoc renormalize. Bundle at [`mlboydaisuke/embeddinggemma-300m-coreml`](https://huggingface.co/mlboydaisuke/embeddinggemma-300m-coreml).
+- **3× end-to-end speedup for FunctionGemma** via batched prefill — `Gemma3PrefillWrapper` processes 32 prompt tokens per forward with a matmul-scatter KV write. Decode and prefill share weights but have independent `MLState`s; Swift bridges them after the last chunk with a single `memcpy` inside `MLState.withMultiArray(for:)`. Measured on M3: 1.6 tok/s → 5.3 tok/s for a 300-token chat-template prompt.
+- **Semantic-preserving fp16 rescaling** — Gemma 3's post-FF layernorm has effective weights up to ~2535 and 24 encoder layers with no `layer_scalar`, so the residual stream overflows fp16 (NaN by layer 7). Pre-scaling `embed_tokens` by 1/K and every post-{attn,ff} layernorm weight by `(1+w)/K - 1` makes each per-layer addition K× smaller without touching the attention math; the encoder's outer RMSNorm and the final L2-normalize both cancel the K factor, so the output unit vector is bit-identical to the un-rescaled model. Combined with an fp16-safe L2 normalize (divide by `max|x|` first to keep `sum(x²)` bounded), this is what unlocks pure-fp16 full-ANE EmbeddingGemma.
+- **New public Swift API** — `FunctionGemma`, `EmbeddingGemma`, `Gemma3BundleDownloader`. Narrow surface, zero coupling to the Gemma 4 stack. Companion standalone iOS sample at `Examples/Gemma3Demo/` that imports `CoreMLLLM` and drives both models through `downloadAndLoad(modelsDir:)` + `stream(messages:tools:)` / `encode(text:task:dim:)`.
+- **Tooling** — `scripts/audit_mlpackage_placement.swift` walks `MLComputePlan` for any single `.mlmodelc` and prints per-op ANE/CPU/GPU dispatch; `scripts/upload_gemma3_bundles.py` publishes the inference-required files (no safetensors) with a README + license inheritance.
 
 ### v1.1.0 — Qwen3.5 2B (4-chunk ANE + mmap embed sidecar)
 

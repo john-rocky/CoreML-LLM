@@ -26,7 +26,7 @@ from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax
 
 from .gemma4 import Gemma4Model
 
-PREFILL_N = 512
+PREFILL_N = 1024
 
 
 def v_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:

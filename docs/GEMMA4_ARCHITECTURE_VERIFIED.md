@@ -221,7 +221,7 @@ These are the "structural advantages" Gemma 4 provides. None can be retrofitted 
 
 2. **RoPE `partial_rotary_factor=0.25` for full-attention layers** — only 128 of 512 dims are RoPE'd; remaining 384 are plain. Does our code handle this correctly?
 
-3. **Attention K-V aliasing (`attention_k_eq_v`)** — HF Gemma4TextAttention has this flag (modeling file line 917, 954-958). Our config doesn't expose it. Is Gemma 4 E2B actually using K=V sharing on some layers?
+3. **Attention K-V aliasing (`attention_k_eq_v`)** — **RESOLVED 2026-04-24: FALSE for E2B.** HF config.json sets `attention_k_eq_v: false`. Per `modular_gemma4.py:911` (`use_alternative_attention = attention_k_eq_v and not is_sliding`) and `:943-947` (`v_proj = None` when K=V mode on), the K=V path requires the flag to be true AND drops `v_proj` entirely, reusing K as V. E2B has an independent `v_proj` with learned weights, so K ≠ V and no export-level alias is possible. **Implication:** the "global-layer K=V alias" optimization proposed in `SESSION_2026_04_23.md` #2 is not applicable to E2B. Applies to E4B only if its config.json also flips this flag — not checked yet.
 
 4. **Embedding-head tie:** `tie_word_embeddings=True` but we run external INT8 embedding lookup. The lm_head in chunk4 still needs a weight. Is it a copy or aliased?
 

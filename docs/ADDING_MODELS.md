@@ -136,3 +136,11 @@ Common fixes for `aten::Int`:
 - [ ] CoreML conversion completes without errors
 - [ ] CoreML model loads and produces same predictions
 - [ ] Int4 quantized model still produces reasonable output
+
+## Worked examples
+
+- **Gemma 3 / FunctionGemma-270M** (causal decoder, rides the existing
+  `exporter.py` path with a lean wrapper): see `docs/FUNCTIONGEMMA.md`.
+- **EmbeddingGemma-300M** (bidirectional Gemma-3 encoder with mean pool +
+  2 dense + L2; stateless, no KV cache, fixed trace-time sequence length):
+  see `docs/EMBEDDINGGEMMA.md`.

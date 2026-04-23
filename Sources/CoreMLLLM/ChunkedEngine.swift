@@ -22,11 +22,34 @@ final class ChunkedEngine {
     private let chunk3: MLModel
     private let chunk4: MLModel
 
-    // Prefill chunks (optional; falls back to per-token decode if nil)
-    private let prefillChunk1: MLModel?
-    private let prefillChunk2: MLModel?
-    private let prefillChunk3: MLModel?
-    private let prefillChunk4: MLModel?
+    // Prefill chunks (optional; falls back to per-token decode if nil).
+    //
+    // These are `var` + lock so the deferred-load path (LLM_DEFER_PREFILL=1)
+    // can attach them after engine construction. Readers must go through
+    // the computed accessors below to avoid torn state during attachment.
+    private let prefillLock = NSLock()
+    private var _prefillChunk1: MLModel?
+    private var _prefillChunk2: MLModel?
+    private var _prefillChunk3: MLModel?
+    private var _prefillChunk4: MLModel?
+    private var _prefillLoadTask: Task<Void, Error>?
+
+    private var prefillChunk1: MLModel? {
+        prefillLock.lock(); defer { prefillLock.unlock() }
+        return _prefillChunk1
+    }
+    private var prefillChunk2: MLModel? {
+        prefillLock.lock(); defer { prefillLock.unlock() }
+        return _prefillChunk2
+    }
+    private var prefillChunk3: MLModel? {
+        prefillLock.lock(); defer { prefillLock.unlock() }
+        return _prefillChunk3
+    }
+    private var prefillChunk4: MLModel? {
+        prefillLock.lock(); defer { prefillLock.unlock() }
+        return _prefillChunk4
+    }
 
     // Verify chunks (optional; loaded from multi-function mlpackages via functionName)
     private let verifyChunk1: MLModel?
@@ -91,8 +114,58 @@ final class ChunkedEngine {
     private(set) var lastArgmaxAfterDecode: Int = 0
 
     var hasPrefill: Bool {
-        prefillChunk1 != nil && prefillChunk2 != nil
-            && prefillChunk3 != nil && prefillChunk4 != nil
+        prefillLock.lock(); defer { prefillLock.unlock() }
+        return _prefillChunk1 != nil && _prefillChunk2 != nil
+            && _prefillChunk3 != nil && _prefillChunk4 != nil
+    }
+
+    /// Attach prefill chunks after engine construction (LLM_DEFER_PREFILL path).
+    /// Set all four at once under lock so `hasPrefill` never observes
+    /// a partial attachment.
+    func attachPrefill(_ p1: MLModel, _ p2: MLModel, _ p3: MLModel, _ p4: MLModel) {
+        prefillLock.lock()
+        _prefillChunk1 = p1; _prefillChunk2 = p2
+        _prefillChunk3 = p3; _prefillChunk4 = p4
+        prefillLock.unlock()
+    }
+
+    /// Token handle for the background prefill load (if any). Callers can
+    /// `try await engine.prefillLoadTask?.value` to block until prefill is
+    /// ready — e.g., before shipping a long prompt where fallback per-token
+    /// decode would be too slow.
+    var prefillLoadTask: Task<Void, Error>? {
+        prefillLock.lock(); defer { prefillLock.unlock() }
+        return _prefillLoadTask
+    }
+
+    fileprivate func setPrefillLoadTask(_ t: Task<Void, Error>) {
+        prefillLock.lock()
+        _prefillLoadTask = t
+        prefillLock.unlock()
+    }
+
+    /// Warm the prefill path only. Called by the deferred-load task after
+    /// attachPrefill so the first real prefill doesn't pay the cold-compile
+    /// hit even when prefill arrived after finalPrewarm.
+    ///
+    /// Skips if the engine is already mid-conversation (currentPosition > 0)
+    /// — warmup resets KV and would corrupt the user's in-flight state.
+    /// The first real prefill pays the cold cost in that case.
+    public func warmPrefillOnly() throws {
+        guard hasPrefill else { return }
+        guard currentPosition == 0 else {
+            print("[Load] Prefill-only warm skipped (engine in use, pos=\(currentPosition))")
+            return
+        }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        _ = try? runPrefill(tokenIDs: [0])
+        // Transition warm: one decode after the populated-KV prefill.
+        for i in 1...2 {
+            _ = try? predictStep(tokenID: 0, position: i)
+        }
+        reset()
+        let dt = CFAbsoluteTimeGetCurrent() - t0
+        print("[Load] Prefill-only warm done in \(String(format: "%.2f", dt))s")
     }
 
     var hasVerify: Bool {
@@ -292,11 +365,23 @@ final class ChunkedEngine {
                   "(override default sequential load)")
         }
 
+        // Default-on: load decode chunks synchronously, then kick off prefill
+        // chunks in a background task so the engine is usable for decode-only
+        // as soon as c1-c4 are ready. The first user prompt during the load
+        // window falls back to per-token decode (slower but interactive) via
+        // the `hasPrefill` gate at call sites. Cuts time-to-usable roughly in
+        // half (~80s → ~35s on iPhone 17 Pro). Opt-out with LLM_DEFER_PREFILL=0.
+        let deferEnv = ProcessInfo.processInfo.environment["LLM_DEFER_PREFILL"]
+        let deferPrefill = (deferEnv != "0")
+        if deferPrefill && hasPrefillFiles {
+            let origin = (deferEnv == "1") ? "env=1" : "default"
+            print("[Load] deferred prefill load (\(origin)) — decode chunks foreground, prefill chunks background")
+        }
         var chunkWork: [(String, MLModelConfiguration)] = [
             ("chunk1", mlConfig), ("chunk2", mlConfig),
             ("chunk3", mlConfig), ("chunk4", mlConfig),
         ]
-        if hasPrefillFiles {
+        if hasPrefillFiles && !deferPrefill {
             for name in ["prefill_chunk1", "prefill_chunk2",
                          "prefill_chunk3", "prefill_chunk4"] {
                 chunkWork.append((name, prefillConfig))
@@ -346,8 +431,13 @@ final class ChunkedEngine {
         case 1:  loadMode = "sequential"
         default: loadMode = "cap=\(loadMaxParallel)"
         }
-        print("[Load] All \(hasPrefillFiles ? 8 : 4) chunks loaded in " +
-              "\(String(format: "%.1f", loadDt))s (\(loadMode))")
+        let loadedCount = chunkWork.count
+        let totalCount = hasPrefillFiles ? 8 : 4
+        let deferredSuffix = (deferPrefill && hasPrefillFiles)
+            ? " (\(totalCount - loadedCount) prefill deferred to bg)"
+            : ""
+        print("[Load] \(loadedCount)/\(totalCount) chunks loaded in " +
+              "\(String(format: "%.1f", loadDt))s (\(loadMode))\(deferredSuffix)")
 
         // Load verify functions from multi-function chunks (if available).
         // Multi-function chunks have a "verify_qK" function alongside the
@@ -620,6 +710,46 @@ final class ChunkedEngine {
         engine.reset()
         print("[Load] ANE prewarm (4 steps) done in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - warmT0))s")
 
+        // Deferred prefill: load the 4 prefill chunks in the background and
+        // attach them once done. Callers can `await engine.prefillLoadTask?.value`
+        // to block on completion. Most code paths instead gate on `hasPrefill`,
+        // which stays false during the load window and silently falls back to
+        // per-token decode.
+        if deferPrefill && hasPrefillFiles {
+            let directoryCopy = directory
+            let prefillConfigCopy = prefillConfig
+            let task = Task.detached(priority: .utility) { [weak engine] () throws -> Void in
+                let bgT0 = CFAbsoluteTimeGetCurrent()
+                func bgFind(_ name: String) -> URL? {
+                    let c = directoryCopy.appendingPathComponent("\(name).mlmodelc")
+                    if FileManager.default.fileExists(atPath:
+                        c.appendingPathComponent("coremldata.bin").path) { return c }
+                    let p = directoryCopy.appendingPathComponent("\(name).mlpackage")
+                    if FileManager.default.fileExists(atPath: p.path) { return p }
+                    return nil
+                }
+                func bgLoad(_ name: String) throws -> MLModel {
+                    guard let url = bgFind(name) else {
+                        throw CoreMLLLMError.modelNotFound(name)
+                    }
+                    let t0 = CFAbsoluteTimeGetCurrent()
+                    let m = try MLModel(contentsOf: url, configuration: prefillConfigCopy)
+                    print("[Load/bg] \(name) done in \(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - t0))s")
+                    return m
+                }
+                let bp1 = try bgLoad("prefill_chunk1")
+                let bp2 = try bgLoad("prefill_chunk2")
+                let bp3 = try bgLoad("prefill_chunk3")
+                let bp4 = try bgLoad("prefill_chunk4")
+                guard let engine else { return }
+                engine.attachPrefill(bp1, bp2, bp3, bp4)
+                let bgDt = CFAbsoluteTimeGetCurrent() - bgT0
+                print("[Load/bg] all 4 prefill chunks ready in \(String(format: "%.1f", bgDt))s — warming")
+                try? engine.warmPrefillOnly()
+            }
+            engine.setPrefillLoadTask(task)
+        }
+
         return engine
     }
 
@@ -630,6 +760,14 @@ final class ChunkedEngine {
     /// Call once from CoreMLLLM.load after everything is loaded.
     public func finalPrewarm() throws {
         let t0 = CFAbsoluteTimeGetCurrent()
+        // Warm prefill path first — the N=prefillN batched prefill graph is
+        // a separate ANE specialization from decode. Without this, the first
+        // user prompt pays a cold-compile hit (~100-300ms) on top of normal
+        // prefill latency. 1-token input is enough: the buffer width is
+        // still prefillN, so ANE compiles the full-shape path.
+        if hasPrefill {
+            _ = try? runPrefill(tokenIDs: [0])
+        }
         // 8 T=1 decode steps (double the early prewarm) so ANE has more
         // dispatch samples to stabilize.
         for i in 0..<8 {
@@ -642,9 +780,20 @@ final class ChunkedEngine {
             let dummy: [Int32] = Array(repeating: 0, count: verifyK)
             _ = try? verifyCandidates(tokens: dummy, startPosition: 0)
         }
+        // Transition warmup: the first decode after a populated-KV prefill
+        // is still cold even with prefill+decode already warmed above
+        // (~63ms vs 36ms steady on iPhone 17 Pro, v0.8.0). Simulate the
+        // runtime prefill→decode handoff one extra time to pre-pay that
+        // per-configuration setup cost.
+        if hasPrefill {
+            _ = try? runPrefill(tokenIDs: [0])
+            for i in 1...2 {
+                _ = try? predictStep(tokenID: 0, position: i)
+            }
+        }
         reset()
         let dt = CFAbsoluteTimeGetCurrent() - t0
-        print("[Load] Final prewarm (8 decode + verify) done in \(String(format: "%.2f", dt))s")
+        print("[Load] Final prewarm (prefill + decode + verify + transition) done in \(String(format: "%.2f", dt))s")
     }
 
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
@@ -664,8 +813,8 @@ final class ChunkedEngine {
                  config: ModelConfig, prefillN: Int) {
         self.chunk1 = chunk1; self.chunk2 = chunk2
         self.chunk3 = chunk3; self.chunk4 = chunk4
-        self.prefillChunk1 = prefillChunk1; self.prefillChunk2 = prefillChunk2
-        self.prefillChunk3 = prefillChunk3; self.prefillChunk4 = prefillChunk4
+        self._prefillChunk1 = prefillChunk1; self._prefillChunk2 = prefillChunk2
+        self._prefillChunk3 = prefillChunk3; self._prefillChunk4 = prefillChunk4
         self.verifyChunk1 = verifyChunk1; self.verifyChunk2 = verifyChunk2
         self.verifyChunk3 = verifyChunk3; self.verifyChunk4 = verifyChunk4
         self.verifyK = verifyK
@@ -1909,9 +2058,14 @@ final class ChunkedEngine {
         let slotStride = 1 * W * maxHd
         let dst = cache.dataPointer.bindMemory(to: UInt16.self, capacity: cache.count)
         let s = srcArr.dataPointer.bindMemory(to: UInt16.self, capacity: srcArr.count)
-        let startCachePos = W - realLen
-        for p in 0..<realLen {
-            let srcOff = p * hd
+        // SWA cache is right-aligned (see makeSlidingCausalMask): valid tokens
+        // live in cache[W-valid..W-1]. When realLen > W, only the last W
+        // source positions fit in the window.
+        let writeCount = min(realLen, W)
+        let sourceStart = realLen - writeCount
+        let startCachePos = W - writeCount
+        for p in 0..<writeCount {
+            let srcOff = (sourceStart + p) * hd
             let dstOff = slot * slotStride + (startCachePos + p) * maxHd
             for j in 0..<hd { dst[dstOff + j] = s[srcOff + j] }
         }

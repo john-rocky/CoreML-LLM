@@ -14,6 +14,12 @@ let package = Package(
         .executable(name: "coreml-llm-smoke", targets: ["CoreMLLLMSmoke"]),
         .executable(name: "union-bitexact", targets: ["UnionBitExact"]),
         .executable(name: "verify-k8-probe", targets: ["VerifyK8Probe"]),
+        // Standalone samples for the two Gemma-3-based models. These live in
+        // the same package on purpose — a LocalAIKit-style wrapper can depend
+        // on the `CoreMLLLM` library and use `FunctionGemma` / `EmbeddingGemma`
+        // / `Gemma3BundleDownloader` directly, without pulling the sample CLIs.
+        .executable(name: "functiongemma-demo", targets: ["FunctionGemmaDemo"]),
+        .executable(name: "embeddinggemma-demo", targets: ["EmbeddingGemmaDemo"]),
     ],
     dependencies: [
         // Range widened to 1.0.x: mlx-swift-examples caps swift-transformers at
@@ -71,6 +77,21 @@ let package = Package(
             name: "VerifyK8Probe",
             dependencies: ["CoreMLLLM"],
             path: "Sources/verify-k8-probe",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // FunctionGemma-270M standalone CLI. Does NOT combine with Gemma 4 —
+        // multi-model orchestration belongs in the LocalAIKit wrapper.
+        .executableTarget(
+            name: "FunctionGemmaDemo",
+            dependencies: ["CoreMLLLM"],
+            path: "Sources/functiongemma-demo",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // EmbeddingGemma-300M standalone CLI. Same rationale as above.
+        .executableTarget(
+            name: "EmbeddingGemmaDemo",
+            dependencies: ["CoreMLLLM"],
+            path: "Sources/embeddinggemma-demo",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
