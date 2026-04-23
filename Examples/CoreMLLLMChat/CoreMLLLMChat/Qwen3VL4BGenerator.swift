@@ -530,22 +530,21 @@ final class Qwen3VL4BGenerator {
         // --- Recurrent prefill ---
         status = "Prefill (recurrent via decode)..."
         let prefillStart = Date()
-        var lastLogits: MLMultiArray?
+        var lastNextToken: Int32 = 0
         for (t, tok) in inputIds.enumerated() {
             let out = try await stepPredict(token: tok, position: t, state: callState)
             if t == S - 1 {
-                lastLogits = out.featureValue(for: "logits")?.multiArrayValue
+                lastNextToken = readNextToken(from: out)
             }
             if (t & 0x7) == 0 { status = "Prefill \(t + 1)/\(S)..." }
         }
         prefillMs = Date().timeIntervalSince(prefillStart) * 1000
 
-        // First sampled token from prefill's last logits.
-        guard let pLogits = lastLogits else {
-            throw NSError(domain: "Qwen3VL4BGenerator", code: 4,
-                userInfo: [NSLocalizedDescriptionKey: "recurrent prefill: no final logits"])
-        }
-        var nextToken = fastArgmax(pLogits, vocab: cfg.vocab)
+        // Head chunk computes argmax in-graph and emits `next_token`
+        // (int32) directly — saves a 600 KB vocab-fp32 transfer per
+        // step plus Swift-side argmax. 1st token is the prefill's
+        // final output.
+        var nextToken = lastNextToken
         firstStepDebug = []
         generatedIds.append(nextToken)
         onToken?(nextToken)
@@ -559,9 +558,7 @@ final class Qwen3VL4BGenerator {
             if position >= cfg.maxSeq { break }
             let out = try await stepPredict(token: nextToken, position: position,
                                              state: callState)
-            guard let logits = out.featureValue(for: "logits")?.multiArrayValue
-            else { break }
-            nextToken = fastArgmax(logits, vocab: cfg.vocab)
+            nextToken = readNextToken(from: out)
             generatedIds.append(nextToken)
             onToken?(nextToken)
             position += 1
@@ -580,7 +577,33 @@ final class Qwen3VL4BGenerator {
         return generatedIds
     }
 
-    // MARK: - argmax
+    // MARK: - next-token extraction
+
+    /// Read the head chunk's in-graph argmax output. The converter
+    /// embeds an argmax in the graph so per-step ANE→Swift transfer
+    /// drops from ~600 KB (fp32 logits over 151K vocab) to 4 bytes
+    /// (one int32). Falls back to Swift-side fp32 argmax if the
+    /// output is a legacy fp32/fp16 logits tensor — lets a v1 bundle
+    /// (fp32 logits) still work with this generator.
+    private func readNextToken(from out: MLFeatureProvider) -> Int32 {
+        if let ntArr = out.featureValue(for: "next_token")?.multiArrayValue {
+            switch ntArr.dataType {
+            case .int32:
+                return ntArr.dataPointer
+                    .assumingMemoryBound(to: Int32.self)[0]
+            case .int64:
+                let v = ntArr.dataPointer
+                    .assumingMemoryBound(to: Int64.self)[0]
+                return Int32(truncatingIfNeeded: v)
+            default:
+                break
+            }
+        }
+        if let logits = out.featureValue(for: "logits")?.multiArrayValue {
+            return fastArgmax(logits, vocab: cfg.vocab)
+        }
+        return 0
+    }
 
     /// Single-pass fp32 argmax over (1, 1, vocab). Logits emerge as
     /// fp32 from the head chunk's logits output.
