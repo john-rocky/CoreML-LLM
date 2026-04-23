@@ -630,6 +630,14 @@ final class ChunkedEngine {
     /// Call once from CoreMLLLM.load after everything is loaded.
     public func finalPrewarm() throws {
         let t0 = CFAbsoluteTimeGetCurrent()
+        // Warm prefill path first — the N=prefillN batched prefill graph is
+        // a separate ANE specialization from decode. Without this, the first
+        // user prompt pays a cold-compile hit (~100-300ms) on top of normal
+        // prefill latency. 1-token input is enough: the buffer width is
+        // still prefillN, so ANE compiles the full-shape path.
+        if hasPrefill {
+            _ = try? runPrefill(tokenIDs: [0])
+        }
         // 8 T=1 decode steps (double the early prewarm) so ANE has more
         // dispatch samples to stabilize.
         for i in 0..<8 {
@@ -644,7 +652,7 @@ final class ChunkedEngine {
         }
         reset()
         let dt = CFAbsoluteTimeGetCurrent() - t0
-        print("[Load] Final prewarm (8 decode + verify) done in \(String(format: "%.2f", dt))s")
+        print("[Load] Final prewarm (prefill + 8 decode + verify) done in \(String(format: "%.2f", dt))s")
     }
 
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
