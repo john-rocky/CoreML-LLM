@@ -65,13 +65,13 @@ enough because the buffer width is still `prefillN` and ANE compiles by shape.
 pipelining. ANE is idle during CPU prep/copy between chunks. Async dispatch
 of chunk N+1 prep during chunk N compute could gain **+10-20% decode tok/s**.
 
-### C. System-prompt KV persistence to disk (days)
-`reset()` zeros KV; the system prompt is re-prefilled every new conversation.
-Serialize the post-system-prompt KV snapshot once, restore on `reset()` to
-skip that prefill entirely. First-message TTFT of every new session drops
-to decode-only. The prefix cache machinery at
-`ChunkedEngine.swift:971-1001` can be the foundation (already handles
-`restoreKVSnapshot`).
+### C. System-prompt KV persistence to disk
+**Already shipped** — `Sources/CoreMLLLM/PrefixCache.swift` + wire-up in
+`CoreMLLLM.swift:242-261`, `ChunkedEngine.swift:1412-1416`. Opt-in via
+`LLM_PREFIX_CACHE=1` (+ optional `LLM_PREFIX_CACHE_MB=<N>` for capacity).
+Stores post-prefill KV with 76-byte header + concatenated buffers,
+LRU evicts at capacity. Hit on `longestPrefixMatch` → restore + per-token
+decode the delta tokens. Already running in production via env var.
 
 ### D. Within-layer K=V alias for global layers (#7 remainder, week)
 Export surgery: emit single `kv14_kv` output from Chunk 2 instead of

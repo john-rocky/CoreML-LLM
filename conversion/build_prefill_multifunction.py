@@ -42,6 +42,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
 from models.gemma4 import Gemma4Model
+from models import gemma4_prefill_chunks as _pc_mod
 from models.gemma4_prefill_chunks import (
     PrefillChunk1, PrefillChunk2, PrefillChunk3, PrefillChunk4,
 )
@@ -221,11 +222,18 @@ def export_chunk_multifunction(base: Gemma4Model, chunk_idx: int, sizes: list[in
     per_variant_paths: list[tuple[int, str]] = []
     for N in sizes:
         print(f"\n--- chunk{chunk_idx} N={N} ---")
+        # The chunk modules pick up N from the module-level PREFILL_N
+        # constant (needed as a Python int so tensor.view()'s dim args
+        # stay static across tracing). Flip it per variant.
+        _pc_mod.PREFILL_N = N
         module = cls(base).eval()
         sample, inputs, outputs = spec_fn(N, hidden, total_pld)
         tmp_path = tmp_dir / f"_tmp_chunk{chunk_idx}_b{N}.mlpackage"
         convert_variant(module, sample, inputs, outputs, str(tmp_path), quantize)
         per_variant_paths.append((N, str(tmp_path)))
+
+    # Restore default in case any other import references it.
+    _pc_mod.PREFILL_N = 512
 
     print(f"\n--- merging chunk{chunk_idx} variants into multifunction mlpackage ---")
     desc = MultiFunctionDescriptor()
