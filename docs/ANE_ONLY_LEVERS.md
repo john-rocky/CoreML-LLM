@@ -99,7 +99,27 @@ whether an INT4 path is viable. Affects load time / RAM, not TTFT.
 ## Action this pass
 
 1. ✅ **A implemented** (prefill added to `finalPrewarm()`, `ChunkedEngine.swift`).
-2. ⏳ **#5 Mac spike** — build a 2-variant (64 + 512) multifunction mlpackage for a single chunk, confirm weight hash dedup + mlpackage size delta. Only if this passes, commit to the full 4-variant conversion work.
+2. ✅ **Transition warmup added** — one extra prefill+decode cycle at end of
+   `finalPrewarm()` to pre-pay the prefill→decode kernel handoff (observed
+   27ms cold cost on first real decode after prefill).
+3. ✅ **#5 Mac spike passed** (`conversion/spikes/multifunction_prefill_spike.py`).
+   On a 7-layer 1536-dim stand-in: n64 variant 7.9MB, n512 variant 7.9MB,
+   sum 15.8MB, **merged 7.9MB** (1.00x of larger, perfect dedup). Both
+   functions load via `function_name=`. Clears the gate on multi-prefill
+   lengths — graph-only delta is below measurement granularity at this scale.
+4. ⏳ **ANE on-device multifunction load test** — wire a minimal 2-variant
+   into a real Gemma 4 chunk, ship to iPhone, confirm ANE executes
+   function-selected paths. Only hard unknown left.
+5. ✅ **Deferred prefill chunk load** (`LLM_DEFER_PREFILL=1`). Existing
+   device bench (see `ChunkedEngine.swift:324`) shows parallel load is
+   *slower* than sequential because ANECompilerService serializes
+   internally, so straight parallelism is a dead end. Structural lever
+   instead: decode chunks (~35s) are enough to start chatting; prefill
+   chunks (~30s more) load in a background `Task.detached`. Call sites
+   already fall back to per-token decode via the `hasPrefill` gate, so
+   the engine is usable during the load window. Prefill storage moved
+   behind `NSLock` to make `attachPrefill` atomic. Opt-in env var for
+   A/B on device; default off until verified.
 
 ## Known unknowns
 
