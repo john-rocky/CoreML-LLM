@@ -114,16 +114,25 @@ enum ComputePlanAudit {
 
         var totalOps = 0
         var fallbackOps = 0
+        // (opName, device) → count, for compact grouped summary when per-op
+        // spam would bury the verdict in 100+ lines.
+        var fallbackByKind: [String: Int] = [:]
 
         for (fnName, function) in program.functions {
             walkBlock(function.block, path: "\(chunkName)/\(fnName)",
-                      plan: plan, totalOps: &totalOps, fallbackOps: &fallbackOps)
+                      plan: plan, totalOps: &totalOps,
+                      fallbackOps: &fallbackOps,
+                      fallbackByKind: &fallbackByKind)
         }
 
         if fallbackOps == 0 {
             print("[ComputePlan] \(chunkName): all \(totalOps) ops on Neural Engine")
         } else {
             print("[ComputePlan] \(chunkName): \(fallbackOps)/\(totalOps) ops NOT on Neural Engine")
+            let sorted = fallbackByKind.sorted { $0.value > $1.value }
+            for (kind, n) in sorted {
+                print("[ComputePlan] \(chunkName) fallback | \(kind): \(n)")
+            }
         }
         return (totalOps, fallbackOps)
     }
@@ -132,7 +141,8 @@ enum ComputePlanAudit {
                                   path: String,
                                   plan: MLComputePlan,
                                   totalOps: inout Int,
-                                  fallbackOps: inout Int) {
+                                  fallbackOps: inout Int,
+                                  fallbackByKind: inout [String: Int]) {
         // Skip constant/weight-loading ops — they run once at load, not per-step
         let constOps: Set<String> = [
             "const", "constexpr_lut_to_dense", "constexpr_affine_dequantize",
@@ -158,6 +168,8 @@ enum ComputePlanAudit {
             if !isANE && !isConstOp {
                 fallbackOps += 1
                 let device = deviceLabel(usage?.preferred)
+                let key = "\(op.operatorName) → \(device)"
+                fallbackByKind[key, default: 0] += 1
                 let costStr: String
                 if let w = cost?.weight {
                     costStr = String(format: "cost=%.4f", w)
@@ -171,7 +183,8 @@ enum ComputePlanAudit {
             // Recurse into nested blocks (e.g. cond, while_loop)
             for nested in op.blocks {
                 walkBlock(nested, path: "\(path)/\(op.operatorName)",
-                          plan: plan, totalOps: &totalOps, fallbackOps: &fallbackOps)
+                          plan: plan, totalOps: &totalOps, fallbackOps: &fallbackOps,
+                          fallbackByKind: &fallbackByKind)
             }
         }
     }
