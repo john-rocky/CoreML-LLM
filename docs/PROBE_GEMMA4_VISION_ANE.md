@@ -9,14 +9,43 @@ prompts.
 
 ## TL;DR — result
 
-- **97.3% ANE placement** (1932/1985 compute ops; 53 CPU, 0 GPU).
-- **cosine = 1.0000**, max_abs_diff = 0.0098 vs HF fp16 forward.
+- **98.3% ANE placement** (1937/1970 compute ops; 33 CPU, 0 GPU).
+- Real-input parity vs HF: **overall cos = 1.0000**, per-token min cos
+  0.9996, max_abs_diff 0.086 (fp16 noise).
 - Mac Studio (M-series ANE) steady-state predict:
-  - **`.cpuAndNeuralEngine`: 473 ms/image**
-  - `.cpuAndGPU` (same file, forced GPU): 3800 ms/image (8× slower)
+  - **`.cpuAndNeuralEngine`: ~473 ms/image**
+  - `.cpuAndGPU` (same file, forced GPU): ~3800 ms/image (8× slower)
 - Ships as `vision.ane.mlpackage` (326 MB compiled to `vision.ane.mlmodelc`);
   coexists with the legacy `vision.mlpackage` — runtime prefers the ANE
   build when present.
+
+## Two ANE-only bugs (not visible on GPU)
+
+On-device iteration caught two bugs that the convert-time zero-input
+parity check missed. Both are fixed in this PR.
+
+1. **Dynamic-shape `gather_nd` silent zero output**. The stock HF vision
+   tower strips padding via `hidden_states[pooler_mask]`. With a full
+   grid there is no padding, but the trace still emits a data-dependent
+   `gather_nd` that iOS ANE miscompiles — Mac CPU/GPU produced correct
+   features while ANE returned an all-zero tensor (norm = 0 vs 521).
+   Fix: monkey-patch `Gemma4VisionModel.forward` to skip the strip when
+   there are no padding positions.
+
+2. **fp16 subnormal `rsqrt(0) = Inf` in `embedding_pre_projection_norm`**.
+   Torch's `Gemma4RMSNorm.forward` casts to fp32 before `rsqrt`, but
+   coremltools' `FLOAT16` compute_precision folds that cast away. iOS
+   ANE flushes subnormals to zero, so `mean(x²)` for small-activation
+   tokens lands at 0, `rsqrt(0) → Inf`, and a handful of feature
+   vectors end up ~1000× their true magnitude (direction still correct,
+   per-token cos ≈ 1.0). Fix: replace the final RMSNorm with the
+   `layer_norm([x, -x])` identity — ANE's native `layer_norm` handles
+   the reduction correctly in fp16.
+
+The second bug is the one that produced garbled output on the first
+device test (sunflower image → "human eye" response); the first bug
+would have been caught earlier but GPU happened to tolerate the
+`gather_nd`.
 
 ## Background
 

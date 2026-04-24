@@ -316,6 +316,107 @@ STILL_POOL_K = 3
 STILL_OUTPUT_TOKENS = (STILL_GRID_SIDE // STILL_POOL_K) ** 2  # 256
 
 
+def _patch_embed_vision_rmsnorm_eps(hf_model) -> None:
+    """Replace the vision pre-projection RMSNorm with an ANE-friendly form.
+
+    The stock `embedding_pre_projection_norm` is a zero-scale RMSNorm
+    with eps=1e-6 reduced in fp32 (`hidden_states.float()`). After
+    coremltools' FLOAT16 compute_precision collapses the fp32 cast,
+    iOS ANE computes `mean(x²)` in fp16 and flushes any subnormal
+    accumulator to zero, then `rsqrt(0) = Inf` blows a handful of
+    output tokens to ~1000× their true magnitude. Direction is still
+    correct (per-token cos ≈ 1.0) but the outlier magnitudes corrupt
+    every downstream softmax in the LLM.
+
+    Fix: use the `layer_norm([x, -x])` identity — `cat([x, -x])` has
+    mean 0 so `LayerNorm` == RMSNorm on the first half. ANE's native
+    layer_norm kernel handles the reduction + rsqrt correctly in fp16
+    without the subnormal trap, and it fuses into a single op.
+    """
+    import torch.nn.functional as F
+    norm = hf_model.model.embed_vision.embedding_pre_projection_norm
+    if getattr(norm, "_gemma4_ane_eps_patched", False):
+        return
+    hidden_size = norm.dim if hasattr(norm, "dim") else None
+    # Discover hidden size from module params / first-forward probe if
+    # not exposed — all Gemma4RMSNorm instances we patch here have
+    # .dim (or we can pull it from config).
+    if hidden_size is None:
+        hidden_size = hf_model.model.vision_tower.config.hidden_size
+
+    # fp16-safe eps that is NOT subnormal (min fp16 normal ≈ 6.1e-5).
+    ane_eps = 1e-5
+
+    def _ane_forward(self, x):
+        doubled = torch.cat([x, -x], dim=-1)
+        normed = F.layer_norm(
+            doubled,
+            normalized_shape=(2 * hidden_size,),
+            weight=None, bias=None,
+            eps=float(ane_eps),
+        )
+        half, _ = torch.chunk(normed, 2, dim=-1)
+        if getattr(self, "with_scale", False) and getattr(self, "weight", None) is not None:
+            half = half * self.weight.to(half.dtype)
+        return half
+
+    norm.forward = types.MethodType(_ane_forward, norm)
+    norm._gemma4_ane_eps_patched = True
+
+
+def _patch_vision_tower_skip_strip(hf_model) -> None:
+    """Bypass `hidden_states[pooler_mask]` strip-padding in the vision tower.
+
+    The stock forward does a boolean-index gather at the end so the
+    output dim matches the number of non-padding soft tokens. With our
+    fixed full-grid input there *are* no padding positions, so the
+    strip is a no-op — but the data-dependent gather traces into a
+    `gather_nd` that iOS ANE silently miscompiles (output comes back
+    as all zeros at predict time, even though Mac CPU/GPU produces
+    correct features). Replacing the strip with identity drops that
+    op entirely and keeps the output shape static.
+    """
+    vision = hf_model.model.vision_tower
+    if getattr(vision, "_gemma4_ane_skip_strip_patched", False):
+        return
+
+    _orig_forward = vision.forward
+
+    def _static_shape_forward(self, pixel_values, pixel_position_ids, **kwargs):
+        pooling_kernel_size = self.config.pooling_kernel_size
+        output_length = pixel_values.shape[-2] // (pooling_kernel_size ** 2)
+
+        padding_positions = (pixel_position_ids == -1).all(dim=-1)
+        inputs_embeds = self.patch_embedder(
+            pixel_values, pixel_position_ids, padding_positions)
+        output = self.encoder(
+            inputs_embeds=inputs_embeds,
+            attention_mask=~padding_positions,
+            pixel_position_ids=pixel_position_ids,
+            **kwargs,
+        )
+
+        hidden_states, _pooler_mask = self.pooler(
+            hidden_states=output.last_hidden_state,
+            pixel_position_ids=pixel_position_ids,
+            padding_positions=padding_positions,
+            output_length=output_length,
+        )
+        # SKIP: hidden_states = hidden_states[pooler_mask]
+        # (caller guarantees no padding positions — full square grid)
+
+        if self.config.standardize:
+            hidden_states = (hidden_states - self.std_bias) * self.std_scale
+
+        from transformers.modeling_outputs import BaseModelOutputWithPast
+        return BaseModelOutputWithPast(last_hidden_state=hidden_states)
+
+    vision.forward = types.MethodType(_static_shape_forward, vision)
+    vision._gemma4_ane_skip_strip_patched = True
+    # Keep the unbound original so future callers can restore it.
+    vision._gemma4_orig_forward = _orig_forward
+
+
 class _StillImageVisionWrapper(nn.Module):
     """(1, 2304, 768) fp16 + (1, 2304, 2) int32 → (1, 256, hidden) fp16.
 
@@ -334,8 +435,14 @@ class _StillImageVisionWrapper(nn.Module):
             image_position_ids=pixel_position_ids.long(),
             return_dict=True,
         )
-        # (output_tokens, hidden) → (1, output_tokens, hidden)
-        return out.pooler_output.unsqueeze(0)
+        # With the ANE strip-bypass patch, pooler_output is already
+        # (1, output_tokens, hidden). Without it (stock HF), the tensor
+        # is (output_tokens, hidden) because `hidden_states[pooler_mask]`
+        # drops the batch dim; reshape back to canonical 3-D.
+        x = out.pooler_output
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        return x
 
 
 def _synthetic_still_inputs():
@@ -398,6 +505,8 @@ def convert_still_image_vision_ane_to_coreml(
     """
     _patch_coremltools_for_video_convert()
     _patch_vision_encoder_forward(hf_model)
+    _patch_vision_tower_skip_strip(hf_model)
+    _patch_embed_vision_rmsnorm_eps(hf_model)
 
     wrapper = _StillImageVisionWrapper(hf_model).eval()
     pv, pid = _synthetic_still_inputs()
