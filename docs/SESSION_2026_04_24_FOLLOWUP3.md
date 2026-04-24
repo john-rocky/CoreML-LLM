@@ -144,7 +144,59 @@ i.e. opt-out only for regression bisection. Justified because:
 3. Correctness is construction-safe (same bytes to same buffers, just
    deferred); off-path is kept intact.
 
-## Verification plan (iPhone E4B, pending)
+## iPhone E4B verification (2026-04-24)
+
+Same device, same prompt ordering, `gemma4-e4b` bundle
+(USB-sideloaded since E4B is not on HF yet). Steady-state on the
+second turn "江戸時代の面白い話。", 80+ decode steps post-warmup.
+
+| Metric | OFF | ON (default) | Δ |
+|---|---|---|---|
+| tok/s | 14.8 | 15.0 | **+0.2 (+1.4 %)** |
+| per-step total | 67.8 ms | 66.6 ms | −1.2 ms |
+| `copyBack=` | 1.8-2.0 ms | **0.0 ms** | overlap confirmed |
+| `cpu_active=` | 2.0-2.2 ms | 0.9-1.4 ms | **−55 %** |
+| chunks | c1=20.3 c2=20.7 c3=11.0 c4=15.4 (sum=67.4) | c1=19.7 c2=19.4 c3=11.0 c4=15.6 (sum=65.7) | c1/c2 drop reflects copyBack moving out of `profileC{1,2}` window |
+
+**Gain vs doc estimate.** Well below `ANE_ONLY_LEVERS.md`'s +10-20 %.
+The estimate assumed E4B prep/copy was 20-30 ms / step; actual
+iPhone-measured copyBack on E4B is only **1.8-2.0 ms**. iPhone ANE
+handles nkv=2 writes efficiently — the memcpy size roughly doubles
+from E2B to E4B, but absolute time stays within a few ms. The
+assumption that motivated "+10-20 %" does not hold.
+
+**Scaling pattern.** Larger models → smaller relative win. E2B's
+chunks sum to ~32 ms and copyBack was 0.4-0.6 ms → pipelining saves
+5-6 %. E4B's chunks sum to ~67 ms and copyBack is ~2 ms → saves
+1-2 %. The lever targets a fixed CPU cost overlapped onto ANE
+compute; as ANE compute grows model-size-linearly and copyBack stays
+bounded, the ratio shrinks.
+
+**Decision.** Default-on justified by:
+1. Measured win on both models (E2B +5.9 %, E4B +1.4 %) with zero
+   regression over 2-turn chat.
+2. `cpu_active` halved on both models — meaningful secondary benefit
+   on iPhone where ANE + UI + audio/image coexist.
+3. Construction-safe correctness (same bytes, same buffers).
+
+## Next-session candidates (Metal-free)
+
+Metal Phase 3 is off the table (no product differentiation vs
+LiteRT's implementation). Remaining ANE-only levers:
+
+1. **[D] R7-1 COMPACT** — 3-5 days Mac-heavy, E2B +2-3 tok/s at 2K.
+   Calibration-based vocab + FFN structured pruning. Accuracy risk:
+   vocab pruning is usually free on 262144-vocab Gemma4 (mostly
+   CJK/English needed); FFN structured pruning at 20-30 % per the
+   paper typically costs 1-2 pt on few-shot benchmarks. Reversible,
+   monitor-able. See `docs/ROUND7_FINDINGS.md` §R7-1.
+2. **Prefix cache tuning** (`LLM_PREFIX_CACHE=1`) — already shipped,
+   low-hanging UX; quantify system-prompt TTFT win.
+3. **Cross-step mask prep** — per-step scratch pool + step t+1 mask
+   build during step t c3/c4. Estimated +0.3-0.5 ms/step. ROI weak
+   after this session's E4B data; probably skip.
+
+## Legacy: Verification plan (superseded by actual results above)
 
 1. **Baseline**: E2B + E4B at 2K, no env var, 100-token generation.
    Record `tok/s` and the `[Profile]` / `[ANE/CPU]` lines.
