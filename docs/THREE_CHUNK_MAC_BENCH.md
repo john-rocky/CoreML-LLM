@@ -1,4 +1,4 @@
-# 3-chunk decode — Mac A/B bench
+# 3-chunk decode — Mac A/B bench + iPhone verdict
 
 **Date:** 2026-04-24
 **Machine:** Apple Silicon Mac (Darwin 25.0, macOS Tahoe)
@@ -43,17 +43,33 @@ outputs of `MergedChunk23` vs `SWAChunk2→SWAChunk3` — see
 The 3-chunk bundle drops one compile step (`chunk3`) without growing
 the bigger merged chunk's compile time proportionally — net **−5.8 s**.
 
-## iPhone extrapolation
+## iPhone 17 Pro (A19 Pro) — measured
 
-Mac per-dispatch cost ≈ 1.5 ms in this run vs Orion's iPhone A19 Pro
-measurement of ≈ 2.3 ms. One dispatch removed → **≈ +7 % tok/s** on
-iPhone (31 → 33 tok/s on the current ANE-only baseline). Realising that
-gain on device requires:
+| Config | steady tok/s | c1 | c2 | c3 | c4 | sum |
+|---|---:|---:|---:|---:|---:|---:|
+| 4-chunk | 31.6 | 5.8 | 6.8 | 8.2 | 10.3 | 31.1 |
+| **3-chunk** | **33.0** | 5.8 | **13.0** | 0.0 | 10.9 | **29.7** |
 
-1. Re-running `install_3way_bundle.py` on the device-shipped bundle.
-2. `xcrun devicectl device copy to … --source output/gemma4-e2b/bundle …`
-3. Xcode scheme env `LLM_3CHUNK=1` (+ `COMPUTE_PLAN_AUDIT=1` once to
-   confirm the 17-layer chunk stays 100 % ANE-resident).
+**Delta: +1.4 tok/s (+4.4 %)** / −1.4 ms/step. c2+c3 (15.0 ms) collapses
+to merged c2 (13.0 ms) — 2.0 ms saved, matching Orion's 2.3 ms/dispatch
+estimate for A-series ANE within measurement noise.
+
+`COMPUTE_PLAN_AUDIT=1` initially reported "chunk2_3way: 133/1847 ops NOT
+on Neural Engine". All 133 turned out to be `ios18.constexpr_lut_to_dense`
+(INT4 LUT → fp16 weight dequant), which run once at load, not per-step.
+`ComputePlanAudit.swift` had a pre-existing bug where its `constOps`
+whitelist missed the `ios18.` dialect prefix; fixed in this PR. After the
+fix the audit reports all ops on ANE for every decode chunk, matching
+the 4-chunk baseline. **Per-step compute is 100 % ANE in both modes.**
+
+## Further gains from here
+
+3-chunk hits the ANE dispatch-reduction ceiling for Gemma 4 E2B under
+the 17-layer compile limit — `chunk3+chunk4` merge would be 20 layers
+and almost certainly won't compile. Beyond this, the remaining levers
+are orthogonal to chunk count: SDPA fusion retest, per-block-32
+palettization, within-layer K=V alias for global layers, and the
+runtime hints (prefill warm-pool, ...).
 
 Per-chunk profile print lines live at `ChunkedEngine.swift` 1078-1100 —
 on 3-chunk mode `c3` is expected to print as `0.0` (dispatch skipped).
