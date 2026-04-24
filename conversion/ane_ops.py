@@ -13,6 +13,7 @@ Reference: ANEMLL project (github.com/Anemll/Anemll)
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -20,6 +21,13 @@ import torch.nn.functional as F
 
 
 MODEL_DTYPE = torch.float16
+
+# Env toggle for the decomposed-vs-native softmax probe.  `ane_softmax`
+# historically avoids the native softmax op (earlier iOS/chip rejected it
+# on ANE) and decomposes into max/sub/exp/sum/div.  Set USE_NATIVE_SOFTMAX=1
+# at conversion time to emit `F.softmax` instead — four fewer MIL ops per
+# attention layer, speed impact is the subject of the A/B probe.
+_USE_NATIVE_SOFTMAX = os.environ.get("USE_NATIVE_SOFTMAX") == "1"
 
 
 class ANERMSNorm(nn.Module):
@@ -156,9 +164,14 @@ def apply_rotary_pos_emb(
 def ane_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Numerically stable softmax using only ANE-friendly primitives.
 
-    Avoids the softmax op entirely: max, sub, exp, sum, div.
-    All casts explicit to prevent PyTorch fp16→fp32 auto-upcast in torch.exp.
+    Default: decomposed form (max/sub/exp/sum/div) — avoids the native
+    softmax op because earlier iOS/chip combinations rejected it on ANE.
+
+    If USE_NATIVE_SOFTMAX=1, fall back to `F.softmax` — iOS 26 + ctools 9
+    accepts the native op; probe whether the ANE runs it efficiently.
     """
+    if _USE_NATIVE_SOFTMAX:
+        return F.softmax(x.to(MODEL_DTYPE), dim=dim).to(MODEL_DTYPE)
     # Force fp16 throughout; torch.exp auto-upcasts without this.
     x = x.to(MODEL_DTYPE)
     x_max = x.max(dim=dim, keepdim=True).values.to(MODEL_DTYPE)
