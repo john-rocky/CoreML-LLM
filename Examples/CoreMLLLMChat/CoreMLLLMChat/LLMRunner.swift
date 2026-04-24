@@ -40,6 +40,12 @@ final class LLMRunner {
     private var qwen35Generator: Qwen35Generator?
     private var qwen35Tokenizer: (any Tokenizer)?
 
+    // Qwen3-VL 2B stateful path (Phase 1 ship): MLState + slice_update,
+    // selected when `qwen3_vl_2b_stateful_chunks/` is present in the
+    // model folder. Runs alongside the v1.4.0 recurrent path; vision
+    // stays on the v1.4.0 generator, text goes through this one.
+    private var qwen3vl2bStatefulGenerator: Qwen3VL2BStatefulGenerator?
+
     // Qwen3-VL 2B path: separate generator + tokenizer, selected when
     // the downloaded folder contains `qwen3_vl_2b_decode_chunks/`.
     // Plain GQA architecture (not the Qwen3.5 hybrid SSM), so it gets
@@ -109,6 +115,25 @@ final class LLMRunner {
                 try await loadQwen35(folder: folder)
                 return
             }
+        }
+
+        // Qwen3-VL 2B STATEFUL detection (Phase 1): chunk_0..N +
+        // chunk_head + embed_weight.bin under qwen3_vl_2b_stateful_chunks/.
+        // Preferred over the v1.4.0 recurrent layout when both exist.
+        let vl2bStatefulDir = folder.appendingPathComponent("qwen3_vl_2b_stateful_chunks")
+        let vl2bStatefulEmbed = fm.fileExists(atPath:
+            vl2bStatefulDir.appendingPathComponent("embed_weight.bin").path)
+        let vl2bStatefulHead = fm.fileExists(atPath:
+            vl2bStatefulDir.appendingPathComponent("chunk_head.mlpackage").path)
+            || fm.fileExists(atPath:
+            vl2bStatefulDir.appendingPathComponent("chunk_head.mlmodelc").path)
+        let vl2bStatefulChunk0 = fm.fileExists(atPath:
+            vl2bStatefulDir.appendingPathComponent("chunk_0.mlpackage").path)
+            || fm.fileExists(atPath:
+            vl2bStatefulDir.appendingPathComponent("chunk_0.mlmodelc").path)
+        if vl2bStatefulEmbed && vl2bStatefulHead && vl2bStatefulChunk0 {
+            try await loadQwen3VL2BStateful(folder: folder)
+            return
         }
 
         // Qwen3-VL 2B detection: 6 body chunks + chunk_head + embed
@@ -183,6 +208,9 @@ final class LLMRunner {
                   audio: [Float]? = nil) async throws -> AsyncStream<String> {
         if qwen35Generator != nil {
             return try await generateQwen35(messages: messages)
+        }
+        if qwen3vl2bStatefulGenerator != nil {
+            return try await generateQwen3VL2BStateful(messages: messages)
         }
         if qwen3vl2bGenerator != nil {
             return try await generateQwen3VL2B(messages: messages, image: image)
@@ -537,6 +565,105 @@ final class LLMRunner {
                             // (replacement char `◇`). Drop trailing FFFDs
                             // before emitting; the next token will complete
                             // the sequence and we'll emit the full glyph.
+                            var current = tok.decode(tokens: accumIds)
+                            while current.last == "\u{FFFD}" {
+                                current.removeLast()
+                            }
+                            if current.count > emittedText.count,
+                               current.hasPrefix(emittedText) {
+                                let delta = String(current.dropFirst(emittedText.count))
+                                continuation.yield(delta)
+                                emittedText = current
+                            }
+                            let elapsed = Date().timeIntervalSince(genStart)
+                            if elapsed > 0 {
+                                Task { @MainActor in
+                                    self?.tokensPerSecond = Double(tokenCount) / elapsed
+                                }
+                            }
+                        })
+                } catch {
+                    continuation.yield("[Error: \(error.localizedDescription)]")
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    // MARK: - Qwen3-VL 2B stateful dispatch (Phase 1 ship)
+
+    private func loadQwen3VL2BStateful(folder: URL) async throws {
+        loadingStatus = "Loading Qwen3-VL tokenizer..."
+        let tok = try await AutoTokenizer.from(pretrained: "Qwen/Qwen3-VL-2B-Instruct")
+        loadingStatus = "Compiling Qwen3-VL 2B stateful chunks (first run only)..."
+        let gen = Qwen3VL2BStatefulGenerator(cfg: .defaultFourChunk)
+        gen.modelFolderOverride = folder
+        try gen.load()
+        qwen3vl2bStatefulGenerator = gen
+        qwen3vl2bTokenizer = tok
+        modelName = "Qwen3-VL 2B (stateful)"
+        hasVision = false  // text-only ship; vision stays on v1.4.0
+        hasAudio = false
+        isLoaded = true
+        loadingStatus = "Ready"
+        print("[LLMRunner] loaded Qwen3-VL 2B stateful from \(folder.lastPathComponent)")
+    }
+
+    private func generateQwen3VL2BStateful(messages: [ChatMessage]) async throws
+        -> AsyncStream<String>
+    {
+        guard let gen = qwen3vl2bStatefulGenerator,
+              let tok = qwen3vl2bTokenizer
+        else {
+            throw NSError(domain: "LLMRunner", code: 33,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Qwen3-VL 2B stateful not loaded"])
+        }
+        isGenerating = true
+        tokensPerSecond = 0
+
+        let chatMessages: [[String: Any]] = messages.compactMap { m in
+            let role: String
+            switch m.role {
+            case .user: role = "user"
+            case .assistant: role = "assistant"
+            case .system: return nil
+            }
+            return ["role": role, "content": m.content]
+        }
+        let ids: [Int] = (try? tok.applyChatTemplate(messages: chatMessages))
+            ?? tok.encode(text: messages.last?.content ?? "")
+        let inputIdsInt32 = ids.map { Int32($0) }
+
+        let maxSeq = 2048
+        let remaining = maxSeq - inputIdsInt32.count - 1
+        if remaining < 1 {
+            throw NSError(domain: "LLMRunner", code: 34,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "prompt (\(inputIdsInt32.count) tokens) exceeds max_seq=\(maxSeq). "
+                    + "Clear chat or shorten."])
+        }
+        let maxNew = min(remaining, 1024)
+
+        var eosSet: Set<Int32> = [151643, 151644, 151645]
+        if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
+
+        let genStart = Date()
+        return AsyncStream { continuation in
+            Task { [weak self] in
+                defer { Task { @MainActor in self?.isGenerating = false } }
+                var accumIds: [Int] = []
+                var emittedText = ""
+                var tokenCount = 0
+                do {
+                    _ = try await gen.generate(
+                        inputIds: inputIdsInt32,
+                        maxNewTokens: maxNew,
+                        eosTokenIds: eosSet,
+                        onToken: { [weak self] tokenId in
+                            tokenCount += 1
+                            if eosSet.contains(tokenId) { return }
+                            accumIds.append(Int(tokenId))
                             var current = tok.decode(tokens: accumIds)
                             while current.last == "\u{FFFD}" {
                                 current.removeLast()

@@ -8,7 +8,7 @@ import SwiftUI
 import Darwin.Mach
 
 struct Qwen3VL2BStatefulGeneratorView: View {
-    @State private var gen = Qwen3VL2BStatefulGenerator()
+    @State private var gen = Qwen3VL2BStatefulGenerator(cfg: .defaultFourChunk)
     @State private var tokensPerSec = ""
     @State private var decodedTokens = ""
     @State private var phys = ""
@@ -34,6 +34,12 @@ struct Qwen3VL2BStatefulGeneratorView: View {
                         Task { await runAudit() }
                     } label: {
                         Text("Audit ANE placement (MLComputePlan)")
+                    }
+                    .disabled(gen.running)
+                    Button(role: .destructive) {
+                        clearChunksDir()
+                    } label: {
+                        Text("Clear stateful chunks dir (before re-push)")
                     }
                     .disabled(gen.running)
                     Text(gen.status).font(.caption).foregroundStyle(.secondary)
@@ -74,6 +80,27 @@ struct Qwen3VL2BStatefulGeneratorView: View {
             }
             .navigationTitle("VL 2B (stateful)")
         }
+    }
+
+    private func clearChunksDir() {
+        let fm = FileManager.default
+        guard let docs = try? fm.url(for: .documentDirectory,
+                                     in: .userDomainMask,
+                                     appropriateFor: nil, create: false)
+        else { return }
+        let dirs = [
+            docs.appendingPathComponent(
+                "Models/qwen3-vl-2b-stateful/qwen3_vl_2b_stateful_chunks"),
+            docs.appendingPathComponent("qwen3_vl_2b_stateful_chunks"),
+        ]
+        var cleared = 0
+        for d in dirs {
+            if fm.fileExists(atPath: d.path) {
+                try? fm.removeItem(at: d)
+                cleared += 1
+            }
+        }
+        gen.status = "Cleared \(cleared) chunks dir(s). Re-push from Mac."
     }
 
     private func runAudit() async {

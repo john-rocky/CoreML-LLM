@@ -118,6 +118,18 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://huggingface.co/mlboydaisuke/qwen3-vl-2b-coreml/resolve/main",
             folderName: "qwen3-vl-2b")
 
+        /// Qwen3-VL 2B stateful (Phase 1) — MLState + slice_update KV,
+        /// 4-chunk INT8 + fp16 embed sidecar. iPhone 17 Pro bench
+        /// 24.4 tok/s decode / 264 MB phys_footprint — 6.4× memory drop
+        /// vs v1.4.0's 1.7 GB recurrent build. Text-only first ship;
+        /// sideload-only under Documents/Models/qwen3-vl-2b-stateful/
+        /// via scripts/qwen3vl_stateful_push.sh.
+        public static let qwen3vl_2b_stateful = ModelInfo(
+            id: "qwen3-vl-2b-stateful", name: "Qwen3-VL 2B (stateful, Phase 1)",
+            size: "2.3 GB",
+            downloadURL: "",
+            folderName: "qwen3-vl-2b-stateful")
+
         /// Gemma 4 E4B — 42 layers, hidden=2560, 2 KV heads, text-only decoder.
         /// INT4 palettized, ctx=2048. Baseline ~14 tok/s on iPhone 17 Pro.
         /// A local build (`conversion/build_gemma4_bundle.py --model gemma4-e4b`)
@@ -179,7 +191,7 @@ public final class ModelDownloader: NSObject {
             let experimental =
                 ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
                 || UserDefaults.standard.bool(forKey: "showExperimentalModels")
-            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, gemma4e2bFashion, qwen25_05b, qwen35_08b, qwen35_2b, qwen3vl_2b]
+            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, gemma4e2bFashion, qwen25_05b, qwen35_08b, qwen35_2b, qwen3vl_2b, qwen3vl_2b_stateful]
             if experimental {
                 list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
                 list.insert(gemma4e2bLookaheadProbe, at: 3)  // after EAGLE-3
@@ -302,6 +314,33 @@ public final class ModelDownloader: NSObject {
                 "Data/com.apple.CoreML/weights/weight.bin").path) {
                 return pkg
             }
+        }
+
+        // Qwen3-VL 2B stateful (Phase 1): chunk_0..N + chunk_head +
+        // embed_weight.bin under qwen3_vl_2b_stateful_chunks/. N ≥ 2
+        // (we ship 4, but any count ≥ 2 loads fine). All sideloaded.
+        let vl2bStatefulDir = dir.appendingPathComponent("qwen3_vl_2b_stateful_chunks")
+        func vl2bStatefulChunkExists(_ base: String) -> Bool {
+            let pkgWeights = vl2bStatefulDir
+                .appendingPathComponent("\(base).mlpackage")
+                .appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")
+            if fileManager.fileExists(atPath: pkgWeights.path) { return true }
+            let mlcWeights = vl2bStatefulDir
+                .appendingPathComponent("\(base).mlmodelc")
+                .appendingPathComponent("weights/weight.bin")
+            return fileManager.fileExists(atPath: mlcWeights.path)
+        }
+        let vl2bStatefulEmbed = vl2bStatefulDir.appendingPathComponent("embed_weight.bin")
+        if fileManager.fileExists(atPath: vl2bStatefulEmbed.path)
+            && vl2bStatefulChunkExists("chunk_0")
+            && vl2bStatefulChunkExists("chunk_1")
+            && vl2bStatefulChunkExists("chunk_head") {
+            // Return the OUTER model folder (dir), not the inner chunks
+            // subdir. ChatView appends "model.mlpackage" and LLMRunner
+            // does deletingLastPathComponent(), so LLMRunner's detection
+            // `folder.appendingPathComponent("qwen3_vl_2b_stateful_chunks")`
+            // needs `folder` to be the outer dir.
+            return dir
         }
 
         // Qwen3-VL 2B: 4 body chunks + chunk_head + embed_weight.bin

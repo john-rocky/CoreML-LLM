@@ -44,6 +44,14 @@ final class Qwen3VL2BStatefulGenerator {
             numBodyChunks: 4, layersPerChunk: 7,
             ropeTheta: 5_000_000,
             computeUnits: .cpuAndNeuralEngine)
+
+        static let defaultTwoChunk = Config(
+            maxSeq: 2048, vocab: 151936,
+            hiddenSize: 2048, numLayers: 28,
+            numKVHeads: 8, headDim: 128,
+            numBodyChunks: 2, layersPerChunk: 14,
+            ropeTheta: 5_000_000,
+            computeUnits: .cpuAndNeuralEngine)
     }
 
     var status = "Idle"
@@ -426,7 +434,9 @@ final class Qwen3VL2BStatefulGenerator {
 
     // MARK: - Generate
 
-    func generate(inputIds: [Int32], maxNewTokens: Int = 64) async throws -> [Int32] {
+    func generate(inputIds: [Int32], maxNewTokens: Int = 64,
+                  eosTokenIds: Set<Int32> = [],
+                  onToken: ((Int32) -> Void)? = nil) async throws -> [Int32] {
         guard !bodyChunks.isEmpty, headChunk != nil else {
             throw NSError(domain: "Qwen3VL2BStateful", code: 60,
                 userInfo: [NSLocalizedDescriptionKey: "not loaded"])
@@ -441,10 +451,14 @@ final class Qwen3VL2BStatefulGenerator {
         perChunkMs = Array(repeating: 0, count: bodyChunks.count)
         headMs = 0; embedMs = 0; ropeFillMs = 0; timedSteps = 0
 
-        // Recurrent prefill (T=1 per step — batched prefill via multifunction later).
+        // Recurrent prefill. Every step emits a "next_token" but we only
+        // care about the LAST one — Qwen3-VL's standard pattern is feed the
+        // final prompt token through the same step to kick off decode.
+        var prefillPredicted: Int32 = 0
         for (i, tok) in inputIds.enumerated() {
-            _ = try await stepPredict(token: tok, position: position,
-                                       states: states, collectTimings: false)
+            prefillPredicted = try await stepPredict(
+                token: tok, position: position,
+                states: states, collectTimings: false)
             lastToken = tok
             position += 1
             if i == inputIds.count - 1 {
@@ -452,16 +466,25 @@ final class Qwen3VL2BStatefulGenerator {
             }
         }
 
-        // Decode — collect per-chunk timing so we can see where tok/s goes.
+        // Decode — the prefill's last step already produced the first
+        // decode token (prefillPredicted). Emit it, then continue looping.
         let decodeStart = CFAbsoluteTimeGetCurrent()
         var decoded: [Int32] = []
-        for _ in 0..<maxNewTokens {
-            let next = try await stepPredict(token: lastToken, position: position,
-                                             states: states, collectTimings: true)
+        if maxNewTokens > 0 {
+            decoded.append(prefillPredicted)
+            onToken?(prefillPredicted)
+            lastToken = prefillPredicted
+        }
+        while decoded.count < maxNewTokens {
+            if eosTokenIds.contains(lastToken) { break }
+            if position >= cfg.maxSeq { break }
+            let next = try await stepPredict(
+                token: lastToken, position: position,
+                states: states, collectTimings: true)
             decoded.append(next)
+            onToken?(next)
             lastToken = next
             position += 1
-            if position >= cfg.maxSeq { break }
         }
         let t1 = CFAbsoluteTimeGetCurrent()
 
