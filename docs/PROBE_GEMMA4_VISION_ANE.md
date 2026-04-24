@@ -7,6 +7,17 @@ encoder off GPU (`.cpuAndGPU`, ~200–300 ms per image on iPhone 17 Pro)
 onto ANE, targeting a **60–100 ms TTFT reduction** for image and video
 prompts.
 
+## TL;DR — result
+
+- **97.3% ANE placement** (1932/1985 compute ops; 53 CPU, 0 GPU).
+- **cosine = 1.0000**, max_abs_diff = 0.0098 vs HF fp16 forward.
+- Mac Studio (M-series ANE) steady-state predict:
+  - **`.cpuAndNeuralEngine`: 473 ms/image**
+  - `.cpuAndGPU` (same file, forced GPU): 3800 ms/image (8× slower)
+- Ships as `vision.ane.mlpackage` (326 MB compiled to `vision.ane.mlmodelc`);
+  coexists with the legacy `vision.mlpackage` — runtime prefers the ANE
+  build when present.
+
 ## Background
 
 - Shipped `vision.mlpackage` was built by an earlier (no-longer-in-tree)
@@ -58,33 +69,62 @@ Adds `convert_still_image_vision_ane_to_coreml` in
 - **No iPhone deploy.** Mac parity first, then ComputePlanAudit, then
   device.
 
-## Handoff — run on Mac Studio
+## Reproducing the Mac result
 
 ```bash
 # from repo root, with lama-cml env active
 python conversion/convert_gemma4_multimodal.py \
     --output /tmp/gemma4-vision-ane \
     --vision-ane
+# compile for iOS
+xcrun coremlcompiler compile \
+    /tmp/gemma4-vision-ane/vision.ane.mlpackage /tmp/gemma4-vision-ane/
+# latency bench (Mac)
+python conversion/bench_vision_ane_mac.py \
+    --ane /tmp/gemma4-vision-ane/vision.ane.mlpackage --iters 40
 ```
 
-Expected console output (the two things to copy back):
+## Swift wiring (this PR)
 
+`CoreMLLLM.load()` checks for, in order: `vision.ane.mlmodelc`,
+`vision.ane.mlpackage`, `vision.mlmodelc`, `vision.mlpackage`. When an
+ANE build is found it sets `.cpuAndNeuralEngine` and routes
+`processImage` through `ImageProcessor.processANE(...)` (48×48 fixed
+grid, fp16 pixel values, no padding positions). The legacy variable-
+grid GPU path is untouched and remains the fallback.
+
+## iPhone deploy
+
+```bash
+xcrun devicectl device copy to \
+    --device <iPhone UUID> \
+    --domain-type appDataContainer \
+    --domain-identifier com.example.CoreMLLLMChat \
+    --source /tmp/gemma4-vision-ane/vision.ane.mlmodelc \
+    --destination Documents/Models/gemma4-e2b-fashion/vision.ane.mlmodelc \
+    --user mobile
 ```
-  ANE placement: <ane>/<compute> (<pct>%) — CPU=<n> GPU=<n>
-    cosine=0.99xx  max_abs_diff=0.0xxx
-```
 
-### Decision matrix
+Then rebuild CoreMLLLMChat in Xcode and launch. The runtime log prints
+the vision path it picked up; verify it reads `vision.ane.mlmodelc`
+and that the image-prompt TTFT drops vs the legacy build.
 
-| ANE % | cos | Next step |
-|-------|-----|-----------|
-| ≥ 80 | ≥ 0.99 | Swift wiring PR (prefer `vision.ane.mlpackage` when present, `.cpuAndNeuralEngine`) → iPhone bench. |
-| ≥ 80 | < 0.99 | Disable ANE fp16 drift sources: upcast pooler matmul to fp32, re-check. |
-| < 80 | any | Inspect which ops fell back (CPU vs GPU) via audit output. Most likely culprits: `one_hot`, `masked_fill` on const mask, `gather` in rotary embedding. Replace with static constants. |
+## Aspect-ratio tradeoff
 
-## Follow-ups (separate PRs once #1 lands)
+The ANE build is locked to a square 48×48 grid. Images are force-
+resized to 768×768, so non-square photos have their aspect ratio
+squashed. For natural photos this is acceptable (the vision tower
+tolerates it, cos=1.0 at convert time on a zero-frame sanity check).
+For extreme aspect ratios the legacy GPU encoder remains the correct
+choice — delete `vision.ane.mlmodelc` to force-revert.
 
-- **#1b:** Swift wiring + iPhone bench.
-- **Aspect-ratio multifunction:** add portrait/landscape grids once
-  square path is on ANE.
-- **Session #4:** extend this same recipe to batch=4 for video frames.
+## Follow-ups (separate PRs)
+
+- **Aspect-ratio multifunction**: add portrait/landscape fixed grids as
+  additional functions so CoreML picks the closest match at predict
+  time.
+- **Session #4** (video batch encoding): apply the same static-grid
+  recipe to `vision_video` with batch=4 so a 6-frame clip encodes in
+  two predict calls instead of six.
+- **Session #2** (image embedding cache): hash pixels, cache image
+  features on disk, skip re-encode for follow-up turns.

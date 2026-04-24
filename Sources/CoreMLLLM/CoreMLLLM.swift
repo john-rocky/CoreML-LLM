@@ -50,6 +50,12 @@ public final class CoreMLLLM: @unchecked Sendable {
     private var visionModel: MLModel?
     private var visionModelURL: URL?
     private var visionConfig: MLModelConfiguration?
+    /// True when visionModelURL points to a `vision.ane.*` sibling — the
+    /// square 48×48 fixed-grid encoder built by
+    /// `convert_gemma4_multimodal.py --vision-ane`. Changes the
+    /// preprocessing path (forced 768×768 resize, fp16 pixel values,
+    /// no padding) and the ANE-friendly compute unit selection.
+    private var visionUsesANEBuild: Bool = false
 
     // Optional video-grade vision encoder (max_soft_tokens=70 → 64
     // tokens/frame). When present, replaces the Phase 1 Swift 2×2 pool.
@@ -407,17 +413,30 @@ public final class CoreMLLLM: @unchecked Sendable {
             }
         }
 
-        // Vision model (optional, lazy loaded on first image)
+        // Vision model (optional, lazy loaded on first image).
+        //
+        // Prefer the ANE-targeted build (`vision.ane.*`, fixed 48×48
+        // square grid, 256 soft tokens) when present — it runs on ANE
+        // at ~8× GPU throughput for this encoder on Mac, and cuts TTFT
+        // on iPhone. Fall back to the legacy variable-grid GPU build.
+        let visionANECompiled = directory.appendingPathComponent("vision.ane.mlmodelc")
+        let visionANEPkg = directory.appendingPathComponent("vision.ane.mlpackage")
         let visionCompiled = directory.appendingPathComponent("vision.mlmodelc")
         let visionPkg = directory.appendingPathComponent("vision.mlpackage")
-        if FileManager.default.fileExists(atPath: visionCompiled.path) {
+        if FileManager.default.fileExists(atPath: visionANECompiled.path) {
+            llm.visionModelURL = visionANECompiled
+            llm.visionUsesANEBuild = true
+        } else if FileManager.default.fileExists(atPath: visionANEPkg.path) {
+            llm.visionModelURL = visionANEPkg
+            llm.visionUsesANEBuild = true
+        } else if FileManager.default.fileExists(atPath: visionCompiled.path) {
             llm.visionModelURL = visionCompiled
         } else if FileManager.default.fileExists(atPath: visionPkg.path) {
             llm.visionModelURL = visionPkg
         }
         if llm.visionModelURL != nil {
             let cfg = MLModelConfiguration()
-            cfg.computeUnits = .cpuAndGPU
+            cfg.computeUnits = llm.visionUsesANEBuild ? .cpuAndNeuralEngine : .cpuAndGPU
             llm.visionConfig = cfg
         }
 
@@ -1268,6 +1287,9 @@ public final class CoreMLLLM: @unchecked Sendable {
             visionModel = try MLModel(contentsOf: url, configuration: cfg)
         }
         guard let vm = visionModel else { throw CoreMLLLMError.visionNotAvailable }
+        if visionUsesANEBuild {
+            return try ImageProcessor.processANE(image, with: vm)
+        }
         return try ImageProcessor.process(image, with: vm)
     }
 
