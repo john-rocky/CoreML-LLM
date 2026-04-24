@@ -270,8 +270,17 @@ final class Qwen3VL2BGenerator {
     /// generator processes full-T batches at `generate()` start.
     @ObservationIgnored private var prefillBodyChunks: [MLModel] = []
     @ObservationIgnored private var prefillChunk0Vision: MLModel?
-    /// Prefill batch size baked into the mlpackages (currently T=32).
-    @ObservationIgnored private let prefillT: Int = 32
+    /// Prefill batch size baked into the mlpackages. First attempt was
+    /// T=32 (same as FunctionGemma) but iPhone 17 Pro ANE rejected the
+    /// compile with `MILCompilerForANE error ... Error=(11)` — the
+    /// `matmul(update_mask[1,1,MS,T], k[1,HKV,T,D])` materializes a
+    /// `(1, HKV, MS=2048, D)` intermediate per layer × 7 layers, which
+    /// breaks A18 ANE's tile budget even though Mac Studio ANE accepts
+    /// it. T=8 quarters the batched intermediate size and still gives
+    /// ~24 batches for a 196-image prompt (→ ~12× TTFT speedup over
+    /// recurrent). The permanent fix is stateful `slice_update` (v1.5
+    /// Phase 1 MLState + multifunction rewrite).
+    @ObservationIgnored private let prefillT: Int = 8
     var hasBatchedPrefill: Bool {
         prefillBodyChunks.count == cfg.numBodyChunks
     }
@@ -1308,6 +1317,12 @@ final class Qwen3VL2BGenerator {
             if (t & 0x7) == 0 { status = "Prefill \(t)/\(S)..." }
         }
         prefillMs = Date().timeIntervalSince(prefillStart) * 1000
+        let prefillTps = Double(S) / (prefillMs / 1000.0)
+        print(String(format: "[Qwen3VL2B] prefill done: %d tokens in %.0f ms (%.1f tok/s)%@",
+                      S, prefillMs, prefillTps,
+                      batchedBudget > 0
+                        ? "  [\(batchedBudget / prefillT) batches × T=\(prefillT) + \(S - batchedBudget) recurrent]"
+                        : "  [recurrent]"))
 
         // Head chunk computes argmax in-graph and emits `next_token`
         // (int32) directly — saves a 600 KB vocab-fp32 transfer per
@@ -1340,7 +1355,12 @@ final class Qwen3VL2BGenerator {
 
         let totalDecodeMs = Date().timeIntervalSince(decodeStart) * 1000
         decodeMsAvg = totalDecodeMs / Double(max(decodedSteps, 1))
+        let decodeTps = Double(decodedSteps) / (totalDecodeMs / 1000.0)
         tokensPerSecond = Double(generatedIds.count) / ((prefillMs + totalDecodeMs) / 1000.0)
+        print(String(format: "[Qwen3VL2B] decode done: %d tokens in %.0f ms (%.2f ms/tok, %.1f tok/s pure-decode)",
+                      decodedSteps, totalDecodeMs, decodeMsAvg, decodeTps))
+        print(String(format: "[Qwen3VL2B] end-to-end: %d total tokens, %.1f tok/s (prefill %.0fms + decode %.0fms)",
+                      generatedIds.count, tokensPerSecond, prefillMs, totalDecodeMs))
         status = String(format: "Done: %d tokens, prefill=%.0fms, decode=%.1fms/tok, %.1f tok/s",
                          generatedIds.count, prefillMs, decodeMsAvg, tokensPerSecond)
         return generatedIds
