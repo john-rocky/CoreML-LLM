@@ -418,12 +418,20 @@ public final class CoreMLLLM: @unchecked Sendable {
         // Prefer the ANE-targeted build (`vision.ane.*`, fixed 48×48
         // square grid, 256 soft tokens) when present — it runs on ANE
         // at ~8× GPU throughput for this encoder on Mac, and cuts TTFT
-        // on iPhone. Fall back to the legacy variable-grid GPU build.
+        // on iPhone. The `.v2.` suffix wins over the unsuffixed name
+        // so a newer converted copy can be deployed alongside a stale
+        // on-device file without reinstalling (`devicectl copy to`
+        // refuses to overwrite). Fall back to the legacy variable-grid
+        // GPU build when no ANE build is present.
+        let visionANEv2Compiled = directory.appendingPathComponent("vision.ane.v2.mlmodelc")
         let visionANECompiled = directory.appendingPathComponent("vision.ane.mlmodelc")
         let visionANEPkg = directory.appendingPathComponent("vision.ane.mlpackage")
         let visionCompiled = directory.appendingPathComponent("vision.mlmodelc")
         let visionPkg = directory.appendingPathComponent("vision.mlpackage")
-        if FileManager.default.fileExists(atPath: visionANECompiled.path) {
+        if FileManager.default.fileExists(atPath: visionANEv2Compiled.path) {
+            llm.visionModelURL = visionANEv2Compiled
+            llm.visionUsesANEBuild = true
+        } else if FileManager.default.fileExists(atPath: visionANECompiled.path) {
             llm.visionModelURL = visionANECompiled
             llm.visionUsesANEBuild = true
         } else if FileManager.default.fileExists(atPath: visionANEPkg.path) {
