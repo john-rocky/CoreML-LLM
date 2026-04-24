@@ -26,6 +26,8 @@
 		B60E4AB380E7B9E215F1B15E /* Qwen35DecodeBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */; };
 		EF8840D7959C1AB14894FE13 /* Qwen35Benchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = A640406284DC310A703609F0 /* Qwen35Benchmark.swift */; };
 		CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */; };
+		D1E20000000000000000BE01 /* GateZeroBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE02 /* GateZeroBenchmark.swift */; };
+		D1E20000000000000000BE03 /* GateZeroBenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -48,6 +50,8 @@
 		CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35DecodeBenchmark.swift; path = CoreMLLLMChat/Qwen35DecodeBenchmark.swift; sourceTree = SOURCE_ROOT; };
 		F8714748BF0A5E81B6E3499A /* Qwen35BenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35BenchmarkView.swift; path = CoreMLLLMChat/Qwen35BenchmarkView.swift; sourceTree = SOURCE_ROOT; };
 		DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35ChatView.swift; path = CoreMLLLMChat/Qwen35ChatView.swift; sourceTree = SOURCE_ROOT; };
+		D1E20000000000000000BE02 /* GateZeroBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GateZeroBenchmark.swift; path = CoreMLLLMChat/GateZeroBenchmark.swift; sourceTree = SOURCE_ROOT; };
+		D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GateZeroBenchmarkView.swift; path = CoreMLLLMChat/GateZeroBenchmarkView.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -78,6 +82,8 @@
 				C2A1B2C3D4E5F6A7B8C9D003 /* Qwen3VL2BVisionEncoder.swift */,
 				AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */,
 				DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */,
+				D1E20000000000000000BE02 /* GateZeroBenchmark.swift */,
+				D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -192,6 +198,8 @@
 				C1A1B2C3D4E5F6A7B8C9D002 /* Qwen3VL2BVisionEncoder.swift in Sources */,
 				32404BC1AC91219654BB4034 /* Qwen35GeneratorView.swift in Sources */,
 				CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */,
+				D1E20000000000000000BE01 /* GateZeroBenchmark.swift in Sources */,
+				D1E20000000000000000BE03 /* GateZeroBenchmarkView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -83,6 +83,12 @@ struct ModelPickerView: View {
                 //     }
                 // }
 
+                Section("Qwen3-VL 2B — Phase 1") {
+                    NavigationLink { GateZeroBenchmarkView() } label: {
+                        Label("Gate Zero (MLState stub)", systemImage: "bolt.shield")
+                    }
+                }
+
                 Section("Troubleshooting") {
                     Button(role: .destructive) {
                         do {
