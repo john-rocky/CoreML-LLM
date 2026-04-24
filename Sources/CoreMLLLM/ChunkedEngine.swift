@@ -5,22 +5,36 @@ import Foundation
 
 /// Internal engine for SWA-chunked Gemma 4 E2B inference.
 ///
-/// The model is split into 4 decode chunks + 4 optional prefill chunks:
+/// Decode splits into either 4 chunks (default) or 3 chunks (LLM_3CHUNK=1,
+/// build via `conversion/build_gemma4_3way.py`). Prefill is always 4 chunks.
+///
+/// 4-chunk decode (default):
 ///   - chunk1: layers 0-7 (7 sliding + 1 full) + PLE projection
 ///   - chunk2: layers 8-14 (5 sliding + 2 full), outputs shared kv13/kv14
 ///   - chunk3: layers 15-24 (all KV-shared via kv13/kv14)
 ///   - chunk4: layers 25-34 (all KV-shared) + RMSNorm + LM head + argmax
+///
+/// 3-chunk decode (LLM_3CHUNK=1, requires chunk2_3way.mlmodelc + chunk3_3way.mlmodelc):
+///   - chunk1: layers 0-7 (same binary as 4-chunk)
+///   - chunk2: layers 8-24 merged (17 layers — 5 sliding + 2 full own-KV + 10 KV-shared),
+///             outputs kv13/kv14 identically to 4-chunk chunk2
+///   - chunk3: nil; chunk4 slot holds layers 25-34 + LM head (same I/O as 4-chunk chunk4)
+/// Saves one ANE dispatch per decode step (~2.3ms / Orion). Bit-for-bit
+/// equivalent to the 4-chunk path (parity proven in
+/// conversion/parity_3way_vs_4chunk.py).
 ///
 /// External resources (loaded from disk, not baked into the model):
 ///   - INT8 quantized embedding tables (embed_tokens + embed_per_layer)
 ///   - Per-layer projection weight + norm weight (for PLE on CPU/Accelerate)
 ///   - Pre-computed RoPE cos/sin tables (sliding 256-d, full 512-d)
 final class ChunkedEngine {
-    // Decode chunks
+    // Decode chunks. chunk3 is nil in 3-chunk mode; chunk2 holds the 17-layer
+    // merged decoder in that case. chunk4 holds the LM-head chunk in both modes.
     private let chunk1: MLModel
     private let chunk2: MLModel
-    private let chunk3: MLModel
+    private let chunk3: MLModel?
     private let chunk4: MLModel
+    let is3ChunkDecode: Bool
 
     // Prefill chunks (optional; falls back to per-token decode if nil).
     //
@@ -398,7 +412,25 @@ final class ChunkedEngine {
         //   = 0     → unlimited concurrency (legacy fast-burn behavior)
         //   = N > 0 → cap = N concurrent MIL/ANE compilations
         let hasPrefillFiles = findModel("prefill_chunk1") != nil
-        var c1: MLModel!, c2: MLModel!, c3: MLModel!, c4: MLModel!
+
+        // 3-chunk decode (opt-in). The 3-chunk variant merges the 4-chunk
+        // decode's chunk2 (L8-14) + chunk3 (L15-24) into a single 17-layer
+        // dispatch and renames the LM-head chunk from "chunk4" to
+        // "chunk3_3way". Env var + file presence both required so a bundle
+        // that's missing the new files silently falls back to 4-chunk.
+        let is3Chunk =
+            ProcessInfo.processInfo.environment["LLM_3CHUNK"] == "1"
+            && findModel("chunk2_3way") != nil
+            && findModel("chunk3_3way") != nil
+        if ProcessInfo.processInfo.environment["LLM_3CHUNK"] == "1" && !is3Chunk {
+            print("[Load] LLM_3CHUNK=1 set but chunk2_3way/chunk3_3way not found — " +
+                  "falling back to 4-chunk decode")
+        }
+        if is3Chunk {
+            print("[Load] LLM_3CHUNK=1 — 3-chunk decode (chunk1 + chunk2_3way[L8-24 merged] + chunk3_3way[L25-34+head])")
+        }
+
+        var c1: MLModel!, c2: MLModel!, c3: MLModel?, c4: MLModel!
         var p1: MLModel?, p2: MLModel?, p3: MLModel?, p4: MLModel?
 
         let loadMaxParallel: Int = {
@@ -424,10 +456,18 @@ final class ChunkedEngine {
             let origin = (deferEnv == "1") ? "env=1" : "default"
             print("[Load] deferred prefill load (\(origin)) — decode chunks foreground, prefill chunks background")
         }
+        // Chunk file names depend on decode mode. In 3-chunk mode the
+        // merged decoder takes chunk2's slot (file chunk2_3way) and the
+        // LM-head chunk takes chunk4's slot (file chunk3_3way); chunk3
+        // is not loaded.
         var chunkWork: [(String, MLModelConfiguration)] = [
-            ("chunk1", mlConfig), ("chunk2", mlConfig),
-            ("chunk3", mlConfig), ("chunk4", mlConfig),
+            ("chunk1", mlConfig),
+            (is3Chunk ? "chunk2_3way" : "chunk2", mlConfig),
         ]
+        if !is3Chunk {
+            chunkWork.append(("chunk3", mlConfig))
+        }
+        chunkWork.append((is3Chunk ? "chunk3_3way" : "chunk4", mlConfig))
         if hasPrefillFiles && !deferPrefill {
             for name in ["prefill_chunk1", "prefill_chunk2",
                          "prefill_chunk3", "prefill_chunk4"] {
@@ -453,9 +493,9 @@ final class ChunkedEngine {
             while let (name, model) = try await group.next() {
                 switch name {
                 case "chunk1": c1 = model
-                case "chunk2": c2 = model
+                case "chunk2", "chunk2_3way": c2 = model
                 case "chunk3": c3 = model
-                case "chunk4": c4 = model
+                case "chunk4", "chunk3_3way": c4 = model
                 case "prefill_chunk1": p1 = model
                 case "prefill_chunk2": p2 = model
                 case "prefill_chunk3": p3 = model
@@ -479,7 +519,8 @@ final class ChunkedEngine {
         default: loadMode = "cap=\(loadMaxParallel)"
         }
         let loadedCount = chunkWork.count
-        let totalCount = hasPrefillFiles ? 8 : 4
+        let decodeSlots = is3Chunk ? 3 : 4
+        let totalCount = hasPrefillFiles ? (decodeSlots + 4) : decodeSlots
         let deferredSuffix = (deferPrefill && hasPrefillFiles)
             ? " (\(totalCount - loadedCount) prefill deferred to bg)"
             : ""
@@ -663,7 +704,9 @@ final class ChunkedEngine {
         // Mixed 2K / 8K chunk files from different builds are rejected with a clear
         // error so the user knows to re-download a consistent set.
         let configuredCtx = config.contextLength
-        for (label, model) in [("chunk1", c1!), ("chunk2", c2!), ("chunk3", c3!), ("chunk4", c4!)] {
+        var ctxCheckModels: [(String, MLModel)] = [("chunk1", c1!), ("chunk2", c2!), ("chunk4", c4!)]
+        if let c3 = c3 { ctxCheckModels.insert(("chunk3", c3), at: 2) }
+        for (label, model) in ctxCheckModels {
             if let desc = model.modelDescription.inputDescriptionsByName["causal_mask_full"],
                let c = desc.multiArrayConstraint,
                let last = c.shape.last?.intValue, last != configuredCtx {
@@ -729,6 +772,7 @@ final class ChunkedEngine {
 
         let engine = try ChunkedEngine(
             chunk1: c1, chunk2: c2, chunk3: c3, chunk4: c4,
+            is3ChunkDecode: is3Chunk,
             prefillChunk1: p1, prefillChunk2: p2, prefillChunk3: p3, prefillChunk4: p4,
             verifyChunk1: v1, verifyChunk2: v2, verifyChunk3: v3, verifyChunk4: v4,
             verifyK: detectedK,
@@ -848,7 +892,8 @@ final class ChunkedEngine {
         print("[Load] Final prewarm (prefill + decode + verify + transition) done in \(String(format: "%.2f", dt))s")
     }
 
-    private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
+    private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel?, chunk4: MLModel,
+                 is3ChunkDecode: Bool,
                  prefillChunk1: MLModel?, prefillChunk2: MLModel?,
                  prefillChunk3: MLModel?, prefillChunk4: MLModel?,
                  verifyChunk1: MLModel?, verifyChunk2: MLModel?,
@@ -865,6 +910,7 @@ final class ChunkedEngine {
                  config: ModelConfig, prefillN: Int) {
         self.chunk1 = chunk1; self.chunk2 = chunk2
         self.chunk3 = chunk3; self.chunk4 = chunk4
+        self.is3ChunkDecode = is3ChunkDecode
         self._prefillChunk1 = prefillChunk1; self._prefillChunk2 = prefillChunk2
         self._prefillChunk3 = prefillChunk3; self._prefillChunk4 = prefillChunk4
         self.verifyChunk1 = verifyChunk1; self.verifyChunk2 = verifyChunk2
@@ -1148,18 +1194,26 @@ final class ChunkedEngine {
             "kv14_k": MLFeatureValue(multiArray: kv14_k), "kv14_v": MLFeatureValue(multiArray: kv14_v),
         ]
 
-        // Chunk 3
-        let tC3Start = CFAbsoluteTimeGetCurrent()
-        var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
-        let in3 = try MLDictionaryFeatureProvider(dictionary: d3)
-        let tC3Wait0 = CFAbsoluteTimeGetCurrent()
-        let out3 = try chunk3.prediction(from: in3)
-        let h3 = out3.featureValue(for: "hidden_states_out")!.multiArrayValue!
-        // EAGLE-3 hidden tap (present only in EAGLE-3 decode chunks).
-        lastHiddenAtL17 = out3.featureValue(for: "hidden_at_L17")?.multiArrayValue
-        let tC3End = CFAbsoluteTimeGetCurrent()
-        profileANEWait += (tC3End - tC3Wait0)
-        profileC3 += (tC3End - tC3Start)
+        // Chunk 3 (4-chunk mode only; 3-chunk mode merged L15-24 into chunk2).
+        let h3: MLMultiArray
+        if let chunk3 = chunk3 {
+            let tC3Start = CFAbsoluteTimeGetCurrent()
+            var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
+            let in3 = try MLDictionaryFeatureProvider(dictionary: d3)
+            let tC3Wait0 = CFAbsoluteTimeGetCurrent()
+            let out3 = try chunk3.prediction(from: in3)
+            h3 = out3.featureValue(for: "hidden_states_out")!.multiArrayValue!
+            // EAGLE-3 hidden tap (present only in EAGLE-3 decode chunks).
+            lastHiddenAtL17 = out3.featureValue(for: "hidden_at_L17")?.multiArrayValue
+            let tC3End = CFAbsoluteTimeGetCurrent()
+            profileANEWait += (tC3End - tC3Wait0)
+            profileC3 += (tC3End - tC3Start)
+        } else {
+            // 3-chunk: chunk2 already ran L15-24 internally. Feed its hidden
+            // state straight into the LM-head chunk.
+            h3 = h2
+            lastHiddenAtL17 = nil
+        }
 
         // Chunk 4
         let tC4Start = CFAbsoluteTimeGetCurrent()
@@ -1173,8 +1227,9 @@ final class ChunkedEngine {
         profileANEWait += (tC4End - tC4Wait0)
         profileC4 += (tC4End - tC4Start)
 
-        // LayerSkip probe: skip chunk3, feed h2 directly to chunk4
-        if layerSkipProbe {
+        // LayerSkip probe: skip chunk3, feed h2 directly to chunk4.
+        // Meaningless in 3-chunk mode (chunk3 is already merged), so guard.
+        if layerSkipProbe && chunk3 != nil {
             var d4skip = shared; d4skip["hidden_states"] = MLFeatureValue(multiArray: h2)
             let skipOut = try chunk4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4skip))
             let skipToken = skipOut.featureValue(for: "token_id")!.multiArrayValue![0].intValue
