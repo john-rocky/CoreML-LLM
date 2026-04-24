@@ -13,6 +13,7 @@ let package = Package(
         .executable(name: "accept-rate-bench", targets: ["AcceptRateBench"]),
         .executable(name: "coreml-llm-smoke", targets: ["CoreMLLLMSmoke"]),
         .executable(name: "union-bitexact", targets: ["UnionBitExact"]),
+        .executable(name: "determinism-oracle", targets: ["DeterminismOracle"]),
         .executable(name: "verify-k8-probe", targets: ["VerifyK8Probe"]),
         // Standalone samples for the two Gemma-3-based models. These live in
         // the same package on purpose — a LocalAIKit-style wrapper can depend
@@ -68,6 +69,16 @@ let package = Package(
             name: "UnionBitExact",
             dependencies: ["CoreMLLLM"],
             path: "Sources/union-bitexact",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // Mac-only CoreML determinism oracle (quality-gate PoC). Runs a
+        // tiny fixed corpus at argmax (all drafters off) and compares token
+        // IDs against a committed oracle. Catches silent regressions in the
+        // shipped decode path. See docs/QUALITY_GATE.md.
+        .executableTarget(
+            name: "DeterminismOracle",
+            dependencies: ["CoreMLLLM"],
+            path: "Sources/determinism-oracle",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // LookAhead K=8 probe harness — measures pure verify_qK=8 wall-clock

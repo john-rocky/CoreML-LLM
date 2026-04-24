@@ -175,12 +175,16 @@ Key investigation chains (the contributing docs are still in `docs/`):
 
 ### Stale-but-still-present docs (don't plan work on their numbers)
 
+For the full rejection ledger (what's dead and why) see
+[`REJECTED_APPROACHES.md`](REJECTED_APPROACHES.md).
+
 | Doc | Issue |
 |---|---|
 | CONVERSION.md | Claims MLState is "Shipping" — it's rejected |
 | EAGLE3_DEPLOY.md | Claims 55-70 tok/s target — EAGLE-3 is dead |
 | FUNDAMENTAL_UNTRIED.md | Optimistic on MLState and W2A16 — both rejected |
 | UNEXPLORED_APPROACHES_V5.md | MTP as "S-tier" — all MTP paths failed |
+| SESSION_STATE.md | Last updated 2026-04-15; HANDOFF.md is the current truth |
 
 (2026-04-18 cleanup: 14 fully-superseded docs removed — RESEARCH,
 INTEGRATED_ROADMAP, ROUTE_B_EXECUTION_PLAN, ALTERNATIVE_APPROACHES,
