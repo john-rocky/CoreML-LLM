@@ -415,20 +415,39 @@ public final class CoreMLLLM: @unchecked Sendable {
 
         // Vision model (optional, lazy loaded on first image).
         //
-        // Prefer the ANE-targeted build (`vision.ane.*`, fixed 48×48
-        // square grid, 256 soft tokens) when present — it runs on ANE
-        // at ~8× GPU throughput for this encoder on Mac, and cuts TTFT
-        // on iPhone. The `.v2.` suffix wins over the unsuffixed name
-        // so a newer converted copy can be deployed alongside a stale
-        // on-device file without reinstalling (`devicectl copy to`
-        // refuses to overwrite). Fall back to the legacy variable-grid
-        // GPU build when no ANE build is present.
+        // Default is the legacy variable-grid GPU build
+        // (`vision.mlmodelc`). iPhone 17 Pro A19 A/B (2026-04-25)
+        // measured predict 205 ms GPU vs 584 ms ANE (steady-state,
+        // both prewarmed) — the Mac 8× ANE win does not reproduce on
+        // A19, and the GPU path preserves aspect ratio while the ANE
+        // build force-squashes to 48×48.
+        //
+        // LLM_VISION_FORCE_ANE=1 opts into the `vision.ane.*` build
+        // for benchmarking / future A19 firmware retest. The `.v2.`
+        // suffix still wins over the unsuffixed ANE file so a newer
+        // converted copy can be dropped on-device without reinstall.
+        let forceANE = ProcessInfo.processInfo.environment["LLM_VISION_FORCE_ANE"] == "1"
         let visionANEv2Compiled = directory.appendingPathComponent("vision.ane.v2.mlmodelc")
         let visionANECompiled = directory.appendingPathComponent("vision.ane.mlmodelc")
         let visionANEPkg = directory.appendingPathComponent("vision.ane.mlpackage")
         let visionCompiled = directory.appendingPathComponent("vision.mlmodelc")
         let visionPkg = directory.appendingPathComponent("vision.mlpackage")
-        if FileManager.default.fileExists(atPath: visionANEv2Compiled.path) {
+        if forceANE, FileManager.default.fileExists(atPath: visionANEv2Compiled.path) {
+            llm.visionModelURL = visionANEv2Compiled
+            llm.visionUsesANEBuild = true
+        } else if forceANE, FileManager.default.fileExists(atPath: visionANECompiled.path) {
+            llm.visionModelURL = visionANECompiled
+            llm.visionUsesANEBuild = true
+        } else if forceANE, FileManager.default.fileExists(atPath: visionANEPkg.path) {
+            llm.visionModelURL = visionANEPkg
+            llm.visionUsesANEBuild = true
+        } else if FileManager.default.fileExists(atPath: visionCompiled.path) {
+            llm.visionModelURL = visionCompiled
+        } else if FileManager.default.fileExists(atPath: visionPkg.path) {
+            llm.visionModelURL = visionPkg
+        } else if FileManager.default.fileExists(atPath: visionANEv2Compiled.path) {
+            // No legacy file present — fall back to any ANE sibling so
+            // vision still works on partially-deployed bundles.
             llm.visionModelURL = visionANEv2Compiled
             llm.visionUsesANEBuild = true
         } else if FileManager.default.fileExists(atPath: visionANECompiled.path) {
@@ -437,15 +456,18 @@ public final class CoreMLLLM: @unchecked Sendable {
         } else if FileManager.default.fileExists(atPath: visionANEPkg.path) {
             llm.visionModelURL = visionANEPkg
             llm.visionUsesANEBuild = true
-        } else if FileManager.default.fileExists(atPath: visionCompiled.path) {
-            llm.visionModelURL = visionCompiled
-        } else if FileManager.default.fileExists(atPath: visionPkg.path) {
-            llm.visionModelURL = visionPkg
         }
         if llm.visionModelURL != nil {
             let cfg = MLModelConfiguration()
             cfg.computeUnits = llm.visionUsesANEBuild ? .cpuAndNeuralEngine : .cpuAndGPU
             llm.visionConfig = cfg
+            let tag = llm.visionUsesANEBuild ? "ANE" : "GPU"
+            let name = llm.visionModelURL!.lastPathComponent
+            let forced = forceANE ? " (LLM_VISION_FORCE_ANE=1)" : ""
+            print("[Vision] selected \(name) → \(tag)\(forced)")
+            await ComputePlanAudit.runVision(modelURL: llm.visionModelURL!,
+                                             computeUnits: cfg.computeUnits,
+                                             backendTag: tag)
         }
 
         // Optional video-grade vision encoder. Ships alongside
@@ -523,6 +545,61 @@ public final class CoreMLLLM: @unchecked Sendable {
         // a full 48×48 grid compiles the ANE graph and pages the
         // 326 MB of weights in so the first real image call drops to
         // steady-state (~200-300 ms).
+        //
+        // The legacy GPU build is now the default; prewarm it with a
+        // dummy 48×48 (multiple-of-48) grid so first-call compile
+        // doesn't land on TTFT for the first real image. GPU load is
+        // cheap (~1 s on iPhone) but first predict compiles the graph
+        // (~30 s observed) — running it on a utility queue hides the
+        // cost behind user typing time.
+        if let url = llm.visionModelURL,
+           let cfg = llm.visionConfig,
+           !llm.visionUsesANEBuild {
+            do {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                let m = try MLModel(contentsOf: url, configuration: cfg)
+                llm.visionModel = m
+                let dt = CFAbsoluteTimeGetCurrent() - t0
+                print("[Load] vision GPU load done in \(String(format: "%.1f", dt))s")
+                DispatchQueue.global(qos: .utility).async {
+                    do {
+                        let tw = CFAbsoluteTimeGetCurrent()
+                        let pd = 16 * 16 * 3
+                        let total = 2520
+                        let pv = try MLMultiArray(
+                            shape: [1, NSNumber(value: total), NSNumber(value: pd)],
+                            dataType: .float32)
+                        let pid = try MLMultiArray(
+                            shape: [1, NSNumber(value: total), 2], dataType: .int32)
+                        let pidp = pid.dataPointer.bindMemory(
+                            to: Int32.self, capacity: total * 2)
+                        var k = 0
+                        for py in 0..<48 {
+                            for px in 0..<48 {
+                                pidp[k * 2] = Int32(px)
+                                pidp[k * 2 + 1] = Int32(py)
+                                k += 1
+                            }
+                        }
+                        for i in (48 * 48)..<total {
+                            pidp[i * 2] = -1
+                            pidp[i * 2 + 1] = -1
+                        }
+                        let input = try MLDictionaryFeatureProvider(dictionary: [
+                            "pixel_values": MLFeatureValue(multiArray: pv),
+                            "pixel_position_ids": MLFeatureValue(multiArray: pid),
+                        ])
+                        _ = try m.prediction(from: input)
+                        let dw = CFAbsoluteTimeGetCurrent() - tw
+                        print("[Load] vision GPU prewarm predict in \(String(format: "%.1f", dw))s")
+                    } catch {
+                        print("[Load] vision GPU prewarm predict skipped: \(error)")
+                    }
+                }
+            } catch {
+                print("[Load] vision GPU load skipped: \(error)")
+            }
+        }
         if let url = llm.visionModelURL,
            let cfg = llm.visionConfig,
            llm.visionUsesANEBuild {

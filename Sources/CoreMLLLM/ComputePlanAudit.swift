@@ -102,6 +102,40 @@ enum ComputePlanAudit {
         }
     }
 
+    /// Audit the Gemma 4 vision encoder. `backendTag` is "ANE" for the
+    /// fixed-grid ANE build (`vision.ane.*`) and "GPU" for the legacy
+    /// variable-grid build. Runs only when COMPUTE_PLAN_AUDIT is set.
+    /// Lets the iPhone A/B compare *where the ops actually land* in
+    /// addition to wall-clock predict time — Mac-fast ANE placements
+    /// can come back as CPU fallback on A19 when an op shape misses
+    /// the ANE compiler's pattern.
+    static func runVision(modelURL: URL,
+                          computeUnits: MLComputeUnits,
+                          backendTag: String) async {
+        guard isEnabled else { return }
+        let config = MLModelConfiguration()
+        config.computeUnits = computeUnits
+        let name = "vision[\(backendTag)]"
+        do {
+            let plan = try await MLComputePlan.load(contentsOf: modelURL,
+                                                    configuration: config)
+            // Route to the ANE-vs-rest auditor for the ANE build and the
+            // GPU-vs-rest auditor for the legacy build so "fallback" is
+            // measured against the intended device for each backend.
+            let ops: Int
+            let fallbacks: Int
+            if backendTag == "ANE" {
+                (ops, fallbacks) = auditPlan(plan, chunkName: name)
+            } else {
+                (ops, fallbacks) = auditDrafterPlan(plan, name: name,
+                                                   expectedDevice: backendTag)
+            }
+            print("[ComputePlan] \(name): \(fallbacks) off-\(backendTag) op(s) out of \(ops) total")
+        } catch {
+            print("[ComputePlan] \(name): failed to load plan — \(error)")
+        }
+    }
+
     // MARK: - Private
 
     /// Walk a single compute plan, log non-ANE ops, return (totalOps, fallbackCount).
