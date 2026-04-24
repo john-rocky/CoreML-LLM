@@ -50,6 +50,12 @@ public final class CoreMLLLM: @unchecked Sendable {
     private var visionModel: MLModel?
     private var visionModelURL: URL?
     private var visionConfig: MLModelConfiguration?
+    /// True when visionModelURL points to a `vision.ane.*` sibling — the
+    /// square 48×48 fixed-grid encoder built by
+    /// `convert_gemma4_multimodal.py --vision-ane`. Changes the
+    /// preprocessing path (forced 768×768 resize, fp16 pixel values,
+    /// no padding) and the ANE-friendly compute unit selection.
+    private var visionUsesANEBuild: Bool = false
 
     // Optional video-grade vision encoder (max_soft_tokens=70 → 64
     // tokens/frame). When present, replaces the Phase 1 Swift 2×2 pool.
@@ -407,17 +413,38 @@ public final class CoreMLLLM: @unchecked Sendable {
             }
         }
 
-        // Vision model (optional, lazy loaded on first image)
+        // Vision model (optional, lazy loaded on first image).
+        //
+        // Prefer the ANE-targeted build (`vision.ane.*`, fixed 48×48
+        // square grid, 256 soft tokens) when present — it runs on ANE
+        // at ~8× GPU throughput for this encoder on Mac, and cuts TTFT
+        // on iPhone. The `.v2.` suffix wins over the unsuffixed name
+        // so a newer converted copy can be deployed alongside a stale
+        // on-device file without reinstalling (`devicectl copy to`
+        // refuses to overwrite). Fall back to the legacy variable-grid
+        // GPU build when no ANE build is present.
+        let visionANEv2Compiled = directory.appendingPathComponent("vision.ane.v2.mlmodelc")
+        let visionANECompiled = directory.appendingPathComponent("vision.ane.mlmodelc")
+        let visionANEPkg = directory.appendingPathComponent("vision.ane.mlpackage")
         let visionCompiled = directory.appendingPathComponent("vision.mlmodelc")
         let visionPkg = directory.appendingPathComponent("vision.mlpackage")
-        if FileManager.default.fileExists(atPath: visionCompiled.path) {
+        if FileManager.default.fileExists(atPath: visionANEv2Compiled.path) {
+            llm.visionModelURL = visionANEv2Compiled
+            llm.visionUsesANEBuild = true
+        } else if FileManager.default.fileExists(atPath: visionANECompiled.path) {
+            llm.visionModelURL = visionANECompiled
+            llm.visionUsesANEBuild = true
+        } else if FileManager.default.fileExists(atPath: visionANEPkg.path) {
+            llm.visionModelURL = visionANEPkg
+            llm.visionUsesANEBuild = true
+        } else if FileManager.default.fileExists(atPath: visionCompiled.path) {
             llm.visionModelURL = visionCompiled
         } else if FileManager.default.fileExists(atPath: visionPkg.path) {
             llm.visionModelURL = visionPkg
         }
         if llm.visionModelURL != nil {
             let cfg = MLModelConfiguration()
-            cfg.computeUnits = .cpuAndGPU
+            cfg.computeUnits = llm.visionUsesANEBuild ? .cpuAndNeuralEngine : .cpuAndGPU
             llm.visionConfig = cfg
         }
 
@@ -486,6 +513,67 @@ public final class CoreMLLLM: @unchecked Sendable {
                 try engine.finalPrewarm()
             } catch {
                 print("[Load] final prewarm skipped: \(error)")
+            }
+        }
+
+        // Warm the vision encoder in the background — first-call ANE
+        // compile / weight paging costs ~550 ms on iPhone 17 Pro for
+        // the still-image ANE build, which lands right on TTFT for the
+        // first image prompt. A dry forward with zero pixel values and
+        // a full 48×48 grid compiles the ANE graph and pages the
+        // 326 MB of weights in so the first real image call drops to
+        // steady-state (~200-300 ms).
+        if let url = llm.visionModelURL,
+           let cfg = llm.visionConfig,
+           llm.visionUsesANEBuild {
+            // Load the vision MLModel synchronously *and* attach it
+            // to `llm.visionModel` before the first user prompt. Then
+            // kick off a dry forward on a utility queue so the ANE
+            // compile + weight paging happen in the background. The
+            // key property we need vs the previous DispatchQueue
+            // approach: the FIRST user predict must hit the same
+            // MLModel instance the prewarm warmed, otherwise we eat
+            // the 500 ms compile cost again. Attaching synchronously
+            // on the caller's thread guarantees that.
+            do {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                let m = try MLModel(contentsOf: url, configuration: cfg)
+                llm.visionModel = m
+                let dt = CFAbsoluteTimeGetCurrent() - t0
+                print("[Load] vision ANE load done in \(String(format: "%.1f", dt))s")
+                DispatchQueue.global(qos: .utility).async {
+                    do {
+                        let tw = CFAbsoluteTimeGetCurrent()
+                        let pd = 16 * 16 * 3
+                        let total = 48 * 48
+                        let pv = try MLMultiArray(
+                            shape: [1, NSNumber(value: total), NSNumber(value: pd)],
+                            dataType: .float16)
+                        let pid = try MLMultiArray(
+                            shape: [1, NSNumber(value: total), 2], dataType: .int32)
+                        let pidp = pid.dataPointer.bindMemory(
+                            to: Int32.self, capacity: total * 2)
+                        var k = 0
+                        for py in 0..<48 {
+                            for px in 0..<48 {
+                                pidp[k * 2] = Int32(px)
+                                pidp[k * 2 + 1] = Int32(py)
+                                k += 1
+                            }
+                        }
+                        let input = try MLDictionaryFeatureProvider(dictionary: [
+                            "pixel_values": MLFeatureValue(multiArray: pv),
+                            "pixel_position_ids": MLFeatureValue(multiArray: pid),
+                        ])
+                        _ = try m.prediction(from: input)
+                        let dw = CFAbsoluteTimeGetCurrent() - tw
+                        print("[Load] vision ANE prewarm predict in \(String(format: "%.1f", dw))s")
+                    } catch {
+                        print("[Load] vision ANE prewarm predict skipped: \(error)")
+                    }
+                }
+            } catch {
+                print("[Load] vision ANE load skipped: \(error)")
             }
         }
 
@@ -609,7 +697,11 @@ public final class CoreMLLLM: @unchecked Sendable {
         // Process image (or reuse cached)
         var imageFeatures: MLMultiArray? = cachedImageFeatures
         if let image {
+            let tVision = CFAbsoluteTimeGetCurrent()
             imageFeatures = try processImage(image)
+            let dtVision = (CFAbsoluteTimeGetCurrent() - tVision) * 1000
+            let which = visionUsesANEBuild ? "ANE" : "GPU"
+            print("[Vision] encode (\(which)): \(String(format: "%.1f", dtVision)) ms")
             cachedImageFeatures = imageFeatures
         }
 
@@ -799,21 +891,25 @@ public final class CoreMLLLM: @unchecked Sendable {
                     let engine = mutableSelf.chunkedEngine
 
                     if let engine {
-                        // For long prompts (>= 64 tokens), block on the
-                        // background prefill load rather than falling back to
-                        // per-token decode. Break-even on E4B is ~17 tokens
-                        // (1.2 s prefill fixed cost vs 70 ms/tok decode −
-                        // 12 ms/tok prefill); 64 keeps short prompts fully
-                        // responsive while saving multi-second TTFT on any
-                        // long prompt issued during the ~160 s load window.
-                        if tokens.count >= 64,
-                           !engine.hasPrefill,
-                           let loadTask = engine.prefillLoadTask {
-                            print("[Load] prefillLoadTask awaited for long prompt (\(tokens.count) tok)")
-                            try await loadTask.value
+                        // Prefill chunks load in the background (see
+                        // ChunkedEngine `deferred prefill load`). If a long
+                        // prompt lands while they're still loading, we used
+                        // to block on the full load — but in practice that
+                        // could take 60+ s during app warmup, dwarfing the
+                        // ~8 s decode-loop alternative (272 tok × 30 ms).
+                        // Decide at request time:
+                        //   * prefill ready → use batched prefill
+                        //   * not ready     → run decode-loop prefill now,
+                        //                     don't wait
+                        // For short prompts (< 64 tok) the decode loop is
+                        // already comparable to batched prefill and we
+                        // never waited.
+                        let prefillReady = engine.hasPrefill
+                        if !prefillReady, tokens.count >= 64 {
+                            print("[Load] prefill chunks not ready — using decode-loop prefill for \(tokens.count) tok (avoids multi-s await)")
                         }
-                        let prefillLen = min(tokens.count, engine.prefillN)
-                        let useHybrid = engine.hasPrefill && prefillLen > 0
+                        let prefillLen = prefillReady ? min(tokens.count, engine.prefillN) : 0
+                        let useHybrid = prefillReady && prefillLen > 0
 
                         if useHybrid {
                             try autoreleasepool {
@@ -1268,6 +1364,9 @@ public final class CoreMLLLM: @unchecked Sendable {
             visionModel = try MLModel(contentsOf: url, configuration: cfg)
         }
         guard let vm = visionModel else { throw CoreMLLLMError.visionNotAvailable }
+        if visionUsesANEBuild {
+            return try ImageProcessor.processANE(image, with: vm)
+        }
         return try ImageProcessor.process(image, with: vm)
     }
 

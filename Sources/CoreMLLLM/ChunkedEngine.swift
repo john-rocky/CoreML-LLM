@@ -874,10 +874,16 @@ final class ChunkedEngine {
                     print("[Load/bg] \(name) done in \(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - t0))s")
                     return m
                 }
-                let bp1 = try bgLoad("prefill_chunk1")
-                let bp2 = try bgLoad("prefill_chunk2")
-                let bp3 = try bgLoad("prefill_chunk3")
-                let bp4 = try bgLoad("prefill_chunk4")
+                // Load the four prefill chunks concurrently so the
+                // window is bound by the slowest chunk, not their sum.
+                // On iPhone 17 Pro sequential was ~75 s (19+10+27+18);
+                // parallel is ~30 s. Use a throwing task group so any
+                // load error propagates out of the detached task.
+                async let ap1: MLModel = bgLoad("prefill_chunk1")
+                async let ap2: MLModel = bgLoad("prefill_chunk2")
+                async let ap3: MLModel = bgLoad("prefill_chunk3")
+                async let ap4: MLModel = bgLoad("prefill_chunk4")
+                let (bp1, bp2, bp3, bp4) = try await (ap1, ap2, ap3, ap4)
                 guard let engine else { return }
                 engine.attachPrefill(bp1, bp2, bp3, bp4)
                 let bgDt = CFAbsoluteTimeGetCurrent() - bgT0

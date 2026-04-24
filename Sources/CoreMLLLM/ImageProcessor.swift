@@ -164,6 +164,82 @@ public enum ImageProcessor {
         return features
     }
 
+    /// Process an image through the ANE-targeted still-image vision encoder.
+    ///
+    /// Matches `conversion/models/gemma4_vision.py::convert_still_image_vision_ane_to_coreml`:
+    /// the model expects a fixed 48×48 square grid (2304 patches, 256
+    /// soft tokens after k=3 avg pool) and fp16 pixel values. We force-
+    /// resize to 768×768, so aspect ratio is squashed — acceptable for
+    /// natural photos, less so for extreme ratios. For now the legacy
+    /// GPU encoder is used when aspect ratio matters; this path is
+    /// opted into automatically when `vision.ane.*` is present on disk.
+    ///
+    /// Returns image features MLMultiArray (1, 256, hidden_size) fp16.
+    public static func processANE(_ image: CGImage, with visionModel: MLModel) throws -> MLMultiArray {
+        let ps = 16
+        let Hp = 48
+        let Wp = 48
+        let total = Hp * Wp   // 2304
+        let pd = ps * ps * 3  // 768
+
+        // 1. Rasterize into a 768×768 RGBA canvas.
+        let side = Hp * ps    // 768
+        var pixels = [UInt8](repeating: 0, count: side * side * 4)
+        let bitmap = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        let ctx = CGContext(data: &pixels, width: side, height: side,
+                            bitsPerComponent: 8, bytesPerRow: side * 4,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: bitmap.rawValue)!
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
+
+        // 2. Build pixel_values (1, 2304, 768) fp16 and pixel_position_ids (1, 2304, 2) int32.
+        //    No padding — every slot holds a valid patch, so the HF pooler's
+        //    masked_fill + one_hot fold into compile-time constants.
+        let pv = try MLMultiArray(shape: [1, NSNumber(value: total), NSNumber(value: pd)],
+                                  dataType: .float16)
+        let pid = try MLMultiArray(shape: [1, NSNumber(value: total), 2], dataType: .int32)
+        let pvp = pv.dataPointer.bindMemory(to: UInt16.self, capacity: total * pd)
+        let pidp = pid.dataPointer.bindMemory(to: Int32.self, capacity: total * 2)
+
+        let tPrep = CFAbsoluteTimeGetCurrent()
+        var pi = 0
+        for py in 0..<Hp {
+            for px in 0..<Wp {
+                var o = pi * pd
+                for dy in 0..<ps {
+                    for dx in 0..<ps {
+                        let srcIdx = ((py * ps + dy) * side + (px * ps + dx)) * 4
+                        let r = Float16(Float(pixels[srcIdx])     / 255)
+                        let g = Float16(Float(pixels[srcIdx + 1]) / 255)
+                        let b = Float16(Float(pixels[srcIdx + 2]) / 255)
+                        pvp[o]     = r.bitPattern
+                        pvp[o + 1] = g.bitPattern
+                        pvp[o + 2] = b.bitPattern
+                        o += 3
+                    }
+                }
+                pidp[pi * 2]     = Int32(px)
+                pidp[pi * 2 + 1] = Int32(py)
+                pi += 1
+            }
+        }
+        let dtPrep = (CFAbsoluteTimeGetCurrent() - tPrep) * 1000
+
+        let tPredict = CFAbsoluteTimeGetCurrent()
+        let input = try MLDictionaryFeatureProvider(dictionary: [
+            "pixel_values": MLFeatureValue(multiArray: pv),
+            "pixel_position_ids": MLFeatureValue(multiArray: pid),
+        ])
+        guard let features = try visionModel.prediction(from: input)
+                .featureValue(for: "image_features")?.multiArrayValue else {
+            throw CoreMLLLMError.predictionFailed
+        }
+        let dtPredict = (CFAbsoluteTimeGetCurrent() - tPredict) * 1000
+        print("[Vision/ANE] prep=\(String(format: "%.1f", dtPrep))ms predict=\(String(format: "%.1f", dtPredict))ms")
+        return features
+    }
+
     /// Extract a single image feature token from the vision output.
     public static func sliceFeature(_ features: MLMultiArray, at index: Int,
                                      hiddenSize: Int) -> MLMultiArray {
