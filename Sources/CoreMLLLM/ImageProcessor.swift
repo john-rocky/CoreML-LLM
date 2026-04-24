@@ -202,6 +202,7 @@ public enum ImageProcessor {
         let pvp = pv.dataPointer.bindMemory(to: UInt16.self, capacity: total * pd)
         let pidp = pid.dataPointer.bindMemory(to: Int32.self, capacity: total * 2)
 
+        let tPrep = CFAbsoluteTimeGetCurrent()
         var pi = 0
         for py in 0..<Hp {
             for px in 0..<Wp {
@@ -223,7 +224,9 @@ public enum ImageProcessor {
                 pi += 1
             }
         }
+        let dtPrep = (CFAbsoluteTimeGetCurrent() - tPrep) * 1000
 
+        let tPredict = CFAbsoluteTimeGetCurrent()
         let input = try MLDictionaryFeatureProvider(dictionary: [
             "pixel_values": MLFeatureValue(multiArray: pv),
             "pixel_position_ids": MLFeatureValue(multiArray: pid),
@@ -232,6 +235,8 @@ public enum ImageProcessor {
                 .featureValue(for: "image_features")?.multiArrayValue else {
             throw CoreMLLLMError.predictionFailed
         }
+        let dtPredict = (CFAbsoluteTimeGetCurrent() - tPredict) * 1000
+        print("[Vision/ANE] prep=\(String(format: "%.1f", dtPrep))ms predict=\(String(format: "%.1f", dtPredict))ms")
         return features
     }
 
