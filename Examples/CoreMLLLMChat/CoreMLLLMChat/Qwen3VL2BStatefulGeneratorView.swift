@@ -30,12 +30,28 @@ struct Qwen3VL2BStatefulGeneratorView: View {
                         }
                     }
                     .disabled(gen.running)
+                    Button {
+                        Task { await runAudit() }
+                    } label: {
+                        Text("Audit ANE placement (MLComputePlan)")
+                    }
+                    .disabled(gen.running)
                     Text(gen.status).font(.caption).foregroundStyle(.secondary)
+                }
+
+                if !gen.auditText.isEmpty {
+                    Section("Runtime device placement") {
+                        Text(gen.auditText)
+                            .font(.system(.caption2, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
                 }
 
                 if !tokensPerSec.isEmpty {
                     Section("Throughput") {
-                        Text(tokensPerSec).font(.callout)
+                        Text(tokensPerSec)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
                     }
                 }
                 if !phys.isEmpty {
@@ -57,6 +73,16 @@ struct Qwen3VL2BStatefulGeneratorView: View {
                 }
             }
             .navigationTitle("VL 2B (stateful)")
+        }
+    }
+
+    private func runAudit() async {
+        gen.running = true
+        defer { gen.running = false }
+        if #available(iOS 17.0, *) {
+            await gen.audit()
+        } else {
+            gen.auditText = "MLComputePlan requires iOS 17+"
         }
     }
 

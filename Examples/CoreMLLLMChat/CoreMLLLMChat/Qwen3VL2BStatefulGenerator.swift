@@ -50,6 +50,7 @@ final class Qwen3VL2BStatefulGenerator {
     var running = false
     var outputText = ""
     var stats = ""
+    var auditText = ""
 
     private var cfg = Config.defaultFourChunk
 
@@ -235,6 +236,86 @@ final class Qwen3VL2BStatefulGenerator {
         return defaultFolder.flatMap { resolve($0.appendingPathComponent("Models/qwen3-vl-2b-stateful")) }
     }
 
+    // MARK: - Compute plan audit
+
+    /// Count ops by preferred compute device for each loaded chunk.
+    /// Surfaces the 42 ops that INT8 palettize pushed off ANE — if any
+    /// chunk shows <95% ANE at runtime-preferred we know dispatch is
+    /// forking to CPU/GPU for those ops, which stalls the pipeline.
+    @available(iOS 17.0, *)
+    func audit() async {
+        guard let r = resolveURLs() else {
+            auditText = "FAIL — chunks not resolved"
+            return
+        }
+        auditText = "Auditing..."
+        let mcfg = MLModelConfiguration(); mcfg.computeUnits = cfg.computeUnits
+
+        var lines: [String] = []
+        var urls: [(name: String, url: URL)] = []
+        for (i, u) in r.body.enumerated() { urls.append(("chunk_\(i)", u)) }
+        urls.append(("chunk_head", r.head))
+
+        for (name, url) in urls {
+            do {
+                let plan = try await MLComputePlan.load(contentsOf: url, configuration: mcfg)
+                guard case .program(let program) = plan.modelStructure else {
+                    lines.append("\(name): not a program")
+                    continue
+                }
+                var total = 0, ane = 0, gpu = 0, cpu = 0, other = 0
+                for (_, fn) in program.functions {
+                    Self.walkOps(fn.block, plan: plan,
+                                 total: &total, ane: &ane, gpu: &gpu,
+                                 cpu: &cpu, other: &other)
+                }
+                let d = max(1, total)
+                lines.append(String(format:
+                    "%@: total=%d ANE=%d(%.0f%%) GPU=%d CPU=%d other=%d",
+                    name, total, ane, 100.0*Double(ane)/Double(d),
+                    gpu, cpu, other))
+            } catch {
+                lines.append("\(name): audit failed \(error.localizedDescription)")
+            }
+        }
+        auditText = lines.joined(separator: "\n")
+    }
+
+    @available(iOS 17.0, *)
+    private static func walkOps(_ block: MLModelStructure.Program.Block,
+                                 plan: MLComputePlan,
+                                 total: inout Int, ane: inout Int,
+                                 gpu: inout Int, cpu: inout Int,
+                                 other: inout Int) {
+        let constOps: Set<String> = [
+            "const", "constexpr_lut_to_dense", "constexpr_affine_dequantize",
+            "constexpr_blockwise_shift_scale", "constexpr_sparse_to_dense",
+            "constexpr_cast",
+        ]
+        for op in block.operations {
+            if constOps.contains(op.operatorName) {
+                for inner in op.blocks {
+                    walkOps(inner, plan: plan,
+                            total: &total, ane: &ane, gpu: &gpu,
+                            cpu: &cpu, other: &other)
+                }
+                continue
+            }
+            total += 1
+            switch plan.deviceUsage(for: op)?.preferred {
+            case .cpu:          cpu += 1
+            case .gpu:          gpu += 1
+            case .neuralEngine: ane += 1
+            default:            other += 1
+            }
+            for inner in op.blocks {
+                walkOps(inner, plan: plan,
+                        total: &total, ane: &ane, gpu: &gpu,
+                        cpu: &cpu, other: &other)
+            }
+        }
+    }
+
     // MARK: - Load
 
     func load() throws {
@@ -284,12 +365,25 @@ final class Qwen3VL2BStatefulGenerator {
         }
     }
 
+    // Per-chunk cumulative timings during a decode run (milliseconds).
+    // Reset at the start of each generate(), populated inside stepPredict
+    // when `collectTimings == true` (decode only, not prefill).
+    private var perChunkMs: [Double] = []
+    private var headMs: Double = 0
+    private var embedMs: Double = 0
+    private var ropeFillMs: Double = 0
+    private var timedSteps: Int = 0
+
     private func stepPredict(token: Int32, position: Int,
-                              states: [MLState]) async throws -> Int32 {
+                              states: [MLState],
+                              collectTimings: Bool) async throws -> Int32 {
+        let t0 = CFAbsoluteTimeGetCurrent()
         embedLookup(token: token)
+        let tEmbed = CFAbsoluteTimeGetCurrent()
         fillCosSin(forPosition: position)
         fillCausalMask(forPosition: position)
         setCurrentPos(position)
+        let tRope = CFAbsoluteTimeGetCurrent()
 
         var hiddenFV = fvHidden!
         let opts = MLPredictionOptions()
@@ -297,8 +391,12 @@ final class Qwen3VL2BStatefulGenerator {
             let prov = StatefulBodyProvider(hiddenIn: hiddenFV,
                                              cos: fvCos, sin: fvSin,
                                              mask: fvMask, pos: fvPos)
+            let t = CFAbsoluteTimeGetCurrent()
             let out = try await chunk.prediction(
                 from: prov, using: states[ci], options: opts)
+            if collectTimings {
+                perChunkMs[ci] += (CFAbsoluteTimeGetCurrent() - t) * 1000
+            }
             guard let fv = out.featureValue(for: "hidden") else {
                 throw NSError(domain: "Qwen3VL2BStateful", code: 50,
                     userInfo: [NSLocalizedDescriptionKey:
@@ -306,11 +404,17 @@ final class Qwen3VL2BStatefulGenerator {
             }
             hiddenFV = fv
         }
-        // Head: one-input feature provider
         let head = headChunk!
         let headProv = try MLDictionaryFeatureProvider(
             dictionary: ["hidden_in": hiddenFV])
+        let tHead = CFAbsoluteTimeGetCurrent()
         let out = try await head.prediction(from: headProv, options: opts)
+        if collectTimings {
+            headMs += (CFAbsoluteTimeGetCurrent() - tHead) * 1000
+            embedMs += (tEmbed - t0) * 1000
+            ropeFillMs += (tRope - tEmbed) * 1000
+            timedSteps += 1
+        }
         guard let fv = out.featureValue(for: "next_token"),
               let arr = fv.multiArrayValue
         else {
@@ -334,9 +438,13 @@ final class Qwen3VL2BStatefulGenerator {
         let t0 = CFAbsoluteTimeGetCurrent()
         var prefillEnd: CFAbsoluteTime = t0
 
+        perChunkMs = Array(repeating: 0, count: bodyChunks.count)
+        headMs = 0; embedMs = 0; ropeFillMs = 0; timedSteps = 0
+
         // Recurrent prefill (T=1 per step — batched prefill via multifunction later).
         for (i, tok) in inputIds.enumerated() {
-            _ = try await stepPredict(token: tok, position: position, states: states)
+            _ = try await stepPredict(token: tok, position: position,
+                                       states: states, collectTimings: false)
             lastToken = tok
             position += 1
             if i == inputIds.count - 1 {
@@ -344,15 +452,12 @@ final class Qwen3VL2BStatefulGenerator {
             }
         }
 
-        // Decode: the last prefill step already produced next_token. To
-        // keep stepPredict uniform we redo the last-prefill-step here so
-        // we grab the token id into decoded[]. Small waste on a long
-        // prompt; fixed later when batched prefill lands.
+        // Decode — collect per-chunk timing so we can see where tok/s goes.
         let decodeStart = CFAbsoluteTimeGetCurrent()
         var decoded: [Int32] = []
         for _ in 0..<maxNewTokens {
             let next = try await stepPredict(token: lastToken, position: position,
-                                             states: states)
+                                             states: states, collectTimings: true)
             decoded.append(next)
             lastToken = next
             position += 1
@@ -363,11 +468,20 @@ final class Qwen3VL2BStatefulGenerator {
         let prefillMs = (prefillEnd - t0) * 1000
         let decodeMs = (t1 - decodeStart) * 1000
         let decodeTokPerS = Double(decoded.count) / ((t1 - decodeStart))
+        let n = max(timedSteps, 1)
+        var breakdown = ""
+        for (i, ms) in perChunkMs.enumerated() {
+            breakdown += String(format: "  chunk_%d: %.1f ms/step\n", i, ms / Double(n))
+        }
+        breakdown += String(format: "  head:    %.1f ms/step\n", headMs / Double(n))
+        breakdown += String(format: "  embed+rope fill: %.2f ms/step",
+                             (embedMs + ropeFillMs) / Double(n))
         stats = String(format:
-            "prefill %d tok in %.1fms (%.1f tok/s) | decode %d tok in %.1fms (%.1f tok/s)",
+            "prefill %d tok in %.1fms (%.1f tok/s) | decode %d tok in %.1fms (%.1f tok/s)\n\n"
+            + "per-step breakdown (decode):\n%@",
             inputIds.count, prefillMs,
             Double(inputIds.count) / max(prefillEnd - t0, 1e-3),
-            decoded.count, decodeMs, decodeTokPerS)
+            decoded.count, decodeMs, decodeTokPerS, breakdown)
         return decoded
     }
 }
