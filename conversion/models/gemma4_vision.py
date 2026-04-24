@@ -1,15 +1,19 @@
 """Gemma 4 Vision Encoder conversion for CoreML.
 
-Contains two paths:
+Contains three paths:
 
 1. `save_vision_weights` — dumps the still-image encoder weights as an
-   npz. This is the legacy fallback used while the still-image encoder
-   is shipped as a prebuilt `vision.mlpackage` from HF.
+   npz. Legacy fallback.
 
 2. `convert_video_vision_to_coreml` — traces the vision tower at
    video-grade resolution (max_soft_tokens=70 → 64 real tokens) and
    converts it to `vision_video.mlpackage`. Output shape is
-   `(1, 64, hidden_size)` and replaces the Phase 1 Swift 2×2 pool.
+   `(1, 64, hidden_size)`. Runs on GPU today.
+
+3. `convert_still_image_vision_ane_to_coreml` — still-image encoder at
+   square 48×48 fixed grid (=2304 patches, 256 soft tokens), static
+   attention mask, static pooling, input pre-patchified in Swift.
+   Targets ANE; meant to replace the prebuilt `vision.mlpackage`.
 
 The video path monkey-patches two things so coremltools 9.0 can handle
 the vision tower:
@@ -292,6 +296,179 @@ def convert_video_vision_to_coreml(
         if cos < 0.98:
             raise RuntimeError(
                 f"video vision parity check failed: cosine={cos:.4f} < 0.98"
+            )
+
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Still-image ANE path — square fixed 48×48 grid, static mask, static pool
+# ---------------------------------------------------------------------------
+
+# 48×48 patches. patch_size=16 → 768×768 input canvas.
+# k=3 average pooling over the 48×48 grid → 16×16 = 256 soft tokens.
+# No padding (no -1 positions), so the pooler's one_hot / masked_fill
+# degenerate to constants that fold at convert time.
+STILL_GRID_SIDE = 48
+STILL_NUM_PATCHES = STILL_GRID_SIDE * STILL_GRID_SIDE  # 2304
+STILL_PATCH_DIM = 16 * 16 * 3                           # 768
+STILL_POOL_K = 3
+STILL_OUTPUT_TOKENS = (STILL_GRID_SIDE // STILL_POOL_K) ** 2  # 256
+
+
+class _StillImageVisionWrapper(nn.Module):
+    """(1, 2304, 768) fp16 + (1, 2304, 2) int32 → (1, 256, hidden) fp16.
+
+    Square-fixed grid, no padding. Feeding always-valid positions (no
+    -1 entries) lets the pooler's `masked_fill` and one_hot paths
+    collapse to constants that fold into the compiled graph.
+    """
+
+    def __init__(self, hf_model):
+        super().__init__()
+        self.model = hf_model.model
+
+    def forward(self, pixel_values, pixel_position_ids):
+        out = self.model.get_image_features(
+            pixel_values=pixel_values.to(torch.float16),
+            image_position_ids=pixel_position_ids.long(),
+            return_dict=True,
+        )
+        # (output_tokens, hidden) → (1, output_tokens, hidden)
+        return out.pooler_output.unsqueeze(0)
+
+
+def _synthetic_still_inputs():
+    """Zero frame + full 48×48 patch grid (2304 valid, 0 padding)."""
+    pv = torch.zeros(1, STILL_NUM_PATCHES, STILL_PATCH_DIM, dtype=torch.float32)
+    pid = torch.zeros(1, STILL_NUM_PATCHES, 2, dtype=torch.int32)
+    k = 0
+    for py in range(STILL_GRID_SIDE):
+        for px in range(STILL_GRID_SIDE):
+            pid[0, k, 0] = px
+            pid[0, k, 1] = py
+            k += 1
+    return pv, pid
+
+
+def _audit_ane_placement(mlpackage_path: str) -> float:
+    """Return ANE % of compute ops for a saved mlpackage. Mac-only."""
+    from collections import Counter
+    try:
+        reloaded = ct.models.MLModel(
+            mlpackage_path, compute_units=ct.ComputeUnit.CPU_AND_NE,
+        )
+        compiled = reloaded.get_compiled_model_path()
+        plan = ct.models.compute_plan.MLComputePlan.load_from_path(
+            path=str(compiled), compute_units=ct.ComputeUnit.CPU_AND_NE,
+        )
+    except Exception as e:
+        print(f"    ANE audit skipped: {e}")
+        return -1.0
+    dev = Counter()
+    for fn in plan.model_structure.program.functions.values():
+        for op in fn.block.operations:
+            a = plan.get_compute_device_usage_for_mlprogram_operation(op)
+            d = ("const" if (a is None and op.operator_name == "const")
+                 else (a.preferred_compute_device.__class__.__name__ if a else "unknown"))
+            dev[d] += 1
+    total = sum(dev.values())
+    compute = total - dev.get("const", 0)
+    ane = dev.get("MLNeuralEngineComputeDevice", 0)
+    cpu = dev.get("MLCPUComputeDevice", 0)
+    gpu = dev.get("MLGPUComputeDevice", 0)
+    pct = 100 * ane / compute if compute else 0.0
+    print(f"    ANE placement: {ane}/{compute} ({pct:.1f}%) — CPU={cpu} GPU={gpu}")
+    return pct
+
+
+def convert_still_image_vision_ane_to_coreml(
+    hf_model,
+    output_dir: str,
+    *,
+    filename: str = "vision.ane.mlpackage",
+    run_parity_check: bool = True,
+) -> str:
+    """Trace + convert the still-image vision encoder to an ANE-targeted CoreML.
+
+    Square 48×48 fixed grid → 256 soft tokens. Swift-side preprocess
+    must resize the input to 768×768 and patchify to (2304, 768).
+
+    Returns the absolute path to the produced mlpackage.
+    """
+    _patch_coremltools_for_video_convert()
+    _patch_vision_encoder_forward(hf_model)
+
+    wrapper = _StillImageVisionWrapper(hf_model).eval()
+    pv, pid = _synthetic_still_inputs()
+
+    print(f"  Still-image grid: {STILL_GRID_SIDE}×{STILL_GRID_SIDE} = "
+          f"{STILL_NUM_PATCHES} patches → pool k={STILL_POOL_K} → "
+          f"{STILL_OUTPUT_TOKENS} soft tokens")
+
+    print("  Running reference forward (fp32 → fp16 inside wrapper)...")
+    with torch.no_grad():
+        ref = wrapper(pv, pid)
+    print(f"    ref shape: {tuple(ref.shape)}")
+
+    print("  Tracing vision tower (patched static mask)...")
+    with torch.no_grad():
+        traced = torch.jit.trace(
+            wrapper, (pv, pid), check_trace=False, strict=False,
+        )
+
+    print("  Converting to CoreML (target ANE)...")
+    mlmodel = ct.convert(
+        traced,
+        inputs=[
+            ct.TensorType(name="pixel_values",
+                          shape=(1, STILL_NUM_PATCHES, STILL_PATCH_DIM),
+                          dtype=np.float16),
+            ct.TensorType(name="pixel_position_ids",
+                          shape=(1, STILL_NUM_PATCHES, 2),
+                          dtype=np.int32),
+        ],
+        outputs=[ct.TensorType(name="image_features", dtype=np.float16)],
+        minimum_deployment_target=ct.target.iOS18,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        compute_precision=ct.precision.FLOAT16,
+    )
+
+    out_path = os.path.join(output_dir, filename)
+    if os.path.exists(out_path):
+        shutil.rmtree(out_path)
+    mlmodel.save(out_path)
+    size_mb = sum(
+        os.path.getsize(os.path.join(dp, f))
+        for dp, _, fns in os.walk(out_path) for f in fns
+    ) / 1024 / 1024
+    print(f"  Saved {out_path} ({size_mb:.1f} MB)")
+
+    ane_pct = _audit_ane_placement(out_path)
+    if 0 <= ane_pct < 80:
+        print(f"  WARNING: ANE placement {ane_pct:.1f}% < 80% — iterate "
+              f"before deploying (likely ops to hoist: pooler one_hot, "
+              f"masked_fill, rotary_emb cos/sin from pixel_position_ids).")
+
+    if run_parity_check:
+        print("  Parity check vs HF forward...")
+        # Use CPU_AND_GPU for parity reference — avoids ANE fp16 quant
+        # noise polluting the numerical check; we'll measure ANE drift
+        # separately on-device.
+        cm = ct.models.MLModel(out_path, compute_units=ct.ComputeUnit.CPU_AND_GPU)
+        res = cm.predict({
+            "pixel_values": pv.numpy().astype(np.float16),
+            "pixel_position_ids": pid.numpy().astype(np.int32),
+        })
+        pred = res["image_features"].astype(np.float32)
+        ref_np = ref.cpu().to(torch.float32).numpy()
+        cos = float((ref_np * pred).sum() /
+                    (np.linalg.norm(ref_np) * np.linalg.norm(pred) + 1e-9))
+        max_abs = float(np.abs(ref_np - pred).max())
+        print(f"    cosine={cos:.4f}  max_abs_diff={max_abs:.4f}")
+        if cos < 0.98:
+            raise RuntimeError(
+                f"still-image vision parity check failed: cosine={cos:.4f} < 0.98"
             )
 
     return out_path

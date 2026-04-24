@@ -29,6 +29,7 @@ from transformers import Gemma4ForConditionalGeneration
 from models.gemma4 import Gemma4Model
 from models.gemma4_decoder import Gemma4DecoderWrapper
 from models.gemma4_vision import (
+    convert_still_image_vision_ane_to_coreml,
     convert_video_vision_to_coreml,
     save_vision_weights,
 )
@@ -46,6 +47,14 @@ def main():
         action="store_true",
         help="Also convert the video-grade vision tower "
              "(max_soft_tokens=70 → 64 tokens/frame) to vision_video.mlpackage.",
+    )
+    parser.add_argument(
+        "--vision-ane",
+        action="store_true",
+        help="Also convert a still-image vision encoder targeting ANE "
+             "(square 48×48 fixed grid → 256 soft tokens) to "
+             "vision.ane.mlpackage. Use instead of the prebuilt GPU-only "
+             "vision.mlpackage once parity + placement are validated.",
     )
     args = parser.parse_args()
 
@@ -85,6 +94,12 @@ def main():
         print("\nConverting video-grade vision tower (max_soft_tokens=70)...")
         convert_video_vision_to_coreml(hf_model, args.output)
         video_vision_produced = True
+
+    vision_ane_produced = False
+    if args.vision_ane:
+        print("\nConverting still-image vision tower (ANE, 48×48 square)...")
+        convert_still_image_vision_ane_to_coreml(hf_model, args.output)
+        vision_ane_produced = True
 
     # Free the full model to save memory before decoder conversion
     del hf_model
@@ -232,6 +247,8 @@ def main():
             "embeddings": "embeddings/",
             **({"vision_video": "vision_video.mlpackage"}
                if video_vision_produced else {}),
+            **({"vision_ane": "vision.ane.mlpackage"}
+               if vision_ane_produced else {}),
         },
         "tokenizer_repo": "google/gemma-4-E2B-it",
         "embed_scale": float(hidden_size ** 0.5),
@@ -250,6 +267,8 @@ def main():
     print(f"  Vision:  {args.output}/vision.mlpackage")
     if video_vision_produced:
         print(f"  Video:   {args.output}/vision_video.mlpackage")
+    if vision_ane_produced:
+        print(f"  Vision (ANE): {args.output}/vision.ane.mlpackage")
     print(f"  Decoder: {args.output}/decoder.mlpackage")
     print(f"  Embeds:  {args.output}/embeddings/")
     print(f"  Config:  {args.output}/model_config.json")
