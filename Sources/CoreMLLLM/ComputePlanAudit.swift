@@ -134,14 +134,23 @@ enum ComputePlanAudit {
                                   totalOps: inout Int,
                                   fallbackOps: inout Int) {
         // Skip constant/weight-loading ops — they run once at load, not per-step
-        let constOps: Set<String> = [
+        let constOpSuffixes: Set<String> = [
             "const", "constexpr_lut_to_dense", "constexpr_affine_dequantize",
             "constexpr_blockwise_shift_scale", "constexpr_sparse_to_dense",
             "constexpr_cast",
         ]
+        func isConstOpName(_ name: String) -> Bool {
+            // operatorName arrives as either "const" or "ios18.const" (the
+            // MIL-version prefix is attached for ops defined in the iOSNN
+            // dialect). Strip any leading "iosNN." so both forms match.
+            if let dot = name.firstIndex(of: ".") {
+                return constOpSuffixes.contains(String(name[name.index(after: dot)...]))
+            }
+            return constOpSuffixes.contains(name)
+        }
 
         for op in block.operations {
-            let isConstOp = constOps.contains(op.operatorName)
+            let isConstOp = isConstOpName(op.operatorName)
             if !isConstOp { totalOps += 1 }
 
             let usage = plan.deviceUsage(for: op)
