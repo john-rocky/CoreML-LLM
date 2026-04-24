@@ -516,6 +516,51 @@ public final class CoreMLLLM: @unchecked Sendable {
             }
         }
 
+        // Warm the vision encoder in the background — first-call ANE
+        // compile / weight paging costs ~550 ms on iPhone 17 Pro for
+        // the still-image ANE build, which lands right on TTFT for the
+        // first image prompt. A dry forward with zero pixel values and
+        // a full 48×48 grid compiles the ANE graph and pages the
+        // 326 MB of weights in so the first real image call drops to
+        // steady-state (~200-300 ms).
+        if let url = llm.visionModelURL,
+           let cfg = llm.visionConfig,
+           llm.visionUsesANEBuild {
+            let llmRef = llm
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    let t0 = CFAbsoluteTimeGetCurrent()
+                    let m = try MLModel(contentsOf: url, configuration: cfg)
+                    let pd = 16 * 16 * 3
+                    let total = 48 * 48
+                    let pv = try MLMultiArray(
+                        shape: [1, NSNumber(value: total), NSNumber(value: pd)],
+                        dataType: .float16)
+                    let pid = try MLMultiArray(
+                        shape: [1, NSNumber(value: total), 2], dataType: .int32)
+                    let pidp = pid.dataPointer.bindMemory(to: Int32.self, capacity: total * 2)
+                    var k = 0
+                    for py in 0..<48 {
+                        for px in 0..<48 {
+                            pidp[k * 2] = Int32(px)
+                            pidp[k * 2 + 1] = Int32(py)
+                            k += 1
+                        }
+                    }
+                    let input = try MLDictionaryFeatureProvider(dictionary: [
+                        "pixel_values": MLFeatureValue(multiArray: pv),
+                        "pixel_position_ids": MLFeatureValue(multiArray: pid),
+                    ])
+                    _ = try m.prediction(from: input)
+                    let dt = CFAbsoluteTimeGetCurrent() - t0
+                    print("[Load] vision ANE prewarm done in \(String(format: "%.1f", dt))s")
+                    DispatchQueue.main.async { [weak llmRef] in llmRef?.visionModel = m }
+                } catch {
+                    print("[Load] vision ANE prewarm skipped: \(error)")
+                }
+            }
+        }
+
         // Also warm the EAGLE-3 draft + fusion mlpackages if loaded —
         // one dry forward through each so the first user burst doesn't
         // eat the ANE compile cost for these two graphs.
