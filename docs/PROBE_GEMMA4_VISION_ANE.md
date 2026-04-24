@@ -158,55 +158,67 @@ choice — delete `vision.ane.mlmodelc` to force-revert.
 - **Session #2** (image embedding cache): hash pixels, cache image
   features on disk, skip re-encode for follow-up turns.
 
-## iPhone A/B: ANE vs legacy GPU (2026-04-24)
+## iPhone A/B: ANE vs legacy GPU (2026-04-25)
 
-Mac showed 8× ANE win (473 ms ANE vs 3800 ms GPU). Steady-state on
-iPhone 17 Pro A19 is unverified — early single-run numbers put ANE
-at ~520 ms, which might lose to the GPU path. This A/B settles the
-question before the ANE build is promoted to the default bundle.
+Mac (Apple Silicon M-class ANE) showed 8× ANE win (473 ms ANE vs
+3800 ms GPU). iPhone 17 Pro A19 disagrees: **GPU wins 2.84×** on
+predict, 18× on load, and keeps aspect ratio. Decision: flip the
+loader default.
 
-### Switch
-
-`LLM_VISION_FORCE_GPU=1` in the scheme env forces the loader to skip
-every `vision.ane.*` sibling on disk and use the legacy
-`vision.mlmodelc`. Unset (or `=0`) keeps the ANE preference from
-PR #136. The select log prints the picked file and backend:
+### Measurements (iPhone 17 Pro A19, steady-state, both prewarmed)
 
 ```
-[Vision] selected vision.ane.mlmodelc → ANE
-[Vision] selected vision.mlmodelc → GPU (LLM_VISION_FORCE_GPU=1)
+ANE (vision.ane.v2.mlmodelc):
+  [Vision] selected vision.ane.v2.mlmodelc → ANE
+  [Load] vision ANE load done in 16.2s
+  [Load] vision ANE prewarm predict in 0.7s
+  [Vision/ANE] prep=59.2ms predict=584.0ms
+  [ComputePlan] vision[ANE]: 33 off-ANE op(s) out of 1970 total  (98.3% on ANE)
+
+GPU (vision.mlmodelc, forced):
+  [Vision] selected vision.mlmodelc → GPU (LLM_VISION_FORCE_GPU=1)
+  [Load] vision GPU load done in 0.9s
+  [Load] vision GPU prewarm predict in 32.5s
+  [Vision/GPU] prep=55.2ms predict=205.5ms grid=60x39
+  [ComputePlan] vision[GPU]: 4 off-GPU op(s) out of 1914 total   (99.8% on GPU)
 ```
 
-### Procedure
+Both backends have clean placement (only 1–2% off-device), so the
+gap is not a fallback — A19 ANE is simply slower than A19 GPU on
+this workload. GPU prewarm pays a ~30 s first-call compile, but
+that's hidden behind user typing time on the utility queue.
+
+### Decision: GPU default, ANE opt-in (flipped 2026-04-25)
+
+Loader priority reversed. `LLM_VISION_FORCE_ANE=1` now opts into the
+ANE build for future A19 firmware retests. The select log prints the
+picked file and backend:
+
+```
+[Vision] selected vision.mlmodelc → GPU
+[Vision] selected vision.ane.mlmodelc → ANE (LLM_VISION_FORCE_ANE=1)
+```
+
+### Procedure (for future retests)
 
 1. Build and install CoreMLLLMChat on iPhone 17 Pro. The
    `gemma4-e2b-fashion` bundle must have both `vision.mlmodelc` and
-   `vision.ane.mlmodelc` present (copy both with `devicectl` if the
-   device has only one).
-2. Launch, pick `gemma4-e2b`, wait for `[Load] vision ANE prewarm
-   predict in ...s` (or the GPU equivalent) in the Xcode console.
-3. Send the same image (sunflower works — previous session verified
-   ANE parity on it) with an identical prompt 5 times in a row, 30 s
-   cooldown between runs. Record `[Vision/ANE] predict=...` or
-   `[Vision/GPU] predict=...` from runs 3–5 and take the median.
-4. Toggle the scheme env var and repeat.
-5. Optional: set `COMPUTE_PLAN_AUDIT=1` once per backend to log
-   `[ComputePlan] vision[ANE]` / `vision[GPU]` op placement.
+   `vision.ane.mlmodelc` present (copy the missing one with
+   `devicectl copy to` if the device has only one).
+2. Launch, pick `gemma4-e2b`, wait for `[Load] vision ... prewarm
+   predict in ...s` in the Xcode console.
+3. Send the same image (sunflower — previous session verified ANE
+   parity on it) with an identical prompt 5 times, 30 s cooldown
+   between runs. Record `[Vision/...] predict=...` from runs 3–5
+   and take the median.
+4. Toggle `LLM_VISION_FORCE_ANE` in the scheme env, repeat.
+5. Optional: `COMPUTE_PLAN_AUDIT=1` logs op placement.
 
-### Decision rule
+### Why Mac ≠ iPhone on this
 
-| Result                              | Action                                                          |
-|-------------------------------------|-----------------------------------------------------------------|
-| ANE median ≤ GPU median − 50 ms     | Add `vision.ane.mlmodelc` to `ModelDownloader` manifest (ship). |
-| Within ±50 ms                       | Keep ANE as opt-in (current state), note result here.           |
-| GPU median < ANE median − 50 ms     | Flip loader priority: GPU first, ANE opt-in via env.            |
-
-Results (fill in after measurement):
-
-```
-ANE (vision.ane.mlmodelc): predict p50 = ___ ms, p95 = ___ ms
-GPU (vision.mlmodelc):     predict p50 = ___ ms, p95 = ___ ms
-ComputePlan ANE off-count: ___ / ___
-ComputePlan GPU off-count: ___ / ___
-Decision: ___
-```
+A17/M-class ANE handled the 48×48 grid under ~500 ms while the
+softmax-heavy attention pattern ran ~4 s on Metal. A19 ANE is
+estimated roughly the same ~500 ms budget, but A19 GPU (larger,
+newer) drops the same workload to ~200 ms — so the per-device
+winner flips. Vision encoders are a large-tile GEMM-heavy workload,
+and iPhone GPU architecture has been scaled for exactly that.
