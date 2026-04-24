@@ -30,10 +30,11 @@ new upstream result or API change, (b) link the reproduction harness, and
 |---|---|---|---|
 | MTP Path A (TFLite drafter extraction) | 2026-04-14 | Extraction failed; needs 3-5 day A100 training to continue | `MTP_INVESTIGATION_PATH_A_AUTOPSY.md`, memory `project_mtp_pivot.md` |
 | MTP Path C (live integration) | 2026-04 | Accept rate gap; dead end on Gemma 4 E2B | `MTP_PATH_C_FINDINGS.md`, `MTP_INTEGRATION_RESULTS.md` |
-| EAGLE-3 HASS (live) | 2026-04 | 14% accept live, +5-8% tok/s; demoted below ship bar | `EAGLE3_INTEGRATION_STATE.md`, memory `project_drafter_structurally_dead.md` |
+| EAGLE-3 HASS (live) | 2026-04 | Phase 3 bench 11–17 tok/s with fallback to T=1; live speedup ≈0.96–1.11× (net even after oracle-live accept-rate gap). Demoted below ship bar. | `EAGLE3_INTEGRATION_STATE.md`, `ROUND7_FINDINGS.md` §Math verification |
 | LayerSkip at L14 | 2026-04-08, 2026-04-16 | 0/60 match twice; L14 hidden useless without refinement | `HANDOFF.md:56` (`LAYERSKIP_PROBE=1`) |
 | Path A post-11c drafter | 2026-04 | 0% Mac CPU across 29 rounds | memory `project_drafter_structurally_dead.md` |
-| PLD-only union mode | — | Kept as a mode flag in `union-bitexact`; not a speedup route on its own | `Sources/union-bitexact/Verifier.swift` |
+| verify_qK fp16 write-before-accept (item 11c) | 2026-04 | Structural blocker: verify writes drafter proposals into KV at P+1..P+K-1 *before* acceptance is decided, corrupting all spec-decode paths. Confirmed by MTP Path C, EAGLE-3 Blocker 1, PHASE_B. | `MTP_PATH_C_FINDINGS.md:149`, `SESSION_STATE.md:179` |
+| PLD-only standalone mode | — | Standalone PLD is not a speedup route; PLD *inside* the union orchestrator is still default-ON (the `pld-only` flag in `union-bitexact` exists as an isolation harness, not a product mode). | `Sources/union-bitexact/Verifier.swift`, `HANDOFF.md:34` |
 
 Umbrella verdict: **all accessible drafter routes are closed on Gemma 4
 E2B.** Only remaining drafter-adjacent path is ROUND7 post-training
