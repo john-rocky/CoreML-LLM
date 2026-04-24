@@ -636,7 +636,11 @@ public final class CoreMLLLM: @unchecked Sendable {
         // Process image (or reuse cached)
         var imageFeatures: MLMultiArray? = cachedImageFeatures
         if let image {
+            let tVision = CFAbsoluteTimeGetCurrent()
             imageFeatures = try processImage(image)
+            let dtVision = (CFAbsoluteTimeGetCurrent() - tVision) * 1000
+            let which = visionUsesANEBuild ? "ANE" : "GPU"
+            print("[Vision] encode (\(which)): \(String(format: "%.1f", dtVision)) ms")
             cachedImageFeatures = imageFeatures
         }
 
@@ -826,21 +830,25 @@ public final class CoreMLLLM: @unchecked Sendable {
                     let engine = mutableSelf.chunkedEngine
 
                     if let engine {
-                        // For long prompts (>= 64 tokens), block on the
-                        // background prefill load rather than falling back to
-                        // per-token decode. Break-even on E4B is ~17 tokens
-                        // (1.2 s prefill fixed cost vs 70 ms/tok decode −
-                        // 12 ms/tok prefill); 64 keeps short prompts fully
-                        // responsive while saving multi-second TTFT on any
-                        // long prompt issued during the ~160 s load window.
-                        if tokens.count >= 64,
-                           !engine.hasPrefill,
-                           let loadTask = engine.prefillLoadTask {
-                            print("[Load] prefillLoadTask awaited for long prompt (\(tokens.count) tok)")
-                            try await loadTask.value
+                        // Prefill chunks load in the background (see
+                        // ChunkedEngine `deferred prefill load`). If a long
+                        // prompt lands while they're still loading, we used
+                        // to block on the full load — but in practice that
+                        // could take 60+ s during app warmup, dwarfing the
+                        // ~8 s decode-loop alternative (272 tok × 30 ms).
+                        // Decide at request time:
+                        //   * prefill ready → use batched prefill
+                        //   * not ready     → run decode-loop prefill now,
+                        //                     don't wait
+                        // For short prompts (< 64 tok) the decode loop is
+                        // already comparable to batched prefill and we
+                        // never waited.
+                        let prefillReady = engine.hasPrefill
+                        if !prefillReady, tokens.count >= 64 {
+                            print("[Load] prefill chunks not ready — using decode-loop prefill for \(tokens.count) tok (avoids multi-s await)")
                         }
-                        let prefillLen = min(tokens.count, engine.prefillN)
-                        let useHybrid = engine.hasPrefill && prefillLen > 0
+                        let prefillLen = prefillReady ? min(tokens.count, engine.prefillN) : 0
+                        let useHybrid = prefillReady && prefillLen > 0
 
                         if useHybrid {
                             try autoreleasepool {
