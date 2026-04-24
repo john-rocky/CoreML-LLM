@@ -26,7 +26,10 @@ enum ComputePlanAudit {
                     computeUnits: MLComputeUnits = .cpuAndNeuralEngine) async {
         guard isEnabled else { return }
 
-        let chunkNames = ["chunk1", "chunk2", "chunk3", "chunk4"]
+        // Include both the 4-chunk decode names and the 3-chunk rename
+        // pair (chunk2_3way, chunk3_3way). Non-present chunks skip silently.
+        let chunkNames = ["chunk1", "chunk2", "chunk3", "chunk4",
+                          "chunk2_3way", "chunk3_3way"]
         var totalOps = 0
         var totalFallbacks = 0
 
