@@ -28,6 +28,8 @@
 		CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */; };
 		D1E20000000000000000BE01 /* GateZeroBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE02 /* GateZeroBenchmark.swift */; };
 		D1E20000000000000000BE03 /* GateZeroBenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */; };
+		D1E20000000000000000BE05 /* Qwen3VL2BStatefulGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE06 /* Qwen3VL2BStatefulGenerator.swift */; };
+		D1E20000000000000000BE07 /* Qwen3VL2BStatefulGeneratorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE08 /* Qwen3VL2BStatefulGeneratorView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -52,6 +54,8 @@
 		DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35ChatView.swift; path = CoreMLLLMChat/Qwen35ChatView.swift; sourceTree = SOURCE_ROOT; };
 		D1E20000000000000000BE02 /* GateZeroBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GateZeroBenchmark.swift; path = CoreMLLLMChat/GateZeroBenchmark.swift; sourceTree = SOURCE_ROOT; };
 		D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GateZeroBenchmarkView.swift; path = CoreMLLLMChat/GateZeroBenchmarkView.swift; sourceTree = SOURCE_ROOT; };
+		D1E20000000000000000BE06 /* Qwen3VL2BStatefulGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen3VL2BStatefulGenerator.swift; path = CoreMLLLMChat/Qwen3VL2BStatefulGenerator.swift; sourceTree = SOURCE_ROOT; };
+		D1E20000000000000000BE08 /* Qwen3VL2BStatefulGeneratorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen3VL2BStatefulGeneratorView.swift; path = CoreMLLLMChat/Qwen3VL2BStatefulGeneratorView.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -84,6 +88,8 @@
 				DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */,
 				D1E20000000000000000BE02 /* GateZeroBenchmark.swift */,
 				D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */,
+				D1E20000000000000000BE06 /* Qwen3VL2BStatefulGenerator.swift */,
+				D1E20000000000000000BE08 /* Qwen3VL2BStatefulGeneratorView.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -200,6 +206,8 @@
 				CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */,
 				D1E20000000000000000BE01 /* GateZeroBenchmark.swift in Sources */,
 				D1E20000000000000000BE03 /* GateZeroBenchmarkView.swift in Sources */,
+				D1E20000000000000000BE05 /* Qwen3VL2BStatefulGenerator.swift in Sources */,
+				D1E20000000000000000BE07 /* Qwen3VL2BStatefulGeneratorView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

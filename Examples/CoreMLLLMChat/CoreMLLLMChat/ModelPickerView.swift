@@ -87,6 +87,9 @@ struct ModelPickerView: View {
                     NavigationLink { GateZeroBenchmarkView() } label: {
                         Label("Gate Zero (MLState stub)", systemImage: "bolt.shield")
                     }
+                    NavigationLink { Qwen3VL2BStatefulGeneratorView() } label: {
+                        Label("Stateful 64-token smoke test", systemImage: "bolt.fill")
+                    }
                 }
 
                 Section("Troubleshooting") {
