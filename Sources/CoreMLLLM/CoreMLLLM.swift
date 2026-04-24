@@ -799,6 +799,19 @@ public final class CoreMLLLM: @unchecked Sendable {
                     let engine = mutableSelf.chunkedEngine
 
                     if let engine {
+                        // For long prompts (>= 64 tokens), block on the
+                        // background prefill load rather than falling back to
+                        // per-token decode. Break-even on E4B is ~17 tokens
+                        // (1.2 s prefill fixed cost vs 70 ms/tok decode −
+                        // 12 ms/tok prefill); 64 keeps short prompts fully
+                        // responsive while saving multi-second TTFT on any
+                        // long prompt issued during the ~160 s load window.
+                        if tokens.count >= 64,
+                           !engine.hasPrefill,
+                           let loadTask = engine.prefillLoadTask {
+                            print("[Load] prefillLoadTask awaited for long prompt (\(tokens.count) tok)")
+                            try await loadTask.value
+                        }
                         let prefillLen = min(tokens.count, engine.prefillN)
                         let useHybrid = engine.hasPrefill && prefillLen > 0
 

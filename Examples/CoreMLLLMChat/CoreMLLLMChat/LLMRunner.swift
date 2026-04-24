@@ -233,7 +233,16 @@ final class LLMRunner {
                              engine: CoreMLLLM) -> AsyncStream<String> {
         let runner = self
         return AsyncStream { continuation in
-            Task {
+            // `@Observable` state mutations must land on the main actor,
+            // otherwise SwiftUI observation notifications can be dropped
+            // and `isGenerating` stays `true` from the view's perspective
+            // even after EOS — the symptom that manifested as
+            // "ChatView unresponsive after turn 3 EOS". The Qwen path
+            // already hops to @MainActor on its `isGenerating = false`
+            // defer; this hoists the entire loop onto @MainActor so every
+            // Observable mutation (tokensPerSecond, loadingStatus, …)
+            // gets the same treatment with a single actor hop per token.
+            Task { @MainActor in
                 defer { runner.isGenerating = false }
                 for await token in inner {
                     continuation.yield(token)

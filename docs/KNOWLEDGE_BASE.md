@@ -23,6 +23,7 @@ Not the world's fastest LLM stack (yet) — potentially the world's best-documen
 | `LITERT_LM_ARCH_VERIFIED.md` | LiteRT-LM 56 tok/s architecture decomposition | source-verified |
 | `ANEMLL_SOURCE_NOTES.md` | ANEMLL actionable tricks | source-verified |
 | `ROUND7_FINDINGS.md` | Post-training ANE-only candidate audit | prior pass; updated 2026-04-22 |
+| `SESSION_2026_04_24_FOLLOWUP2.md` | Gemma 4 E4B prefill port — config-driven chunk boundaries, nkv-aware `writeSliding/FullFromPrefill`, E2B silent-prefill bug fix | shipped c6775a6 |
 
 ## Top 10 surprises from this deep-read
 

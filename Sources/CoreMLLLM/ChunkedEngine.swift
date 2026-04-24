@@ -97,6 +97,35 @@ final class ChunkedEngine {
         try! MLMultiArray(shape: [1, 1, NSNumber(value: config.contextLength), 1], dataType: .float16)
     }()
 
+    // Chunk pipelining. Decode chunks c1 and c2 each produce KV outputs
+    // that must be memcpy'd back into the persistent
+    // kSliding{1,2}/vSliding{1,2}/kFull{1,2}/vFull{1,2} buffers. We
+    // dispatch those memcpys to `copyBackQueue` so c2/c3 ANE compute
+    // overlaps with c1/c2's CPU memcpy. Per-group semaphores guard the
+    // two buffer groups; any caller that touches kv1/kv2 outside
+    // `predictStep` must call `quiesceCopyBacks()` first.
+    //
+    // Default ON (2026-04-24). A/B on iPhone 17 Pro E2B @ 2K measured
+    // +5.9 % (30.3 → 32.1 tok/s), `copyBack` dropped 0.4-0.6 ms → 0.0,
+    // `cpu_active` 1.5-2.2 ms → 0.5-1.0 ms. Set `LLM_CHUNK_PIPELINE=0`
+    // to restore the serial-memcpy path for regression bisection.
+    private let chunkPipelineEnabled: Bool =
+        ProcessInfo.processInfo.environment["LLM_CHUNK_PIPELINE"] != "0"
+    private let copyBackQueue = DispatchQueue(
+        label: "engine.copyback", qos: .userInitiated, attributes: .concurrent)
+    private let kv1Sem = DispatchSemaphore(value: 1)
+    private let kv2Sem = DispatchSemaphore(value: 1)
+
+    /// Block until any in-flight async copyBack dispatched by pipelined
+    /// predictStep has completed. No-op when chunk pipelining is off.
+    /// Callers that mutate or read the kv1/kv2 buffers outside
+    /// `predictStep` must call this first.
+    private func quiesceCopyBacks() {
+        guard chunkPipelineEnabled else { return }
+        kv1Sem.wait(); kv1Sem.signal()
+        kv2Sem.wait(); kv2Sem.signal()
+    }
+
     let config: ModelConfig
     /// Batch width for the prefill graph (e.g. 1024 for v1.2.0+ ships). Read
     /// from the prefill_chunk1 input shape at init when prefill is eagerly
@@ -867,6 +896,7 @@ final class ChunkedEngine {
     /// canonical order: kSliding1, vSliding1, kFull1, vFull1, kSliding2,
     /// vSliding2, kFull2, vFull2.
     func captureKVSnapshot() -> [Data] {
+        quiesceCopyBacks()
         let bufs = [kSliding1, vSliding1, kFull1, vFull1,
                     kSliding2, vSliding2, kFull2, vFull2]
         return bufs.map { buf in
@@ -879,6 +909,7 @@ final class ChunkedEngine {
     /// `currentPosition`. Sizes must exactly match the live buffer sizes;
     /// throws if not (cached snapshot from a different model / context len).
     func restoreKVSnapshot(_ blobs: [Data], position: Int) throws {
+        quiesceCopyBacks()
         let bufs = [kSliding1, vSliding1, kFull1, vFull1,
                     kSliding2, vSliding2, kFull2, vFull2]
         precondition(blobs.count == bufs.count, "snapshot buffer count mismatch")
@@ -900,6 +931,7 @@ final class ChunkedEngine {
     // MARK: - Reset
 
     func reset() {
+        quiesceCopyBacks()
         for buf in [kSliding1, vSliding1, kFull1, vFull1,
                     kSliding2, vSliding2, kFull2, vFull2] {
             memset(buf.dataPointer, 0, buf.count * MemoryLayout<UInt16>.stride)
@@ -952,6 +984,18 @@ final class ChunkedEngine {
         let W = config.slidingWindow
         let hidden = config.hiddenSize
 
+        // Pipelining-only bookkeeping: on any throw after we've `wait`ed on
+        // a per-group semaphore but before we've handed ownership to the
+        // async memcpy closure, we must `signal` here or the next
+        // predictStep deadlocks. Flags are reset when the async dispatch
+        // takes ownership.
+        var kv1Held = false
+        var kv2Held = false
+        defer {
+            if kv1Held { kv1Sem.signal() }
+            if kv2Held { kv2Sem.signal() }
+        }
+
         let t0 = CFAbsoluteTimeGetCurrent()
         let hiddenIn: MLMultiArray
         let plRaw: MLMultiArray
@@ -992,6 +1036,9 @@ final class ChunkedEngine {
             "K_full_in": MLFeatureValue(multiArray: kFull1),
             "V_full_in": MLFeatureValue(multiArray: vFull1),
         ])
+        // Pipelining: block until the prior step's async memcpy into kv1
+        // buffers has finished, since chunk1 is about to read them.
+        if chunkPipelineEnabled { kv1Sem.wait(); kv1Held = true }
         let tC1Wait0 = CFAbsoluteTimeGetCurrent()
         let out1 = try chunk1.prediction(from: in1)
         let tC1Wait1 = CFAbsoluteTimeGetCurrent()
@@ -999,10 +1046,33 @@ final class ChunkedEngine {
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
         let tC1Cb0 = CFAbsoluteTimeGetCurrent()
-        copyBack(out1, "K_sliding_out", into: kSliding1)
-        copyBack(out1, "V_sliding_out", into: vSliding1)
-        copyBack(out1, "K_full_out", into: kFull1)
-        copyBack(out1, "V_full_out", into: vFull1)
+        if chunkPipelineEnabled {
+            // Read all output MLMultiArrays synchronously to keep all
+            // MLFeatureProvider access on this thread; the background closure
+            // only touches raw dataPointers (non-overlapping) which is
+            // thread-safe. Dispatch overlaps with chunk2's ANE compute.
+            let kSrc = out1.featureValue(for: "K_sliding_out")!.multiArrayValue!
+            let vSrc = out1.featureValue(for: "V_sliding_out")!.multiArrayValue!
+            let kfSrc = out1.featureValue(for: "K_full_out")!.multiArrayValue!
+            let vfSrc = out1.featureValue(for: "V_full_out")!.multiArrayValue!
+            copyBackQueue.async { [kSliding1, vSliding1, kFull1, vFull1, kv1Sem] in
+                memcpy(kSliding1.dataPointer, kSrc.dataPointer,
+                       kSliding1.count * MemoryLayout<UInt16>.stride)
+                memcpy(vSliding1.dataPointer, vSrc.dataPointer,
+                       vSliding1.count * MemoryLayout<UInt16>.stride)
+                memcpy(kFull1.dataPointer, kfSrc.dataPointer,
+                       kFull1.count * MemoryLayout<UInt16>.stride)
+                memcpy(vFull1.dataPointer, vfSrc.dataPointer,
+                       vFull1.count * MemoryLayout<UInt16>.stride)
+                kv1Sem.signal()
+            }
+            kv1Held = false  // signal now owned by the async block
+        } else {
+            copyBack(out1, "K_sliding_out", into: kSliding1)
+            copyBack(out1, "V_sliding_out", into: vSliding1)
+            copyBack(out1, "K_full_out", into: kFull1)
+            copyBack(out1, "V_full_out", into: vFull1)
+        }
         let tC1End = CFAbsoluteTimeGetCurrent()
         profileCopyBack += (tC1End - tC1Cb0)
         profileC1 += (tC1End - tC1Start)
@@ -1022,6 +1092,7 @@ final class ChunkedEngine {
             "K_full_in": MLFeatureValue(multiArray: kFull2),
             "V_full_in": MLFeatureValue(multiArray: vFull2),
         ])
+        if chunkPipelineEnabled { kv2Sem.wait(); kv2Held = true }
         let tC2Wait0 = CFAbsoluteTimeGetCurrent()
         let out2 = try chunk2.prediction(from: in2)
         let tC2Wait1 = CFAbsoluteTimeGetCurrent()
@@ -1030,10 +1101,31 @@ final class ChunkedEngine {
         // EAGLE-3 hidden tap (present only in EAGLE-3 decode chunks).
         lastHiddenAtL8 = out2.featureValue(for: "hidden_at_L8")?.multiArrayValue
         let tC2Cb0 = CFAbsoluteTimeGetCurrent()
-        copyBack(out2, "K_sliding_out", into: kSliding2)
-        copyBack(out2, "V_sliding_out", into: vSliding2)
-        copyBack(out2, "K_full_out", into: kFull2)
-        copyBack(out2, "V_full_out", into: vFull2)
+        if chunkPipelineEnabled {
+            // Overlaps with chunk3 ANE compute. kv13/kv14 are passed in
+            // memory below and not gated by this semaphore.
+            let kSrc = out2.featureValue(for: "K_sliding_out")!.multiArrayValue!
+            let vSrc = out2.featureValue(for: "V_sliding_out")!.multiArrayValue!
+            let kfSrc = out2.featureValue(for: "K_full_out")!.multiArrayValue!
+            let vfSrc = out2.featureValue(for: "V_full_out")!.multiArrayValue!
+            copyBackQueue.async { [kSliding2, vSliding2, kFull2, vFull2, kv2Sem] in
+                memcpy(kSliding2.dataPointer, kSrc.dataPointer,
+                       kSliding2.count * MemoryLayout<UInt16>.stride)
+                memcpy(vSliding2.dataPointer, vSrc.dataPointer,
+                       vSliding2.count * MemoryLayout<UInt16>.stride)
+                memcpy(kFull2.dataPointer, kfSrc.dataPointer,
+                       kFull2.count * MemoryLayout<UInt16>.stride)
+                memcpy(vFull2.dataPointer, vfSrc.dataPointer,
+                       vFull2.count * MemoryLayout<UInt16>.stride)
+                kv2Sem.signal()
+            }
+            kv2Held = false  // signal now owned by the async block
+        } else {
+            copyBack(out2, "K_sliding_out", into: kSliding2)
+            copyBack(out2, "V_sliding_out", into: vSliding2)
+            copyBack(out2, "K_full_out", into: kFull2)
+            copyBack(out2, "V_full_out", into: vFull2)
+        }
         let tC2Cb1 = CFAbsoluteTimeGetCurrent()
         profileCopyBack += (tC2Cb1 - tC2Cb0)
         let kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
@@ -1132,6 +1224,7 @@ final class ChunkedEngine {
     func runPrefill(tokenIDs: [Int], imageFeatures: MLMultiArray? = nil,
                     imageNumTokens: Int = 256,
                     audioFeatures: MLMultiArray? = nil, audioNumTokens: Int = 50) throws -> Int {
+        quiesceCopyBacks()
         guard let p1 = prefillChunk1, let p2 = prefillChunk2,
               let p3 = prefillChunk3, let p4 = prefillChunk4 else {
             throw CoreMLLLMError.prefillNotAvailable
@@ -1408,6 +1501,7 @@ final class ChunkedEngine {
     ///   - startPosition: KV cache position of the first draft token
     /// - Returns: Array of K target argmax token IDs
     func verifyCandidates(tokens: [Int32], startPosition: Int) throws -> [Int32] {
+        quiesceCopyBacks()
         guard hasVerify else {
             throw CoreMLLLMError.predictionFailed
         }
@@ -1547,6 +1641,7 @@ final class ChunkedEngine {
                                     topK: Int = 3) throws
         -> (argmax: [Int32], topK: [[(Int32, Float)]])
     {
+        quiesceCopyBacks()
         guard hasVerify else {
             throw CoreMLLLMError.predictionFailed
         }
@@ -2516,6 +2611,7 @@ extension ChunkedEngine: SpeculativeTarget {
     }
 
     public func verifyCandidates(_ candidates: [Int32], K: Int) throws -> [Int32] {
+        quiesceCopyBacks()
         guard let v1 = verifyChunk1, let v2 = verifyChunk2,
               let v3 = verifyChunk3, let v4 = verifyChunk4 else {
             throw SpeculativeError.missingModel("verify_chunk{1..4} not loaded")
