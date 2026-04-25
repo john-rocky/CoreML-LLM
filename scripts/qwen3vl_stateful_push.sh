@@ -57,6 +57,30 @@ if [ -f "$EMBED_BIN" ]; then
         --destination "$REMOTE_DIR/embed_weight.bin" > /dev/null
 fi
 
+# Optional vision encoder: <SRC_DIR>/../qwen3_vl_2b_vision/vision.mlpackage
+# (output of build_qwen3_vl_2b_vision.py --out-dir /tmp/qwen3vl_stateful)
+VISION_DIR="$(dirname "$SRC_DIR")/qwen3_vl_2b_vision"
+VISION_REMOTE="Documents/Models/qwen3-vl-2b-stateful/qwen3_vl_2b_vision"
+if [ -d "$VISION_DIR/vision.mlpackage" ]; then
+    VISION_MLC="$VISION_DIR/_mlmodelc"
+    mkdir -p "$VISION_MLC"
+    if [ ! -d "$VISION_MLC/vision.mlmodelc" ] \
+        || [ "$VISION_DIR/vision.mlpackage" -nt "$VISION_MLC/vision.mlmodelc" ]; then
+        echo "compiling vision.mlpackage..."
+        xcrun coremlcompiler compile "$VISION_DIR/vision.mlpackage" "$VISION_MLC" >/dev/null
+    fi
+    if [ -d "$VISION_MLC/vision.mlmodelc" ]; then
+        size=$(du -sh "$VISION_MLC/vision.mlmodelc" | awk '{print $1}')
+        echo "  push vision.mlmodelc ($size)..."
+        xcrun devicectl device copy to \
+            --device "$DEVICE" \
+            --domain-type appDataContainer \
+            --domain-identifier "$BUNDLE_ID" \
+            --source "$VISION_MLC/vision.mlmodelc" \
+            --destination "$VISION_REMOTE/vision.mlmodelc" > /dev/null
+    fi
+fi
+
 echo ""
 echo "verifying layout on device..."
 xcrun devicectl device info files \

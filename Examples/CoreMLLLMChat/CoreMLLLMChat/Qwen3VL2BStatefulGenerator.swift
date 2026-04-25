@@ -63,8 +63,15 @@ final class Qwen3VL2BStatefulGenerator {
     private var cfg = Config.defaultFourChunk
 
     // Models + per-generate state handles (one per chunk).
+    // bodyChunks[0] is plain chunk_0 used when no image is present.
+    // chunk0Vision is the DeepStack-aware variant; loaded if the
+    // chunk_0_vision.mlpackage/.mlmodelc artifact is present alongside
+    // chunk_0. When present and image features are passed to generate(),
+    // we route chunk[0] through chunk0Vision.
     private var bodyChunks: [MLModel] = []
+    private var chunk0Vision: MLModel?
     private var headChunk: MLModel?
+    var hasVisionChunk: Bool { chunk0Vision != nil }
 
     // Embed sidecar (mmap'd fp16 vocab x hidden).
     private var embedMmapBase: UnsafeMutableRawPointer?
@@ -86,11 +93,33 @@ final class Qwen3VL2BStatefulGenerator {
 
     private var cosTable: [Float] = []
     private var sinTable: [Float] = []
+    /// Per-dim base RoPE frequencies for mRoPE (image-token cos/sin
+    /// uses 3D coords on the section [24, 20, 20] interleave, last 4
+    /// dims fall back to T). half_head_dim = 64 entries.
+    private var baseFreqs: [Float] = []
+
+    // Vision DeepStack scratch — populated per-step when an image-pad
+    // token comes through. visual_active gates the DeepStack add at
+    // layers 0/1/2 in chunk_0_vision (gate=0 → no-op).
+    private var reusableDs0: MLMultiArray!
+    private var reusableDs1: MLMultiArray!
+    private var reusableDs2: MLMultiArray!
+    private var reusableGate: MLMultiArray!
+    private var fvDs0: MLFeatureValue!
+    private var fvDs1: MLFeatureValue!
+    private var fvDs2: MLFeatureValue!
+    private var fvGate: MLFeatureValue!
 
     init(cfg: Config = .defaultFourChunk) {
         self.cfg = cfg
         cosTable = buildRope(isCos: true)
         sinTable = buildRope(isCos: false)
+        let half = cfg.headDim / 2
+        var f = [Float](repeating: 0, count: half)
+        for i in 0..<half {
+            f[i] = 1.0 / powf(cfg.ropeTheta, Float(2 * i) / Float(cfg.headDim))
+        }
+        baseFreqs = f
         allocBuffers()
     }
 
@@ -108,11 +137,26 @@ final class Qwen3VL2BStatefulGenerator {
         reusableMask = try! MLMultiArray(
             shape: [1, 1, 1, NSNumber(value: cfg.maxSeq)], dataType: .float16)
         reusablePos = try! MLMultiArray(shape: [1], dataType: .int32)
+        let dsShape: [NSNumber] = [
+            1, 1, NSNumber(value: cfg.hiddenSize)
+        ]
+        reusableDs0 = try! MLMultiArray(shape: dsShape, dataType: .float16)
+        reusableDs1 = try! MLMultiArray(shape: dsShape, dataType: .float16)
+        reusableDs2 = try! MLMultiArray(shape: dsShape, dataType: .float16)
+        reusableGate = try! MLMultiArray(shape: [1], dataType: .float32)
+        memset(reusableDs0.dataPointer, 0, reusableDs0.count * 2)
+        memset(reusableDs1.dataPointer, 0, reusableDs1.count * 2)
+        memset(reusableDs2.dataPointer, 0, reusableDs2.count * 2)
+        reusableGate.dataPointer.assumingMemoryBound(to: Float.self)[0] = 0
         fvHidden = MLFeatureValue(multiArray: reusableHidden)
         fvCos = MLFeatureValue(multiArray: reusableCos)
         fvSin = MLFeatureValue(multiArray: reusableSin)
         fvMask = MLFeatureValue(multiArray: reusableMask)
         fvPos = MLFeatureValue(multiArray: reusablePos)
+        fvDs0 = MLFeatureValue(multiArray: reusableDs0)
+        fvDs1 = MLFeatureValue(multiArray: reusableDs1)
+        fvDs2 = MLFeatureValue(multiArray: reusableDs2)
+        fvGate = MLFeatureValue(multiArray: reusableGate)
     }
 
     // MARK: - RoPE (text-only 1D, matches existing Qwen3VL2BGenerator)
@@ -142,6 +186,41 @@ final class Qwen3VL2BStatefulGenerator {
             cosDst[i] = Float16(cosTable[clamped * d + i]).bitPattern
             sinDst[i] = Float16(sinTable[clamped * d + i]).bitPattern
         }
+    }
+
+    /// 3D mRoPE: section [24,20,20] interleave on half head_dim=64,
+    /// last 4 dims fall back to T (matches HF Qwen3-VL config).
+    /// Text tokens pass T=H=W=position → reduces to 1D RoPE.
+    private func fillVisionCosSin(forPosition position: Int,
+                                   T: Float, H: Float, W: Float) {
+        let d = cfg.headDim
+        let half = d / 2
+        let cp = reusableCos.dataPointer.assumingMemoryBound(to: UInt16.self)
+        let sp = reusableSin.dataPointer.assumingMemoryBound(to: UInt16.self)
+        for i in 0..<half {
+            let pos: Float
+            if i < 60 {
+                switch i % 3 {
+                case 0:  pos = T
+                case 1:  pos = H
+                default: pos = W
+                }
+            } else {
+                pos = T
+            }
+            let a = pos * baseFreqs[i]
+            let c = Float16(cosf(a)).bitPattern
+            let s = Float16(sinf(a)).bitPattern
+            cp[i] = c; cp[i + half] = c
+            sp[i] = s; sp[i + half] = s
+        }
+    }
+
+    private func copyRow(from src: MLMultiArray, row: Int,
+                          into dst: UnsafeMutablePointer<UInt16>) {
+        let p = src.dataPointer.assumingMemoryBound(to: UInt16.self)
+        memcpy(dst, p.advanced(by: row * cfg.hiddenSize),
+               cfg.hiddenSize * 2)
     }
 
     private func fillCausalMask(forPosition pos: Int) {
@@ -208,7 +287,9 @@ final class Qwen3VL2BStatefulGenerator {
 
     var modelFolderOverride: URL?
 
-    private func resolveURLs() -> (body: [URL], head: URL, embed: URL)? {
+    private func resolveURLs()
+        -> (body: [URL], head: URL, embed: URL, chunk0Vision: URL?)?
+    {
         let subdir = "qwen3_vl_2b_stateful_chunks"
         let fm = FileManager.default
 
@@ -222,7 +303,9 @@ final class Qwen3VL2BStatefulGenerator {
             return nil
         }
 
-        func resolve(_ base: URL) -> (body: [URL], head: URL, embed: URL)? {
+        func resolve(_ base: URL)
+            -> (body: [URL], head: URL, embed: URL, chunk0Vision: URL?)?
+        {
             let dir = base.appendingPathComponent(subdir)
             let embed = dir.appendingPathComponent("embed_weight.bin")
             guard fm.fileExists(atPath: embed.path) else { return nil }
@@ -232,7 +315,8 @@ final class Qwen3VL2BStatefulGenerator {
                 bodies.append(u)
             }
             guard let h = resolveOne(dir, "chunk_head") else { return nil }
-            return (bodies, h, embed)
+            let v = resolveOne(dir, "chunk_0_vision")
+            return (bodies, h, embed, v)
         }
 
         if let folder = modelFolderOverride, let r = resolve(folder) { return r }
@@ -338,7 +422,16 @@ final class Qwen3VL2BStatefulGenerator {
         mcfg.computeUnits = cfg.computeUnits
         bodyChunks = try r.body.map { try MLModel(contentsOf: $0, configuration: mcfg) }
         headChunk = try MLModel(contentsOf: r.head, configuration: mcfg)
-        status = "Loaded: \(bodyChunks.count) chunks + head, units=\(cfg.computeUnits.rawValue)"
+        // Optional chunk_0_vision (DeepStack-aware) sits next to chunk_0.
+        // Same KV state shape, so a state created from chunk_0_vision
+        // is equivalent to one from chunk_0 — but Swift uses one or the
+        // other per generate(), not both.
+        if let vurl = r.chunk0Vision {
+            chunk0Vision = try MLModel(contentsOf: vurl, configuration: mcfg)
+        }
+        let visionTag = chunk0Vision == nil ? "" : " + chunk_0_vision"
+        status = "Loaded: \(bodyChunks.count) chunks + head\(visionTag), "
+            + "units=\(cfg.computeUnits.rawValue)"
     }
 
     // MARK: - Step
@@ -352,22 +445,42 @@ final class Qwen3VL2BStatefulGenerator {
         let fvSin: MLFeatureValue
         let fvMask: MLFeatureValue
         let fvPos: MLFeatureValue
-        let featureNames: Set<String> = [
-            "hidden_in", "cos", "sin", "causal_mask", "current_pos"
-        ]
+        // Optional vision inputs — non-nil only when this provider feeds
+        // chunk_0_vision. featureNames is built once in init().
+        let fvDs0: MLFeatureValue?
+        let fvDs1: MLFeatureValue?
+        let fvDs2: MLFeatureValue?
+        let fvGate: MLFeatureValue?
+        let featureNames: Set<String>
+
         init(hiddenIn: MLFeatureValue, cos: MLFeatureValue, sin: MLFeatureValue,
-             mask: MLFeatureValue, pos: MLFeatureValue) {
+             mask: MLFeatureValue, pos: MLFeatureValue,
+             ds0: MLFeatureValue? = nil, ds1: MLFeatureValue? = nil,
+             ds2: MLFeatureValue? = nil, gate: MLFeatureValue? = nil) {
             self.fvHiddenIn = hiddenIn; self.fvCos = cos; self.fvSin = sin
             self.fvMask = mask; self.fvPos = pos
+            self.fvDs0 = ds0; self.fvDs1 = ds1; self.fvDs2 = ds2; self.fvGate = gate
+            var names: Set<String> = [
+                "hidden_in", "cos", "sin", "causal_mask", "current_pos"
+            ]
+            if ds0 != nil {
+                names.insert("ds_0"); names.insert("ds_1")
+                names.insert("ds_2"); names.insert("visual_active")
+            }
+            self.featureNames = names
             super.init()
         }
         func featureValue(for n: String) -> MLFeatureValue? {
             switch n {
-            case "hidden_in":   return fvHiddenIn
-            case "cos":         return fvCos
-            case "sin":         return fvSin
-            case "causal_mask": return fvMask
-            case "current_pos": return fvPos
+            case "hidden_in":     return fvHiddenIn
+            case "cos":           return fvCos
+            case "sin":           return fvSin
+            case "causal_mask":   return fvMask
+            case "current_pos":   return fvPos
+            case "ds_0":          return fvDs0
+            case "ds_1":          return fvDs1
+            case "ds_2":          return fvDs2
+            case "visual_active": return fvGate
             default: return nil
             }
         }
@@ -382,13 +495,50 @@ final class Qwen3VL2BStatefulGenerator {
     private var ropeFillMs: Double = 0
     private var timedSteps: Int = 0
 
+    /// Per-step vision context. Set when current step is consuming an
+    /// image-pad token. nil for text steps.
+    private struct VisionStepContext {
+        let hiddenRow: Int          // index into vision.hidden / ds_*
+        let features: Qwen3VL2BVisionFeatures
+        let gridT: Float, gridH: Float, gridW: Float
+    }
+
     private func stepPredict(token: Int32, position: Int,
                               states: [MLState],
-                              collectTimings: Bool) async throws -> Int32 {
+                              collectTimings: Bool,
+                              vision: VisionStepContext? = nil
+    ) async throws -> Int32 {
         let t0 = CFAbsoluteTimeGetCurrent()
-        embedLookup(token: token)
+        // Hidden source: image-merger row OR embed lookup.
+        if let vis = vision {
+            copyRow(from: vis.features.hidden, row: vis.hiddenRow,
+                    into: reusableHidden.dataPointer
+                        .assumingMemoryBound(to: UInt16.self))
+            copyRow(from: vis.features.deepstack[0], row: vis.hiddenRow,
+                    into: reusableDs0.dataPointer
+                        .assumingMemoryBound(to: UInt16.self))
+            copyRow(from: vis.features.deepstack[1], row: vis.hiddenRow,
+                    into: reusableDs1.dataPointer
+                        .assumingMemoryBound(to: UInt16.self))
+            copyRow(from: vis.features.deepstack[2], row: vis.hiddenRow,
+                    into: reusableDs2.dataPointer
+                        .assumingMemoryBound(to: UInt16.self))
+            reusableGate.dataPointer
+                .assumingMemoryBound(to: Float.self)[0] = 1.0
+        } else {
+            embedLookup(token: token)
+            // chunk_0_vision still expects ds_*/visual_active when the
+            // model is loaded — gate=0 makes the DeepStack add a no-op.
+            reusableGate.dataPointer
+                .assumingMemoryBound(to: Float.self)[0] = 0.0
+        }
         let tEmbed = CFAbsoluteTimeGetCurrent()
-        fillCosSin(forPosition: position)
+        if let vis = vision {
+            fillVisionCosSin(forPosition: position,
+                             T: vis.gridT, H: vis.gridH, W: vis.gridW)
+        } else {
+            fillCosSin(forPosition: position)
+        }
         fillCausalMask(forPosition: position)
         setCurrentPos(position)
         let tRope = CFAbsoluteTimeGetCurrent()
@@ -396,11 +546,23 @@ final class Qwen3VL2BStatefulGenerator {
         var hiddenFV = fvHidden!
         let opts = MLPredictionOptions()
         for (ci, chunk) in bodyChunks.enumerated() {
-            let prov = StatefulBodyProvider(hiddenIn: hiddenFV,
-                                             cos: fvCos, sin: fvSin,
-                                             mask: fvMask, pos: fvPos)
+            // Use chunk_0_vision for chunk[0] when it's loaded — same
+            // KV state shape, accepts the extra ds_*/visual_active.
+            let useVision = (ci == 0 && chunk0Vision != nil)
+            let activeChunk = useVision ? chunk0Vision! : chunk
+            let prov: StatefulBodyProvider
+            if useVision {
+                prov = StatefulBodyProvider(
+                    hiddenIn: hiddenFV, cos: fvCos, sin: fvSin,
+                    mask: fvMask, pos: fvPos,
+                    ds0: fvDs0, ds1: fvDs1, ds2: fvDs2, gate: fvGate)
+            } else {
+                prov = StatefulBodyProvider(
+                    hiddenIn: hiddenFV, cos: fvCos, sin: fvSin,
+                    mask: fvMask, pos: fvPos)
+            }
             let t = CFAbsoluteTimeGetCurrent()
-            let out = try await chunk.prediction(
+            let out = try await activeChunk.prediction(
                 from: prov, using: states[ci], options: opts)
             if collectTimings {
                 perChunkMs[ci] += (CFAbsoluteTimeGetCurrent() - t) * 1000
@@ -436,10 +598,18 @@ final class Qwen3VL2BStatefulGenerator {
 
     func generate(inputIds: [Int32], maxNewTokens: Int = 64,
                   eosTokenIds: Set<Int32> = [],
+                  visionFeatures: Qwen3VL2BVisionFeatures? = nil,
+                  imagePadTokenId: Int32 = 151655,
+                  gridH: Int = 14, gridW: Int = 14,
                   onToken: ((Int32) -> Void)? = nil) async throws -> [Int32] {
         guard !bodyChunks.isEmpty, headChunk != nil else {
             throw NSError(domain: "Qwen3VL2BStateful", code: 60,
                 userInfo: [NSLocalizedDescriptionKey: "not loaded"])
+        }
+        if visionFeatures != nil && chunk0Vision == nil {
+            throw NSError(domain: "Qwen3VL2BStateful", code: 61,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "image present but chunk_0_vision is not loaded"])
         }
         let states = bodyChunks.map { $0.makeState() }
 
@@ -451,14 +621,32 @@ final class Qwen3VL2BStatefulGenerator {
         perChunkMs = Array(repeating: 0, count: bodyChunks.count)
         headMs = 0; embedMs = 0; ropeFillMs = 0; timedSteps = 0
 
-        // Recurrent prefill. Every step emits a "next_token" but we only
-        // care about the LAST one — Qwen3-VL's standard pattern is feed the
-        // final prompt token through the same step to kick off decode.
+        // Vision state: track which image-row to consume on each
+        // image-pad token in the prompt.
+        var imageTokenIdx = 0
+        var imageStartPos: Int? = nil
+
         var prefillPredicted: Int32 = 0
         for (i, tok) in inputIds.enumerated() {
+            // Build the optional VisionStepContext for this token.
+            var vision: VisionStepContext? = nil
+            if let vf = visionFeatures, tok == imagePadTokenId,
+               imageTokenIdx < vf.count {
+                if imageStartPos == nil { imageStartPos = position }
+                let h = imageTokenIdx / gridW
+                let w = imageTokenIdx % gridW
+                vision = VisionStepContext(
+                    hiddenRow: imageTokenIdx,
+                    features: vf,
+                    gridT: Float(imageStartPos ?? position),
+                    gridH: Float(imageStartPos ?? position) + Float(h),
+                    gridW: Float(imageStartPos ?? position) + Float(w))
+                imageTokenIdx += 1
+            }
             prefillPredicted = try await stepPredict(
                 token: tok, position: position,
-                states: states, collectTimings: false)
+                states: states, collectTimings: false,
+                vision: vision)
             lastToken = tok
             position += 1
             if i == inputIds.count - 1 {

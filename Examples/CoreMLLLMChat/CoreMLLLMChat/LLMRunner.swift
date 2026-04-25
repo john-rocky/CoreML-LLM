@@ -210,7 +210,8 @@ final class LLMRunner {
             return try await generateQwen35(messages: messages)
         }
         if qwen3vl2bStatefulGenerator != nil {
-            return try await generateQwen3VL2BStateful(messages: messages)
+            return try await generateQwen3VL2BStateful(
+                messages: messages, image: image)
         }
         if qwen3vl2bGenerator != nil {
             return try await generateQwen3VL2B(messages: messages, image: image)
@@ -601,17 +602,33 @@ final class LLMRunner {
         try gen.load()
         qwen3vl2bStatefulGenerator = gen
         qwen3vl2bTokenizer = tok
-        modelName = "Qwen3-VL 2B (stateful)"
-        hasVision = false  // text-only ship; vision stays on v1.4.0
+
+        // Optional vision: encoder + chunk_0_vision must both be present
+        // to enable image input. If either is missing, fall back to
+        // text-only.
+        var visionTag = ""
+        if gen.hasVisionChunk,
+           let visionURL = Qwen3VL2BVisionEncoder.resolveModel(folder: folder) {
+            let enc = Qwen3VL2BVisionEncoder()
+            do {
+                try enc.load(modelURL: visionURL)
+                qwen3vl2bVisionEncoder = enc
+                visionTag = " + vision"
+            } catch {
+                print("[LLMRunner] stateful vision encoder load failed: \(error)")
+            }
+        }
+        modelName = "Qwen3-VL 2B (stateful)\(visionTag)"
+        hasVision = qwen3vl2bVisionEncoder != nil && gen.hasVisionChunk
         hasAudio = false
         isLoaded = true
         loadingStatus = "Ready"
-        print("[LLMRunner] loaded Qwen3-VL 2B stateful from \(folder.lastPathComponent)")
+        print("[LLMRunner] loaded Qwen3-VL 2B stateful\(visionTag) from \(folder.lastPathComponent)")
     }
 
-    private func generateQwen3VL2BStateful(messages: [ChatMessage]) async throws
-        -> AsyncStream<String>
-    {
+    private func generateQwen3VL2BStateful(messages: [ChatMessage],
+                                            image: CGImage? = nil
+    ) async throws -> AsyncStream<String> {
         guard let gen = qwen3vl2bStatefulGenerator,
               let tok = qwen3vl2bTokenizer
         else {
@@ -622,18 +639,27 @@ final class LLMRunner {
         isGenerating = true
         tokensPerSecond = 0
 
-        let chatMessages: [[String: Any]] = messages.compactMap { m in
-            let role: String
-            switch m.role {
-            case .user: role = "user"
-            case .assistant: role = "assistant"
-            case .system: return nil
+        // Build prompt + run vision encoder if image is present.
+        var visionFeatures: Qwen3VL2BVisionFeatures? = nil
+        let inputIdsInt32: [Int32]
+        if let image, let encoder = qwen3vl2bVisionEncoder {
+            visionFeatures = try await encoder.encode(image)
+            inputIdsInt32 = try buildQwen3VLVisionPromptIds(
+                tokenizer: tok, history: messages)
+        } else {
+            let chatMessages: [[String: Any]] = messages.compactMap { m in
+                let role: String
+                switch m.role {
+                case .user: role = "user"
+                case .assistant: role = "assistant"
+                case .system: return nil
+                }
+                return ["role": role, "content": m.content]
             }
-            return ["role": role, "content": m.content]
+            let ids: [Int] = (try? tok.applyChatTemplate(messages: chatMessages))
+                ?? tok.encode(text: messages.last?.content ?? "")
+            inputIdsInt32 = ids.map { Int32($0) }
         }
-        let ids: [Int] = (try? tok.applyChatTemplate(messages: chatMessages))
-            ?? tok.encode(text: messages.last?.content ?? "")
-        let inputIdsInt32 = ids.map { Int32($0) }
 
         let maxSeq = 2048
         let remaining = maxSeq - inputIdsInt32.count - 1
@@ -660,6 +686,7 @@ final class LLMRunner {
                         inputIds: inputIdsInt32,
                         maxNewTokens: maxNew,
                         eosTokenIds: eosSet,
+                        visionFeatures: visionFeatures,
                         onToken: { [weak self] tokenId in
                             tokenCount += 1
                             if eosSet.contains(tokenId) { return }
