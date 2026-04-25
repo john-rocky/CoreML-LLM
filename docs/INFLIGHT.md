@@ -11,3 +11,4 @@ Format: one line per active claim.
 ---
 
 (empty — no active claims)
+stage4-lmsplit-finalise | 3D633D83 | 2026-04-25T19:38:40Z | iPhone A/B/C measurement
