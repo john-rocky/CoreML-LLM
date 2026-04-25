@@ -10,5 +10,4 @@ Format: one line per active claim.
 
 ---
 
-(empty — no active claims)
-stage5-qwen3vl-linear | 365AEF57 | 2026-04-25T19:41:57Z | Plan 3 fanout to Qwen3-VL converter
+stage5-qwen3vl-linear | 365AEF57 | 2026-04-25T19:41:57Z | Plan 3 fanout to Qwen3-VL converter — Mac-side complete, holding for iPhone 17 Pro tok/s check
