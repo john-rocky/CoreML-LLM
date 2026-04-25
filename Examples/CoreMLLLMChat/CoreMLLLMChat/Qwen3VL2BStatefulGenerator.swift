@@ -63,15 +63,22 @@ final class Qwen3VL2BStatefulGenerator {
     private var cfg = Config.defaultFourChunk
 
     // Models + per-generate state handles (one per chunk).
-    // bodyChunks[0] is plain chunk_0 used when no image is present.
-    // chunk0Vision is the DeepStack-aware variant; loaded if the
-    // chunk_0_vision.mlpackage/.mlmodelc artifact is present alongside
-    // chunk_0. When present and image features are passed to generate(),
-    // we route chunk[0] through chunk0Vision.
+    // bodyChunks[i] is the T=1 decode (`infer` function) variant.
+    // bodyPrefillChunks[i] is the T=N prefill (`prefill_b<N>` function)
+    // variant when the multifunction mlpackage is present; otherwise nil
+    // and prefill falls back to the T=1 path.
+    // chunk0Vision is the DeepStack-aware T=1 variant; vision prefill
+    // stays on the T=1 path for now (multifunction vision is a
+    // follow-up). State is created once per generate from the prefill
+    // model when present (decode-only models still create state via
+    // bodyChunks[0]).
     private var bodyChunks: [MLModel] = []
+    private var bodyPrefillChunks: [MLModel] = []
+    private var prefillT: Int = 1
     private var chunk0Vision: MLModel?
     private var headChunk: MLModel?
     var hasVisionChunk: Bool { chunk0Vision != nil }
+    var hasMultifunctionPrefill: Bool { !bodyPrefillChunks.isEmpty }
 
     // Embed sidecar (mmap'd fp16 vocab x hidden).
     private var embedMmapBase: UnsafeMutableRawPointer?
@@ -97,6 +104,17 @@ final class Qwen3VL2BStatefulGenerator {
     /// uses 3D coords on the section [24, 20, 20] interleave, last 4
     /// dims fall back to T). half_head_dim = 64 entries.
     private var baseFreqs: [Float] = []
+
+    // T-batched prefill scratch (allocated lazily on first batched
+    // step). hidden/cos/sin grow with T; causal_mask is (1, 1, T, max_seq).
+    private var prefillHidden: MLMultiArray?
+    private var prefillCos: MLMultiArray?
+    private var prefillSin: MLMultiArray?
+    private var prefillMask: MLMultiArray?
+    private var fvPrefillHidden: MLFeatureValue?
+    private var fvPrefillCos: MLFeatureValue?
+    private var fvPrefillSin: MLFeatureValue?
+    private var fvPrefillMask: MLFeatureValue?
 
     // Vision DeepStack scratch — populated per-step when an image-pad
     // token comes through. visual_active gates the DeepStack add at
@@ -422,16 +440,51 @@ final class Qwen3VL2BStatefulGenerator {
         mcfg.computeUnits = cfg.computeUnits
         bodyChunks = try r.body.map { try MLModel(contentsOf: $0, configuration: mcfg) }
         headChunk = try MLModel(contentsOf: r.head, configuration: mcfg)
-        // Optional chunk_0_vision (DeepStack-aware) sits next to chunk_0.
-        // Same KV state shape, so a state created from chunk_0_vision
-        // is equivalent to one from chunk_0 — but Swift uses one or the
-        // other per generate(), not both.
+
+        // Probe each body chunk for a `prefill_b<N>` function by
+        // attempting to load chunk_0 with each common N. Core ML throws
+        // if the function name doesn't exist; if it succeeds, the
+        // mlpackage is multifunction and we load the rest at that N.
+        bodyPrefillChunks = []
+        prefillT = 1
+        for candidate in [8, 16, 32, 64] {
+            let pcfg = MLModelConfiguration()
+            pcfg.computeUnits = cfg.computeUnits
+            pcfg.functionName = "prefill_b\(candidate)"
+            guard let firstURL = r.body.first,
+                  (try? MLModel(contentsOf: firstURL, configuration: pcfg)) != nil
+            else { continue }
+            var prefills: [MLModel] = []
+            for url in r.body {
+                if let m = try? MLModel(contentsOf: url, configuration: pcfg) {
+                    prefills.append(m)
+                } else {
+                    prefills = []
+                    break
+                }
+            }
+            if prefills.count == bodyChunks.count {
+                bodyPrefillChunks = prefills
+                prefillT = candidate
+                break
+            }
+        }
+
         if let vurl = r.chunk0Vision {
             chunk0Vision = try MLModel(contentsOf: vurl, configuration: mcfg)
         }
         let visionTag = chunk0Vision == nil ? "" : " + chunk_0_vision"
-        status = "Loaded: \(bodyChunks.count) chunks + head\(visionTag), "
+        let prefillTag = bodyPrefillChunks.isEmpty ? "" : " + prefill_b\(prefillT)"
+        status = "Loaded: \(bodyChunks.count) chunks + head\(visionTag)\(prefillTag), "
             + "units=\(cfg.computeUnits.rawValue)"
+    }
+
+    /// Probe whether the chunk is a multifunction mlpackage with a
+    /// `prefill_b<N>` function. Returns N if found, nil otherwise.
+    /// The cheap path is to attempt loading with each candidate
+    /// functionName — Core ML throws if the function is missing.
+    private static func detectPrefillT(model: MLModel) -> Int? {
+        return nil  // overridden by file-based probe in load()
     }
 
     // MARK: - Step
@@ -494,6 +547,162 @@ final class Qwen3VL2BStatefulGenerator {
     private var embedMs: Double = 0
     private var ropeFillMs: Double = 0
     private var timedSteps: Int = 0
+
+    private func ensurePrefillBuffers() {
+        guard prefillHidden == nil else { return }
+        let T = prefillT
+        let H = cfg.hiddenSize
+        let D = cfg.headDim
+        let MS = cfg.maxSeq
+        prefillHidden = try! MLMultiArray(
+            shape: [1, NSNumber(value: T), NSNumber(value: H)],
+            dataType: .float16)
+        prefillCos = try! MLMultiArray(
+            shape: [1, NSNumber(value: T), NSNumber(value: D)],
+            dataType: .float16)
+        prefillSin = try! MLMultiArray(
+            shape: [1, NSNumber(value: T), NSNumber(value: D)],
+            dataType: .float16)
+        prefillMask = try! MLMultiArray(
+            shape: [1, 1, NSNumber(value: T), NSNumber(value: MS)],
+            dataType: .float16)
+        fvPrefillHidden = MLFeatureValue(multiArray: prefillHidden!)
+        fvPrefillCos = MLFeatureValue(multiArray: prefillCos!)
+        fvPrefillSin = MLFeatureValue(multiArray: prefillSin!)
+        fvPrefillMask = MLFeatureValue(multiArray: prefillMask!)
+    }
+
+    /// Run one T-batched prefill step through chunk_0..N and the head.
+    /// `inputIds[startPos..startPos+T)` are consumed at sequence
+    /// positions [startPos, startPos+T). State advances by T slots.
+    /// Returns the head's prediction for the last token in the batch.
+    private func prefillBatchStep(inputIds: [Int32], startPos: Int,
+                                   states: [MLState]) async throws -> Int32 {
+        ensurePrefillBuffers()
+        let T = prefillT
+        let H = cfg.hiddenSize
+        let D = cfg.headDim
+        let MS = cfg.maxSeq
+
+        // 1) Hidden: T embed lookups packed in (1, T, H).
+        let hPtr = prefillHidden!.dataPointer
+            .assumingMemoryBound(to: UInt16.self)
+        guard let embedPtr = embedMmapPtr else {
+            throw NSError(domain: "Qwen3VL2BStateful", code: 70,
+                userInfo: [NSLocalizedDescriptionKey: "embed not mmap'd"])
+        }
+        for t in 0..<T {
+            let tok = inputIds[startPos + t]
+            memcpy(hPtr.advanced(by: t * H),
+                    embedPtr.advanced(by: Int(tok) * H),
+                    H * 2)
+        }
+
+        // 2) cos/sin: T positions of 1D RoPE (text path).
+        let cPtr = prefillCos!.dataPointer.assumingMemoryBound(to: UInt16.self)
+        let sPtr = prefillSin!.dataPointer.assumingMemoryBound(to: UInt16.self)
+        for t in 0..<T {
+            let p = min(max(startPos + t, 0), cfg.maxSeq - 1)
+            for i in 0..<D {
+                cPtr[t * D + i] = Float16(cosTable[p * D + i]).bitPattern
+                sPtr[t * D + i] = Float16(sinTable[p * D + i]).bitPattern
+            }
+        }
+
+        // 3) causal_mask (1, 1, T, MS): row t allows positions
+        //    <= startPos + t, masks the rest with -1e4.
+        let mPtr = prefillMask!.dataPointer.assumingMemoryBound(to: UInt16.self)
+        let neg = Float16(-10_000.0).bitPattern
+        for t in 0..<T {
+            let allowedUpTo = min(max(startPos + t, 0), MS - 1)
+            for i in 0..<MS {
+                mPtr[t * MS + i] = (i <= allowedUpTo) ? 0 : neg
+            }
+        }
+
+        // 4) current_pos = startPos
+        reusablePos.dataPointer.assumingMemoryBound(to: Int32.self)[0]
+            = Int32(startPos)
+
+        // Provider for prefill (no DeepStack — text-only multifunction).
+        let prov = StatefulPrefillProvider(
+            hiddenIn: fvPrefillHidden!, cos: fvPrefillCos!, sin: fvPrefillSin!,
+            mask: fvPrefillMask!, pos: fvPos)
+
+        var hiddenFV: MLFeatureValue = fvPrefillHidden!
+        let opts = MLPredictionOptions()
+        for (ci, chunk) in bodyPrefillChunks.enumerated() {
+            // hidden_in for chunk 0 = the prefilled embeds; for chunk N
+            // = previous chunk's "hidden" output, also (1, T, H).
+            let useProv: MLFeatureProvider
+            if ci == 0 {
+                useProv = prov
+            } else {
+                useProv = StatefulPrefillProvider(
+                    hiddenIn: hiddenFV, cos: fvPrefillCos!, sin: fvPrefillSin!,
+                    mask: fvPrefillMask!, pos: fvPos)
+            }
+            let out = try await chunk.prediction(
+                from: useProv, using: states[ci], options: opts)
+            guard let fv = out.featureValue(for: "hidden") else {
+                throw NSError(domain: "Qwen3VL2BStateful", code: 71,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "prefill chunk_\(ci) did not emit 'hidden'"])
+            }
+            hiddenFV = fv
+        }
+
+        // Head only consumes T=1; pull the LAST row of the (1, T, H)
+        // hidden output and feed it as (1, 1, H).
+        guard let arr = hiddenFV.multiArrayValue else {
+            throw NSError(domain: "Qwen3VL2BStateful", code: 72,
+                userInfo: [NSLocalizedDescriptionKey: "prefill hidden missing"])
+        }
+        let src = arr.dataPointer.assumingMemoryBound(to: UInt16.self)
+        let dst = reusableHidden.dataPointer.assumingMemoryBound(to: UInt16.self)
+        memcpy(dst, src.advanced(by: (T - 1) * H), H * 2)
+
+        let headProv = try MLDictionaryFeatureProvider(
+            dictionary: ["hidden_in": fvHidden!])
+        let headOut = try await headChunk!.prediction(
+            from: headProv, options: opts)
+        guard let fv = headOut.featureValue(for: "next_token"),
+              let nt = fv.multiArrayValue
+        else {
+            throw NSError(domain: "Qwen3VL2BStateful", code: 73,
+                userInfo: [NSLocalizedDescriptionKey: "head no next_token"])
+        }
+        return nt.dataPointer.bindMemory(to: Int32.self, capacity: 1)[0]
+    }
+
+    /// Provider for chunk_N prefill (T-batched). Same input names as
+    /// the T=1 decode path so the multifunction merge is well-formed.
+    private final class StatefulPrefillProvider: NSObject, MLFeatureProvider {
+        let fvHiddenIn: MLFeatureValue
+        let fvCos: MLFeatureValue
+        let fvSin: MLFeatureValue
+        let fvMask: MLFeatureValue
+        let fvPos: MLFeatureValue
+        let featureNames: Set<String> = [
+            "hidden_in", "cos", "sin", "causal_mask", "current_pos"
+        ]
+        init(hiddenIn: MLFeatureValue, cos: MLFeatureValue, sin: MLFeatureValue,
+             mask: MLFeatureValue, pos: MLFeatureValue) {
+            self.fvHiddenIn = hiddenIn; self.fvCos = cos; self.fvSin = sin
+            self.fvMask = mask; self.fvPos = pos
+            super.init()
+        }
+        func featureValue(for n: String) -> MLFeatureValue? {
+            switch n {
+            case "hidden_in":   return fvHiddenIn
+            case "cos":         return fvCos
+            case "sin":         return fvSin
+            case "causal_mask": return fvMask
+            case "current_pos": return fvPos
+            default: return nil
+            }
+        }
+    }
 
     /// Per-step vision context. Set when current step is consuming an
     /// image-pad token. nil for text steps.
@@ -611,7 +820,13 @@ final class Qwen3VL2BStatefulGenerator {
                 userInfo: [NSLocalizedDescriptionKey:
                     "image present but chunk_0_vision is not loaded"])
         }
-        let states = bodyChunks.map { $0.makeState() }
+        // State must be created from one fixed function-instance per
+        // chunk, then reused across both prefill_b<N> and infer calls
+        // (Core ML binds state by name+shape, not by MLModel instance).
+        // Use the prefill model's makeState when multifunction is on.
+        let stateSource: [MLModel] =
+            bodyPrefillChunks.isEmpty ? bodyChunks : bodyPrefillChunks
+        let states = stateSource.map { $0.makeState() }
 
         var position = 0
         var lastToken: Int32 = 0
@@ -627,8 +842,31 @@ final class Qwen3VL2BStatefulGenerator {
         var imageStartPos: Int? = nil
 
         var prefillPredicted: Int32 = 0
-        for (i, tok) in inputIds.enumerated() {
-            // Build the optional VisionStepContext for this token.
+
+        // Use T-batched multifunction prefill when:
+        //   - prefill chunks are loaded
+        //   - no image (vision steps go through chunk_0_vision T=1)
+        //   - prompt has at least T tokens to batch
+        let canBatchPrefill = !bodyPrefillChunks.isEmpty
+            && visionFeatures == nil
+            && inputIds.count >= prefillT
+        var i = 0
+        if canBatchPrefill {
+            let T = prefillT
+            // Batch prefill in T-chunks; leave any tail for T=1 path.
+            while i + T <= inputIds.count {
+                prefillPredicted = try await prefillBatchStep(
+                    inputIds: inputIds, startPos: position, states: states)
+                lastToken = inputIds[i + T - 1]
+                position += T
+                i += T
+            }
+        }
+
+        // Tail tokens (or all tokens for vision / no-multifunction
+        // builds) go through the T=1 path.
+        for j in i..<inputIds.count {
+            let tok = inputIds[j]
             var vision: VisionStepContext? = nil
             if let vf = visionFeatures, tok == imagePadTokenId,
                imageTokenIdx < vf.count {
@@ -649,9 +887,12 @@ final class Qwen3VL2BStatefulGenerator {
                 vision: vision)
             lastToken = tok
             position += 1
-            if i == inputIds.count - 1 {
+            if j == inputIds.count - 1 {
                 prefillEnd = CFAbsoluteTimeGetCurrent()
             }
+        }
+        if inputIds.count > 0 && prefillEnd == t0 {
+            prefillEnd = CFAbsoluteTimeGetCurrent()
         }
 
         // Decode — the prefill's last step already produced the first
