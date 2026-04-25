@@ -24,3 +24,4 @@ Format: one line per active claim.
 ---
 
 (empty — no active claims)
+stage3-prefill-bn | 8A5C2B35 | 2026-04-25T19:27:16Z | multifunction prefill_bN
