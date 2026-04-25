@@ -358,6 +358,9 @@ final class LLMRunner {
         // Qwen3-VL 2B stateful: drop the persisted KV cache + vision
         // feature cache so the next turn rebuilds from scratch.
         qwen3vl2bStatefulGenerator?.resetPersistedState()
+        // Gemma 4 stateful: same pattern, drop the cross-turn KV state
+        // (Phase 2a) so the next turn re-prefills from scratch.
+        gemma4StatefulEngine?.resetPersistedState()
         cachedVisionImage = nil
         cachedVisionFeatures = nil
     }

@@ -77,13 +77,39 @@ public final class Gemma4StatefulEngine {
     private var fvPos: MLFeatureValue!
     private var fvRing: MLFeatureValue!
 
+    // Cross-turn KV reuse (Phase 2a). When persistedInputIds is a strict
+    // prefix of the next generate's inputIds AND both states are non-nil,
+    // skip prefill of the matching prefix and resume from the LCP boundary.
+    // Mirrors the Qwen3-VL v1.6.0 pattern. State handles bind to specific
+    // MLModel instances — load() drops them so a model reload doesn't
+    // dangle. LLMRunner is expected to call resetPersistedState() on chat
+    // clear, image change, or any prompt-prefix invariant break.
+    private var persistedState1: MLState?
+    private var persistedState2: MLState?
+    private var persistedInputIds: [Int32] = []
+    private var persistedPosition: Int = 0
+
     public init(config: Config = Config()) {
         self.cfg = config
     }
 
     // MARK: - Load
 
+    /// Drop the cross-turn KV cache. Call when chat history clears, the
+    /// vision/audio prefix changes, or anything else that breaks the
+    /// "persisted prefix is a prefix of the next prompt" invariant.
+    public func resetPersistedState() {
+        persistedState1 = nil
+        persistedState2 = nil
+        persistedInputIds = []
+        persistedPosition = 0
+    }
+
     public func load(modelDirectory: URL) async throws {
+        // State handles bind to specific MLModel instances. Any persisted
+        // state from a prior load points at models we're about to release;
+        // drop it before we lose the binding.
+        resetPersistedState()
         modelDir = modelDirectory
         let mc = try ModelConfig.load(from: modelDirectory)
         modelConfig = mc
@@ -322,11 +348,15 @@ public final class Gemma4StatefulEngine {
         return tokArr.dataPointer.bindMemory(to: Int32.self, capacity: 1)[0]
     }
 
-    // MARK: - Generate (T=1 prefill + T=1 decode)
+    // MARK: - Generate (T=1 prefill + T=1 decode, cross-turn KV reuse)
 
     /// Runs the prompt through chunks (T=1 prefill, slow but correct),
     /// then continues decoding up to maxNewTokens.
-    /// Phase 1: fresh MLState per call. Phase 2 will add cross-turn reuse.
+    ///
+    /// Phase 2a: cross-turn KV reuse. If `persistedInputIds` is a strict
+    /// prefix of `inputIds` and both states are still bound, skip prefill
+    /// of the matching prefix and resume at the LCP boundary. Otherwise
+    /// allocate fresh states and start from scratch.
     public func generate(inputIds: [Int32], maxNewTokens: Int = 64,
                           eosTokenIds: Set<Int32> = [],
                           onToken: ((Int32) -> Void)? = nil
@@ -343,19 +373,56 @@ public final class Gemma4StatefulEngine {
                 "prompt (\(inputIds.count) tokens) >= ctx (\(mc.contextLength))")
         }
 
-        // State must come from THIS chunk1/chunk2 instance — handles bind
-        // to specific MLModels. Stateless chunks (3, 4) need none.
-        let state1 = chunk1.makeState()
-        let state2 = chunk2!.makeState()
+        // Cross-turn resume detection. We require persistedInputIds to be a
+        // STRICT prefix of inputIds (and non-empty) — partial overlaps would
+        // mean the persisted state has tokens the new prompt doesn't, and
+        // MLState's slice_update can't rewind. In that case, drop persisted
+        // state and start fresh.
+        var resumeAt = 0
+        let canResume = persistedState1 != nil && persistedState2 != nil
+            && !persistedInputIds.isEmpty
+        if canResume {
+            let cap = min(persistedInputIds.count, inputIds.count)
+            var l = 0
+            while l < cap && persistedInputIds[l] == inputIds[l] { l += 1 }
+            if l == persistedInputIds.count && l < inputIds.count && l > 0 {
+                resumeAt = l
+            }
+        }
+
+        let state1: MLState
+        let state2: MLState
+        if resumeAt > 0, let s1 = persistedState1, let s2 = persistedState2 {
+            state1 = s1; state2 = s2
+            print("[Gemma4Stateful] RESUME L=\(resumeAt) "
+                  + "(persisted=\(persistedInputIds.count), "
+                  + "new=\(inputIds.count))")
+            // Clear bookkeeping during in-flight; restored on success below.
+            // If we throw mid-prefill, persistedInputIds = [] prevents a
+            // future generate from trying to resume past where the state
+            // actually got advanced to.
+            persistedInputIds = []
+            persistedPosition = 0
+        } else {
+            // State must come from THIS chunk1/chunk2 instance — handles
+            // bind to specific MLModels. Stateless chunks (3, 4) need none.
+            state1 = chunk1.makeState()
+            state2 = chunk2!.makeState()
+            persistedState1 = state1
+            persistedState2 = state2
+            persistedInputIds = []
+            persistedPosition = 0
+        }
         let opts = MLPredictionOptions()
 
-        var position = 0
-        var lastToken: Int32 = inputIds[0]
+        var position = resumeAt
+        var lastToken: Int32 = inputIds[max(resumeAt - 1, 0)]
         var prefillPredicted: Int32 = 0
 
         let t0 = CFAbsoluteTimeGetCurrent()
-        // T=1 prefill — multifunction prefill_bN is a follow-up.
-        for j in 0..<inputIds.count {
+        // T=1 prefill from the resume boundary — multifunction prefill_bN
+        // is Phase 2b.
+        for j in resumeAt..<inputIds.count {
             let tok = inputIds[j]
             prefillPredicted = try await step(
                 token: tok, position: position,
@@ -367,8 +434,11 @@ public final class Gemma4StatefulEngine {
 
         // Decode. The prefill's last step already produced the first
         // post-prompt token (prefillPredicted) — emit it, then continue.
+        // (Skip the auto-emit when resumeAt == inputIds.count — there was
+        // nothing new to prefill, the next user-visible token must come
+        // from a real decode step.)
         var decoded: [Int32] = []
-        if maxNewTokens > 0 {
+        if maxNewTokens > 0 && inputIds.count > resumeAt {
             decoded.append(prefillPredicted)
             onToken?(prefillPredicted)
             lastToken = prefillPredicted
@@ -386,15 +456,30 @@ public final class Gemma4StatefulEngine {
         }
         let t1 = CFAbsoluteTimeGetCurrent()
 
+        // Persist consumed tokens. The state has consumed
+        //   prompt[0..<inputIds.count]  +  decoded[..<decoded.count-1]
+        // (the last decoded token's "feed" step never ran). Off-by-one
+        // vs the displayed assistant text in the max-tokens-hit case
+        // costs at most 1 token of re-prefill on the next turn.
+        let consumed = decoded.dropLast()
+        var newPersisted = inputIds
+        newPersisted.append(contentsOf: consumed)
+        persistedInputIds = newPersisted
+        persistedPosition = newPersisted.count
+
+        let prefillTokCount = inputIds.count - resumeAt
         let prefillMs = (prefillEnd - t0) * 1000
         let decodeMs = (t1 - prefillEnd) * 1000
         if decodeMs > 0 && decoded.count > 1 {
             lastDecodeTokensPerSecond = Double(decoded.count - 1) / (decodeMs / 1000)
         }
-        print("[Gemma4Stateful] prefill \(inputIds.count) tok in "
-              + String(format: "%.0fms (%.1f tok/s) | decode %d tok in %.0fms (%.1f tok/s)",
+        let resumeTag = resumeAt > 0 ? " [resumed L=\(resumeAt)]" : ""
+        print("[Gemma4Stateful] prefill \(prefillTokCount) tok in "
+              + String(format: "%.0fms (%.1f tok/s)%@ | decode %d tok in %.0fms (%.1f tok/s)",
                         prefillMs,
-                        Double(inputIds.count) / max(prefillMs / 1000, 1e-3),
+                        Double(max(prefillTokCount, 1))
+                            / max(prefillMs / 1000, 1e-3),
+                        resumeTag,
                         decoded.count, decodeMs, lastDecodeTokensPerSecond))
         return decoded
     }
