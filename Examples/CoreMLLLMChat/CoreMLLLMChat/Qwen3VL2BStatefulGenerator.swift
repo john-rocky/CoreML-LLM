@@ -76,9 +76,11 @@ final class Qwen3VL2BStatefulGenerator {
     private var bodyPrefillChunks: [MLModel] = []
     private var prefillT: Int = 1
     private var chunk0Vision: MLModel?
+    private var chunk0VisionPrefill: MLModel?
     private var headChunk: MLModel?
     var hasVisionChunk: Bool { chunk0Vision != nil }
     var hasMultifunctionPrefill: Bool { !bodyPrefillChunks.isEmpty }
+    var hasVisionMultifunctionPrefill: Bool { chunk0VisionPrefill != nil }
 
     // Embed sidecar (mmap'd fp16 vocab x hidden).
     private var embedMmapBase: UnsafeMutableRawPointer?
@@ -115,6 +117,16 @@ final class Qwen3VL2BStatefulGenerator {
     private var fvPrefillCos: MLFeatureValue?
     private var fvPrefillSin: MLFeatureValue?
     private var fvPrefillMask: MLFeatureValue?
+
+    // T-batched VISION prefill scratch (DeepStack inputs).
+    private var prefillDs0: MLMultiArray?
+    private var prefillDs1: MLMultiArray?
+    private var prefillDs2: MLMultiArray?
+    private var prefillGate: MLMultiArray?
+    private var fvPrefillDs0: MLFeatureValue?
+    private var fvPrefillDs1: MLFeatureValue?
+    private var fvPrefillDs2: MLFeatureValue?
+    private var fvPrefillGate: MLFeatureValue?
 
     // Vision DeepStack scratch — populated per-step when an image-pad
     // token comes through. visual_active gates the DeepStack add at
@@ -472,10 +484,21 @@ final class Qwen3VL2BStatefulGenerator {
 
         if let vurl = r.chunk0Vision {
             chunk0Vision = try MLModel(contentsOf: vurl, configuration: mcfg)
+            // Probe chunk_0_vision for prefill_b<prefillT> too (vision
+            // multifunction). Same compatibility rules as the text path.
+            if prefillT > 1 {
+                let pcfg = MLModelConfiguration()
+                pcfg.computeUnits = cfg.computeUnits
+                pcfg.functionName = "prefill_b\(prefillT)"
+                if let pm = try? MLModel(contentsOf: vurl, configuration: pcfg) {
+                    chunk0VisionPrefill = pm
+                }
+            }
         }
         let visionTag = chunk0Vision == nil ? "" : " + chunk_0_vision"
+        let visionMfTag = chunk0VisionPrefill == nil ? "" : "(mf)"
         let prefillTag = bodyPrefillChunks.isEmpty ? "" : " + prefill_b\(prefillT)"
-        status = "Loaded: \(bodyChunks.count) chunks + head\(visionTag)\(prefillTag), "
+        status = "Loaded: \(bodyChunks.count) chunks + head\(visionTag)\(visionMfTag)\(prefillTag), "
             + "units=\(cfg.computeUnits.rawValue)"
     }
 
@@ -570,43 +593,139 @@ final class Qwen3VL2BStatefulGenerator {
         fvPrefillCos = MLFeatureValue(multiArray: prefillCos!)
         fvPrefillSin = MLFeatureValue(multiArray: prefillSin!)
         fvPrefillMask = MLFeatureValue(multiArray: prefillMask!)
+
+        // Vision DeepStack scratch (T rows of hidden each).
+        let dsShape: [NSNumber] = [
+            1, NSNumber(value: T), NSNumber(value: H)
+        ]
+        prefillDs0 = try! MLMultiArray(shape: dsShape, dataType: .float16)
+        prefillDs1 = try! MLMultiArray(shape: dsShape, dataType: .float16)
+        prefillDs2 = try! MLMultiArray(shape: dsShape, dataType: .float16)
+        prefillGate = try! MLMultiArray(shape: [1], dataType: .float32)
+        memset(prefillDs0!.dataPointer, 0, prefillDs0!.count * 2)
+        memset(prefillDs1!.dataPointer, 0, prefillDs1!.count * 2)
+        memset(prefillDs2!.dataPointer, 0, prefillDs2!.count * 2)
+        prefillGate!.dataPointer.assumingMemoryBound(to: Float.self)[0] = 0
+        fvPrefillDs0 = MLFeatureValue(multiArray: prefillDs0!)
+        fvPrefillDs1 = MLFeatureValue(multiArray: prefillDs1!)
+        fvPrefillDs2 = MLFeatureValue(multiArray: prefillDs2!)
+        fvPrefillGate = MLFeatureValue(multiArray: prefillGate!)
+    }
+
+    /// Vision-prefill batch context: T contiguous image-pad tokens.
+    private struct VisionPrefillBatch {
+        let features: Qwen3VL2BVisionFeatures
+        let firstImageRow: Int    // imageTokenIdx at the start of this batch
+        let imageStartGlobalPos: Int   // sequence position where image span begins
+        let gridH: Int
+        let gridW: Int
     }
 
     /// Run one T-batched prefill step through chunk_0..N and the head.
     /// `inputIds[startPos..startPos+T)` are consumed at sequence
     /// positions [startPos, startPos+T). State advances by T slots.
     /// Returns the head's prediction for the last token in the batch.
+    /// When `vision != nil`, all T tokens are image-pad and chunk[0]
+    /// is routed through chunk0VisionPrefill with DS rows + gate=1.
     private func prefillBatchStep(inputIds: [Int32], startPos: Int,
-                                   states: [MLState]) async throws -> Int32 {
+                                   states: [MLState],
+                                   vision: VisionPrefillBatch? = nil
+    ) async throws -> Int32 {
         ensurePrefillBuffers()
         let T = prefillT
         let H = cfg.hiddenSize
         let D = cfg.headDim
         let MS = cfg.maxSeq
 
-        // 1) Hidden: T embed lookups packed in (1, T, H).
+        // 1) Hidden: T embed lookups (text) OR T merger rows (vision).
         let hPtr = prefillHidden!.dataPointer
             .assumingMemoryBound(to: UInt16.self)
-        guard let embedPtr = embedMmapPtr else {
-            throw NSError(domain: "Qwen3VL2BStateful", code: 70,
-                userInfo: [NSLocalizedDescriptionKey: "embed not mmap'd"])
-        }
-        for t in 0..<T {
-            let tok = inputIds[startPos + t]
-            memcpy(hPtr.advanced(by: t * H),
-                    embedPtr.advanced(by: Int(tok) * H),
-                    H * 2)
+        if let vis = vision {
+            for t in 0..<T {
+                let row = vis.firstImageRow + t
+                let src = vis.features.hidden.dataPointer
+                    .assumingMemoryBound(to: UInt16.self)
+                memcpy(hPtr.advanced(by: t * H),
+                        src.advanced(by: row * H), H * 2)
+            }
+        } else {
+            guard let embedPtr = embedMmapPtr else {
+                throw NSError(domain: "Qwen3VL2BStateful", code: 70,
+                    userInfo: [NSLocalizedDescriptionKey: "embed not mmap'd"])
+            }
+            for t in 0..<T {
+                let tok = inputIds[startPos + t]
+                memcpy(hPtr.advanced(by: t * H),
+                        embedPtr.advanced(by: Int(tok) * H), H * 2)
+            }
         }
 
-        // 2) cos/sin: T positions of 1D RoPE (text path).
+        // 2) cos/sin: T positions, 1D RoPE for text or 3D mRoPE for image
         let cPtr = prefillCos!.dataPointer.assumingMemoryBound(to: UInt16.self)
         let sPtr = prefillSin!.dataPointer.assumingMemoryBound(to: UInt16.self)
-        for t in 0..<T {
-            let p = min(max(startPos + t, 0), cfg.maxSeq - 1)
-            for i in 0..<D {
-                cPtr[t * D + i] = Float16(cosTable[p * D + i]).bitPattern
-                sPtr[t * D + i] = Float16(sinTable[p * D + i]).bitPattern
+        if let vis = vision {
+            // image tokens: T per-position mRoPE coords
+            for t in 0..<T {
+                let row = vis.firstImageRow + t
+                let h = row / vis.gridW
+                let w = row % vis.gridW
+                let Tp = Float(vis.imageStartGlobalPos)
+                let Hp = Tp + Float(h)
+                let Wp = Tp + Float(w)
+                let half = D / 2
+                for i in 0..<half {
+                    let pos: Float
+                    if i < 60 {
+                        switch i % 3 {
+                        case 0:  pos = Tp
+                        case 1:  pos = Hp
+                        default: pos = Wp
+                        }
+                    } else {
+                        pos = Tp
+                    }
+                    let a = pos * baseFreqs[i]
+                    let c = Float16(cosf(a)).bitPattern
+                    let s = Float16(sinf(a)).bitPattern
+                    cPtr[t * D + i]        = c
+                    cPtr[t * D + i + half] = c
+                    sPtr[t * D + i]        = s
+                    sPtr[t * D + i + half] = s
+                }
             }
+        } else {
+            for t in 0..<T {
+                let p = min(max(startPos + t, 0), cfg.maxSeq - 1)
+                for i in 0..<D {
+                    cPtr[t * D + i] = Float16(cosTable[p * D + i]).bitPattern
+                    sPtr[t * D + i] = Float16(sinTable[p * D + i]).bitPattern
+                }
+            }
+        }
+
+        // DS rows + gate scalar (only relevant when ci=0 dispatches to
+        // chunk0VisionPrefill; harmless otherwise).
+        if let vis = vision {
+            let dsPtrs = [
+                prefillDs0!.dataPointer.assumingMemoryBound(to: UInt16.self),
+                prefillDs1!.dataPointer.assumingMemoryBound(to: UInt16.self),
+                prefillDs2!.dataPointer.assumingMemoryBound(to: UInt16.self),
+            ]
+            for t in 0..<T {
+                let row = vis.firstImageRow + t
+                for slot in 0..<3 {
+                    let src = vis.features.deepstack[slot].dataPointer
+                        .assumingMemoryBound(to: UInt16.self)
+                    memcpy(dsPtrs[slot].advanced(by: t * H),
+                            src.advanced(by: row * H), H * 2)
+                }
+            }
+            prefillGate!.dataPointer.assumingMemoryBound(to: Float.self)[0] = 1.0
+        } else {
+            prefillGate!.dataPointer.assumingMemoryBound(to: Float.self)[0] = 0.0
+            // ds buffers stay zeroed from ensurePrefillBuffers (or last
+            // vision step's leftover; gate=0 makes the add a no-op
+            // either way, so we don't need to re-zero per text batch).
         }
 
         // 3) causal_mask (1, 1, T, MS): row t allows positions
@@ -624,24 +743,44 @@ final class Qwen3VL2BStatefulGenerator {
         reusablePos.dataPointer.assumingMemoryBound(to: Int32.self)[0]
             = Int32(startPos)
 
-        // Provider for prefill (no DeepStack — text-only multifunction).
-        let prov = StatefulPrefillProvider(
-            hiddenIn: fvPrefillHidden!, cos: fvPrefillCos!, sin: fvPrefillSin!,
-            mask: fvPrefillMask!, pos: fvPos)
-
         var hiddenFV: MLFeatureValue = fvPrefillHidden!
         let opts = MLPredictionOptions()
-        for (ci, chunk) in bodyPrefillChunks.enumerated() {
-            // hidden_in for chunk 0 = the prefilled embeds; for chunk N
-            // = previous chunk's "hidden" output, also (1, T, H).
-            let useProv: MLFeatureProvider
-            if ci == 0 {
-                useProv = prov
-            } else {
-                useProv = StatefulPrefillProvider(
-                    hiddenIn: hiddenFV, cos: fvPrefillCos!, sin: fvPrefillSin!,
-                    mask: fvPrefillMask!, pos: fvPos)
-            }
+        // chunk[0]: route through chunk0VisionPrefill when vision is
+        // loaded (preserves state binding); else through bodyPrefillChunks[0].
+        let useVisionChunk0 = chunk0VisionPrefill != nil
+        let chunk0Model: MLModel = useVisionChunk0
+            ? chunk0VisionPrefill!
+            : bodyPrefillChunks[0]
+        let chunk0Prov: MLFeatureProvider
+        if useVisionChunk0 {
+            chunk0Prov = StatefulPrefillProvider(
+                hiddenIn: fvPrefillHidden!,
+                cos: fvPrefillCos!, sin: fvPrefillSin!,
+                mask: fvPrefillMask!, pos: fvPos,
+                ds0: fvPrefillDs0, ds1: fvPrefillDs1,
+                ds2: fvPrefillDs2, gate: fvPrefillGate)
+        } else {
+            chunk0Prov = StatefulPrefillProvider(
+                hiddenIn: fvPrefillHidden!,
+                cos: fvPrefillCos!, sin: fvPrefillSin!,
+                mask: fvPrefillMask!, pos: fvPos)
+        }
+        let out0 = try await chunk0Model.prediction(
+            from: chunk0Prov, using: states[0], options: opts)
+        guard let fv0 = out0.featureValue(for: "hidden") else {
+            throw NSError(domain: "Qwen3VL2BStateful", code: 71,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "prefill chunk_0 did not emit 'hidden'"])
+        }
+        hiddenFV = fv0
+
+        // chunks 1..N-1: bodyPrefillChunks (no DS).
+        for ci in 1..<bodyPrefillChunks.count {
+            let chunk = bodyPrefillChunks[ci]
+            let useProv = StatefulPrefillProvider(
+                hiddenIn: hiddenFV,
+                cos: fvPrefillCos!, sin: fvPrefillSin!,
+                mask: fvPrefillMask!, pos: fvPos)
             let out = try await chunk.prediction(
                 from: useProv, using: states[ci], options: opts)
             guard let fv = out.featureValue(for: "hidden") else {
@@ -677,28 +816,49 @@ final class Qwen3VL2BStatefulGenerator {
 
     /// Provider for chunk_N prefill (T-batched). Same input names as
     /// the T=1 decode path so the multifunction merge is well-formed.
+    /// Vision DeepStack inputs (ds_0/1/2 + visual_active) are optional
+    /// — only added to featureNames when ds0 is non-nil so chunks
+    /// 1..3 (no DS) don't see surplus inputs.
     private final class StatefulPrefillProvider: NSObject, MLFeatureProvider {
         let fvHiddenIn: MLFeatureValue
         let fvCos: MLFeatureValue
         let fvSin: MLFeatureValue
         let fvMask: MLFeatureValue
         let fvPos: MLFeatureValue
-        let featureNames: Set<String> = [
-            "hidden_in", "cos", "sin", "causal_mask", "current_pos"
-        ]
+        let fvDs0: MLFeatureValue?
+        let fvDs1: MLFeatureValue?
+        let fvDs2: MLFeatureValue?
+        let fvGate: MLFeatureValue?
+        let featureNames: Set<String>
         init(hiddenIn: MLFeatureValue, cos: MLFeatureValue, sin: MLFeatureValue,
-             mask: MLFeatureValue, pos: MLFeatureValue) {
+             mask: MLFeatureValue, pos: MLFeatureValue,
+             ds0: MLFeatureValue? = nil, ds1: MLFeatureValue? = nil,
+             ds2: MLFeatureValue? = nil, gate: MLFeatureValue? = nil) {
             self.fvHiddenIn = hiddenIn; self.fvCos = cos; self.fvSin = sin
             self.fvMask = mask; self.fvPos = pos
+            self.fvDs0 = ds0; self.fvDs1 = ds1
+            self.fvDs2 = ds2; self.fvGate = gate
+            var names: Set<String> = [
+                "hidden_in", "cos", "sin", "causal_mask", "current_pos"
+            ]
+            if ds0 != nil {
+                names.insert("ds_0"); names.insert("ds_1")
+                names.insert("ds_2"); names.insert("visual_active")
+            }
+            self.featureNames = names
             super.init()
         }
         func featureValue(for n: String) -> MLFeatureValue? {
             switch n {
-            case "hidden_in":   return fvHiddenIn
-            case "cos":         return fvCos
-            case "sin":         return fvSin
-            case "causal_mask": return fvMask
-            case "current_pos": return fvPos
+            case "hidden_in":     return fvHiddenIn
+            case "cos":           return fvCos
+            case "sin":           return fvSin
+            case "causal_mask":   return fvMask
+            case "current_pos":   return fvPos
+            case "ds_0":          return fvDs0
+            case "ds_1":          return fvDs1
+            case "ds_2":          return fvDs2
+            case "visual_active": return fvGate
             default: return nil
             }
         }
@@ -821,11 +981,22 @@ final class Qwen3VL2BStatefulGenerator {
                     "image present but chunk_0_vision is not loaded"])
         }
         // State must be created from one fixed function-instance per
-        // chunk, then reused across both prefill_b<N> and infer calls
-        // (Core ML binds state by name+shape, not by MLModel instance).
-        // Use the prefill model's makeState when multifunction is on.
-        let stateSource: [MLModel] =
-            bodyPrefillChunks.isEmpty ? bodyChunks : bodyPrefillChunks
+        // chunk, then reused across both prefill_b<N> and infer calls.
+        // For chunk[0] in vision mode, state must come from
+        // chunk0Vision's mlpackage (separate from chunk_0.mlpackage).
+        var stateSource: [MLModel] = []
+        for ci in 0..<bodyChunks.count {
+            let m: MLModel
+            if ci == 0 && chunk0Vision != nil {
+                // vision mode: prefer multifunction prefill model when
+                // available, else fall back to T=1 chunk_0_vision.
+                m = chunk0VisionPrefill ?? chunk0Vision!
+            } else {
+                m = bodyPrefillChunks.isEmpty ? bodyChunks[ci]
+                    : bodyPrefillChunks[ci]
+            }
+            stateSource.append(m)
+        }
         let states = stateSource.map { $0.makeState() }
 
         var position = 0
@@ -843,20 +1014,48 @@ final class Qwen3VL2BStatefulGenerator {
 
         var prefillPredicted: Int32 = 0
 
-        // Use T-batched multifunction prefill when:
-        //   - prefill chunks are loaded
-        //   - no image (vision steps go through chunk_0_vision T=1)
-        //   - prompt has at least T tokens to batch
+        // Use T-batched multifunction prefill when prefill chunks are
+        // loaded. Three batch types per T-window:
+        //   * text-only batch  → bodyPrefillChunks (no DS)
+        //   * image-pad batch  → chunk0VisionPrefill (DS, gate=1) + chunks 1..N-1
+        //   * mixed (text+image)  → not batched, fall back to T=1
+        // Vision batching needs chunk0VisionPrefill loaded; otherwise
+        // fall back to T=1 for any image-bearing batch.
         let canBatchPrefill = !bodyPrefillChunks.isEmpty
-            && visionFeatures == nil
             && inputIds.count >= prefillT
         var i = 0
         if canBatchPrefill {
             let T = prefillT
-            // Batch prefill in T-chunks; leave any tail for T=1 path.
             while i + T <= inputIds.count {
-                prefillPredicted = try await prefillBatchStep(
-                    inputIds: inputIds, startPos: position, states: states)
+                // Classify the next T tokens.
+                let pad = imagePadTokenId
+                var allImagePad = true
+                var anyImagePad = false
+                for t in 0..<T {
+                    if inputIds[i + t] == pad { anyImagePad = true }
+                    else { allImagePad = false }
+                }
+                let mixed = anyImagePad && !allImagePad
+                if mixed { break }  // fall back to T=1 for the rest
+                if allImagePad && (visionFeatures == nil || chunk0VisionPrefill == nil) {
+                    break  // need vision multifunction to batch image-pad
+                }
+
+                if allImagePad, let vf = visionFeatures {
+                    if imageStartPos == nil { imageStartPos = position }
+                    let batch = VisionPrefillBatch(
+                        features: vf,
+                        firstImageRow: imageTokenIdx,
+                        imageStartGlobalPos: imageStartPos ?? position,
+                        gridH: gridH, gridW: gridW)
+                    prefillPredicted = try await prefillBatchStep(
+                        inputIds: inputIds, startPos: position,
+                        states: states, vision: batch)
+                    imageTokenIdx += T
+                } else {
+                    prefillPredicted = try await prefillBatchStep(
+                        inputIds: inputIds, startPos: position, states: states)
+                }
                 lastToken = inputIds[i + T - 1]
                 position += T
                 i += T
