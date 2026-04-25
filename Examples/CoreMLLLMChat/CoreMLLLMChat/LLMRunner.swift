@@ -119,20 +119,34 @@ final class LLMRunner {
 
         // Qwen3-VL 2B STATEFUL detection (Phase 1): chunk_0..N +
         // chunk_head + embed_weight.bin under qwen3_vl_2b_stateful_chunks/.
-        // Preferred over the v1.4.0 recurrent layout when both exist.
-        let vl2bStatefulDir = folder.appendingPathComponent("qwen3_vl_2b_stateful_chunks")
-        let vl2bStatefulEmbed = fm.fileExists(atPath:
-            vl2bStatefulDir.appendingPathComponent("embed_weight.bin").path)
-        let vl2bStatefulHead = fm.fileExists(atPath:
-            vl2bStatefulDir.appendingPathComponent("chunk_head.mlpackage").path)
-            || fm.fileExists(atPath:
-            vl2bStatefulDir.appendingPathComponent("chunk_head.mlmodelc").path)
-        let vl2bStatefulChunk0 = fm.fileExists(atPath:
-            vl2bStatefulDir.appendingPathComponent("chunk_0.mlpackage").path)
-            || fm.fileExists(atPath:
-            vl2bStatefulDir.appendingPathComponent("chunk_0.mlmodelc").path)
-        if vl2bStatefulEmbed && vl2bStatefulHead && vl2bStatefulChunk0 {
-            try await loadQwen3VL2BStateful(folder: folder)
+        // Tolerate both layouts depending on what `localModelURL`
+        // returned (outer model folder OR inner chunks subdir):
+        //   A. folder = .../qwen3-vl-2b-stateful/        → chunks at folder + subdir
+        //   B. folder = .../qwen3_vl_2b_stateful_chunks/ → chunks live in folder itself
+        func statefulCandidates(_ base: URL) -> URL? {
+            for cand in [
+                base.appendingPathComponent("qwen3_vl_2b_stateful_chunks"),
+                base,
+            ] {
+                let embed = cand.appendingPathComponent("embed_weight.bin")
+                let head = cand.appendingPathComponent("chunk_head.mlpackage")
+                let headC = cand.appendingPathComponent("chunk_head.mlmodelc")
+                let c0 = cand.appendingPathComponent("chunk_0.mlpackage")
+                let c0C = cand.appendingPathComponent("chunk_0.mlmodelc")
+                if fm.fileExists(atPath: embed.path)
+                    && (fm.fileExists(atPath: head.path) || fm.fileExists(atPath: headC.path))
+                    && (fm.fileExists(atPath: c0.path) || fm.fileExists(atPath: c0C.path))
+                {
+                    return cand
+                }
+            }
+            return nil
+        }
+        if let chunksRoot = statefulCandidates(folder) {
+            // chunksRoot is the inner chunks dir; the generator's
+            // resolveURLs expects the OUTER folder so it can append
+            // its own subdir. Pass chunksRoot.deletingLastPathComponent().
+            try await loadQwen3VL2BStateful(folder: chunksRoot.deletingLastPathComponent())
             return
         }
 
@@ -674,13 +688,15 @@ final class LLMRunner {
         var eosSet: Set<Int32> = [151643, 151644, 151645]
         if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
 
-        let genStart = Date()
         return AsyncStream { continuation in
             Task { [weak self] in
                 defer { Task { @MainActor in self?.isGenerating = false } }
                 var accumIds: [Int] = []
                 var emittedText = ""
                 var tokenCount = 0
+                // Measure pure decode tok/s: skip prefill + vision encode
+                // by anchoring on the first decode token.
+                var firstTokenAt: Date?
                 do {
                     _ = try await gen.generate(
                         inputIds: inputIdsInt32,
@@ -701,10 +717,17 @@ final class LLMRunner {
                                 continuation.yield(delta)
                                 emittedText = current
                             }
-                            let elapsed = Date().timeIntervalSince(genStart)
-                            if elapsed > 0 {
-                                Task { @MainActor in
-                                    self?.tokensPerSecond = Double(tokenCount) / elapsed
+                            if firstTokenAt == nil { firstTokenAt = Date() }
+                            if let start = firstTokenAt {
+                                let elapsed = Date().timeIntervalSince(start)
+                                // Subtract 1 because the first token cost is
+                                // bundled into the prefill window we're
+                                // excluding from the denominator.
+                                let n = max(tokenCount - 1, 0)
+                                if elapsed > 0 && n > 0 {
+                                    Task { @MainActor in
+                                        self?.tokensPerSecond = Double(n) / elapsed
+                                    }
                                 }
                             }
                         })

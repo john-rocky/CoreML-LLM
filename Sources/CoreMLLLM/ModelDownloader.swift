@@ -335,12 +335,12 @@ public final class ModelDownloader: NSObject {
             && vl2bStatefulChunkExists("chunk_0")
             && vl2bStatefulChunkExists("chunk_1")
             && vl2bStatefulChunkExists("chunk_head") {
-            // Return the OUTER model folder (dir), not the inner chunks
-            // subdir. ChatView appends "model.mlpackage" and LLMRunner
-            // does deletingLastPathComponent(), so LLMRunner's detection
-            // `folder.appendingPathComponent("qwen3_vl_2b_stateful_chunks")`
-            // needs `folder` to be the outer dir.
-            return dir
+            // Return the INNER chunks dir. ChatView strips one level
+            // via .deletingLastPathComponent() before passing to its
+            // local loadModel(), and LLMRunner does the same again, so
+            // we need an extra layer of nesting in the URL we return.
+            // Mirror the Qwen3.5 chunked + Qwen3-VL v1.4.0 convention.
+            return vl2bStatefulDir
         }
 
         // Qwen3-VL 2B: 4 body chunks + chunk_head + embed_weight.bin
