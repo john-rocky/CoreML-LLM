@@ -853,6 +853,14 @@ public final class ModelDownloader: NSObject {
              + mlc("swa", "chunk2", "chunk2", weightSize: 133_963_968)
              + mlc("swa", "chunk3", "chunk3", weightSize: 325_282_880)
              + mlc("swa", "chunk4", "chunk4", weightSize: 526_874_880)
+             // 3-chunk decode variant (opt-in at runtime via LLM_3CHUNK=1).
+             // Adds ~940 MB on disk but stays out of RAM unless selected.
+             // chunk2_3way = merged L8-24 (17 layers), chunk3_3way = LM-head
+             // chunk.  See docs/THREE_CHUNK_MAC_BENCH.md for the +8%
+             // measurement.  Files 404 on older HF snapshots — optional mlc
+             // files are skipped by the downloader, so absence is fine.
+             + mlc("swa", "chunk2_3way", "chunk2_3way", weightSize: 459_768_064)
+             + mlc("swa", "chunk3_3way", "chunk3_3way", weightSize: 526_874_880)
         let prefillFiles = prefillMeta("chunk1", "prefill_chunk1")
              + prefillMeta("chunk2", "prefill_chunk2")
              + prefillMeta("chunk3", "prefill_chunk3")
@@ -1198,8 +1206,21 @@ public final class ModelDownloader: NSObject {
     /// latter is purely descriptive. Keep this list conservative — anything
     /// not listed here is treated as required.
     private func isOptionalMlmodelcFile(_ localPath: String) -> Bool {
-        localPath.hasSuffix(".mlmodelc/metadata.json")
-            || localPath.hasSuffix(".mlmodelc/analytics/coremldata.bin")
+        // metadata.json and analytics/coremldata.bin are descriptive and
+        // missing from some historical uploads — always optional.
+        if localPath.hasSuffix(".mlmodelc/metadata.json")
+            || localPath.hasSuffix(".mlmodelc/analytics/coremldata.bin") {
+            return true
+        }
+        // 3-chunk variant files are entirely optional — they enable the
+        // LLM_3CHUNK=1 opt-in path but are not needed for the default
+        // 4-chunk decoder. If HF doesn't yet have them (older snapshot),
+        // skip so existing bundles still install cleanly.
+        let optionalMlmodelcPrefixes = [
+            "chunk2_3way.mlmodelc/",
+            "chunk3_3way.mlmodelc/",
+        ]
+        return optionalMlmodelcPrefixes.contains { localPath.hasPrefix($0) }
     }
 
     private var modelsDirectory: URL {

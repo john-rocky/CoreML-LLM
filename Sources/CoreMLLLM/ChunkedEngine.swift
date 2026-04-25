@@ -5,22 +5,40 @@ import Foundation
 
 /// Internal engine for SWA-chunked Gemma 4 E2B inference.
 ///
-/// The model is split into 4 decode chunks + 4 optional prefill chunks:
+/// Decode splits into either 4 chunks (default) or 3 chunks (LLM_3CHUNK=1,
+/// build via `conversion/build_gemma4_3way.py`). Prefill is always 4 chunks.
+///
+/// 4-chunk decode (default):
 ///   - chunk1: layers 0-7 (7 sliding + 1 full) + PLE projection
 ///   - chunk2: layers 8-14 (5 sliding + 2 full), outputs shared kv13/kv14
 ///   - chunk3: layers 15-24 (all KV-shared via kv13/kv14)
 ///   - chunk4: layers 25-34 (all KV-shared) + RMSNorm + LM head + argmax
+///
+/// 3-chunk decode (LLM_3CHUNK=1, requires chunk2_3way.mlmodelc + chunk3_3way.mlmodelc):
+///   - chunk1: layers 0-7 (same binary as 4-chunk)
+///   - chunk2: layers 8-24 merged (17 layers — 5 sliding + 2 full own-KV + 10 KV-shared),
+///             outputs kv13/kv14 identically to 4-chunk chunk2
+///   - chunk3: nil; chunk4 slot holds layers 25-34 + LM head (same I/O as 4-chunk chunk4)
+/// Saves one ANE dispatch per decode step (~2.3ms / Orion). Bit-for-bit
+/// equivalent to the 4-chunk path (parity proven in
+/// conversion/parity_3way_vs_4chunk.py).
 ///
 /// External resources (loaded from disk, not baked into the model):
 ///   - INT8 quantized embedding tables (embed_tokens + embed_per_layer)
 ///   - Per-layer projection weight + norm weight (for PLE on CPU/Accelerate)
 ///   - Pre-computed RoPE cos/sin tables (sliding 256-d, full 512-d)
 final class ChunkedEngine {
-    // Decode chunks
+    // Decode chunks. chunk3 is nil in 3-chunk mode; chunk2 holds the 17-layer
+    // merged decoder in that case. chunk4 holds the LM-head chunk in both modes.
     private let chunk1: MLModel
     private let chunk2: MLModel
-    private let chunk3: MLModel
+    private let chunk3: MLModel?
     private let chunk4: MLModel
+    let is3ChunkDecode: Bool
+    /// When true, chunk1 is BigChunk1 (L0-14 own-KV, emits kv13/kv14) and
+    /// chunk2 is a pure shared-KV block (SWAChunk3 L15-24). When false and
+    /// is3ChunkDecode == true, chunk2 is the merged MergedChunk23 (L8-24).
+    let is3ChunkTopoI: Bool
 
     // Prefill chunks (optional; falls back to per-token decode if nil).
     //
@@ -398,7 +416,48 @@ final class ChunkedEngine {
         //   = 0     → unlimited concurrency (legacy fast-burn behavior)
         //   = N > 0 → cap = N concurrent MIL/ANE compilations
         let hasPrefillFiles = findModel("prefill_chunk1") != nil
-        var c1: MLModel!, c2: MLModel!, c3: MLModel!, c4: MLModel!
+
+        // 3-chunk decode variants (opt-in, two topologies).
+        //
+        // Topology II (shipped, default when LLM_3CHUNK=1):
+        //   chunk1 (L0-7) + chunk2_3way (L8-24 merged, 17 layers) + chunk3_3way (L25-34+head)
+        //
+        // Topology I (experimental, LLM_3CHUNK=1 + LLM_3CHUNK_TOPO=I):
+        //   chunk1_topoI (L0-14 merged, 15 layers) + chunk2_topoI (L15-24)
+        //   + chunk3_topoI (L25-34+head). Same 3 dispatches, different split.
+        //   Isolates whether ANE prefers 15-layer first chunk over the shipped
+        //   17-layer middle chunk — dispatch count is identical so any delta is
+        //   per-chunk ANE efficiency at different layer counts.
+        let threeChunkEnv = ProcessInfo.processInfo.environment["LLM_3CHUNK"] == "1"
+        let topoEnv = ProcessInfo.processInfo.environment["LLM_3CHUNK_TOPO"] ?? "II"
+        let topoIRequested = threeChunkEnv && topoEnv.uppercased() == "I"
+        let topoIFilesPresent =
+            findModel("chunk1_topoI") != nil
+            && findModel("chunk2_topoI") != nil
+            && findModel("chunk3_topoI") != nil
+        let topoIIRequested = threeChunkEnv && topoEnv.uppercased() != "I"
+        let topoIIFilesPresent =
+            findModel("chunk2_3way") != nil
+            && findModel("chunk3_3way") != nil
+
+        let is3ChunkTopoI = topoIRequested && topoIFilesPresent
+        let is3Chunk = is3ChunkTopoI || (topoIIRequested && topoIIFilesPresent)
+
+        if topoIRequested && !topoIFilesPresent {
+            print("[Load] LLM_3CHUNK_TOPO=I requested but chunk{1,2,3}_topoI not found — " +
+                  "falling back to Topology II / 4-chunk")
+        }
+        if topoIIRequested && !topoIIFilesPresent && !topoIRequested {
+            print("[Load] LLM_3CHUNK=1 set but chunk2_3way/chunk3_3way not found — " +
+                  "falling back to 4-chunk decode")
+        }
+        if is3ChunkTopoI {
+            print("[Load] Topology I — 3-chunk (chunk1_topoI[L0-14] + chunk2_topoI[L15-24] + chunk3_topoI[L25-34+head])")
+        } else if is3Chunk {
+            print("[Load] Topology II — 3-chunk (chunk1 + chunk2_3way[L8-24 merged] + chunk3_3way[L25-34+head])")
+        }
+
+        var c1: MLModel!, c2: MLModel!, c3: MLModel?, c4: MLModel!
         var p1: MLModel?, p2: MLModel?, p3: MLModel?, p4: MLModel?
 
         let loadMaxParallel: Int = {
@@ -424,10 +483,31 @@ final class ChunkedEngine {
             let origin = (deferEnv == "1") ? "env=1" : "default"
             print("[Load] deferred prefill load (\(origin)) — decode chunks foreground, prefill chunks background")
         }
+        // Chunk file names depend on decode mode.
+        //   4-chunk: chunk1 + chunk2 + chunk3 + chunk4
+        //   3-chunk Topology II: chunk1 + chunk2_3way + chunk3_3way (chunk3 absent)
+        //   3-chunk Topology I:  chunk1_topoI + chunk2_topoI + chunk3_topoI (chunk3 absent)
+        let c1Name = is3ChunkTopoI ? "chunk1_topoI" : "chunk1"
+        let c2Name: String
+        let c4Name: String
+        if is3ChunkTopoI {
+            c2Name = "chunk2_topoI"
+            c4Name = "chunk3_topoI"
+        } else if is3Chunk {
+            c2Name = "chunk2_3way"
+            c4Name = "chunk3_3way"
+        } else {
+            c2Name = "chunk2"
+            c4Name = "chunk4"
+        }
         var chunkWork: [(String, MLModelConfiguration)] = [
-            ("chunk1", mlConfig), ("chunk2", mlConfig),
-            ("chunk3", mlConfig), ("chunk4", mlConfig),
+            (c1Name, mlConfig),
+            (c2Name, mlConfig),
         ]
+        if !is3Chunk {
+            chunkWork.append(("chunk3", mlConfig))
+        }
+        chunkWork.append((c4Name, mlConfig))
         if hasPrefillFiles && !deferPrefill {
             for name in ["prefill_chunk1", "prefill_chunk2",
                          "prefill_chunk3", "prefill_chunk4"] {
@@ -452,10 +532,10 @@ final class ChunkedEngine {
             // all-at-once launch (all tasks seeded, none refilled).
             while let (name, model) = try await group.next() {
                 switch name {
-                case "chunk1": c1 = model
-                case "chunk2": c2 = model
+                case "chunk1", "chunk1_topoI": c1 = model
+                case "chunk2", "chunk2_3way", "chunk2_topoI": c2 = model
                 case "chunk3": c3 = model
-                case "chunk4": c4 = model
+                case "chunk4", "chunk3_3way", "chunk3_topoI": c4 = model
                 case "prefill_chunk1": p1 = model
                 case "prefill_chunk2": p2 = model
                 case "prefill_chunk3": p3 = model
@@ -479,7 +559,8 @@ final class ChunkedEngine {
         default: loadMode = "cap=\(loadMaxParallel)"
         }
         let loadedCount = chunkWork.count
-        let totalCount = hasPrefillFiles ? 8 : 4
+        let decodeSlots = is3Chunk ? 3 : 4
+        let totalCount = hasPrefillFiles ? (decodeSlots + 4) : decodeSlots
         let deferredSuffix = (deferPrefill && hasPrefillFiles)
             ? " (\(totalCount - loadedCount) prefill deferred to bg)"
             : ""
@@ -663,7 +744,9 @@ final class ChunkedEngine {
         // Mixed 2K / 8K chunk files from different builds are rejected with a clear
         // error so the user knows to re-download a consistent set.
         let configuredCtx = config.contextLength
-        for (label, model) in [("chunk1", c1!), ("chunk2", c2!), ("chunk3", c3!), ("chunk4", c4!)] {
+        var ctxCheckModels: [(String, MLModel)] = [("chunk1", c1!), ("chunk2", c2!), ("chunk4", c4!)]
+        if let c3 = c3 { ctxCheckModels.insert(("chunk3", c3), at: 2) }
+        for (label, model) in ctxCheckModels {
             if let desc = model.modelDescription.inputDescriptionsByName["causal_mask_full"],
                let c = desc.multiArrayConstraint,
                let last = c.shape.last?.intValue, last != configuredCtx {
@@ -729,6 +812,8 @@ final class ChunkedEngine {
 
         let engine = try ChunkedEngine(
             chunk1: c1, chunk2: c2, chunk3: c3, chunk4: c4,
+            is3ChunkDecode: is3Chunk,
+            is3ChunkTopoI: is3ChunkTopoI,
             prefillChunk1: p1, prefillChunk2: p2, prefillChunk3: p3, prefillChunk4: p4,
             verifyChunk1: v1, verifyChunk2: v2, verifyChunk3: v3, verifyChunk4: v4,
             verifyK: detectedK,
@@ -789,10 +874,16 @@ final class ChunkedEngine {
                     print("[Load/bg] \(name) done in \(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - t0))s")
                     return m
                 }
-                let bp1 = try bgLoad("prefill_chunk1")
-                let bp2 = try bgLoad("prefill_chunk2")
-                let bp3 = try bgLoad("prefill_chunk3")
-                let bp4 = try bgLoad("prefill_chunk4")
+                // Load the four prefill chunks concurrently so the
+                // window is bound by the slowest chunk, not their sum.
+                // On iPhone 17 Pro sequential was ~75 s (19+10+27+18);
+                // parallel is ~30 s. Use a throwing task group so any
+                // load error propagates out of the detached task.
+                async let ap1: MLModel = bgLoad("prefill_chunk1")
+                async let ap2: MLModel = bgLoad("prefill_chunk2")
+                async let ap3: MLModel = bgLoad("prefill_chunk3")
+                async let ap4: MLModel = bgLoad("prefill_chunk4")
+                let (bp1, bp2, bp3, bp4) = try await (ap1, ap2, ap3, ap4)
                 guard let engine else { return }
                 engine.attachPrefill(bp1, bp2, bp3, bp4)
                 let bgDt = CFAbsoluteTimeGetCurrent() - bgT0
@@ -848,7 +939,8 @@ final class ChunkedEngine {
         print("[Load] Final prewarm (prefill + decode + verify + transition) done in \(String(format: "%.2f", dt))s")
     }
 
-    private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
+    private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel?, chunk4: MLModel,
+                 is3ChunkDecode: Bool, is3ChunkTopoI: Bool,
                  prefillChunk1: MLModel?, prefillChunk2: MLModel?,
                  prefillChunk3: MLModel?, prefillChunk4: MLModel?,
                  verifyChunk1: MLModel?, verifyChunk2: MLModel?,
@@ -865,6 +957,8 @@ final class ChunkedEngine {
                  config: ModelConfig, prefillN: Int) {
         self.chunk1 = chunk1; self.chunk2 = chunk2
         self.chunk3 = chunk3; self.chunk4 = chunk4
+        self.is3ChunkDecode = is3ChunkDecode
+        self.is3ChunkTopoI = is3ChunkTopoI
         self._prefillChunk1 = prefillChunk1; self._prefillChunk2 = prefillChunk2
         self._prefillChunk3 = prefillChunk3; self._prefillChunk4 = prefillChunk4
         self.verifyChunk1 = verifyChunk1; self.verifyChunk2 = verifyChunk2
@@ -1045,6 +1139,17 @@ final class ChunkedEngine {
         profileANEWait += (tC1Wait1 - tC1Wait0)
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
         let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
+        // Topology I: chunk1 is BigChunk1 (L0-14) — it owns L13/L14 producers
+        // and emits kv13/kv14 directly. Capture them here; the normal Topology II
+        // / 4-chunk path extracts them from chunk2's output below instead.
+        let kv13_k_early: MLMultiArray? = is3ChunkDecode && chunk3 == nil && is3ChunkTopoI
+            ? out1.featureValue(for: "kv13_k")?.multiArrayValue : nil
+        let kv13_v_early: MLMultiArray? = is3ChunkDecode && chunk3 == nil && is3ChunkTopoI
+            ? out1.featureValue(for: "kv13_v")?.multiArrayValue : nil
+        let kv14_k_early: MLMultiArray? = is3ChunkDecode && chunk3 == nil && is3ChunkTopoI
+            ? out1.featureValue(for: "kv14_k")?.multiArrayValue : nil
+        let kv14_v_early: MLMultiArray? = is3ChunkDecode && chunk3 == nil && is3ChunkTopoI
+            ? out1.featureValue(for: "kv14_v")?.multiArrayValue : nil
         let tC1Cb0 = CFAbsoluteTimeGetCurrent()
         if chunkPipelineEnabled {
             // Read all output MLMultiArrays synchronously to keep all
@@ -1077,21 +1182,44 @@ final class ChunkedEngine {
         profileCopyBack += (tC1End - tC1Cb0)
         profileC1 += (tC1End - tC1Start)
 
-        // Chunk 2
+        // Chunk 2 — input dict depends on topology.
+        //   4-chunk / Topology II: chunk2 is an own-KV block (takes K_sliding_in/...).
+        //   Topology I:            chunk2 is a pure shared-KV block (takes kv13/kv14).
         let tC2Start = CFAbsoluteTimeGetCurrent()
-        let in2 = try MLDictionaryFeatureProvider(dictionary: [
-            "hidden_states": MLFeatureValue(multiArray: h1),
-            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
-            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
-            "update_mask": MLFeatureValue(multiArray: umask),
-            "per_layer_combined": MLFeatureValue(multiArray: plc),
-            "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
-            "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
-            "K_sliding_in": MLFeatureValue(multiArray: kSliding2),
-            "V_sliding_in": MLFeatureValue(multiArray: vSliding2),
-            "K_full_in": MLFeatureValue(multiArray: kFull2),
-            "V_full_in": MLFeatureValue(multiArray: vFull2),
-        ])
+        let in2: MLDictionaryFeatureProvider
+        if is3ChunkTopoI {
+            guard let kv13k = kv13_k_early, let kv13v = kv13_v_early,
+                  let kv14k = kv14_k_early, let kv14v = kv14_v_early else {
+                throw CoreMLLLMError.modelNotFound("Topology I chunk1 did not emit kv13_*/kv14_*")
+            }
+            in2 = try MLDictionaryFeatureProvider(dictionary: [
+                "hidden_states": MLFeatureValue(multiArray: h1),
+                "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+                "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+                "update_mask": MLFeatureValue(multiArray: umask),
+                "per_layer_combined": MLFeatureValue(multiArray: plc),
+                "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
+                "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
+                "kv13_k": MLFeatureValue(multiArray: kv13k),
+                "kv13_v": MLFeatureValue(multiArray: kv13v),
+                "kv14_k": MLFeatureValue(multiArray: kv14k),
+                "kv14_v": MLFeatureValue(multiArray: kv14v),
+            ])
+        } else {
+            in2 = try MLDictionaryFeatureProvider(dictionary: [
+                "hidden_states": MLFeatureValue(multiArray: h1),
+                "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+                "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
+                "update_mask": MLFeatureValue(multiArray: umask),
+                "per_layer_combined": MLFeatureValue(multiArray: plc),
+                "cos_s": MLFeatureValue(multiArray: cosS), "sin_s": MLFeatureValue(multiArray: sinS),
+                "cos_f": MLFeatureValue(multiArray: cosF), "sin_f": MLFeatureValue(multiArray: sinF),
+                "K_sliding_in": MLFeatureValue(multiArray: kSliding2),
+                "V_sliding_in": MLFeatureValue(multiArray: vSliding2),
+                "K_full_in": MLFeatureValue(multiArray: kFull2),
+                "V_full_in": MLFeatureValue(multiArray: vFull2),
+            ])
+        }
         if chunkPipelineEnabled { kv2Sem.wait(); kv2Held = true }
         let tC2Wait0 = CFAbsoluteTimeGetCurrent()
         let out2 = try chunk2.prediction(from: in2)
@@ -1101,7 +1229,21 @@ final class ChunkedEngine {
         // EAGLE-3 hidden tap (present only in EAGLE-3 decode chunks).
         lastHiddenAtL8 = out2.featureValue(for: "hidden_at_L8")?.multiArrayValue
         let tC2Cb0 = CFAbsoluteTimeGetCurrent()
-        if chunkPipelineEnabled {
+        // Topology I: chunk2 is pure shared-KV (no own-KV output / no kv13-14 output).
+        // chunk1 already produced kv13/kv14; kSliding2/kFull2 are unused buffers
+        // (the static loader still allocates them at fallback default shapes, but
+        // they never see a write).
+        let kv13_k: MLMultiArray
+        let kv13_v: MLMultiArray
+        let kv14_k: MLMultiArray
+        let kv14_v: MLMultiArray
+        if is3ChunkTopoI {
+            // Use the kv13/14 we captured from chunk1 earlier.
+            kv13_k = kv13_k_early!
+            kv13_v = kv13_v_early!
+            kv14_k = kv14_k_early!
+            kv14_v = kv14_v_early!
+        } else if chunkPipelineEnabled {
             // Overlaps with chunk3 ANE compute. kv13/kv14 are passed in
             // memory below and not gated by this semaphore.
             let kSrc = out2.featureValue(for: "K_sliding_out")!.multiArrayValue!
@@ -1120,18 +1262,22 @@ final class ChunkedEngine {
                 kv2Sem.signal()
             }
             kv2Held = false  // signal now owned by the async block
+            kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
+            kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
+            kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
+            kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
         } else {
             copyBack(out2, "K_sliding_out", into: kSliding2)
             copyBack(out2, "V_sliding_out", into: vSliding2)
             copyBack(out2, "K_full_out", into: kFull2)
             copyBack(out2, "V_full_out", into: vFull2)
+            kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
+            kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
+            kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
+            kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
         }
         let tC2Cb1 = CFAbsoluteTimeGetCurrent()
         profileCopyBack += (tC2Cb1 - tC2Cb0)
-        let kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
-        let kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
-        let kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
-        let kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
         lastKV13K = kv13_k; lastKV13V = kv13_v
         lastKV14K = kv14_k; lastKV14V = kv14_v
         let tC2End = CFAbsoluteTimeGetCurrent()
@@ -1148,18 +1294,26 @@ final class ChunkedEngine {
             "kv14_k": MLFeatureValue(multiArray: kv14_k), "kv14_v": MLFeatureValue(multiArray: kv14_v),
         ]
 
-        // Chunk 3
-        let tC3Start = CFAbsoluteTimeGetCurrent()
-        var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
-        let in3 = try MLDictionaryFeatureProvider(dictionary: d3)
-        let tC3Wait0 = CFAbsoluteTimeGetCurrent()
-        let out3 = try chunk3.prediction(from: in3)
-        let h3 = out3.featureValue(for: "hidden_states_out")!.multiArrayValue!
-        // EAGLE-3 hidden tap (present only in EAGLE-3 decode chunks).
-        lastHiddenAtL17 = out3.featureValue(for: "hidden_at_L17")?.multiArrayValue
-        let tC3End = CFAbsoluteTimeGetCurrent()
-        profileANEWait += (tC3End - tC3Wait0)
-        profileC3 += (tC3End - tC3Start)
+        // Chunk 3 (4-chunk mode only; 3-chunk mode merged L15-24 into chunk2).
+        let h3: MLMultiArray
+        if let chunk3 = chunk3 {
+            let tC3Start = CFAbsoluteTimeGetCurrent()
+            var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
+            let in3 = try MLDictionaryFeatureProvider(dictionary: d3)
+            let tC3Wait0 = CFAbsoluteTimeGetCurrent()
+            let out3 = try chunk3.prediction(from: in3)
+            h3 = out3.featureValue(for: "hidden_states_out")!.multiArrayValue!
+            // EAGLE-3 hidden tap (present only in EAGLE-3 decode chunks).
+            lastHiddenAtL17 = out3.featureValue(for: "hidden_at_L17")?.multiArrayValue
+            let tC3End = CFAbsoluteTimeGetCurrent()
+            profileANEWait += (tC3End - tC3Wait0)
+            profileC3 += (tC3End - tC3Start)
+        } else {
+            // 3-chunk: chunk2 already ran L15-24 internally. Feed its hidden
+            // state straight into the LM-head chunk.
+            h3 = h2
+            lastHiddenAtL17 = nil
+        }
 
         // Chunk 4
         let tC4Start = CFAbsoluteTimeGetCurrent()
@@ -1173,8 +1327,9 @@ final class ChunkedEngine {
         profileANEWait += (tC4End - tC4Wait0)
         profileC4 += (tC4End - tC4Start)
 
-        // LayerSkip probe: skip chunk3, feed h2 directly to chunk4
-        if layerSkipProbe {
+        // LayerSkip probe: skip chunk3, feed h2 directly to chunk4.
+        // Meaningless in 3-chunk mode (chunk3 is already merged), so guard.
+        if layerSkipProbe && chunk3 != nil {
             var d4skip = shared; d4skip["hidden_states"] = MLFeatureValue(multiArray: h2)
             let skipOut = try chunk4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4skip))
             let skipToken = skipOut.featureValue(for: "token_id")!.multiArrayValue![0].intValue

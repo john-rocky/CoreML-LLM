@@ -26,7 +26,10 @@ enum ComputePlanAudit {
                     computeUnits: MLComputeUnits = .cpuAndNeuralEngine) async {
         guard isEnabled else { return }
 
-        let chunkNames = ["chunk1", "chunk2", "chunk3", "chunk4"]
+        // Include both the 4-chunk decode names and the 3-chunk rename
+        // pair (chunk2_3way, chunk3_3way). Non-present chunks skip silently.
+        let chunkNames = ["chunk1", "chunk2", "chunk3", "chunk4",
+                          "chunk2_3way", "chunk3_3way"]
         var totalOps = 0
         var totalFallbacks = 0
 
@@ -99,6 +102,40 @@ enum ComputePlanAudit {
         }
     }
 
+    /// Audit the Gemma 4 vision encoder. `backendTag` is "ANE" for the
+    /// fixed-grid ANE build (`vision.ane.*`) and "GPU" for the legacy
+    /// variable-grid build. Runs only when COMPUTE_PLAN_AUDIT is set.
+    /// Lets the iPhone A/B compare *where the ops actually land* in
+    /// addition to wall-clock predict time — Mac-fast ANE placements
+    /// can come back as CPU fallback on A19 when an op shape misses
+    /// the ANE compiler's pattern.
+    static func runVision(modelURL: URL,
+                          computeUnits: MLComputeUnits,
+                          backendTag: String) async {
+        guard isEnabled else { return }
+        let config = MLModelConfiguration()
+        config.computeUnits = computeUnits
+        let name = "vision[\(backendTag)]"
+        do {
+            let plan = try await MLComputePlan.load(contentsOf: modelURL,
+                                                    configuration: config)
+            // Route to the ANE-vs-rest auditor for the ANE build and the
+            // GPU-vs-rest auditor for the legacy build so "fallback" is
+            // measured against the intended device for each backend.
+            let ops: Int
+            let fallbacks: Int
+            if backendTag == "ANE" {
+                (ops, fallbacks) = auditPlan(plan, chunkName: name)
+            } else {
+                (ops, fallbacks) = auditDrafterPlan(plan, name: name,
+                                                   expectedDevice: backendTag)
+            }
+            print("[ComputePlan] \(name): \(fallbacks) off-\(backendTag) op(s) out of \(ops) total")
+        } catch {
+            print("[ComputePlan] \(name): failed to load plan — \(error)")
+        }
+    }
+
     // MARK: - Private
 
     /// Walk a single compute plan, log non-ANE ops, return (totalOps, fallbackCount).
@@ -111,16 +148,25 @@ enum ComputePlanAudit {
 
         var totalOps = 0
         var fallbackOps = 0
+        // (opName, device) → count, for compact grouped summary when per-op
+        // spam would bury the verdict in 100+ lines.
+        var fallbackByKind: [String: Int] = [:]
 
         for (fnName, function) in program.functions {
             walkBlock(function.block, path: "\(chunkName)/\(fnName)",
-                      plan: plan, totalOps: &totalOps, fallbackOps: &fallbackOps)
+                      plan: plan, totalOps: &totalOps,
+                      fallbackOps: &fallbackOps,
+                      fallbackByKind: &fallbackByKind)
         }
 
         if fallbackOps == 0 {
             print("[ComputePlan] \(chunkName): all \(totalOps) ops on Neural Engine")
         } else {
             print("[ComputePlan] \(chunkName): \(fallbackOps)/\(totalOps) ops NOT on Neural Engine")
+            let sorted = fallbackByKind.sorted { $0.value > $1.value }
+            for (kind, n) in sorted {
+                print("[ComputePlan] \(chunkName) fallback | \(kind): \(n)")
+            }
         }
         return (totalOps, fallbackOps)
     }
@@ -129,16 +175,26 @@ enum ComputePlanAudit {
                                   path: String,
                                   plan: MLComputePlan,
                                   totalOps: inout Int,
-                                  fallbackOps: inout Int) {
+                                  fallbackOps: inout Int,
+                                  fallbackByKind: inout [String: Int]) {
         // Skip constant/weight-loading ops — they run once at load, not per-step
-        let constOps: Set<String> = [
+        let constOpSuffixes: Set<String> = [
             "const", "constexpr_lut_to_dense", "constexpr_affine_dequantize",
             "constexpr_blockwise_shift_scale", "constexpr_sparse_to_dense",
             "constexpr_cast",
         ]
+        func isConstOpName(_ name: String) -> Bool {
+            // operatorName arrives as either "const" or "ios18.const" (the
+            // MIL-version prefix is attached for ops defined in the iOSNN
+            // dialect). Strip any leading "iosNN." so both forms match.
+            if let dot = name.firstIndex(of: ".") {
+                return constOpSuffixes.contains(String(name[name.index(after: dot)...]))
+            }
+            return constOpSuffixes.contains(name)
+        }
 
         for op in block.operations {
-            let isConstOp = constOps.contains(op.operatorName)
+            let isConstOp = isConstOpName(op.operatorName)
             if !isConstOp { totalOps += 1 }
 
             let usage = plan.deviceUsage(for: op)
@@ -155,6 +211,8 @@ enum ComputePlanAudit {
             if !isANE && !isConstOp {
                 fallbackOps += 1
                 let device = deviceLabel(usage?.preferred)
+                let key = "\(op.operatorName) → \(device)"
+                fallbackByKind[key, default: 0] += 1
                 let costStr: String
                 if let w = cost?.weight {
                     costStr = String(format: "cost=%.4f", w)
@@ -168,7 +226,8 @@ enum ComputePlanAudit {
             // Recurse into nested blocks (e.g. cond, while_loop)
             for nested in op.blocks {
                 walkBlock(nested, path: "\(path)/\(op.operatorName)",
-                          plan: plan, totalOps: &totalOps, fallbackOps: &fallbackOps)
+                          plan: plan, totalOps: &totalOps, fallbackOps: &fallbackOps,
+                          fallbackByKind: &fallbackByKind)
             }
         }
     }

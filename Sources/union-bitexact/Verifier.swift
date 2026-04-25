@@ -62,23 +62,23 @@ func parseArgs() -> Args {
     return a
 }
 
-// One representative prompt per A5 category, kept short so the bench
-// finishes in a few minutes on Mac Studio.
-let CORPUS: [(String, String, String)] = [
-    ("chat-1",    "chat",
-     "Explain what a transformer is in two short sentences."),
-    ("code-1",    "code",
-     "Write a Python function that returns the n-th Fibonacci number using memoization."),
-    ("qa-1",     "qa",
-     "What is the capital of France, and which river runs through it?"),
-    ("summary-1", "summary",
-     "Summarize in one sentence: The mitochondrion is a double-membrane-bound organelle "
-     + "found in most eukaryotic cells, often called the powerhouse of the cell because "
-     + "it generates most of the cell's supply of adenosine triphosphate."),
-]
-
 @main
 struct Verifier {
+    // One representative prompt per A5 category, kept short so the bench
+    // finishes in a few minutes on Mac Studio.
+    static let corpus: [(String, String, String)] = [
+        ("chat-1",    "chat",
+         "Explain what a transformer is in two short sentences."),
+        ("code-1",    "code",
+         "Write a Python function that returns the n-th Fibonacci number using memoization."),
+        ("qa-1",     "qa",
+         "What is the capital of France, and which river runs through it?"),
+        ("summary-1", "summary",
+         "Summarize in one sentence: The mitochondrion is a double-membrane-bound organelle "
+         + "found in most eukaryotic cells, often called the powerhouse of the cell because "
+         + "it generates most of the cell's supply of adenosine triphosphate."),
+    ]
+
     static func main() async {
         let args = parseArgs()
         do {
@@ -87,7 +87,7 @@ struct Verifier {
 
             var failures = 0
             var checks = 0
-            for (id, cat, prompt) in CORPUS {
+            for (id, cat, prompt) in corpus {
                 if !args.categories.isEmpty && !args.categories.contains(cat) { continue }
                 checks += 1
 
