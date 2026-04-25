@@ -51,6 +51,10 @@ sys.path.insert(0, ROOT)
 import coremltools as ct
 from coremltools.optimize.coreml import (
     OpPalettizerConfig, OptimizationConfig, palettize_weights,
+    linear_quantize_activations,
+)
+from coremltools.optimize.coreml.experimental import (
+    OpActivationLinearQuantizerConfig,
 )
 
 from ane_ops import MODEL_DTYPE
@@ -123,9 +127,195 @@ def _audit_ane(pkg_path: str) -> float:
         return 0.0
 
 
+def _patch_suffix_skip_missing():
+    """`insert_suffix_quantize_dequantize_pair` reads `rmin`/`rmax` for the
+    OUTPUT var of every dequantize→conv/add/linear/pool pattern via
+    `optimize_utils.get_min_and_max_values`. If our prefix patch caused
+    the calibration to skip an op (e.g. bool-typed intermediate), the
+    suffix pass also crashes with KeyError.
+
+    Wrap the suffix pass's _try_apply_transform to silently skip when
+    the relevant var has no stats. Idempotent.
+    """
+    from coremltools.converters.mil.mil.passes.defs import (
+        optimize_activation_quantization as suff_mod,
+    )
+    cls = suff_mod.insert_suffix_quantize_dequantize_pair
+    if getattr(cls._try_apply_transform, "_missing_stats_patched", False):
+        return
+    original = cls._try_apply_transform
+
+    def patched(self, last_op, _child_op, block, visited_ops, op_config):
+        var_name = last_op.outputs[0].name
+        stats = self._activation_stats
+        if stats is None or var_name not in stats:
+            return False
+        if "rmin" not in stats[var_name] or "rmax" not in stats[var_name]:
+            return False
+        # Skip degenerate ranges where the suffix path produces scale=0,
+        # tripping iOS17 quantize op's "scale cannot be 0" validation.
+        # (cml9 prefix has a guard; suffix doesn't.)
+        if float(stats[var_name]["rmin"]) == float(stats[var_name]["rmax"]):
+            return False
+        return original(self, last_op, _child_op, block, visited_ops, op_config)
+
+    patched._missing_stats_patched = True
+    cls._try_apply_transform = patched
+
+
+def _patch_quant_dequant_skip_missing():
+    """cml9's `insert_prefix_quantize_dequantize_pair` pass walks every
+    `linear`/`conv`/`matmul`/`add`/pool op and tries to quantize its
+    inputs. If an input's source op has a non-output-compatible type
+    (e.g. bool intermediates from mask construction), the calibration
+    pass silently SKIPS that var (cloned_output_type is None branch in
+    `predict_intermediate_outputs`), so its rmin/rmax are absent. The
+    insertion pass then crashes with KeyError('rmin').
+
+    Patch `transform_op` to skip ops whose `x` input has no stats,
+    rather than crash. Effect: those specific edges stay fp16 while
+    everything else gets INT8 quantized — partial coverage is fine
+    for memory-bandwidth gain.
+    """
+    from coremltools.optimize.coreml import _quantization_passes as qpasses
+    cls = qpasses.insert_prefix_quantize_dequantize_pair
+    if getattr(cls.transform_op, "_missing_stats_patched", False):
+        return
+    original_transform = cls.transform_op
+
+    def patched_transform_op(self, op):
+        from coremltools.converters.mil.mil import types as mil_types
+        x = op.inputs.get("x") if hasattr(op.inputs, "get") else None
+        if x is None:
+            x = op.inputs["x"] if "x" in op.inputs else None
+        if x is None:
+            return original_transform(self, op)
+        # Skip non-floating-point inputs — quantize op requires scale dtype
+        # to match input dtype, but cml9 always uses fp16/fp32 scales.
+        # An int32 `add` (e.g. ring_pos + 1) trips a downstream
+        # ValueError during quantize op construction.
+        if x.dtype not in (mil_types.fp16, mil_types.fp32):
+            return
+        if self._activation_stats is not None:
+            if x.name not in self._activation_stats:
+                return
+            stats = self._activation_stats[x.name]
+            if "rmin" not in stats or "rmax" not in stats:
+                return
+        return original_transform(self, op)
+
+    patched_transform_op._missing_stats_patched = True
+    cls.transform_op = patched_transform_op
+
+
+def _patch_calibrator_for_stateful():
+    """cml9's `linear_quantize_activations` calibrator clones the spec,
+    appends intermediate outputs, builds a temp MLModel, and calls
+    `model.predict(inputs)` per calibration sample. For STATEFUL models
+    this raises "The input feature for kv_cache_full must be an MLState,
+    but it was not." because no state is allocated.
+
+    Patch `ModelDebugger.predict_intermediate_outputs` to detect a
+    stateful temp model and allocate fresh state per call. Idempotent.
+    """
+    import coremltools.optimize.coreml.experimental._model_debugger as dbg
+    if getattr(dbg.ModelDebugger.predict_intermediate_outputs,
+               "_stateful_patched", False):
+        return
+    from coremltools.optimize.coreml.experimental._model_debugger import (
+        ModelDebugger, ModelInfo, _SPECIFICATION_VERSION_IOS_16, logger,
+    )
+
+    def predict_intermediate_outputs(
+        self, inputs, intermediate_output_names,
+        compute_units=ct.ComputeUnit.CPU_ONLY,
+    ):
+        cloned_spec = ModelDebugger.clone_spec(self.model_info.spec)
+        if self.model_info.spec.specificationVersion < _SPECIFICATION_VERSION_IOS_16:
+            logger.warning(
+                f"The model has spec version {self.model_info.spec.specificationVersion}, "
+                f"forcefully updated to {_SPECIFICATION_VERSION_IOS_16} during calibration."
+            )
+            cloned_spec.specificationVersion = max(
+                self.model_info.spec.specificationVersion, 7)
+        cloned_model_info = ModelInfo(
+            ModelDebugger.get_program_info(cloned_spec.mlProgram), cloned_spec
+        )
+        cloned_block_info = ModelDebugger.get_any_block(cloned_model_info)
+
+        for output_name in intermediate_output_names:
+            cloned_output_type = ModelDebugger.get_output_feature_type(
+                output_name, self.block_info.operations
+            )
+            if cloned_output_type is None:
+                continue
+            cloned_block_info.spec.outputs.append(output_name)
+            cloned_output = ct.proto.Model_pb2.FeatureDescription()
+            cloned_output.name = output_name
+            cloned_output.type.multiArrayType.dataType = cloned_output_type
+            cloned_model_info.spec.description.output.append(cloned_output)
+
+        model = ct.models.MLModel(
+            cloned_spec,
+            weights_dir=self.weights_dir,
+            compute_units=compute_units,
+            skip_model_load=False,
+        )
+        # PATCH: allocate fresh state for stateful models so predict()
+        # doesn't trip "input feature for <state> must be an MLState".
+        if model._is_stateful():
+            return model.predict(inputs, state=model.make_state())
+        return model.predict(inputs)
+
+    predict_intermediate_outputs._stateful_patched = True
+    dbg.ModelDebugger.predict_intermediate_outputs = predict_intermediate_outputs
+
+
+def _make_calibration_samples(input_specs, num_samples=4, seed=0):
+    """Synthetic calibration data for `linear_quantize_activations`.
+
+    Names + shapes are taken from the converted model's input specs;
+    values are sampled from distributions that approximate the real
+    activations entering each chunk:
+      - mask inputs: zero (all-attend) — masks are added, so 0 is the
+        "no penalty" value; -inf positions don't affect activation range
+      - cos/sin: uniform(-1, 1) — RoPE outputs are bounded
+      - position counters (int32): small monotone values per sample
+      - everything else (hidden_states, per_layer, kv13/kv14): N(0, 0.5)
+        roughly matches embedding scales after RMSNorm
+
+    Stateful chunks: only regular tensor inputs go in the dict. The
+    `predict` call inside the calibrator allocates fresh state via the
+    spec's StateType; we don't pass MLState ourselves.
+    """
+    from coremltools.converters.mil.mil import types as mil_types
+    rng = np.random.default_rng(seed)
+    samples = []
+    for i in range(num_samples):
+        d = {}
+        for spec in input_specs:
+            # ct.TensorType.shape is a `Shape` object — use .to_list() to
+            # get a python list of dim ints. ct.TensorType.dtype is a MIL
+            # type, not a numpy dtype, so compare against mil_types.
+            shape = tuple(int(s) for s in spec.shape.to_list())
+            name = spec.name
+            if spec.dtype == mil_types.int32:
+                d[name] = np.full(shape, i, dtype=np.int32)
+            elif "mask" in name:
+                d[name] = np.zeros(shape, dtype=np.float16)
+            elif name.startswith(("cos_", "sin_")):
+                d[name] = rng.uniform(-1.0, 1.0, shape).astype(np.float16)
+            else:
+                d[name] = rng.normal(0.0, 0.5, shape).astype(np.float16)
+        samples.append(d)
+    return samples
+
+
 def _trace_and_convert_stateful(
     model, sample_inputs, input_specs, output_specs, state_specs,
     out_path: str, quantize_nbits: int,
+    activation_quant: bool = False,
+    calib_samples: int = 4,
 ):
     """Trace + ct.convert with StateType, save, optionally palettize, audit."""
     t = time.time()
@@ -159,6 +349,29 @@ def _trace_and_convert_stateful(
         mlmodel = palettize_weights(mlmodel, OptimizationConfig(global_config=op_cfg))
         print(f"    palettized int{quantize_nbits} in {time.time()-t:.1f}s")
 
+    if activation_quant:
+        t = time.time()
+        _patch_calibrator_for_stateful()
+        _patch_quant_dequant_skip_missing()
+        _patch_suffix_skip_missing()
+        # Scope to `linear` op only (cml9 PR #2577's specific contribution).
+        # Reason for not using global_config: cml9 also quantizes inputs of
+        # `add` ops, which on Gemma 4 are residual connections — INT8 round-
+        # trip on residuals compounds error across 35 layers, dropping
+        # `hidden_states_out` cosine to ~0.1 vs W4 baseline. `linear`-only
+        # keeps quant on the matmul path where it's actually beneficial.
+        act_cfg = OpActivationLinearQuantizerConfig(
+            mode="linear_symmetric",
+            weight_threshold=2048,
+        )
+        opt_cfg = OptimizationConfig(op_type_configs={"linear": act_cfg})
+        sample_data = _make_calibration_samples(input_specs,
+                                                 num_samples=calib_samples)
+        print(f"    activation-quantizing INT8 (linear-only) with "
+              f"{len(sample_data)} calibration samples...")
+        mlmodel = linear_quantize_activations(mlmodel, opt_cfg, sample_data)
+        print(f"    activation-quantized in {time.time()-t:.1f}s")
+
     if os.path.exists(out_path):
         shutil.rmtree(out_path)
     mlmodel.save(out_path)
@@ -175,7 +388,8 @@ def _trace_and_convert_stateful(
 # Per-chunk converters
 # ============================================================
 
-def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits, *, use_linear=False):
+def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits, *,
+                   use_linear=False, activation_quant=False):
     print("\n" + "=" * 60)
     print(f"CHUNK 1 (L{c_start}-{c_end-1}) — own KV state, computes PLE")
     print("=" * 60)
@@ -233,10 +447,12 @@ def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits, *, use_linear=Fal
         ),
     ]
     _trace_and_convert_stateful(
-        chunk, sample, inputs, outputs, states, out_path, nbits)
+        chunk, sample, inputs, outputs, states, out_path, nbits,
+        activation_quant=activation_quant)
 
 
-def convert_chunk2(base, c_start, c_end, ctx, out_path, nbits, *, use_linear=False):
+def convert_chunk2(base, c_start, c_end, ctx, out_path, nbits, *,
+                   use_linear=False, activation_quant=False):
     print("\n" + "=" * 60)
     print(f"CHUNK 2 (L{c_start}-{c_end-1}) — own KV state, emits kv13/kv14")
     print("=" * 60)
@@ -297,11 +513,13 @@ def convert_chunk2(base, c_start, c_end, ctx, out_path, nbits, *, use_linear=Fal
         ),
     ]
     _trace_and_convert_stateful(
-        chunk, sample, inputs, outputs, states, out_path, nbits)
+        chunk, sample, inputs, outputs, states, out_path, nbits,
+        activation_quant=activation_quant)
 
 
 def convert_chunk_shared(chunk_cls, base, c_start, c_end, ctx,
-                         out_path, nbits, name, with_lm_head, *, use_linear=False):
+                         out_path, nbits, name, with_lm_head, *,
+                         use_linear=False, activation_quant=False):
     """Stateless chunk (3 or 4). All layers KV-shared from kv13/kv14."""
     print("\n" + "=" * 60)
     print(f"{name} (L{c_start}-{c_end-1}) — stateless, reads kv13/14"
@@ -355,7 +573,8 @@ def convert_chunk_shared(chunk_cls, base, c_start, c_end, ctx,
         outputs = [ct.TensorType(name="hidden_states_out", dtype=fp16)]
     _trace_and_convert_stateful(
         chunk, sample, inputs, outputs, state_specs=[],
-        out_path=out_path, quantize_nbits=nbits)
+        out_path=out_path, quantize_nbits=nbits,
+        activation_quant=activation_quant)
 
 
 # ============================================================
@@ -386,6 +605,18 @@ def main():
                          "ops. ANE placement was 100% in 5-layer PoC + W4, "
                          "but Mac W4 latency was +21% — iPhone re-test "
                          "gates production migration.")
+    ap.add_argument("--activation-quant", action="store_true",
+                    help="Stage 1 (cml9 PR #2577 final form): apply "
+                         "linear_quantize_activations (INT8 symmetric) on "
+                         "top of W4 palettize. Halves intra-op memory "
+                         "bandwidth on Apple ANE. Currently cml9 only "
+                         "supports n=8 activations. Calibration uses "
+                         "synthetic samples by default.")
+    ap.add_argument("--calib-samples", type=int, default=4,
+                    help="Number of synthetic calibration samples for "
+                         "--activation-quant (default: 4). More samples "
+                         "= broader activation range coverage but slower "
+                         "calibration.")
     args = ap.parse_args()
 
     if args.ctx is None:
@@ -419,28 +650,32 @@ def main():
         print(f"Projections: nn.Linear (cml9 PR #2577 variant)")
     else:
         print(f"Projections: nn.Conv2d(1×1) wrapper (current default)")
+    if args.activation_quant:
+        print(f"Activations: INT8 linear_symmetric "
+              f"(calib samples={args.calib_samples})")
 
     do = (lambda n: args.only_chunk is None or args.only_chunk == n)
     use_linear = args.linear_projections
+    act_q = args.activation_quant
 
     if do(1):
         convert_chunk1(base, *boundaries[0], args.ctx,
                        str(out / "chunk_1.mlpackage"), args.nbits,
-                       use_linear=use_linear)
+                       use_linear=use_linear, activation_quant=act_q)
     if do(2):
         convert_chunk2(base, *boundaries[1], args.ctx,
                        str(out / "chunk_2.mlpackage"), args.nbits,
-                       use_linear=use_linear)
+                       use_linear=use_linear, activation_quant=act_q)
     if do(3):
         convert_chunk_shared(SWAStatefulChunk3, base, *boundaries[2], args.ctx,
                              str(out / "chunk_3.mlpackage"), args.nbits,
                              name="CHUNK 3", with_lm_head=False,
-                             use_linear=use_linear)
+                             use_linear=use_linear, activation_quant=act_q)
     if do(4):
         convert_chunk_shared(SWAStatefulChunk4, base, *boundaries[3], args.ctx,
                              str(out / "chunk_4.mlpackage"), args.nbits,
                              name="CHUNK 4", with_lm_head=True,
-                             use_linear=use_linear)
+                             use_linear=use_linear, activation_quant=act_q)
 
     print(f"\nartifacts under {out}")
     for p in sorted(out.iterdir()):

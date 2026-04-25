@@ -11,4 +11,3 @@ Format: one line per active claim.
 ---
 
 (empty — no active claims)
-stage1-w4a8 | 9846EE00 | 2026-04-25T19:28:18Z | W4A8 linear_quantize_activations adoption
