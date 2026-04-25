@@ -1026,9 +1026,8 @@ final class Qwen3VL2BStatefulGenerator {
         var i = 0
         if canBatchPrefill {
             let T = prefillT
+            let pad = imagePadTokenId
             while i + T <= inputIds.count {
-                // Classify the next T tokens.
-                let pad = imagePadTokenId
                 var allImagePad = true
                 var anyImagePad = false
                 for t in 0..<T {
@@ -1036,9 +1035,36 @@ final class Qwen3VL2BStatefulGenerator {
                     else { allImagePad = false }
                 }
                 let mixed = anyImagePad && !allImagePad
-                if mixed { break }  // fall back to T=1 for the rest
-                if allImagePad && (visionFeatures == nil || chunk0VisionPrefill == nil) {
-                    break  // need vision multifunction to batch image-pad
+                let cantBatchImage = allImagePad
+                    && (visionFeatures == nil || chunk0VisionPrefill == nil)
+                if mixed || cantBatchImage {
+                    // Consume the offending token T=1 and try the next
+                    // window — boundary tokens are rare (1 vision_start +
+                    // 1 vision_end per image), so the batched fast path
+                    // resumes immediately.
+                    let tok = inputIds[i]
+                    var vision: VisionStepContext? = nil
+                    if let vf = visionFeatures, tok == pad,
+                       imageTokenIdx < vf.count {
+                        if imageStartPos == nil { imageStartPos = position }
+                        let h = imageTokenIdx / gridW
+                        let w = imageTokenIdx % gridW
+                        vision = VisionStepContext(
+                            hiddenRow: imageTokenIdx,
+                            features: vf,
+                            gridT: Float(imageStartPos ?? position),
+                            gridH: Float(imageStartPos ?? position) + Float(h),
+                            gridW: Float(imageStartPos ?? position) + Float(w))
+                        imageTokenIdx += 1
+                    }
+                    prefillPredicted = try await stepPredict(
+                        token: tok, position: position,
+                        states: states, collectTimings: false,
+                        vision: vision)
+                    lastToken = tok
+                    position += 1
+                    i += 1
+                    continue
                 }
 
                 if allImagePad, let vf = visionFeatures {
