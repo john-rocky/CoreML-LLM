@@ -54,6 +54,14 @@ MODEL_REGISTRY: dict[str, ConversionConfig] = {
         max_context_length=131072,
         description="Gemma 4 E4B Instruct - 4B-effective text decoder (42 layers, hidden=2560, 2 KV heads)",
     ),
+    # NOTE: prism-ml/{,Ternary-}Bonsai-1.7B were investigated and intentionally
+    # not registered here. Their per-(row, block) ternary structure cannot be
+    # faithfully represented on ANE — Apple's ANEC rejects per-block LUT
+    # palettization with error -14, and any stock-API approximation collapses
+    # the per-block scales into a rank-1 outer product, defeating the model's
+    # core compression. See `docs/TERNARY_BONSAI.md` for the post-mortem.
+    # To run Bonsai on Apple Silicon, use mlx-lm with
+    # `prism-ml/Ternary-Bonsai-1.7B-mlx-2bit` (GPU, native ternary matmul).
 }
 
 

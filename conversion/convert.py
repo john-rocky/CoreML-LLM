@@ -197,6 +197,9 @@ def _get_model_class(architecture: str):
     if architecture == "qwen2":
         from models.qwen2 import Qwen2Model
         return Qwen2Model
+    if architecture == "qwen3":
+        from models.qwen3 import Qwen3Model
+        return Qwen3Model
     if architecture == "gemma4":
         from models.gemma4 import Gemma4Model
         return Gemma4Model
