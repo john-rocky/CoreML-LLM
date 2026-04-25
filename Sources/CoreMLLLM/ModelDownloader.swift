@@ -130,6 +130,23 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://huggingface.co/mlboydaisuke/qwen3-vl-2b-stateful-coreml/resolve/main",
             folderName: "qwen3-vl-2b-stateful")
 
+        /// Qwen3-VL 2B stateful — Linear variant (cml9 PR #2577 native
+        /// `linear` op activation-quant). Same structural layout as
+        /// `qwen3vl_2b_stateful` (chunk_0..3 + chunk_head + embed_weight.bin
+        /// under `qwen3_vl_2b_stateful_chunks/`); each chunk's `Conv2dLinear`
+        /// (1×1) projection is swapped for `nn.Linear` weights reshaped from
+        /// (out, in, 1, 1) to (out, in). Mac chunk_0 A/B (INT8) shows
+        /// ANE placement +1 pt (94.5 % vs 93.5 %) and Mac dispatch latency
+        /// parity (+0.2 %, within noise). iPhone re-test gates the
+        /// `ane_ops.Conv2dLinear` migration. Sideload-only to
+        /// `Documents/Models/qwen3-vl-2b-stateful-linear/`.
+        public static let qwen3vl_2b_stateful_linear = ModelInfo(
+            id: "qwen3-vl-2b-stateful-linear",
+            name: "Qwen3-VL 2B (stateful, Linear projections)",
+            size: "2.3 GB",
+            downloadURL: "",
+            folderName: "qwen3-vl-2b-stateful-linear")
+
         /// Gemma 4 E4B — 42 layers, hidden=2560, 2 KV heads, text-only decoder.
         /// INT4 palettized, ctx=2048. Baseline ~14 tok/s on iPhone 17 Pro.
         /// A local build (`conversion/build_gemma4_bundle.py --model gemma4-e4b`)
@@ -226,6 +243,7 @@ public final class ModelDownloader: NSObject {
                 list.insert(gemma4e2bLookaheadProbe, at: 3)  // after EAGLE-3
                 list.insert(gemma4e2bStateful, at: 4)        // after LookAhead
                 list.insert(gemma4e2bStatefulLinear, at: 5)  // Plan 3 A/B partner
+                list.append(qwen3vl_2b_stateful_linear)      // Qwen3-VL Plan 3 A/B partner
             }
             return list
         }
