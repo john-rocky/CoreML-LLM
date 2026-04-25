@@ -1024,6 +1024,11 @@ final class Qwen3VL2BStatefulGenerator {
         let canBatchPrefill = !bodyPrefillChunks.isEmpty
             && inputIds.count >= prefillT
         var i = 0
+        // TTFT diagnostic counters (printed at end of prefill loop).
+        var batchedTextCount = 0
+        var batchedVisionCount = 0
+        var t1StepCount = 0
+        let prefillLoopStart = CFAbsoluteTimeGetCurrent()
         if canBatchPrefill {
             let T = prefillT
             let pad = imagePadTokenId
@@ -1038,10 +1043,7 @@ final class Qwen3VL2BStatefulGenerator {
                 let cantBatchImage = allImagePad
                     && (visionFeatures == nil || chunk0VisionPrefill == nil)
                 if mixed || cantBatchImage {
-                    // Consume the offending token T=1 and try the next
-                    // window — boundary tokens are rare (1 vision_start +
-                    // 1 vision_end per image), so the batched fast path
-                    // resumes immediately.
+                    t1StepCount += 1
                     let tok = inputIds[i]
                     var vision: VisionStepContext? = nil
                     if let vf = visionFeatures, tok == pad,
@@ -1078,15 +1080,22 @@ final class Qwen3VL2BStatefulGenerator {
                         inputIds: inputIds, startPos: position,
                         states: states, vision: batch)
                     imageTokenIdx += T
+                    batchedVisionCount += 1
                 } else {
                     prefillPredicted = try await prefillBatchStep(
                         inputIds: inputIds, startPos: position, states: states)
+                    batchedTextCount += 1
                 }
                 lastToken = inputIds[i + T - 1]
                 position += T
                 i += T
             }
         }
+        let prefillLoopMs = (CFAbsoluteTimeGetCurrent() - prefillLoopStart) * 1000
+        print("[Qwen3VL2BStateful] prefill inputIds=\(inputIds.count) "
+              + "batchedText=\(batchedTextCount)×\(prefillT) "
+              + "batchedVision=\(batchedVisionCount)×\(prefillT) "
+              + "t1Steps=\(t1StepCount) elapsed=\(Int(prefillLoopMs))ms")
 
         // Tail tokens (or all tokens for vision / no-multifunction
         // builds) go through the T=1 path.

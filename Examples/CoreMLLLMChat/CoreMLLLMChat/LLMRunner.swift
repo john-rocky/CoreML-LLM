@@ -637,11 +637,7 @@ final class LLMRunner {
         hasAudio = false
         isLoaded = true
         loadingStatus = "Ready"
-        print("[LLMRunner] loaded Qwen3-VL 2B stateful\(visionTag) from \(folder.lastPathComponent)")
-        print("[LLMRunner]   gen.status = \(gen.status)")
-        print("[LLMRunner]   hasMultifunctionPrefill=\(gen.hasMultifunctionPrefill) "
-              + "hasVisionChunk=\(gen.hasVisionChunk) "
-              + "hasVisionMultifunctionPrefill=\(gen.hasVisionMultifunctionPrefill)")
+        print("[LLMRunner] Qwen3-VL 2B stateful — \(gen.status)")
     }
 
     private func generateQwen3VL2BStateful(messages: [ChatMessage],
