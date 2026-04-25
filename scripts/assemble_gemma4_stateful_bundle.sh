@@ -31,9 +31,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SRC_CHUNKS="/tmp/gemma4-e2b-stateful"
-STAGING="/Users/majimadaisuke/Downloads/coreml-llm-artifacts/staging-2k-fast-prefill/gemma4-e2b"
-OUT_PARENT="$ROOT/build/gemma4_stateful"
+SRC_CHUNKS="${SRC_CHUNKS:-/tmp/gemma4-e2b-stateful}"
+STAGING="${STAGING:-/Users/majimadaisuke/Downloads/coreml-llm-artifacts/staging-2k-fast-prefill/gemma4-e2b}"
+OUT_PARENT="${OUT_PARENT:-$ROOT/build/gemma4_stateful}"
 OUT="$OUT_PARENT/gemma4_e2b_stateful_chunks"
 
 # Sanity

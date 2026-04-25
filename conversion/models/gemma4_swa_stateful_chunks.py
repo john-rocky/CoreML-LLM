@@ -494,3 +494,326 @@ class SWAStatefulChunk4(nn.Module):
             logits = torch.tanh(logits / self.softcap) * self.softcap
         token_id, token_logit = self.argmax(logits.squeeze(0))
         return token_id, token_logit, normed
+
+
+# ============================================================
+# T=N prefill variants — Phase 2b multifunction (`prefill_bN`)
+# ============================================================
+#
+# Mirrors the Qwen3-VL stateful T=1 → T=N progression. Each prefill
+# chunk takes T tokens at once, writes T contiguous KV slots via
+# slice_update, and returns hidden states for all T positions (chunk4
+# argmaxes the LAST row only). Engine-side dispatch guarantees
+# `current_pos + T <= ctx` and `ring_pos + T <= W` (no mid-batch wrap)
+# so the slice_update remains a contiguous slice. The tail of any
+# prompt where these constraints fail goes through the T=1 path.
+
+
+def _run_layer_swa_stateful_prefill(
+    layer, layer_idx, hidden_states,
+    cos_s, sin_s, cos_f, sin_f,
+    causal_mask_full, causal_mask_sliding,
+    current_pos, ring_pos,
+    kv_sliding_state, kv_full_state,
+    sliding_map, full_map,
+    config, per_layer_combined,
+    kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v,
+    T,
+):
+    """T=N variant of _run_layer_swa_stateful. Shapes:
+      hidden_states:       (1, T, hidden)
+      cos_*/sin_*:         (1, 1, T, hd_*)
+      causal_mask_full:    (1, 1, T, ctx)
+      causal_mask_sliding: (1, 1, T, W)
+      per_layer_combined:  (1, T, num_layers*pld)
+      kv_*_state:          unchanged from T=1 build; written T slots at
+                            current_pos:current_pos+T (full) or
+                            ring_pos:ring_pos+T (sliding).
+    """
+    num_heads = config.num_attention_heads
+    num_kv_heads = config.num_key_value_heads
+    n_rep = num_heads // num_kv_heads
+    max_hd = config.global_head_dim
+    is_full = config.is_full_attention(layer_idx)
+    hd = config.get_head_dim(layer_idx)
+    is_kv_shared = config.is_kv_shared(layer_idx)
+
+    residual = hidden_states
+    h = layer.input_layernorm(hidden_states).to(MODEL_DTYPE)  # (1, T, hidden)
+
+    # Q: (1, T, num_heads*hd) → (1, num_heads, T, hd)
+    q = _project(layer.self_attn["q_proj"], h).view(
+        1, T, num_heads, hd).permute(0, 2, 1, 3).to(MODEL_DTYPE)
+    q = layer.self_attn["q_norm"](q.reshape(1, num_heads, T, hd))
+    if is_full:
+        q, _ = apply_rotary_pos_emb(q, q, cos_f, sin_f)
+    else:
+        q, _ = apply_rotary_pos_emb(q, q, cos_s, sin_s)
+
+    if not is_kv_shared:
+        k = _project(layer.self_attn["k_proj"], h).view(
+            1, T, num_kv_heads, hd).permute(0, 2, 1, 3).to(MODEL_DTYPE)
+        v = _project(layer.self_attn["v_proj"], h).view(
+            1, T, num_kv_heads, hd).permute(0, 2, 1, 3).to(MODEL_DTYPE)
+        k = layer.self_attn["k_norm"](k.reshape(1, num_kv_heads, T, hd))
+        v = v_norm(v)
+        if is_full:
+            _, k = apply_rotary_pos_emb(k, k, cos_f, sin_f)
+        else:
+            _, k = apply_rotary_pos_emb(k, k, cos_s, sin_s)
+
+        if hd < max_hd:
+            k_padded = F.pad(k, (0, max_hd - hd))
+            v_padded = F.pad(v, (0, max_hd - hd))
+        else:
+            k_padded, v_padded = k, v
+        # k_padded/v_padded shape: (1, HKV, T, max_hd)
+
+        if is_full:
+            fi = full_map[layer_idx]
+            kv_full_state[2*fi:2*fi+1, :, current_pos:current_pos+T, :] = k_padded
+            kv_full_state[2*fi+1:2*fi+2, :, current_pos:current_pos+T, :] = v_padded
+            K_full_slice = kv_full_state[2*fi:2*fi+1, :, :, :hd]
+            V_full_slice = kv_full_state[2*fi+1:2*fi+2, :, :, :hd]
+            K_for_attn = K_full_slice
+            V_for_attn = V_full_slice
+        else:
+            si = sliding_map[layer_idx]
+            kv_sliding_state[2*si:2*si+1, :, ring_pos:ring_pos+T, :] = k_padded
+            kv_sliding_state[2*si+1:2*si+2, :, ring_pos:ring_pos+T, :] = v_padded
+            K_sliding_slice = kv_sliding_state[2*si:2*si+1, :, :, :hd]
+            V_sliding_slice = kv_sliding_state[2*si+1:2*si+2, :, :, :hd]
+            K_for_attn = K_sliding_slice
+            V_for_attn = V_sliding_slice
+
+        if layer_idx == config.kv_sliding_producer:
+            kv_store_13_k = K_for_attn[..., :config.head_dim]
+            kv_store_13_v = V_for_attn[..., :config.head_dim]
+        elif layer_idx == config.kv_full_producer:
+            kv_store_14_k = K_for_attn[..., :config.global_head_dim]
+            kv_store_14_v = V_for_attn[..., :config.global_head_dim]
+    else:
+        if is_full:
+            K_for_attn = kv_store_14_k
+            V_for_attn = kv_store_14_v
+        else:
+            K_for_attn = kv_store_13_k
+            V_for_attn = kv_store_13_v
+
+    # GQA expansion + manual attention. q (1, H, T, hd), K (1, HKV, S, hd)
+    # → expand HKV to H, attn (1, H, T, S). Mask shape (1, 1, T, S)
+    # broadcasts across heads.
+    K_expanded = K_for_attn.repeat_interleave(n_rep, dim=1)
+    V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
+    mask = causal_mask_full if is_full else causal_mask_sliding
+    attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
+    attn_weights = attn_weights + mask
+    attn_weights = ane_softmax(attn_weights, dim=-1)
+    attn_output = torch.matmul(attn_weights, V_expanded)
+
+    # (1, num_heads, T, hd) → (1, T, num_heads*hd)
+    attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(1, T, -1)
+    attn_output = _project(layer.self_attn["o_proj"], attn_output)
+    attn_output = layer.post_attention_layernorm(attn_output)
+    hidden_states = residual + attn_output
+
+    # MLP
+    residual = hidden_states
+    h = layer.pre_feedforward_layernorm(hidden_states).to(MODEL_DTYPE)
+    gate = _project(layer.mlp["gate_proj"], h)
+    up = _project(layer.mlp["up_proj"], h)
+    gate = F.gelu(gate, approximate="tanh")
+    mlp_out = _project(layer.mlp["down_proj"], gate * up)
+    hidden_states = layer.post_feedforward_layernorm(mlp_out)
+    hidden_states = residual + hidden_states
+
+    # Per-layer input — slice along the trailing (num_layers*pld) dim,
+    # which lives on dim=-1 for both T=1 (1, 1, *) and T>1 (1, T, *).
+    residual_pl = hidden_states
+    s = layer_idx * config.hidden_size_per_layer_input
+    e = s + config.hidden_size_per_layer_input
+    per_layer_slice = per_layer_combined[:, :, s:e]   # (1, T, pld)
+    h_pl = hidden_states.to(MODEL_DTYPE)
+    gated = _project(layer.per_layer_input_gate, h_pl)
+    gated = F.gelu(gated, approximate="tanh")
+    gated = gated * per_layer_slice
+    gated = _project(layer.per_layer_projection, gated)
+    hidden_states = layer.post_per_layer_input_norm(gated)
+    hidden_states = residual_pl + hidden_states
+    hidden_states = hidden_states * layer.layer_scalar.to(MODEL_DTYPE)
+
+    return (hidden_states,
+            kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v)
+
+
+class SWAStatefulChunk1Prefill(SWAStatefulChunk1):
+    """T=N prefill variant of SWAStatefulChunk1. Shares the parent's
+    layers, KV state buffers, and PLE projection — coremltools merges
+    by state name when packaged as a multifunction mlpackage."""
+
+    def __init__(self, model, start=0, end=8, ctx=2048,
+                 use_linear=False, T: int = 8):
+        super().__init__(model, start, end, ctx, use_linear=use_linear)
+        self.T = T
+
+    def _compute_ple_prefill(self, hidden_states, per_layer_raw):
+        """T-aware reshape of the cat-trick RMSNorm. hidden_states is
+        (1, T, hidden); output is (1, T, num_layers*pld)."""
+        T = self.T
+        h = hidden_states.to(MODEL_DTYPE)
+        proj = _project(self.per_layer_model_projection, h) \
+               * self.per_layer_model_projection_scale
+        # (1, T, num_layers*pld) → (1, T, num_layers, pld)
+        proj_grouped = proj.view(1, T, self.num_layers_total, self.per_layer_dim)
+
+        norm_w = self.per_layer_projection_norm.weight
+        eps = float(self.per_layer_projection_norm.eps)
+        doubled = torch.cat([proj_grouped, -proj_grouped], dim=-1)
+        normed = F.layer_norm(doubled, normalized_shape=(2 * self.per_layer_dim,),
+                              weight=None, bias=None, eps=eps)
+        normed, _ = torch.chunk(normed, 2, dim=-1)
+        proj_normed = (normed * norm_w).view(
+            1, T, self.num_layers_total * self.per_layer_dim)
+
+        return (proj_normed + per_layer_raw) * self.per_layer_input_scale
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                per_layer_raw, cos_s, sin_s, cos_f, sin_f,
+                current_pos, ring_pos):
+        config = self.config
+        T = self.T
+        per_layer_combined = self._compute_ple_prefill(hidden_states, per_layer_raw)
+
+        dummy_13_k = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        dummy_13_v = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        dummy_14_k = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+        dummy_14_v = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
+            (hidden_states, dummy_13_k, dummy_13_v, dummy_14_k, dummy_14_v
+             ) = _run_layer_swa_stateful_prefill(
+                self.layers[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                current_pos, ring_pos,
+                self.kv_cache_sliding, self.kv_cache_full,
+                self.sliding_map, self.full_map,
+                config, per_layer_combined,
+                dummy_13_k, dummy_13_v, dummy_14_k, dummy_14_v,
+                T,
+            )
+        return hidden_states, per_layer_combined
+
+
+class SWAStatefulChunk2Prefill(SWAStatefulChunk2):
+    """T=N prefill variant of SWAStatefulChunk2."""
+
+    def __init__(self, model, start=8, end=15, ctx=2048,
+                 use_linear=False, T: int = 8):
+        super().__init__(model, start, end, ctx, use_linear=use_linear)
+        self.T = T
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                per_layer_combined, cos_s, sin_s, cos_f, sin_f,
+                current_pos, ring_pos):
+        config = self.config
+        T = self.T
+        kv13_k = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        kv13_v = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        kv14_k = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+        kv14_v = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
+            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+             ) = _run_layer_swa_stateful_prefill(
+                self.layers[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                current_pos, ring_pos,
+                self.kv_cache_sliding, self.kv_cache_full,
+                self.sliding_map, self.full_map,
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                T,
+            )
+
+        return hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+
+
+class SWAStatefulChunk3Prefill(SWAStatefulChunk3):
+    """T=N prefill variant of SWAStatefulChunk3 (stateless, KV-shared)."""
+
+    def __init__(self, model, start=15, end=25,
+                 use_linear=False, T: int = 8):
+        super().__init__(model, start, end, use_linear=use_linear)
+        self.T = T
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                per_layer_combined, cos_s, sin_s, cos_f, sin_f,
+                kv13_k, kv13_v, kv14_k, kv14_v):
+        config = self.config
+        T = self.T
+        zero_idx = torch.zeros(1, dtype=torch.int32)
+        dummy_state = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
+            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+             ) = _run_layer_swa_stateful_prefill(
+                self.layers[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                zero_idx, zero_idx,
+                dummy_state, dummy_state,
+                {}, {},
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                T,
+            )
+        return hidden_states
+
+
+class SWAStatefulChunk4Prefill(SWAStatefulChunk4):
+    """T=N prefill variant of SWAStatefulChunk4. Final norm + lm_head on
+    the LAST position only (chunk4 produces a single token regardless
+    of T)."""
+
+    def __init__(self, model, start=25, end=35,
+                 use_linear=False, T: int = 8):
+        super().__init__(model, start, end, use_linear=use_linear)
+        self.T = T
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                per_layer_combined, cos_s, sin_s, cos_f, sin_f,
+                kv13_k, kv13_v, kv14_k, kv14_v):
+        config = self.config
+        T = self.T
+        zero_idx = torch.zeros(1, dtype=torch.int32)
+        dummy_state = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
+            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+             ) = _run_layer_swa_stateful_prefill(
+                self.layers[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                zero_idx, zero_idx,
+                dummy_state, dummy_state,
+                {}, {},
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                T,
+            )
+
+        # Take last position only for argmax; the (T-1) positions before
+        # are intermediate prefill outputs that the runtime discards.
+        last = hidden_states[:, T-1:T, :]   # (1, 1, hidden)
+        normed = self.norm(last)
+        logits = _project(self.lm_head, normed.to(MODEL_DTYPE))
+        if self.softcap > 0:
+            logits = torch.tanh(logits / self.softcap) * self.softcap
+        token_id, token_logit = self.argmax(logits.squeeze(0))
+        return token_id, token_logit, normed
