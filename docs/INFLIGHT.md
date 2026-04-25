@@ -10,4 +10,4 @@ Format: one line per active claim.
 
 ---
 
-(empty — no active claims)
+stage2-e4b | B7B118BA | 2026-04-25T19:37:20Z | E4B stateful port + Phase 2a
