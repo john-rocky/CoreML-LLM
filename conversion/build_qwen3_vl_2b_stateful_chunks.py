@@ -80,11 +80,71 @@ def _norm_from_hf(weight: torch.Tensor, eps: float, hidden: int) -> ANERMSNorm:
     return n
 
 
+# ============================================================
+# Linear-vs-Conv2dLinear projection helpers (cml9 PR #2577 follow-up)
+# ============================================================
+#
+# Default pipeline wraps every projection in `Conv2dLinear` (a 1×1
+# nn.Conv2d) because pre-cml9 the activation-quant path only matched
+# native conv ops. cml9's `linear_quantize_activations` recognises
+# `linear` directly (PR #2577), so we can drop the wrapper. Mirrors the
+# Gemma 4 Plan 3 migration in `models/gemma4_swa_stateful_chunks.py`.
+#
+# `--linear-projections` walks each chunk's layers and swaps every
+# Conv2dLinear for a shape-equivalent nn.Linear; weights are reshaped
+# from (out, in, 1, 1) back to (out, in). The forward path uses
+# `_project` to dispatch on type so the same module works for both —
+# the Linear branch skips the permute/unsqueeze that ANE has to undo at
+# compile time.
+
+def _replace_conv2dlinear_with_linear(module: nn.Module) -> nn.Module:
+    """Return an nn.Linear equivalent to a Conv2dLinear (1×1 wrapper).
+    Pass-through for any non-Conv2dLinear input."""
+    if not isinstance(module, Conv2dLinear):
+        return module
+    has_bias = module.conv.bias is not None
+    lin = nn.Linear(module.in_features, module.out_features,
+                    bias=has_bias, dtype=module.conv.weight.dtype)
+    with torch.no_grad():
+        lin.weight.copy_(module.conv.weight.data.squeeze(-1).squeeze(-1))
+        if has_bias:
+            lin.bias.copy_(module.conv.bias.data)
+    return lin
+
+
+def _swap_layer_projections_to_linear(layer: nn.Module) -> None:
+    """In-place: swap every Conv2dLinear projection on a single decoder
+    layer (ANEStatefulDecoderLayer / ANEStatefulPrefillLayer) for an
+    nn.Linear with reshaped weights."""
+    for name in ("q_proj", "k_proj", "v_proj", "o_proj",
+                 "gate_up_proj", "down_proj"):
+        if hasattr(layer, name):
+            setattr(layer, name,
+                    _replace_conv2dlinear_with_linear(getattr(layer, name)))
+
+
+def _project(proj: nn.Module, x_conv: torch.Tensor) -> torch.Tensor:
+    """Run a (B, in, 1, T)-shaped Conv2d-layout tensor through either a
+    Conv2dLinear (1×1) or nn.Linear projection and return (B, out, 1, T).
+    Conv2dLinear stays in conv layout end-to-end; Linear path squeezes
+    to (B, T, in), runs the matmul, and re-permutes back. Trace
+    specializes on the isinstance branch so the active variant ends up
+    in the MIL graph."""
+    if isinstance(proj, nn.Linear):
+        # (B, in, 1, T) → (B, 1, T, in) → squeeze(1) → (B, T, in)
+        x_3d = x_conv.permute(0, 2, 3, 1).squeeze(1)
+        out = proj(x_3d)  # (B, T, out)
+        # (B, T, out) → (B, out, T) → (B, out, 1, T)
+        return out.permute(0, 2, 1).unsqueeze(2)
+    return proj.forward_conv(x_conv)
+
+
 class ANEStatefulDecoderLayer(nn.Module):
     """One Qwen3-VL text decoder layer that reads/writes a unified KV
     cache buffer owned by the enclosing chunk. T=1 (decode step)."""
 
-    def __init__(self, cfg, hf_layer, max_seq, layer_idx_in_chunk):
+    def __init__(self, cfg, hf_layer, max_seq, layer_idx_in_chunk,
+                 use_linear: bool = False):
         super().__init__()
         self.head_dim = cfg.head_dim
         self.num_heads = cfg.num_attention_heads
@@ -122,6 +182,9 @@ class ANEStatefulDecoderLayer(nn.Module):
         self.intermediate_size = intermediate
         self.down_proj = _conv_from_linear(hf_layer.mlp.down_proj)
 
+        if use_linear:
+            _swap_layer_projections_to_linear(self)
+
     def _norm_in_conv_form(self, x_conv, norm):
         x = x_conv.permute(0, 2, 3, 1).reshape(1, 1, self.hidden_size)
         x = norm(x)
@@ -140,9 +203,9 @@ class ANEStatefulDecoderLayer(nn.Module):
         residual = hidden_conv
         h_conv = self._norm_in_conv_form(hidden_conv, self.input_layernorm)
 
-        q = self.q_proj.forward_conv(h_conv)
-        k = self.k_proj.forward_conv(h_conv)
-        v = self.v_proj.forward_conv(h_conv)
+        q = _project(self.q_proj, h_conv)
+        k = _project(self.k_proj, h_conv)
+        v = _project(self.v_proj, h_conv)
 
         H, HKV, D = self.num_heads, self.num_kv_heads, self.head_dim
         q = q.view(1, H, D, 1).permute(0, 1, 3, 2)
@@ -181,14 +244,14 @@ class ANEStatefulDecoderLayer(nn.Module):
         out = torch.matmul(attn, v_rep)  # (1, H, 1, D)
 
         out = out.permute(0, 1, 3, 2).reshape(1, H * D, 1, 1)
-        attn_out_conv = self.o_proj.forward_conv(out)
+        attn_out_conv = _project(self.o_proj, out)
         hidden_conv = residual + attn_out_conv
 
         residual = hidden_conv
         h_conv = self._norm_in_conv_form(hidden_conv, self.post_attn_layernorm)
-        gate_up = self.gate_up_proj.forward_conv(h_conv)
+        gate_up = _project(self.gate_up_proj, h_conv)
         gate, up = torch.split(gate_up, self.intermediate_size, dim=1)
-        mlp_out = self.down_proj.forward_conv(F.silu(gate) * up)
+        mlp_out = _project(self.down_proj, F.silu(gate) * up)
         hidden_conv = residual + mlp_out
         return hidden_conv
 
@@ -197,7 +260,8 @@ class ANEStatefulBodyChunk(nn.Module):
     """Body chunk with unified kv_cache_0 buffer. One `forward` step
     consumes one token (T=1) and advances the state by one slot."""
 
-    def __init__(self, cfg, hf_layers, start, end, max_seq):
+    def __init__(self, cfg, hf_layers, start, end, max_seq,
+                 use_linear: bool = False):
         super().__init__()
         self.start = start
         self.end = end
@@ -208,7 +272,8 @@ class ANEStatefulBodyChunk(nn.Module):
 
         layers_in_chunk = end - start
         self.layers = nn.ModuleList([
-            ANEStatefulDecoderLayer(cfg, hf_layers[start + li], max_seq, li)
+            ANEStatefulDecoderLayer(cfg, hf_layers[start + li], max_seq, li,
+                                    use_linear=use_linear)
             for li in range(layers_in_chunk)
         ])
 
@@ -227,7 +292,8 @@ class ANEStatefulBodyChunk(nn.Module):
 
 
 class ANEHeadChunk(nn.Module):
-    def __init__(self, cfg, hf_text_model, lm_head, tie_word_embeddings):
+    def __init__(self, cfg, hf_text_model, lm_head, tie_word_embeddings,
+                 use_linear: bool = False):
         super().__init__()
         self.hidden_size = cfg.hidden_size
         self.final_norm = _norm_from_hf(
@@ -239,13 +305,15 @@ class ANEHeadChunk(nn.Module):
         self.lm_head.conv.weight.data = lm_w.detach().to(MODEL_DTYPE) \
             .unsqueeze(-1).unsqueeze(-1)
         self.argmax = InModelArgmax()
+        if use_linear:
+            self.lm_head = _replace_conv2dlinear_with_linear(self.lm_head)
 
     def forward(self, hidden_in):
         h_conv = hidden_in.reshape(1, 1, 1, self.hidden_size).permute(0, 3, 1, 2)
         h_seq = h_conv.permute(0, 2, 3, 1).reshape(1, 1, self.hidden_size)
         h_seq = self.final_norm(h_seq)
         h_conv = h_seq.reshape(1, 1, 1, self.hidden_size).permute(0, 3, 1, 2)
-        logits_conv = self.lm_head.forward_conv(h_conv)
+        logits_conv = _project(self.lm_head, h_conv)
         logits = logits_conv.squeeze(-1).squeeze(-1).unsqueeze(1)
         token_id, _ = self.argmax(logits)
         return token_id.to(torch.int32)
@@ -393,6 +461,13 @@ def main():
     ap.add_argument("--only-one-chunk", action="store_true",
                     help="Convert chunk 0 only — smoke test the stateful path "
                          "before committing to a full 4-chunk build.")
+    ap.add_argument("--linear-projections", action="store_true",
+                    help="Plan-3 (cml9 PR #2577) variant: replace every "
+                         "Conv2dLinear (1×1 wrapper) projection with a "
+                         "shape-equivalent nn.Linear. Drops the permute/"
+                         "squeeze wrapper ops in the MIL graph; iPhone "
+                         "parity validated for Gemma 4 stateful chunks "
+                         "(commit 7c9cfea).")
     args = ap.parse_args()
 
     out_root = Path(args.out_dir).resolve()
@@ -409,17 +484,25 @@ def main():
     text_model, lm_head = load_text_backbone()
     print(f"  loaded in {time.time()-t0:.1f}s")
 
+    use_linear = args.linear_projections
+    if use_linear:
+        print("  projections: nn.Linear (cml9 PR #2577 variant)")
+    else:
+        print("  projections: Conv2dLinear 1×1 wrapper (current default)")
+
     export_embed_fp16(text_model.embed_tokens.weight,
                        chunks_dir / EMBED_BIN_NAME)
     head_module = ANEHeadChunk(cfg, text_model, lm_head,
-                                cfg.tie_word_embeddings).eval().to(MODEL_DTYPE)
+                                cfg.tie_word_embeddings,
+                                use_linear=use_linear).eval().to(MODEL_DTYPE)
 
     boundaries = _body_boundaries(cfg.num_hidden_layers, args.num_chunks)
     print(f"  body boundaries: {boundaries}")
 
     body_modules = []
     for start, end in boundaries:
-        m = ANEStatefulBodyChunk(cfg, text_model.layers, start, end, args.max_seq)
+        m = ANEStatefulBodyChunk(cfg, text_model.layers, start, end, args.max_seq,
+                                  use_linear=use_linear)
         body_modules.append(m.eval().to(MODEL_DTYPE))
 
     if args.only_one_chunk:

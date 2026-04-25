@@ -45,6 +45,8 @@ from build_qwen3_vl_2b_stateful_chunks import (
     convert_body_stateful, convert_head, export_embed_fp16,
     EMBED_BIN_NAME, HEAD_CHUNK_NAME, _body_boundaries,
     ANEStatefulBodyChunk,
+    _replace_conv2dlinear_with_linear, _swap_layer_projections_to_linear,
+    _project,
 )
 from build_qwen3_vl_2b_stateful_chunks import MAX_SEQ as DEFAULT_MAX_SEQ
 
@@ -53,7 +55,8 @@ class ANEStatefulPrefillLayer(nn.Module):
     """T-batched stateful decoder layer. Reads/writes kv_cache_0 via
     slice_update over T consecutive slots."""
 
-    def __init__(self, cfg, hf_layer, max_seq, layer_idx_in_chunk, T):
+    def __init__(self, cfg, hf_layer, max_seq, layer_idx_in_chunk, T,
+                 use_linear: bool = False):
         super().__init__()
         self.head_dim = cfg.head_dim
         self.num_heads = cfg.num_attention_heads
@@ -91,6 +94,9 @@ class ANEStatefulPrefillLayer(nn.Module):
         self.intermediate_size = intermediate
         self.down_proj = _conv_from_linear(hf_layer.mlp.down_proj)
 
+        if use_linear:
+            _swap_layer_projections_to_linear(self)
+
     def _norm_in_conv_form(self, x_conv, norm):
         # (1, hidden, 1, T) → (1, T, hidden) → norm → (1, T, hidden) → (1, hidden, 1, T)
         T = self.T
@@ -110,9 +116,9 @@ class ANEStatefulPrefillLayer(nn.Module):
         residual = hidden_conv
         h_conv = self._norm_in_conv_form(hidden_conv, self.input_layernorm)
 
-        q = self.q_proj.forward_conv(h_conv)  # (1, H*D, 1, T)
-        k = self.k_proj.forward_conv(h_conv)  # (1, HKV*D, 1, T)
-        v = self.v_proj.forward_conv(h_conv)
+        q = _project(self.q_proj, h_conv)  # (1, H*D, 1, T)
+        k = _project(self.k_proj, h_conv)  # (1, HKV*D, 1, T)
+        v = _project(self.v_proj, h_conv)
 
         H, HKV, D, T = self.num_heads, self.num_kv_heads, self.head_dim, self.T
         # (1, H*D, 1, T) → (1, H, D, T) → (1, H, T, D)
@@ -149,20 +155,21 @@ class ANEStatefulPrefillLayer(nn.Module):
 
         # (1, H, T, D) → (1, H*D, 1, T)
         out = out.permute(0, 1, 3, 2).reshape(1, H * D, 1, T)
-        attn_out_conv = self.o_proj.forward_conv(out)
+        attn_out_conv = _project(self.o_proj, out)
         hidden_conv = residual + attn_out_conv
 
         residual = hidden_conv
         h_conv = self._norm_in_conv_form(hidden_conv, self.post_attn_layernorm)
-        gate_up = self.gate_up_proj.forward_conv(h_conv)
+        gate_up = _project(self.gate_up_proj, h_conv)
         gate, up = torch.split(gate_up, self.intermediate_size, dim=1)
-        mlp_out = self.down_proj.forward_conv(F.silu(gate) * up)
+        mlp_out = _project(self.down_proj, F.silu(gate) * up)
         hidden_conv = residual + mlp_out
         return hidden_conv
 
 
 class ANEStatefulPrefillBodyChunk(nn.Module):
-    def __init__(self, cfg, hf_layers, start, end, max_seq, T):
+    def __init__(self, cfg, hf_layers, start, end, max_seq, T,
+                 use_linear: bool = False):
         super().__init__()
         self.start = start
         self.end = end
@@ -171,7 +178,8 @@ class ANEStatefulPrefillBodyChunk(nn.Module):
         layers_in_chunk = end - start
         self.layers = nn.ModuleList([
             ANEStatefulPrefillLayer(cfg, hf_layers[start + li],
-                                     max_seq, li, T)
+                                     max_seq, li, T,
+                                     use_linear=use_linear)
             for li in range(layers_in_chunk)
         ])
         self.register_buffer(
@@ -270,6 +278,12 @@ def main():
                     help="T tokens per prefill forward (8 was v1.4.0 ship)")
     ap.add_argument("--nbits", type=int, default=8, choices=[0, 4, 8])
     ap.add_argument("--keep-fp16", action="store_true")
+    ap.add_argument("--linear-projections", action="store_true",
+                    help="Plan-3 (cml9 PR #2577) variant: replace every "
+                         "Conv2dLinear (1×1 wrapper) with nn.Linear in "
+                         "both decode and prefill chunks. Multifunction "
+                         "weights are shared, so both functions adopt the "
+                         "same projection variant.")
     args = ap.parse_args()
 
     out_root = Path(args.out_dir).resolve()
@@ -284,10 +298,17 @@ def main():
           f"num_kv_heads={cfg.num_key_value_heads} head_dim={cfg.head_dim}")
     text_model, lm_head = load_text_backbone()
 
+    use_linear = args.linear_projections
+    if use_linear:
+        print("  projections: nn.Linear (cml9 PR #2577 variant)")
+    else:
+        print("  projections: Conv2dLinear 1×1 wrapper (current default)")
+
     export_embed_fp16(text_model.embed_tokens.weight,
                        chunks_dir / EMBED_BIN_NAME)
     head_module = ANEHeadChunk(cfg, text_model, lm_head,
-                                cfg.tie_word_embeddings).eval().to(MODEL_DTYPE)
+                                cfg.tie_word_embeddings,
+                                use_linear=use_linear).eval().to(MODEL_DTYPE)
 
     boundaries = _body_boundaries(cfg.num_hidden_layers, args.num_chunks)
     print(f"  body boundaries: {boundaries}")
@@ -295,14 +316,17 @@ def main():
     for ci, (start, end) in enumerate(boundaries):
         # Decode (T=1) module
         decode_mod = ANEStatefulBodyChunk(cfg, text_model.layers, start, end,
-                                           args.max_seq).eval().to(MODEL_DTYPE)
+                                           args.max_seq,
+                                           use_linear=use_linear
+                                           ).eval().to(MODEL_DTYPE)
         decode_fp16 = fp16_dir / f"chunk_{ci}_decode.mlpackage"
         convert_body_stateful(decode_mod, cfg, start, end, args.max_seq, decode_fp16)
         del decode_mod
 
         # Prefill (T=N) module
         prefill_mod = ANEStatefulPrefillBodyChunk(
-            cfg, text_model.layers, start, end, args.max_seq, args.prefill_T
+            cfg, text_model.layers, start, end, args.max_seq, args.prefill_T,
+            use_linear=use_linear,
         ).eval().to(MODEL_DTYPE)
         prefill_fp16 = fp16_dir / f"chunk_{ci}_prefill.mlpackage"
         convert_body_prefill(prefill_mod, cfg, start, end, args.max_seq,
