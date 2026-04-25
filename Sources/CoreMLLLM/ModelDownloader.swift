@@ -211,6 +211,30 @@ public final class ModelDownloader: NSObject {
             downloadURL: "",
             folderName: "gemma4-e2b-stateful-linear")
 
+        /// Gemma 4 E4B stateful — Stage 2 port of the E2B Phase 1 + 2a
+        /// stateful path to the larger 4 B sibling. Built by
+        /// `conversion/build_gemma4_e2b_stateful_chunks.py --model gemma4-e4b`
+        /// (same script; chunk boundaries / hidden / HKV come from the HF
+        /// config). Shares the inner subdir name `gemma4_e2b_stateful_chunks`
+        /// with the E2B variants — Gemma4StatefulEngine reads
+        /// hidden_size / num_layers / per_layer_dim from `model_config.json`,
+        /// so E4B runs without engine code changes. Sideload-only to
+        /// `Documents/Models/gemma4-e4b-stateful/gemma4_e2b_stateful_chunks/`.
+        public static let gemma4e4bStateful = ModelInfo(
+            id: "gemma4-e4b-stateful",
+            name: "Gemma 4 E4B (stateful, MLState)", size: "5.6 GB",
+            downloadURL: "",
+            folderName: "gemma4-e4b-stateful")
+
+        /// Gemma 4 E4B stateful — Linear projections variant (cml9 PR #2577
+        /// `nn.Linear` form, ANE-equivalent placement). Same layout as
+        /// `gemma4e4bStateful`.
+        public static let gemma4e4bStatefulLinear = ModelInfo(
+            id: "gemma4-e4b-stateful-linear",
+            name: "Gemma 4 E4B (stateful, Linear projections)", size: "5.6 GB",
+            downloadURL: "",
+            folderName: "gemma4-e4b-stateful-linear")
+
         /// Visible in the UI picker. EAGLE-3 / LookAhead probe variants are
         /// hidden unless `LLM_SHOW_EXPERIMENTAL=1` is set (or the
         /// UserDefaults key `showExperimentalModels` is true). Keeps the
@@ -226,6 +250,8 @@ public final class ModelDownloader: NSObject {
                 list.insert(gemma4e2bLookaheadProbe, at: 3)  // after EAGLE-3
                 list.insert(gemma4e2bStateful, at: 4)        // after LookAhead
                 list.insert(gemma4e2bStatefulLinear, at: 5)  // Plan 3 A/B partner
+                list.insert(gemma4e4bStateful, at: 6)        // E4B Stage 2
+                list.insert(gemma4e4bStatefulLinear, at: 7)  // E4B Linear partner
             }
             return list
         }
@@ -374,11 +400,13 @@ public final class ModelDownloader: NSObject {
             return vl2bStatefulDir
         }
 
-        // Gemma 4 E2B stateful (MLState + slice_update): chunk_{1..4} +
+        // Gemma 4 stateful (MLState + slice_update): chunk_{1..4} +
         // embed_tokens_q8.bin + RoPE tables + tokenizer under
-        // gemma4_e2b_stateful_chunks/. Two folder names share this
-        // layout: gemma4-e2b-stateful (Conv2d) and
-        // gemma4-e2b-stateful-linear (Plan 3 Linear A/B partner).
+        // gemma4_e2b_stateful_chunks/. Subdir name is intentionally shared
+        // across E2B and E4B (chunk topology is identical; per-model
+        // hidden / num_layers / num_kv_heads come from model_config.json
+        // which Gemma4StatefulEngine reads). Folder names that map here:
+        // gemma4-e2b-stateful{,-linear} and gemma4-e4b-stateful{,-linear}.
         let g4StatefulDir = dir.appendingPathComponent("gemma4_e2b_stateful_chunks")
         func g4StatefulChunkExists(_ base: String) -> Bool {
             let pkg = g4StatefulDir

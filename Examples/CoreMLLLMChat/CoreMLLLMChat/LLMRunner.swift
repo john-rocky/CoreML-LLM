@@ -175,13 +175,15 @@ final class LLMRunner {
             return
         }
 
-        // Gemma 4 E2B STATEFUL detection: chunk_{1..4}.mlpackage/.mlmodelc
-        // + embed_tokens_q8.bin under gemma4_e2b_stateful_chunks/. Both
-        // the Conv2d wrapper variant (folder=gemma4-e2b-stateful) and the
-        // Linear variant (folder=gemma4-e2b-stateful-linear, Plan 3 A/B)
-        // share the same internal layout — Gemma4StatefulEngine handles
-        // both transparently because the only difference is the MIL graph
-        // inside each chunk_*.mlpackage.
+        // Gemma 4 STATEFUL detection: chunk_{1..4}.mlpackage/.mlmodelc
+        // + embed_tokens_q8.bin under gemma4_e2b_stateful_chunks/. The
+        // subdir name is shared across all four published variants —
+        //   E2B: gemma4-e2b-stateful{,-linear}  (Conv2d / Plan 3 Linear)
+        //   E4B: gemma4-e4b-stateful{,-linear}  (Stage 2 port)
+        // — because Gemma4StatefulEngine reads hidden_size / num_layers /
+        // num_kv_heads from model_config.json, so per-model differences
+        // (E2B 35 layers / HKV=1 vs E4B 42 layers / HKV=2) need no
+        // engine code change.
         let gemma4StatefulDir = folder.appendingPathComponent("gemma4_e2b_stateful_chunks")
         let gemma4StatefulPresent = fm.fileExists(atPath:
             gemma4StatefulDir.appendingPathComponent("embed_tokens_q8.bin").path)
