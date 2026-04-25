@@ -175,7 +175,7 @@ def _trace_and_convert_stateful(
 # Per-chunk converters
 # ============================================================
 
-def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits):
+def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits, *, use_linear=False):
     print("\n" + "=" * 60)
     print(f"CHUNK 1 (L{c_start}-{c_end-1}) — own KV state, computes PLE")
     print("=" * 60)
@@ -188,7 +188,8 @@ def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits):
     max_hd = hd_f
     HKV = cfg.num_key_value_heads
 
-    chunk = SWAStatefulChunk1(base, c_start, c_end, ctx).eval().to(MODEL_DTYPE)
+    chunk = SWAStatefulChunk1(base, c_start, c_end, ctx,
+                               use_linear=use_linear).eval().to(MODEL_DTYPE)
     ns, nf = max(chunk.num_sliding, 1), max(chunk.num_full, 1)
 
     sample = (
@@ -235,7 +236,7 @@ def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits):
         chunk, sample, inputs, outputs, states, out_path, nbits)
 
 
-def convert_chunk2(base, c_start, c_end, ctx, out_path, nbits):
+def convert_chunk2(base, c_start, c_end, ctx, out_path, nbits, *, use_linear=False):
     print("\n" + "=" * 60)
     print(f"CHUNK 2 (L{c_start}-{c_end-1}) — own KV state, emits kv13/kv14")
     print("=" * 60)
@@ -248,7 +249,8 @@ def convert_chunk2(base, c_start, c_end, ctx, out_path, nbits):
     max_hd = hd_f
     HKV = cfg.num_key_value_heads
 
-    chunk = SWAStatefulChunk2(base, c_start, c_end, ctx).eval().to(MODEL_DTYPE)
+    chunk = SWAStatefulChunk2(base, c_start, c_end, ctx,
+                               use_linear=use_linear).eval().to(MODEL_DTYPE)
     ns, nf = max(chunk.num_sliding, 1), max(chunk.num_full, 1)
 
     sample = (
@@ -299,7 +301,7 @@ def convert_chunk2(base, c_start, c_end, ctx, out_path, nbits):
 
 
 def convert_chunk_shared(chunk_cls, base, c_start, c_end, ctx,
-                         out_path, nbits, name, with_lm_head):
+                         out_path, nbits, name, with_lm_head, *, use_linear=False):
     """Stateless chunk (3 or 4). All layers KV-shared from kv13/kv14."""
     print("\n" + "=" * 60)
     print(f"{name} (L{c_start}-{c_end-1}) — stateless, reads kv13/14"
@@ -313,7 +315,8 @@ def convert_chunk_shared(chunk_cls, base, c_start, c_end, ctx,
     hd_s, hd_f = cfg.head_dim, cfg.global_head_dim
     HKV = cfg.num_key_value_heads
 
-    chunk = chunk_cls(base, c_start, c_end).eval().to(MODEL_DTYPE)
+    chunk = chunk_cls(base, c_start, c_end,
+                      use_linear=use_linear).eval().to(MODEL_DTYPE)
     sample = (
         torch.zeros(1, 1, hidden, dtype=torch.float16),
         torch.zeros(1, 1, 1, ctx, dtype=torch.float16),
@@ -375,6 +378,14 @@ def main():
                     help="Smoke test: convert only one chunk and stop. "
                          "Useful for first runs on Mac Studio to validate "
                          "the conversion path before committing to all 4.")
+    ap.add_argument("--linear-projections", action="store_true",
+                    help="Plan-3 (cml9 PR #2577) variant: replace every "
+                         "Conv2d(1×1) projection with shape-equivalent "
+                         "nn.Linear (weights reshaped from (out,in,1,1) "
+                         "to (out,in)). Drops the permute/squeeze wrapper "
+                         "ops. ANE placement was 100% in 5-layer PoC + W4, "
+                         "but Mac W4 latency was +21% — iPhone re-test "
+                         "gates production migration.")
     args = ap.parse_args()
 
     if args.ctx is None:
@@ -404,23 +415,32 @@ def main():
           f"full=L{cfg.kv_full_producer}")
     print(f"Chunk boundaries: {boundaries}")
     print(f"Quantize: int{args.nbits}" if args.nbits else "Quantize: fp16")
+    if args.linear_projections:
+        print(f"Projections: nn.Linear (cml9 PR #2577 variant)")
+    else:
+        print(f"Projections: nn.Conv2d(1×1) wrapper (current default)")
 
     do = (lambda n: args.only_chunk is None or args.only_chunk == n)
+    use_linear = args.linear_projections
 
     if do(1):
         convert_chunk1(base, *boundaries[0], args.ctx,
-                       str(out / "chunk_1.mlpackage"), args.nbits)
+                       str(out / "chunk_1.mlpackage"), args.nbits,
+                       use_linear=use_linear)
     if do(2):
         convert_chunk2(base, *boundaries[1], args.ctx,
-                       str(out / "chunk_2.mlpackage"), args.nbits)
+                       str(out / "chunk_2.mlpackage"), args.nbits,
+                       use_linear=use_linear)
     if do(3):
         convert_chunk_shared(SWAStatefulChunk3, base, *boundaries[2], args.ctx,
                              str(out / "chunk_3.mlpackage"), args.nbits,
-                             name="CHUNK 3", with_lm_head=False)
+                             name="CHUNK 3", with_lm_head=False,
+                             use_linear=use_linear)
     if do(4):
         convert_chunk_shared(SWAStatefulChunk4, base, *boundaries[3], args.ctx,
                              str(out / "chunk_4.mlpackage"), args.nbits,
-                             name="CHUNK 4", with_lm_head=True)
+                             name="CHUNK 4", with_lm_head=True,
+                             use_linear=use_linear)
 
     print(f"\nartifacts under {out}")
     for p in sorted(out.iterdir()):

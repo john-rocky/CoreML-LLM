@@ -46,6 +46,15 @@ final class LLMRunner {
     // stays on the v1.4.0 generator, text goes through this one.
     private var qwen3vl2bStatefulGenerator: Qwen3VL2BStatefulGenerator?
 
+    // Gemma 4 E2B stateful path: MLState + slice_update KV. Selected
+    // when `gemma4_e2b_stateful_chunks/` is present. Independent of the
+    // legacy ChunkedEngine path — runs through Gemma4StatefulEngine
+    // (Sources/CoreMLLLM/Gemma4StatefulEngine.swift). Both the Conv2d
+    // wrapper and Linear (cml9 PR #2577) variants land in the same
+    // engine — only the chunk_*.mlpackage internals differ.
+    private var gemma4StatefulEngine: Gemma4StatefulEngine?
+    private var gemma4StatefulTokenizer: (any Tokenizer)?
+
     // Qwen3-VL 2B path: separate generator + tokenizer, selected when
     // the downloaded folder contains `qwen3_vl_2b_decode_chunks/`.
     // Plain GQA architecture (not the Qwen3.5 hybrid SSM), so it gets
@@ -76,6 +85,7 @@ final class LLMRunner {
         // OOMing on 8 GB devices.
         if llm != nil || qwen35Generator != nil || qwen3vl2bGenerator != nil
             || qwen3vl2bStatefulGenerator != nil
+            || gemma4StatefulEngine != nil
         {
             llm = nil
             qwen35Generator = nil
@@ -84,6 +94,8 @@ final class LLMRunner {
             qwen3vl2bStatefulGenerator = nil
             qwen3vl2bTokenizer = nil
             qwen3vl2bVisionEncoder = nil
+            gemma4StatefulEngine = nil
+            gemma4StatefulTokenizer = nil
             cachedVisionImage = nil
             cachedVisionFeatures = nil
             isLoaded = false
@@ -163,6 +175,27 @@ final class LLMRunner {
             return
         }
 
+        // Gemma 4 E2B STATEFUL detection: chunk_{1..4}.mlpackage/.mlmodelc
+        // + embed_tokens_q8.bin under gemma4_e2b_stateful_chunks/. Both
+        // the Conv2d wrapper variant (folder=gemma4-e2b-stateful) and the
+        // Linear variant (folder=gemma4-e2b-stateful-linear, Plan 3 A/B)
+        // share the same internal layout — Gemma4StatefulEngine handles
+        // both transparently because the only difference is the MIL graph
+        // inside each chunk_*.mlpackage.
+        let gemma4StatefulDir = folder.appendingPathComponent("gemma4_e2b_stateful_chunks")
+        let gemma4StatefulPresent = fm.fileExists(atPath:
+            gemma4StatefulDir.appendingPathComponent("embed_tokens_q8.bin").path)
+            && (1...4).allSatisfy { i in
+                fm.fileExists(atPath:
+                    gemma4StatefulDir.appendingPathComponent("chunk_\(i).mlpackage").path)
+                || fm.fileExists(atPath:
+                    gemma4StatefulDir.appendingPathComponent("chunk_\(i).mlmodelc").path)
+            }
+        if gemma4StatefulPresent {
+            try await loadGemma4Stateful(folder: gemma4StatefulDir)
+            return
+        }
+
         // Qwen3-VL 2B detection: 6 body chunks + chunk_head + embed
         // sidecar, all under qwen3_vl_2b_decode_chunks/.
         let vl2bDir = folder.appendingPathComponent("qwen3_vl_2b_decode_chunks")
@@ -239,6 +272,9 @@ final class LLMRunner {
         if qwen3vl2bStatefulGenerator != nil {
             return try await generateQwen3VL2BStateful(
                 messages: messages, image: image)
+        }
+        if gemma4StatefulEngine != nil {
+            return try await generateGemma4Stateful(messages: messages)
         }
         if qwen3vl2bGenerator != nil {
             return try await generateQwen3VL2B(messages: messages, image: image)
@@ -780,6 +816,120 @@ final class LLMRunner {
                                 }
                             }
                         })
+                } catch {
+                    continuation.yield("[Error: \(error.localizedDescription)]")
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    // MARK: - Gemma 4 stateful (text-only)
+
+    private func loadGemma4Stateful(folder: URL) async throws {
+        loadingStatus = "Loading Gemma 4 tokenizer..."
+        let hfDir = folder.appendingPathComponent("hf_model")
+        let tok = try await AutoTokenizer.from(modelFolder: hfDir)
+        loadingStatus = "Compiling Gemma 4 E2B stateful chunks (first run only)..."
+        let engine = Gemma4StatefulEngine()
+        try await engine.load(modelDirectory: folder)
+        gemma4StatefulEngine = engine
+        gemma4StatefulTokenizer = tok
+
+        // Surface the variant in the model name so the user can tell A/B
+        // apart in the UI. folder.path looks like
+        // ".../Documents/Models/gemma4-e2b-stateful{,-linear}/gemma4_e2b_stateful_chunks"
+        let parent = folder.deletingLastPathComponent().lastPathComponent
+        let variantTag = parent.contains("linear") ? " (Linear)" : ""
+        modelName = "Gemma 4 E2B (stateful)\(variantTag)"
+        hasVision = false
+        hasAudio = false
+        isLoaded = true
+        loadingStatus = "Ready"
+        print("[LLMRunner] Gemma 4 E2B stateful loaded — \(modelName) at \(folder.lastPathComponent)")
+    }
+
+    private func generateGemma4Stateful(messages: [ChatMessage])
+        async throws -> AsyncStream<String>
+    {
+        guard let engine = gemma4StatefulEngine,
+              let tok = gemma4StatefulTokenizer
+        else {
+            throw NSError(domain: "LLMRunner", code: 41,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Gemma 4 stateful not loaded"])
+        }
+        isGenerating = true
+        tokensPerSecond = 0
+
+        // Build the Gemma 4 prompt manually — the tokenizer config in the
+        // bundle has no chat_template, and Gemma 4 uses different turn
+        // markers than Gemma 2/3 (`<|turn>` / `<turn|>` vs the older
+        // `<start_of_turn>` / `<end_of_turn>`). Mirrors CoreMLLLM.swift's
+        // buildGemmaPrompt path so the model sees the same token sequence
+        // it was trained on.
+        var prompt = "<bos>"
+        for m in messages {
+            switch m.role {
+            case .user:
+                prompt += "<|turn>user\n\(m.content)<turn|>\n"
+            case .assistant:
+                prompt += "<|turn>model\n\(m.content)<turn|>\n"
+            case .system:
+                continue  // skip UI status messages ("Model loaded!" etc.)
+            }
+        }
+        prompt += "<|turn>model\n"
+        let inputIds = tok.encode(text: prompt)
+        let inputIdsInt32 = inputIds.map { Int32($0) }
+
+        // Gemma 4 stop tokens: EOS (1) + <end_of_turn> (106).
+        var eosSet: Set<Int32> = [1, 106]
+        if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
+
+        // Special tokens we never want to render as user-visible text.
+        // The Engine's generate emits tokens BEFORE the next-iteration EOS
+        // check breaks the loop, so without filtering here `<end_of_turn>`
+        // (106) and `<start_of_turn>` (105) leak into the chat bubble.
+        // Limited to verified Gemma 4 control tokens — earlier "safety"
+        // additions were removed to avoid masking real vocabulary tokens
+        // (e.g. emoji that share low IDs in some tokenizer revisions).
+        let skipSet: Set<Int32> = [1, 105, 106]  // <eos>, <start_of_turn>, <end_of_turn>
+
+        let genStart = Date()
+        return AsyncStream { continuation in
+            Task { [weak self] in
+                defer { Task { @MainActor in self?.isGenerating = false } }
+                // Accumulated-decode streaming for clean multi-byte UTF-8
+                // (Gemma SentencePiece often splits CJK / emoji across
+                // tokens; decoding individually produces mojibake).
+                var accum: [Int] = []
+                var emittedString = ""
+                var totalEmitted = 0
+                do {
+                    _ = try await engine.generate(
+                        inputIds: inputIdsInt32,
+                        maxNewTokens: 256,
+                        eosTokenIds: eosSet,
+                        onToken: { tokenId in
+                            if skipSet.contains(tokenId) { return }
+                            accum.append(Int(tokenId))
+                            let current = tok.decode(tokens: accum)
+                            if current.count > emittedString.count {
+                                let delta = String(
+                                    current.suffix(current.count - emittedString.count))
+                                continuation.yield(delta)
+                                emittedString = current
+                            }
+                            totalEmitted += 1
+                        })
+                    let dt = Date().timeIntervalSince(genStart)
+                    if dt > 0 {
+                        let tps = Double(totalEmitted) / dt
+                        Task { @MainActor in
+                            self?.tokensPerSecond = tps
+                        }
+                    }
                 } catch {
                     continuation.yield("[Error: \(error.localizedDescription)]")
                 }

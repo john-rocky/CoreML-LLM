@@ -182,6 +182,35 @@ public final class ModelDownloader: NSObject {
             downloadURL: "",
             folderName: "gemma4-e2b-lookahead-probe")
 
+        /// Gemma 4 E2B stateful — MLState + slice_update KV cache, mirrors
+        /// the Qwen3-VL 2B v1.5.0 stateful pattern. Routed through
+        /// `Gemma4StatefulGenerator` (Examples/CoreMLLLMChat). Lets us drop
+        /// the explicit kv13/kv14 passthrough in chunk_2 → 3/4 in favor of
+        /// CoreML-managed state buffers, plus enables cross-turn KV reuse
+        /// for ~zero TTFT on prefix-extending prompts. Built by
+        /// `conversion/build_gemma4_e2b_stateful_chunks.py`. Sideload-only
+        /// to `Documents/Models/gemma4-e2b-stateful/gemma4_e2b_stateful_chunks/`.
+        public static let gemma4e2bStateful = ModelInfo(
+            id: "gemma4-e2b-stateful",
+            name: "Gemma 4 E2B (stateful, MLState)", size: "4.0 GB",
+            downloadURL: "",
+            folderName: "gemma4-e2b-stateful")
+
+        /// Gemma 4 E2B stateful — Linear variant (cml9 PR #2577 native
+        /// `linear` op activation-quant). Same layout as `gemma4e2bStateful`
+        /// except every Conv2d(in, out, 1, ...) projection is replaced with
+        /// `nn.Linear(in, out)` (weights reshaped from (out,in,1,1) to
+        /// (out,in)). Mac chunk_1 + W4 latency probe (commit b5fef64+,
+        /// `conversion/probe_e2e_linear_latency.py`) shows E2E parity (-1%
+        /// vs Conv2d) at production scale, refuting MBA's 5-layer +21%
+        /// gap as a synthetic-probe artifact. iPhone re-test gates the
+        /// `ane_ops.Conv2dLinear` migration.
+        public static let gemma4e2bStatefulLinear = ModelInfo(
+            id: "gemma4-e2b-stateful-linear",
+            name: "Gemma 4 E2B (stateful, Linear projections)", size: "4.0 GB",
+            downloadURL: "",
+            folderName: "gemma4-e2b-stateful-linear")
+
         /// Visible in the UI picker. EAGLE-3 / LookAhead probe variants are
         /// hidden unless `LLM_SHOW_EXPERIMENTAL=1` is set (or the
         /// UserDefaults key `showExperimentalModels` is true). Keeps the
@@ -195,6 +224,8 @@ public final class ModelDownloader: NSObject {
             if experimental {
                 list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
                 list.insert(gemma4e2bLookaheadProbe, at: 3)  // after EAGLE-3
+                list.insert(gemma4e2bStateful, at: 4)        // after LookAhead
+                list.insert(gemma4e2bStatefulLinear, at: 5)  // Plan 3 A/B partner
             }
             return list
         }
@@ -341,6 +372,33 @@ public final class ModelDownloader: NSObject {
             // we need an extra layer of nesting in the URL we return.
             // Mirror the Qwen3.5 chunked + Qwen3-VL v1.4.0 convention.
             return vl2bStatefulDir
+        }
+
+        // Gemma 4 E2B stateful (MLState + slice_update): chunk_{1..4} +
+        // embed_tokens_q8.bin + RoPE tables + tokenizer under
+        // gemma4_e2b_stateful_chunks/. Two folder names share this
+        // layout: gemma4-e2b-stateful (Conv2d) and
+        // gemma4-e2b-stateful-linear (Plan 3 Linear A/B partner).
+        let g4StatefulDir = dir.appendingPathComponent("gemma4_e2b_stateful_chunks")
+        func g4StatefulChunkExists(_ base: String) -> Bool {
+            let pkg = g4StatefulDir
+                .appendingPathComponent("\(base).mlpackage")
+                .appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")
+            if fileManager.fileExists(atPath: pkg.path) { return true }
+            let mlc = g4StatefulDir
+                .appendingPathComponent("\(base).mlmodelc")
+                .appendingPathComponent("weights/weight.bin")
+            return fileManager.fileExists(atPath: mlc.path)
+        }
+        let g4StatefulEmbed = g4StatefulDir
+            .appendingPathComponent("embed_tokens_q8.bin")
+        if fileManager.fileExists(atPath: g4StatefulEmbed.path)
+            && (1...4).allSatisfy({ g4StatefulChunkExists("chunk_\($0)") })
+        {
+            // Same nesting convention as Qwen3-VL stateful — return the
+            // INNER chunks dir; LLMRunner strips one level and adds the
+            // subdir back via its own resolver.
+            return g4StatefulDir
         }
 
         // Qwen3-VL 2B: 4 body chunks + chunk_head + embed_weight.bin
