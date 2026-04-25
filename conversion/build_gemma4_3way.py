@@ -36,7 +36,9 @@ import coremltools as ct
 
 from config import MODEL_REGISTRY
 from models.gemma4 import Gemma4Model
-from models.gemma4_swa_chunks import SWAChunk1, SWAChunk4, compute_chunk_boundaries
+from models.gemma4_swa_chunks import (
+    SWAChunk1, SWAChunk4, SWAChunk4_LMSplit, compute_chunk_boundaries,
+)
 from models.gemma4_swa_merged import MergedChunk23
 
 fp16 = np.float16
@@ -229,7 +231,8 @@ def build_chunk2_merged(base, ctx: int, out_pkg: str, *, quantize: bool) -> None
 # self-consistent (chunk1/chunk2/chunk3).
 # ----------------------------------------------------------------------
 
-def build_chunk3_head(base, ctx: int, out_pkg: str, *, quantize: bool) -> None:
+def build_chunk3_head(base, ctx: int, out_pkg: str, *, quantize: bool,
+                      lm_splits: int = 1) -> None:
     cfg = base.config
     hidden = cfg.hidden_size
     pld = cfg.hidden_size_per_layer_input
@@ -242,9 +245,13 @@ def build_chunk3_head(base, ctx: int, out_pkg: str, *, quantize: bool) -> None:
     boundaries = compute_chunk_boundaries(cfg)
     _, c4_end = boundaries[3]
     c4_start = boundaries[3][0]
-    print(f"\n=== chunk3_3way (L{c4_start}-{c4_end-1} + LM head) ===")
+    suffix = "" if lm_splits <= 1 else f" (lm_split={lm_splits})"
+    print(f"\n=== chunk3_3way (L{c4_start}-{c4_end-1} + LM head){suffix} ===")
 
-    swa = SWAChunk4(base, c4_start, c4_end).eval()
+    if lm_splits > 1:
+        swa = SWAChunk4_LMSplit(base, c4_start, c4_end, n_splits=lm_splits).eval()
+    else:
+        swa = SWAChunk4(base, c4_start, c4_end).eval()
     s = (
         torch.zeros(1, 1, hidden, dtype=torch.float16),
         torch.zeros(1, 1, 1, ctx, dtype=torch.float16),
@@ -292,13 +299,17 @@ def main():
                     help="Skip INT4 palettization (fp16 chunks — ~4× larger)")
     ap.add_argument("--only", choices=("chunk1", "chunk2", "chunk3"), default=None,
                     help="Build only one chunk (debug)")
+    ap.add_argument("--lm-splits", type=int, default=1, choices=(1, 2, 4, 8, 16),
+                    help="Split chunk3 lm_head into N parallel Conv2d heads. "
+                         "1=baseline (current production); 16=anemll-style ANE-SRAM-friendly.")
     args = ap.parse_args()
 
     if args.ctx is None and args.model in MODEL_REGISTRY:
         args.ctx = MODEL_REGISTRY[args.model].default_context_length
     elif args.ctx is None:
         args.ctx = 2048
-    args.output = args.output or os.path.join(ROOT, "..", "output", args.model, "chunks_3way")
+    default_subdir = "chunks_3way" if args.lm_splits == 1 else f"chunks_3way_lmsplit{args.lm_splits}"
+    args.output = args.output or os.path.join(ROOT, "..", "output", args.model, default_subdir)
     os.makedirs(args.output, exist_ok=True)
 
     hf_dir = _resolve_hf_dir(args.model, args.hf_dir)
@@ -320,7 +331,8 @@ def main():
     if args.only in (None, "chunk2"):
         build_chunk2_merged(base, args.ctx, c2, quantize=quantize)
     if args.only in (None, "chunk3"):
-        build_chunk3_head(base, args.ctx, c3, quantize=quantize)
+        build_chunk3_head(base, args.ctx, c3, quantize=quantize,
+                          lm_splits=args.lm_splits)
 
     print("\n" + "=" * 60)
     print(f"3-chunk bundle written to {args.output}/")

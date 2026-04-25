@@ -211,6 +211,32 @@ public final class ModelDownloader: NSObject {
             downloadURL: "",
             folderName: "gemma4-e2b-stateful-linear")
 
+        /// LM-head split A/B/C bundles (chunk3 lm_head Conv2d split into N
+        /// parallel heads, per ANEMLL qwen_model.py:1006-1124). Same chunk1
+        /// and chunk2 as production; only chunk3 differs. Sideloaded to
+        /// `Documents/Models/gemma4-e2b-lmsplit-{baseline,8,16}/`. See
+        /// `docs/SESSION_2026_04_25_LMSPLIT_DEPLOY.md`.
+        public static let gemma4e2bLMSplitBaseline = ModelInfo(
+            id: "gemma4-e2b-lmsplit-baseline",
+            name: "Gemma 4 E2B (lm_split=1, baseline)",
+            size: "1.1 GB",
+            downloadURL: "",
+            folderName: "gemma4-e2b-lmsplit-baseline")
+
+        public static let gemma4e2bLMSplit8 = ModelInfo(
+            id: "gemma4-e2b-lmsplit8",
+            name: "Gemma 4 E2B (lm_split=8)",
+            size: "1.1 GB",
+            downloadURL: "",
+            folderName: "gemma4-e2b-lmsplit8")
+
+        public static let gemma4e2bLMSplit16 = ModelInfo(
+            id: "gemma4-e2b-lmsplit16",
+            name: "Gemma 4 E2B (lm_split=16, anemll-style)",
+            size: "1.1 GB",
+            downloadURL: "",
+            folderName: "gemma4-e2b-lmsplit16")
+
         /// Visible in the UI picker. EAGLE-3 / LookAhead probe variants are
         /// hidden unless `LLM_SHOW_EXPERIMENTAL=1` is set (or the
         /// UserDefaults key `showExperimentalModels` is true). Keeps the
@@ -226,6 +252,9 @@ public final class ModelDownloader: NSObject {
                 list.insert(gemma4e2bLookaheadProbe, at: 3)  // after EAGLE-3
                 list.insert(gemma4e2bStateful, at: 4)        // after LookAhead
                 list.insert(gemma4e2bStatefulLinear, at: 5)  // Plan 3 A/B partner
+                list.insert(gemma4e2bLMSplitBaseline, at: 6) // Stage 4 lm-split A/B/C
+                list.insert(gemma4e2bLMSplit8, at: 7)
+                list.insert(gemma4e2bLMSplit16, at: 8)
             }
             return list
         }

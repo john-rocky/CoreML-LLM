@@ -477,6 +477,70 @@ class SWAChunk4(nn.Module):
         return token_id, token_logit, normed
 
 
+class SWAChunk4_LMSplit(SWAChunk4):
+    """Variant of SWAChunk4 with the lm_head Conv2d split into N parallel heads.
+
+    Per ANEMLL's `qwen_model.py:1006-1124`: for vocab=128k Qwen3 they split the
+    final projection into 16 Conv2d kernels because a single Conv2d(hidden,
+    vocab, 1) is too large to tile efficiently in ANE SRAM. Our vocab=262144
+    is 2× larger, so the same motivation applies more strongly.
+
+    `n_splits` must divide `vocab_size`. Common choices: 2 (matches anemll's
+    ENABLE_VACAB_SPLIT), 8, 16 (anemll's ENABLE_VACAB_SPLIT16).
+
+    All other behavior — softcap, in-model argmax, output names — is identical
+    to SWAChunk4 so the runtime contract does not change.
+    """
+
+    def __init__(self, model: Gemma4Model, start: int = 25, end: int = 35,
+                 n_splits: int = 16):
+        super().__init__(model, start, end)
+        vocab = model.lm_head.out_channels
+        hidden = model.lm_head.in_channels
+        if vocab % n_splits != 0:
+            raise ValueError(
+                f"vocab_size {vocab} not divisible by n_splits {n_splits}")
+        split = vocab // n_splits
+        full_w = model.lm_head.weight.data  # (V, H, 1, 1)
+        for i in range(n_splits):
+            head = nn.Conv2d(hidden, split, 1, bias=False, dtype=MODEL_DTYPE)
+            head.weight.data = full_w[i * split:(i + 1) * split].clone()
+            setattr(self, f"lm_head{n_splits}_{i + 1}", head)
+        self.n_splits = n_splits
+        # Drop the unsplit head so it isn't traced.
+        del self.lm_head
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding, update_mask,
+                per_layer_combined, cos_s, sin_s, cos_f, sin_f,
+                kv13_k, kv13_v, kv14_k, kv14_v):
+        config = self.config
+        dummy_K = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+        dummy_V = dummy_K
+
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
+            hidden_states, *_ = _run_layer_swa(
+                self.layers[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding, update_mask,
+                dummy_K, dummy_V, dummy_K, dummy_V,
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+            )
+
+        normed = self.norm(hidden_states)
+        x = normed.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
+        parts = []
+        for i in range(self.n_splits):
+            head = getattr(self, f"lm_head{self.n_splits}_{i + 1}")
+            parts.append(head(x).squeeze(2).permute(0, 2, 1))
+        logits = torch.cat(parts, dim=2)
+        if self.softcap > 0:
+            logits = torch.tanh(logits / self.softcap) * self.softcap
+        token_id, token_logit = self.argmax(logits.squeeze(0))
+        return token_id, token_logit, normed
+
+
 # ============================================================
 # Verify mode: Q=K batched speculative verification (read-only KV)
 # ============================================================
