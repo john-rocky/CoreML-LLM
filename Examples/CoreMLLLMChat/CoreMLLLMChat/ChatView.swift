@@ -14,6 +14,12 @@ struct ChatView: View {
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var selectedImage: CGImage?
     @State private var selectedImageData: Data?
+    /// Tracks whether the currently-selected image has already been shown
+    /// in a user bubble. Image persists across turns (so the generator
+    /// can reuse its KV cache), but we only render the thumbnail in the
+    /// first message that introduces it — subsequent turns are text-only
+    /// in the chat scroll, while the image stays implicitly attached.
+    @State private var imageDisplayedInChat: Bool = false
 
     // Video picker (Gemma 4 video path)
     @State private var selectedVideoItem: PhotosPickerItem?
@@ -362,7 +368,7 @@ struct ChatView: View {
 
         guard !text.isEmpty || audio != nil || videoURL != nil else { return }
 
-        let attachedImageData = selectedImageData
+        let attachedImageData = imageDisplayedInChat ? nil : selectedImageData
         let content: String
         if videoURL != nil && text.isEmpty {
             content = "[Video]"
@@ -379,13 +385,18 @@ struct ChatView: View {
                                        imageData: attachedImageData)
         let userMessageId = userMessage.id
         messages.append(userMessage)
+        if attachedImageData != nil { imageDisplayedInChat = true }
         inputText = ""
         streaming.text = ""
 
         let image = selectedImage
         let frames = videoFrames
         let includeAudio = videoIncludeAudio
-        clearImage()
+        // Image is intentionally NOT cleared after send: it remains
+        // attached to the session so follow-up turns can reuse the
+        // generator's KV cache (image at a fixed sequence offset across
+        // turns). The user clears it explicitly via the X on the
+        // preview, picking a new image, or the Clear toolbar button.
         audioRecorder.clear()
 
         Task {
@@ -603,6 +614,11 @@ struct ChatView: View {
                 if let uiImage = UIImage(data: data) {
                     selectedImage = uiImage.cgImage
                 }
+                // Picking a new image resets the "shown" flag so the
+                // next user message displays the new thumbnail; the
+                // generator's vision fingerprint will mismatch on the
+                // next generate, forcing a fresh KV state.
+                imageDisplayedInChat = false
             }
         }
     }
@@ -611,6 +627,7 @@ struct ChatView: View {
         selectedPhoto = nil
         selectedImage = nil
         selectedImageData = nil
+        imageDisplayedInChat = false
     }
 
     /// Load test_audio.pcm from Documents and run through audio pipeline.

@@ -58,6 +58,14 @@ final class LLMRunner {
     /// `vision.mlpackage` is present in the model folder.
     private var qwen3vl2bVisionEncoder: Qwen3VL2BVisionEncoder?
 
+    /// Cache the most recently encoded image's features so repeat-turn
+    /// generates with the same image skip the encoder run AND reuse
+    /// the same Qwen3VL2BVisionFeatures instance — the generator keys
+    /// its persisted KV cache on `features.hidden`'s ObjectIdentifier
+    /// so a stable instance is required to hit the fast path.
+    private var cachedVisionImage: CGImage?
+    private var cachedVisionFeatures: Qwen3VL2BVisionFeatures?
+
     // MARK: - Loading
 
     func loadModel(from url: URL) async throws {
@@ -66,13 +74,18 @@ final class LLMRunner {
         // Release previous engines BEFORE allocating a new one — peak footprint
         // on model switch would otherwise hold both in memory simultaneously,
         // OOMing on 8 GB devices.
-        if llm != nil || qwen35Generator != nil || qwen3vl2bGenerator != nil {
+        if llm != nil || qwen35Generator != nil || qwen3vl2bGenerator != nil
+            || qwen3vl2bStatefulGenerator != nil
+        {
             llm = nil
             qwen35Generator = nil
             qwen35Tokenizer = nil
             qwen3vl2bGenerator = nil
+            qwen3vl2bStatefulGenerator = nil
             qwen3vl2bTokenizer = nil
             qwen3vl2bVisionEncoder = nil
+            cachedVisionImage = nil
+            cachedVisionFeatures = nil
             isLoaded = false
             modelName = ""
             hasVision = false
@@ -306,6 +319,11 @@ final class LLMRunner {
         llm?.clearImageCache()
         // Qwen3.5 is stateless per-call (state is built recurrently from
         // scratch each generate), so nothing to reset here.
+        // Qwen3-VL 2B stateful: drop the persisted KV cache + vision
+        // feature cache so the next turn rebuilds from scratch.
+        qwen3vl2bStatefulGenerator?.resetPersistedState()
+        cachedVisionImage = nil
+        cachedVisionFeatures = nil
     }
 
     // MARK: - Qwen3.5 dispatch
@@ -635,6 +653,23 @@ final class LLMRunner {
         modelName = "Qwen3-VL 2B (stateful)\(visionTag)"
         hasVision = qwen3vl2bVisionEncoder != nil && gen.hasVisionChunk
         hasAudio = false
+
+        // ANE pre-warm: front-load each chunk's first-call compile
+        // (multi-second per chunk on the iPhone Neural Engine) so the
+        // first user send doesn't pay it. Surface as a distinct status
+        // string so the user knows what the wait is.
+        loadingStatus = "Warming ANE..."
+        do {
+            let warmStart = Date()
+            try await gen.prewarm()
+            let warmMs = Int(Date().timeIntervalSince(warmStart) * 1000)
+            print("[LLMRunner] Qwen3-VL 2B stateful prewarm: \(warmMs) ms")
+        } catch {
+            // Non-fatal: the first generate will simply pay the
+            // compile cost itself. Log and continue.
+            print("[LLMRunner] Qwen3-VL 2B stateful prewarm failed: \(error)")
+        }
+
         isLoaded = true
         loadingStatus = "Ready"
         print("[LLMRunner] Qwen3-VL 2B stateful — \(gen.status)")
@@ -657,7 +692,21 @@ final class LLMRunner {
         var visionFeatures: Qwen3VL2BVisionFeatures? = nil
         let inputIdsInt32: [Int32]
         if let image, let encoder = qwen3vl2bVisionEncoder {
-            visionFeatures = try await encoder.encode(image)
+            // Reuse cached features when the same CGImage instance is
+            // sent again; encoding is the dominant non-prefill cost on
+            // a fresh image (~hundreds of ms on iPhone 17 Pro). The
+            // generator additionally keys its persisted KV state on the
+            // returned features.hidden ObjectIdentifier, so handing
+            // back the same struct is what makes turn-2 KV reuse fire.
+            if let cachedImage = cachedVisionImage, cachedImage === image,
+               let cached = cachedVisionFeatures {
+                visionFeatures = cached
+            } else {
+                let f = try await encoder.encode(image)
+                cachedVisionImage = image
+                cachedVisionFeatures = f
+                visionFeatures = f
+            }
             inputIdsInt32 = try buildQwen3VLVisionPromptIds(
                 tokenizer: tok, history: messages)
         } else {
@@ -745,6 +794,15 @@ final class LLMRunner {
     /// by wrapping 196 `<|image_pad|>` markers between
     /// `<|vision_start|>` / `<|vision_end|>` before the user's text.
     ///
+    /// The vision block is injected into the FIRST user message so the
+    /// image-pad span sits at a fixed sequence offset across turns —
+    /// this lets Qwen3VL2BStatefulGenerator's per-session KV cache
+    /// match by longest-common-prefix (turn 1's prompt becomes a strict
+    /// prefix of turn 2's prompt). If the latest user turn carries a
+    /// distinct image, the persisted state is invalidated upstream
+    /// (vision fingerprint mismatch in the generator), so always
+    /// pinning the block to the first user turn is safe.
+    ///
     /// Special tokens (151644/151645/151652/151653/151655) are spliced
     /// in as raw IDs so we don't depend on the tokenizer recognizing
     /// them from a literal "<|…|>" string.
@@ -761,10 +819,10 @@ final class LLMRunner {
         let userRole:      [Int32] = tok.encode(text: "user").map { Int32($0) }
         let assistantRole: [Int32] = tok.encode(text: "assistant").map { Int32($0) }
 
+        let firstUserIdx = history.firstIndex(where: { $0.role == .user })
+
         var ids: [Int32] = []
-        // Replay prior turns as plain text (no images attached to past
-        // messages — the UI only ships the freshest selected image).
-        for m in history.dropLast() {
+        for (idx, m) in history.enumerated() {
             let role: [Int32]
             switch m.role {
             case .user:       role = userRole
@@ -774,21 +832,15 @@ final class LLMRunner {
             ids.append(imStart)
             ids += role
             ids += newline
+            if idx == firstUserIdx {
+                ids.append(visionStart)
+                ids.append(contentsOf: Array(repeating: imagePad, count: 196))
+                ids.append(visionEnd)
+            }
             ids += tok.encode(text: m.content).map { Int32($0) }
             ids.append(imEnd)
             ids += newline
         }
-        // Latest user turn, injected with the vision block.
-        let userText = history.last(where: { $0.role == .user })?.content ?? ""
-        ids.append(imStart)
-        ids += userRole
-        ids += newline
-        ids.append(visionStart)
-        ids.append(contentsOf: Array(repeating: imagePad, count: 196))
-        ids.append(visionEnd)
-        ids += tok.encode(text: userText).map { Int32($0) }
-        ids.append(imEnd)
-        ids += newline
         // Assistant preamble (no content yet — the model fills it in).
         ids.append(imStart)
         ids += assistantRole

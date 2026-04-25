@@ -140,6 +140,22 @@ final class Qwen3VL2BStatefulGenerator {
     private var fvDs2: MLFeatureValue!
     private var fvGate: MLFeatureValue!
 
+    // Cross-turn KV reuse. Holds the MLState array from the previous
+    // generate() so the next call can skip prefill of the matching
+    // prefix. persistedInputIds tracks the EXACT token sequence the
+    // state has consumed (== prompt + decoded minus the trailing
+    // unconsumed token, see generate()'s post-loop bookkeeping).
+    // persistedVisionFingerprint = ObjectIdentifier of the
+    // Qwen3VL2BVisionFeatures.hidden array; mismatch (different image
+    // OR text-only after a vision turn) forces fresh state.
+    // Reset by resetPersistedState() (called from LLMRunner on
+    // chat-clear) and by load() (state handles bind to specific
+    // MLModel instances and would dangle on reload).
+    private var persistedStates: [MLState] = []
+    private var persistedInputIds: [Int32] = []
+    private var persistedPosition: Int = 0
+    private var persistedVisionFingerprint: ObjectIdentifier?
+
     init(cfg: Config = .defaultFourChunk) {
         self.cfg = cfg
         cosTable = buildRope(isCos: true)
@@ -440,6 +456,121 @@ final class Qwen3VL2BStatefulGenerator {
 
     // MARK: - Load
 
+    /// Run one dummy prediction through every loaded chunk on a
+    /// throwaway MLState so the ANE compiles its dispatch cache before
+    /// the user types anything. The first generate() in a fresh
+    /// process pays a multi-second compile for each chunk; prewarm
+    /// front-loads that cost into a status-bar wait that the user
+    /// already expects after picking a model. Exercises both T=1
+    /// (decode) and T=prefillT (multifunction prefill) paths so neither
+    /// surprises us on the first send. Throwaway states drop on
+    /// return; persistedStates is untouched.
+    func prewarm() async throws {
+        guard !bodyChunks.isEmpty, headChunk != nil else { return }
+
+        // Source models for state creation (mirrors generate()'s logic).
+        var stateSource: [MLModel] = []
+        for ci in 0..<bodyChunks.count {
+            let m: MLModel
+            if ci == 0 && chunk0Vision != nil {
+                m = chunk0VisionPrefill ?? chunk0Vision!
+            } else {
+                m = bodyPrefillChunks.isEmpty ? bodyChunks[ci]
+                    : bodyPrefillChunks[ci]
+            }
+            stateSource.append(m)
+        }
+
+        // T=1 warm. Zero hidden + position 0 RoPE; gate=0 so DeepStack
+        // is a no-op even when chunk_0_vision is on the path.
+        memset(reusableHidden.dataPointer, 0, reusableHidden.count * 2)
+        fillCosSin(forPosition: 0)
+        fillCausalMask(forPosition: 0)
+        setCurrentPos(0)
+        reusableGate.dataPointer.assumingMemoryBound(to: Float.self)[0] = 0
+
+        let opts = MLPredictionOptions()
+        let warmStates = stateSource.map { $0.makeState() }
+        var hiddenFV: MLFeatureValue = fvHidden!
+        for (ci, chunk) in bodyChunks.enumerated() {
+            let useVision = (ci == 0 && chunk0Vision != nil)
+            let activeChunk = useVision ? chunk0Vision! : chunk
+            let prov: StatefulBodyProvider
+            if useVision {
+                prov = StatefulBodyProvider(
+                    hiddenIn: hiddenFV, cos: fvCos, sin: fvSin,
+                    mask: fvMask, pos: fvPos,
+                    ds0: fvDs0, ds1: fvDs1, ds2: fvDs2, gate: fvGate)
+            } else {
+                prov = StatefulBodyProvider(
+                    hiddenIn: hiddenFV, cos: fvCos, sin: fvSin,
+                    mask: fvMask, pos: fvPos)
+            }
+            let out = try await activeChunk.prediction(
+                from: prov, using: warmStates[ci], options: opts)
+            if let fv = out.featureValue(for: "hidden") { hiddenFV = fv }
+        }
+        let headProv = try MLDictionaryFeatureProvider(
+            dictionary: ["hidden_in": hiddenFV])
+        _ = try await headChunk!.prediction(from: headProv, options: opts)
+
+        // Prefill T=prefillT warm (only when multifunction is loaded).
+        if !bodyPrefillChunks.isEmpty {
+            ensurePrefillBuffers()
+            memset(prefillHidden!.dataPointer, 0, prefillHidden!.count * 2)
+            // cos/sin/mask are filled by per-step code; use a flat zero
+            // RoPE + an all-allowed mask sufficient for compile-cache
+            // population (numerical correctness doesn't matter here).
+            memset(prefillCos!.dataPointer, 0, prefillCos!.count * 2)
+            memset(prefillSin!.dataPointer, 0, prefillSin!.count * 2)
+            memset(prefillMask!.dataPointer, 0, prefillMask!.count * 2)
+            prefillGate!.dataPointer
+                .assumingMemoryBound(to: Float.self)[0] = 0
+
+            let warmPrefillStates = stateSource.map { $0.makeState() }
+            var hFV: MLFeatureValue = fvPrefillHidden!
+            let useVision0 = chunk0VisionPrefill != nil
+            let chunk0M = useVision0 ? chunk0VisionPrefill!
+                                     : bodyPrefillChunks[0]
+            let p0: StatefulPrefillProvider
+            if useVision0 {
+                p0 = StatefulPrefillProvider(
+                    hiddenIn: fvPrefillHidden!,
+                    cos: fvPrefillCos!, sin: fvPrefillSin!,
+                    mask: fvPrefillMask!, pos: fvPos,
+                    ds0: fvPrefillDs0, ds1: fvPrefillDs1,
+                    ds2: fvPrefillDs2, gate: fvPrefillGate)
+            } else {
+                p0 = StatefulPrefillProvider(
+                    hiddenIn: fvPrefillHidden!,
+                    cos: fvPrefillCos!, sin: fvPrefillSin!,
+                    mask: fvPrefillMask!, pos: fvPos)
+            }
+            let out0 = try await chunk0M.prediction(
+                from: p0, using: warmPrefillStates[0], options: opts)
+            if let fv = out0.featureValue(for: "hidden") { hFV = fv }
+            for ci in 1..<bodyPrefillChunks.count {
+                let p = StatefulPrefillProvider(
+                    hiddenIn: hFV,
+                    cos: fvPrefillCos!, sin: fvPrefillSin!,
+                    mask: fvPrefillMask!, pos: fvPos)
+                let out = try await bodyPrefillChunks[ci].prediction(
+                    from: p, using: warmPrefillStates[ci], options: opts)
+                if let fv = out.featureValue(for: "hidden") { hFV = fv }
+            }
+        }
+    }
+
+    /// Drop the cross-turn KV cache. Call from the chat UI when the
+    /// user clears history, picks a new image, or otherwise breaks the
+    /// prompt-prefix invariant the resume path depends on.
+    func resetPersistedState() {
+        persistedStates = []
+        persistedInputIds = []
+        persistedPosition = 0
+        persistedVisionFingerprint = nil
+    }
+
     func load() throws {
         guard let r = resolveURLs() else {
             throw NSError(domain: "Qwen3VL2BStateful", code: 40,
@@ -447,6 +578,10 @@ final class Qwen3VL2BStatefulGenerator {
                     "qwen3_vl_2b_stateful_chunks/{embed_weight.bin, chunk_0..N, chunk_head} "
                     + "not found in Documents/ or Documents/Models/qwen3-vl-2b-stateful/"])
         }
+        // MLState handles bind to specific MLModel instances. Any
+        // persisted state from a prior load points at models we're
+        // about to release — drop it before we lose the binding.
+        resetPersistedState()
         try mmapEmbedWeight(url: r.embed)
         let mcfg = MLModelConfiguration()
         mcfg.computeUnits = cfg.computeUnits
@@ -980,26 +1115,67 @@ final class Qwen3VL2BStatefulGenerator {
                 userInfo: [NSLocalizedDescriptionKey:
                     "image present but chunk_0_vision is not loaded"])
         }
-        // State must be created from one fixed function-instance per
-        // chunk, then reused across both prefill_b<N> and infer calls.
-        // For chunk[0] in vision mode, state must come from
-        // chunk0Vision's mlpackage (separate from chunk_0.mlpackage).
-        var stateSource: [MLModel] = []
-        for ci in 0..<bodyChunks.count {
-            let m: MLModel
-            if ci == 0 && chunk0Vision != nil {
-                // vision mode: prefer multifunction prefill model when
-                // available, else fall back to T=1 chunk_0_vision.
-                m = chunk0VisionPrefill ?? chunk0Vision!
-            } else {
-                m = bodyPrefillChunks.isEmpty ? bodyChunks[ci]
-                    : bodyPrefillChunks[ci]
-            }
-            stateSource.append(m)
-        }
-        let states = stateSource.map { $0.makeState() }
 
-        var position = 0
+        // Cross-turn KV reuse: if the persisted state's input prefix
+        // matches the new prompt AND vision identity is unchanged, skip
+        // re-prefill of the common prefix. We require persistedInputIds
+        // to be a STRICT prefix of inputIds (and non-empty) — partial
+        // overlaps would mean the persisted state has tokens the new
+        // prompt doesn't, so we'd have to rewind, which MLState's
+        // slice_update doesn't support. In that case, drop and
+        // restart fresh.
+        let visionFingerprint: ObjectIdentifier? = visionFeatures
+            .map { ObjectIdentifier($0.hidden) }
+        var resumeAt = 0
+        let canResume = !persistedStates.isEmpty
+            && persistedStates.count == bodyChunks.count
+            && persistedVisionFingerprint == visionFingerprint
+        if canResume {
+            let cap = min(persistedInputIds.count, inputIds.count)
+            var l = 0
+            while l < cap && persistedInputIds[l] == inputIds[l] { l += 1 }
+            if l == persistedInputIds.count && l < inputIds.count && l > 0 {
+                resumeAt = l
+            }
+        }
+
+        let states: [MLState]
+        if resumeAt > 0 {
+            states = persistedStates
+            print("[Qwen3VL2BStateful] RESUME L=\(resumeAt) "
+                  + "(persisted=\(persistedInputIds.count), "
+                  + "new=\(inputIds.count))")
+            // Clear bookkeeping while in-flight so a throw mid-prefill
+            // can't leave stale resume metadata that points past where
+            // the state actually got advanced to. Repopulated on
+            // successful completion below.
+            persistedInputIds = []
+            persistedPosition = 0
+        } else {
+            // Fresh state: create from one fixed function-instance per
+            // chunk, then reused across both prefill_b<N> and infer
+            // calls. For chunk[0] in vision-loaded mode, state must come
+            // from chunk0Vision's mlpackage (separate from chunk_0).
+            var stateSource: [MLModel] = []
+            for ci in 0..<bodyChunks.count {
+                let m: MLModel
+                if ci == 0 && chunk0Vision != nil {
+                    m = chunk0VisionPrefill ?? chunk0Vision!
+                } else {
+                    m = bodyPrefillChunks.isEmpty ? bodyChunks[ci]
+                        : bodyPrefillChunks[ci]
+                }
+                stateSource.append(m)
+            }
+            let fresh = stateSource.map { $0.makeState() }
+            states = fresh
+            persistedStates = fresh
+            persistedInputIds = []
+            persistedPosition = 0
+            persistedVisionFingerprint = visionFingerprint
+        }
+
+        var position = resumeAt
         var lastToken: Int32 = 0
         let t0 = CFAbsoluteTimeGetCurrent()
         var prefillEnd: CFAbsoluteTime = t0
@@ -1021,9 +1197,15 @@ final class Qwen3VL2BStatefulGenerator {
         //   * mixed (text+image)  → not batched, fall back to T=1
         // Vision batching needs chunk0VisionPrefill loaded; otherwise
         // fall back to T=1 for any image-bearing batch.
+        // When resuming (resumeAt > 0), prefill starts at the resume
+        // boundary and only re-processes the new tail tokens. The
+        // image-pad span sits at the front of the prompt under the
+        // current builder, so a resume past the image guarantees the
+        // tail is image-free — vision/imageStartPos bookkeeping below
+        // stays harmlessly at zero.
         let canBatchPrefill = !bodyPrefillChunks.isEmpty
-            && inputIds.count >= prefillT
-        var i = 0
+            && (inputIds.count - resumeAt) >= prefillT
+        var i = resumeAt
         // TTFT diagnostic counters (printed at end of prefill loop).
         var batchedTextCount = 0
         var batchedVisionCount = 0
@@ -1151,6 +1333,26 @@ final class Qwen3VL2BStatefulGenerator {
         }
         let t1 = CFAbsoluteTimeGetCurrent()
 
+        // Persist the state's consumed-token sequence so the next
+        // generate() can match by LCP. The MLState was advanced by:
+        //   prefill loop:  positions [resumeAt, inputIds.count)
+        //   decode loop:   one stepPredict per emitted token AFTER the
+        //                  prefill-tail "free" first token. So state
+        //                  has consumed prompt + decoded[:-1] in all
+        //                  cases (EOS-terminated → drop EOS; max-
+        //                  tokens hit → last decoded token never made
+        //                  it into the state because stepPredict
+        //                  consumes the PREVIOUS token). Persist
+        //                  exactly what the state has; off-by-one
+        //                  vs the displayed assistant text in the
+        //                  max-tokens case costs at most 1 token of
+        //                  re-prefill on the next turn.
+        let consumed = decoded.dropLast()
+        var newPersisted = inputIds
+        newPersisted.append(contentsOf: consumed)
+        persistedInputIds = newPersisted
+        persistedPosition = newPersisted.count
+
         let prefillMs = (prefillEnd - t0) * 1000
         let decodeMs = (t1 - decodeStart) * 1000
         let decodeTokPerS = Double(decoded.count) / ((t1 - decodeStart))
@@ -1162,11 +1364,13 @@ final class Qwen3VL2BStatefulGenerator {
         breakdown += String(format: "  head:    %.1f ms/step\n", headMs / Double(n))
         breakdown += String(format: "  embed+rope fill: %.2f ms/step",
                              (embedMs + ropeFillMs) / Double(n))
+        let resumeTag = resumeAt > 0 ? " [resumed L=\(resumeAt)]" : ""
         stats = String(format:
-            "prefill %d tok in %.1fms (%.1f tok/s) | decode %d tok in %.1fms (%.1f tok/s)\n\n"
+            "prefill %d tok in %.1fms (%.1f tok/s)%@ | decode %d tok in %.1fms (%.1f tok/s)\n\n"
             + "per-step breakdown (decode):\n%@",
-            inputIds.count, prefillMs,
-            Double(inputIds.count) / max(prefillEnd - t0, 1e-3),
+            inputIds.count - resumeAt, prefillMs,
+            Double(max(inputIds.count - resumeAt, 1)) / max(prefillEnd - t0, 1e-3),
+            resumeTag as NSString,
             decoded.count, decodeMs, decodeTokPerS, breakdown)
         return decoded
     }
