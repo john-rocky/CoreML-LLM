@@ -14,15 +14,17 @@ Where [MLX Swift](https://github.com/ml-explore/mlx-swift) is the right call whe
 | **Gemma 4 E4B** | 5.5 GB | Text | ~14 tok/s | [mlboydaisuke/gemma-4-E4B-coreml](https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml) |
 | **Qwen3.5 2B** | 2.4 GB | Text | ~17 tok/s (~200 MB RSS) | [mlboydaisuke/qwen3.5-2B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML) |
 | **Qwen3.5 0.8B** | 1.4 GB | Text | ~20 tok/s | [mlboydaisuke/qwen3.5-0.8B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML) |
-| **Qwen3-VL 2B** | 2.9 GB | Text + image (DeepStack) | ~7.5 tok/s | [mlboydaisuke/qwen3-vl-2b-coreml](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-coreml) |
+| **Qwen3-VL 2B (stateful)** | 2.3 GB | Text + image (DeepStack) | **~24 tok/s** (256 MB RSS, TTFT 125 ms on resumed turn) | [mlboydaisuke/qwen3-vl-2b-stateful-coreml](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-stateful-coreml) |
 | **FunctionGemma-270M** | 850 MB | Function calling | (specialist) | [mlboydaisuke/functiongemma-270m-coreml](https://huggingface.co/mlboydaisuke/functiongemma-270m-coreml) |
 | **EmbeddingGemma-300M** | 295 MB | Sentence embeddings (768/512/256/128) | (specialist) | [mlboydaisuke/embeddinggemma-300m-coreml](https://huggingface.co/mlboydaisuke/embeddinggemma-300m-coreml) |
+| Qwen3-VL 2B (legacy, recurrent) | 2.9 GB | Text + image (DeepStack) | ~7.5 tok/s | [mlboydaisuke/qwen3-vl-2b-coreml](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-coreml) |
 | Qwen2.5 0.5B | 302 MB | Text | — | [mlboydaisuke/qwen2.5-0.5b-coreml](https://huggingface.co/mlboydaisuke/qwen2.5-0.5b-coreml) |
 
 All numbers are iPhone 17 Pro A19 Pro, 2048-token context, ANE-only (no GPU fallback at runtime unless noted). Methodology: [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 
 **Which one should I pick?**
 - Multimodal (image / video / audio) → **Gemma 4 E2B**
+- Image + text chat, lowest memory + fastest follow-up → **Qwen3-VL 2B (stateful)**
 - Text-only, maximum quality under ≤3 GB → **Qwen3.5 2B**
 - Text-only, maximum quality → **Gemma 4 E4B**
 - Text-only, fastest + smallest → **Qwen3.5 0.8B**
@@ -235,10 +237,12 @@ Step-by-step: [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md). Full reference (qu
 
 ## What's new
 
-Current release: **v1.4.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases)).
+Current release: **v1.6.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases)).
 
+- **v1.6.0** — Qwen3-VL 2B stateful Phase 2: cross-turn KV reuse + ANE prewarm. Same-prompt 2nd TTFT **4 s → 125 ms** (~32×), vision-chat 2nd-turn TTFT 125 ms (target was <500 ms). LCP-matched MLState resume + image-pinned-to-first-user-turn prompt builder + per-chunk dummy predict at load (231 ms total).
+- **v1.5.0** — Qwen3-VL 2B stateful Phase 1: MLState + slice_update KV cache + multifunction prefill_b8. **24 tok/s decode at 256 MB phys_footprint** on iPhone 17 Pro (vs 7.5 tok/s / 1.7 GB on the v1.3 recurrent build — 3.2× decode, 6.4× memory drop). 4-chunk INT8 + fp16 embed sidecar.
 - **v1.4.0** — Gemma 4 E2B 3-chunk decode (opt-in, `LLM_3CHUNK=1`): 31.6 → **34.2 tok/s** on iPhone 17 Pro A19 Pro (+8.2 %). Bit-equivalent to 4-chunk by construction. Closes the ANE-ceiling sweep for E2B; five additional lossless probes (SDPA fusion, K=V alias, Topology I boundary search, blockwise palettization, native softmax) all landed as negative results — see [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md).
-- **v1.3.0** — Qwen3-VL 2B (text + vision on ANE, 196 image tokens, DeepStack injection at L0/1/2, interleaved mRoPE for image tokens). 28-layer GQA, 2.9 GB bundle, ~7.5 tok/s text decode.
+- **v1.3.0** — Qwen3-VL 2B (text + vision on ANE, 196 image tokens, DeepStack injection at L0/1/2, interleaved mRoPE for image tokens). 28-layer GQA, 2.9 GB bundle, ~7.5 tok/s text decode. (Recurrent KV — superseded by v1.5.0 stateful build; kept for backward compatibility.)
 - **v1.2.0** — FunctionGemma-270M (function calling, batched prefill T=32) and EmbeddingGemma-300M (99.80 % ANE, Matryoshka 768/512/256/128). Standalone `Gemma3Demo` sample.
 - **v1.1.0** — Qwen3.5 2B (4 INT8 chunks + mmap fp16 embed sidecar, ~200 MB phys_footprint for a 2B-param model).
 - **v1.0.0** — Qwen3.5 0.8B (first hybrid SSM+attention LLM on CoreML, 99.9 % ANE).
