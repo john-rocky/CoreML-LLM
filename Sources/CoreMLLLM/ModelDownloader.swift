@@ -127,7 +127,7 @@ public final class ModelDownloader: NSObject {
         public static let qwen3vl_2b_stateful = ModelInfo(
             id: "qwen3-vl-2b-stateful", name: "Qwen3-VL 2B (stateful, Phase 1)",
             size: "2.3 GB",
-            downloadURL: "",
+            downloadURL: "https://huggingface.co/mlboydaisuke/qwen3-vl-2b-stateful-coreml/resolve/main",
             folderName: "qwen3-vl-2b-stateful")
 
         /// Gemma 4 E4B — 42 layers, hidden=2560, 2 KV heads, text-only decoder.
