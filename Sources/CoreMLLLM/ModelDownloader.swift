@@ -911,14 +911,12 @@ public final class ModelDownloader: NSObject {
              + mlc("swa", "chunk2", "chunk2", weightSize: 133_963_968)
              + mlc("swa", "chunk3", "chunk3", weightSize: 325_282_880)
              + mlc("swa", "chunk4", "chunk4", weightSize: 526_874_880)
-             // 3-chunk decode variant (opt-in at runtime via LLM_3CHUNK=1).
-             // Adds ~940 MB on disk but stays out of RAM unless selected.
-             // chunk2_3way = merged L8-24 (17 layers), chunk3_3way = LM-head
-             // chunk.  See docs/THREE_CHUNK_MAC_BENCH.md for the +8%
-             // measurement.  Files 404 on older HF snapshots — optional mlc
-             // files are skipped by the downloader, so absence is fine.
-             + mlc("swa", "chunk2_3way", "chunk2_3way", weightSize: 459_768_064)
-             + mlc("swa", "chunk3_3way", "chunk3_3way", weightSize: 526_874_880)
+             // NOTE: legacy 3-chunk recurrent extras (chunk2_3way +
+             // chunk3_3way, ~987 MB) used to be downloaded by default but
+             // were never used by typical installs (LLM_3CHUNK=1 opt-in
+             // only). The new MLState 3-chunk merged path replaces this
+             // experiment entirely — see docs/SESSION_2026_04_26_STAGE3_PREFILL_BN.md
+             // for the wins. Removed from default to save users 987 MB.
         let prefillFiles = prefillMeta("chunk1", "prefill_chunk1")
              + prefillMeta("chunk2", "prefill_chunk2")
              + prefillMeta("chunk3", "prefill_chunk3")
