@@ -196,19 +196,20 @@ public final class ModelDownloader: NSObject {
             downloadURL: "",
             folderName: "gemma4-e2b-stateful")
 
-        /// Gemma 4 E2B stateful — Linear variant (cml9 PR #2577 native
-        /// `linear` op activation-quant). Same layout as `gemma4e2bStateful`
-        /// except every Conv2d(in, out, 1, ...) projection is replaced with
-        /// `nn.Linear(in, out)` (weights reshaped from (out,in,1,1) to
-        /// (out,in)). Mac chunk_1 + W4 latency probe (commit b5fef64+,
-        /// `conversion/probe_e2e_linear_latency.py`) shows E2E parity (-1%
-        /// vs Conv2d) at production scale, refuting MBA's 5-layer +21%
-        /// gap as a synthetic-probe artifact. iPhone re-test gates the
-        /// `ane_ops.Conv2dLinear` migration.
+        /// Gemma 4 E2B stateful (3-chunk merged + Linear) — Stage 3 ship.
+        /// MLState + slice_update KV, 3-chunk layout (chunk_1 L0-7 +
+        /// chunk_2 merged L8-24 + chunk_3 L25-34+lm_head). Linear
+        /// projections (cml9 PR #2577 native `linear` op). Mac decode
+        /// 34.6 tok/s + multifunction prefill_b8 7.77×; iPhone 17 Pro
+        /// decode 33.4 tok/s with T=1 prefill fallback (multifunction
+        /// T>1 unsupported on iPhone ANE 18). Cross-turn KV reuse via
+        /// LCP-match — multi-turn TTFT -95%. Built by
+        /// `conversion/build_gemma4_e2b_stateful_3chunks.py`. Text-only
+        /// (vision/audio stay on the legacy gemma4e2b multimodal bundle).
         public static let gemma4e2bStatefulLinear = ModelInfo(
             id: "gemma4-e2b-stateful-linear",
-            name: "Gemma 4 E2B (stateful, Linear projections)", size: "4.0 GB",
-            downloadURL: "",
+            name: "Gemma 4 E2B (stateful, Linear)", size: "3.7 GB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-stateful-coreml/resolve/main",
             folderName: "gemma4-e2b-stateful-linear")
 
         /// Visible in the UI picker. EAGLE-3 / LookAhead probe variants are
@@ -220,12 +221,20 @@ public final class ModelDownloader: NSObject {
             let experimental =
                 ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
                 || UserDefaults.standard.bool(forKey: "showExperimentalModels")
-            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, gemma4e2bFashion, qwen25_05b, qwen35_08b, qwen35_2b, qwen3vl_2b, qwen3vl_2b_stateful]
+            // gemma4e2bStatefulLinear is the Stage 3 ship default (text-only
+            // chat: 3-chunk merged + MLState + multifunction). Listed first
+            // so new users land on it. The legacy gemma4e2b bundle still
+            // ships for users who want vision/audio.
+            var list: [ModelInfo] = [
+                gemma4e2bStatefulLinear,
+                gemma4e2b, gemma4e4b, gemma4e2bFashion,
+                qwen25_05b, qwen35_08b, qwen35_2b,
+                qwen3vl_2b, qwen3vl_2b_stateful,
+            ]
             if experimental {
-                list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
-                list.insert(gemma4e2bLookaheadProbe, at: 3)  // after EAGLE-3
-                list.insert(gemma4e2bStateful, at: 4)        // after LookAhead
-                list.insert(gemma4e2bStatefulLinear, at: 5)  // Plan 3 A/B partner
+                list.insert(gemma4e2bEagle3, at: 3)  // after gemma4e4b
+                list.insert(gemma4e2bLookaheadProbe, at: 4)
+                list.insert(gemma4e2bStateful, at: 5)        // Conv2d variant
             }
             return list
         }
@@ -392,8 +401,14 @@ public final class ModelDownloader: NSObject {
         }
         let g4StatefulEmbed = g4StatefulDir
             .appendingPathComponent("embed_tokens_q8.bin")
+        // Accept either the 3-chunk merged layout (chunks 1-3, ship from
+        // Stage 3 e8fb25c) or the legacy 4-chunk layout (chunks 1-4) —
+        // Gemma4StatefulEngine auto-detects via chunk_3 signature.
+        let g4Has3Chunks = (1...3).allSatisfy {
+            g4StatefulChunkExists("chunk_\($0)") }
+        let g4Has4Chunks = g4Has3Chunks && g4StatefulChunkExists("chunk_4")
         if fileManager.fileExists(atPath: g4StatefulEmbed.path)
-            && (1...4).allSatisfy({ g4StatefulChunkExists("chunk_\($0)") })
+            && (g4Has3Chunks || g4Has4Chunks)
         {
             // Same nesting convention as Qwen3-VL stateful — return the
             // INNER chunks dir; LLMRunner strips one level and adds the
@@ -855,6 +870,10 @@ public final class ModelDownloader: NSObject {
             buildE4BFileList()
             return
         }
+        if model.id == "gemma4-e2b-stateful-linear" {
+            buildGemma4StatefulLinearFileList()
+            return
+        }
         if model.id == "qwen3.5-0.8b" {
             buildQwen35FileList()
             return
@@ -1135,6 +1154,98 @@ public final class ModelDownloader: NSObject {
             estimatedSize: 406_000_000))
         pendingFiles = files
         pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
+        totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
+        completedBytes = 0
+        nextFileIndex = 0
+    }
+
+    /// Stage 3 ship: 3-chunk merged stateful Linear bundle. HF repo
+    /// `mlboydaisuke/gemma-4-E2B-stateful-coreml`. Files land under the
+    /// `gemma4_e2b_stateful_chunks/` subdir of the model folder
+    /// (LLMRunner expects this layout for the stateful path).
+    private func buildGemma4StatefulLinearFileList() {
+        let subdir = "gemma4_e2b_stateful_chunks"
+        func mlc(_ name: String, weightSize: Int64,
+                 milSize: Int64) -> [DownloadFile] {
+            [.init(remotePath: "\(name).mlmodelc/weights/weight.bin",
+                   localPath: "\(subdir)/\(name).mlmodelc/weights/weight.bin",
+                   estimatedSize: weightSize),
+             .init(remotePath: "\(name).mlmodelc/coremldata.bin",
+                   localPath: "\(subdir)/\(name).mlmodelc/coremldata.bin",
+                   estimatedSize: 1_200),
+             .init(remotePath: "\(name).mlmodelc/model.mil",
+                   localPath: "\(subdir)/\(name).mlmodelc/model.mil",
+                   estimatedSize: milSize),
+             .init(remotePath: "\(name).mlmodelc/metadata.json",
+                   localPath: "\(subdir)/\(name).mlmodelc/metadata.json",
+                   estimatedSize: 22_000),
+             .init(remotePath: "\(name).mlmodelc/analytics/coremldata.bin",
+                   localPath: "\(subdir)/\(name).mlmodelc/analytics/coremldata.bin",
+                   estimatedSize: 250)]
+        }
+
+        let chunkFiles =
+              mlc("chunk_1", weightSize: 155_484_416, milSize: 716_249)
+            + mlc("chunk_2", weightSize: 459_299_328, milSize: 1_088_904)
+            + mlc("chunk_3", weightSize: 527_440_000, milSize: 494_464)
+
+        let extraFiles: [DownloadFile] = [
+            .init(remotePath: "embed_tokens_q8.bin",
+                  localPath: "\(subdir)/embed_tokens_q8.bin",
+                  estimatedSize: 402_653_184),
+            .init(remotePath: "embed_tokens_scales.bin",
+                  localPath: "\(subdir)/embed_tokens_scales.bin",
+                  estimatedSize: 524_288),
+            .init(remotePath: "embed_tokens_per_layer_q8.bin",
+                  localPath: "\(subdir)/embed_tokens_per_layer_q8.bin",
+                  estimatedSize: 2_348_810_240),
+            .init(remotePath: "embed_tokens_per_layer_scales.bin",
+                  localPath: "\(subdir)/embed_tokens_per_layer_scales.bin",
+                  estimatedSize: 524_288),
+            .init(remotePath: "per_layer_projection.bin",
+                  localPath: "\(subdir)/per_layer_projection.bin",
+                  estimatedSize: 27_525_120),
+            .init(remotePath: "per_layer_norm_weight.bin",
+                  localPath: "\(subdir)/per_layer_norm_weight.bin",
+                  estimatedSize: 1_024),
+            .init(remotePath: "cos_sliding.npy",
+                  localPath: "\(subdir)/cos_sliding.npy",
+                  estimatedSize: 4_194_432),
+            .init(remotePath: "sin_sliding.npy",
+                  localPath: "\(subdir)/sin_sliding.npy",
+                  estimatedSize: 4_194_432),
+            .init(remotePath: "cos_full.npy",
+                  localPath: "\(subdir)/cos_full.npy",
+                  estimatedSize: 8_388_736),
+            .init(remotePath: "sin_full.npy",
+                  localPath: "\(subdir)/sin_full.npy",
+                  estimatedSize: 8_388_736),
+            .init(remotePath: "model_config.json",
+                  localPath: "\(subdir)/model_config.json",
+                  estimatedSize: 700),
+            .init(remotePath: "hf_model/tokenizer.json",
+                  localPath: "\(subdir)/hf_model/tokenizer.json",
+                  estimatedSize: 32_169_626),
+            .init(remotePath: "hf_model/tokenizer_config.json",
+                  localPath: "\(subdir)/hf_model/tokenizer_config.json",
+                  estimatedSize: 2_100),
+            .init(remotePath: "hf_model/config.json",
+                  localPath: "\(subdir)/hf_model/config.json",
+                  estimatedSize: 5_000),
+        ]
+
+        var largeFiles: [DownloadFile] = []
+        var smallFiles: [DownloadFile] = []
+        let threshold: Int64 = 10_000_000
+        for file in chunkFiles + extraFiles {
+            if file.estimatedSize >= threshold {
+                largeFiles.append(file)
+            } else {
+                smallFiles.append(file)
+            }
+        }
+        largeFiles.sort { $0.estimatedSize > $1.estimatedSize }
+        pendingFiles = largeFiles + smallFiles
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
         completedBytes = 0
         nextFileIndex = 0
