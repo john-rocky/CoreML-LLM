@@ -54,6 +54,26 @@ def _make_inputs(input_specs, num_samples, seed):
     return samples
 
 
+def _load_real_inputs(npz_path, input_names, max_samples):
+    """Load real-prompt inputs produced by gen_calib_data_real.py."""
+    data = np.load(npz_path)
+    n = int(data["_meta_num_samples"][0])
+    samples = []
+    for i in range(min(n, max_samples)):
+        d = {}
+        ok = True
+        for name in input_names:
+            key = f"sample_{i:03d}__{name}"
+            if key in data.files:
+                d[name] = data[key]
+            else:
+                ok = False
+                break
+        if ok:
+            samples.append(d)
+    return samples
+
+
 def _input_specs_from_model(mlmodel):
     """Extract (name, shape, dtype) from an mlpackage's input description.
 
@@ -95,7 +115,7 @@ def _is_stateful(mlmodel):
     return False
 
 
-def _run_pair(w4_path, w4a8_path, samples):
+def _run_pair(w4_path, w4a8_path, samples, real_data_path=None):
     print(f"loading W4   from {w4_path}")
     m4 = ct.models.MLModel(w4_path,
                            compute_units=ct.ComputeUnit.CPU_AND_NE)
@@ -108,9 +128,13 @@ def _run_pair(w4_path, w4a8_path, samples):
     for s in input_specs:
         print(f"  {s.name}: {s.shape} {s.dtype}")
 
-    # seed=0 matches the converter's calibration samples — gives a tight
-    # in-distribution comparison; production correctness needs real prompts.
-    inputs = _make_inputs(input_specs, samples, seed=0)
+    if real_data_path:
+        names = {s.name for s in input_specs}
+        inputs = _load_real_inputs(real_data_path, names, samples)
+        print(f"using {len(inputs)} REAL-prompt samples from {real_data_path}")
+    else:
+        inputs = _make_inputs(input_specs, samples, seed=0)
+        print(f"using {len(inputs)} synthetic N(0, 0.5) samples")
 
     stats = {"max_abs": [], "cos": [], "rel": []}
     for i, x in enumerate(inputs):
@@ -147,7 +171,12 @@ def main():
     ap.add_argument("--w4a8", required=True,
                     help="Path to W4A8 chunk_1.mlpackage")
     ap.add_argument("--samples", type=int, default=32,
-                    help="Number of synthetic input samples (default: 32)")
+                    help="Number of input samples (default: 32). For real "
+                         "data, capped by .npz contents.")
+    ap.add_argument("--real-data", default=None,
+                    help="Path to .npz from gen_calib_data_real.py. When "
+                         "set, forwards real-prompt activations through "
+                         "both models instead of synthetic random.")
     args = ap.parse_args()
 
     if not Path(args.w4).exists():
@@ -156,7 +185,8 @@ def main():
         sys.exit(f"W4A8 path not found: {args.w4a8}")
 
     t0 = time.time()
-    stats = _run_pair(args.w4, args.w4a8, args.samples)
+    stats = _run_pair(args.w4, args.w4a8, args.samples,
+                      real_data_path=args.real_data)
     print(f"\ndone in {time.time()-t0:.1f}s\n")
 
     if stats["max_abs"]:
@@ -170,9 +200,17 @@ def main():
               f"min={cs.min():.6f}")
         print(f"  rel L2 error:  mean={rl.mean():.4f}  "
               f"max={rl.max():.4f}")
-        verdict = "PASS" if (cs.mean() > 0.995 and ma.max() < 1.0) else "WARN"
-        print(f"\nverdict: {verdict} "
-              f"(target cos>0.995, max_abs<1.0 on synthetic inputs)")
+        # Stage 1 gate per docs/ROADMAP_2026_04_26.md §2.4: cos sim ≥ 0.95
+        # is the GO threshold; 0.99+ ideal.
+        if cs.mean() >= 0.99:
+            verdict = "PASS (cos≥0.99)"
+        elif cs.mean() >= 0.95:
+            verdict = "PASS-MARGINAL (0.95≤cos<0.99) — re-run iPhone smoke before ship"
+        elif cs.mean() >= 0.90:
+            verdict = "WARN (0.90≤cos<0.95) — try more calib samples"
+        else:
+            verdict = "FAIL (cos<0.90) — structural issue, HOLD"
+        print(f"\nverdict: {verdict}")
 
 
 if __name__ == "__main__":

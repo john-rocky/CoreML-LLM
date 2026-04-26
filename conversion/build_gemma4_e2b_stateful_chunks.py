@@ -311,11 +311,34 @@ def _make_calibration_samples(input_specs, num_samples=4, seed=0):
     return samples
 
 
+def _load_real_calibration_samples(npz_path: str, input_names: set) -> list:
+    """Load .npz produced by `gen_calib_data_real.py` and reshape into
+    the dict-of-arrays format `linear_quantize_activations` expects.
+    Filters to only the input names that exist in the converted model
+    (so chunk_2/3/4 paths can reuse the chunk_1 npz by ignoring extras).
+    """
+    data = np.load(npz_path)
+    n = int(data["_meta_num_samples"][0])
+    samples = []
+    for i in range(n):
+        d = {}
+        for name in input_names:
+            key = f"sample_{i:03d}__{name}"
+            if key in data.files:
+                d[name] = data[key]
+        if len(d) == len(input_names):
+            samples.append(d)
+    return samples
+
+
 def _trace_and_convert_stateful(
     model, sample_inputs, input_specs, output_specs, state_specs,
     out_path: str, quantize_nbits: int,
     activation_quant: bool = False,
     calib_samples: int = 4,
+    calib_data_path: str | None = None,
+    activation_scope: str = "linear",
+    activation_mode: str = "linear_symmetric",
 ):
     """Trace + ct.convert with StateType, save, optionally palettize, audit."""
     t = time.time()
@@ -354,21 +377,37 @@ def _trace_and_convert_stateful(
         _patch_calibrator_for_stateful()
         _patch_quant_dequant_skip_missing()
         _patch_suffix_skip_missing()
-        # Scope to `linear` op only (cml9 PR #2577's specific contribution).
-        # Reason for not using global_config: cml9 also quantizes inputs of
-        # `add` ops, which on Gemma 4 are residual connections — INT8 round-
-        # trip on residuals compounds error across 35 layers, dropping
-        # `hidden_states_out` cosine to ~0.1 vs W4 baseline. `linear`-only
-        # keeps quant on the matmul path where it's actually beneficial.
         act_cfg = OpActivationLinearQuantizerConfig(
-            mode="linear_symmetric",
+            mode=activation_mode,
             weight_threshold=2048,
         )
-        opt_cfg = OptimizationConfig(op_type_configs={"linear": act_cfg})
-        sample_data = _make_calibration_samples(input_specs,
-                                                 num_samples=calib_samples)
-        print(f"    activation-quantizing INT8 (linear-only) with "
-              f"{len(sample_data)} calibration samples...")
+        # Two scope modes: "linear" (cml9 PR #2577's main contribution —
+        # narrow scope on matmul path only) and "all" (also quantize
+        # conv/add/pool inputs). The 2026-04-26 first attempt with synth
+        # calibration found "linear" insufficient (cos sim 0.15), but the
+        # quality root cause was the calibration data, not the scope.
+        # Both modes are valid; default "linear" is the safer narrow scope.
+        if activation_scope == "all":
+            opt_cfg = OptimizationConfig(global_config=act_cfg)
+        else:
+            opt_cfg = OptimizationConfig(op_type_configs={"linear": act_cfg})
+
+        if calib_data_path:
+            input_names = {spec.name for spec in input_specs}
+            sample_data = _load_real_calibration_samples(
+                calib_data_path, input_names)
+            if not sample_data:
+                raise RuntimeError(
+                    f"No samples loaded from {calib_data_path} matching "
+                    f"this chunk's input names {sorted(input_names)}")
+            print(f"    activation-quantizing INT8 (scope={activation_scope}) "
+                  f"with {len(sample_data)} REAL calibration samples "
+                  f"from {calib_data_path}")
+        else:
+            sample_data = _make_calibration_samples(
+                input_specs, num_samples=calib_samples)
+            print(f"    activation-quantizing INT8 (scope={activation_scope}) "
+                  f"with {len(sample_data)} synthetic calibration samples...")
         mlmodel = linear_quantize_activations(mlmodel, opt_cfg, sample_data)
         print(f"    activation-quantized in {time.time()-t:.1f}s")
 
@@ -389,7 +428,9 @@ def _trace_and_convert_stateful(
 # ============================================================
 
 def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits, *,
-                   use_linear=False, activation_quant=False):
+                   use_linear=False, activation_quant=False,
+                   calib_data_path=None, activation_scope="linear",
+                   activation_mode="linear_symmetric"):
     print("\n" + "=" * 60)
     print(f"CHUNK 1 (L{c_start}-{c_end-1}) — own KV state, computes PLE")
     print("=" * 60)
@@ -448,11 +489,16 @@ def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits, *,
     ]
     _trace_and_convert_stateful(
         chunk, sample, inputs, outputs, states, out_path, nbits,
-        activation_quant=activation_quant)
+        activation_quant=activation_quant,
+        calib_data_path=calib_data_path,
+        activation_scope=activation_scope,
+        activation_mode=activation_mode)
 
 
 def convert_chunk2(base, c_start, c_end, ctx, out_path, nbits, *,
-                   use_linear=False, activation_quant=False):
+                   use_linear=False, activation_quant=False,
+                   calib_data_path=None, activation_scope="linear",
+                   activation_mode="linear_symmetric"):
     print("\n" + "=" * 60)
     print(f"CHUNK 2 (L{c_start}-{c_end-1}) — own KV state, emits kv13/kv14")
     print("=" * 60)
@@ -514,12 +560,17 @@ def convert_chunk2(base, c_start, c_end, ctx, out_path, nbits, *,
     ]
     _trace_and_convert_stateful(
         chunk, sample, inputs, outputs, states, out_path, nbits,
-        activation_quant=activation_quant)
+        activation_quant=activation_quant,
+        calib_data_path=calib_data_path,
+        activation_scope=activation_scope,
+        activation_mode=activation_mode)
 
 
 def convert_chunk_shared(chunk_cls, base, c_start, c_end, ctx,
                          out_path, nbits, name, with_lm_head, *,
-                         use_linear=False, activation_quant=False):
+                         use_linear=False, activation_quant=False,
+                         calib_data_path=None, activation_scope="linear",
+                         activation_mode="linear_symmetric"):
     """Stateless chunk (3 or 4). All layers KV-shared from kv13/kv14."""
     print("\n" + "=" * 60)
     print(f"{name} (L{c_start}-{c_end-1}) — stateless, reads kv13/14"
@@ -574,7 +625,10 @@ def convert_chunk_shared(chunk_cls, base, c_start, c_end, ctx,
     _trace_and_convert_stateful(
         chunk, sample, inputs, outputs, state_specs=[],
         out_path=out_path, quantize_nbits=nbits,
-        activation_quant=activation_quant)
+        activation_quant=activation_quant,
+        calib_data_path=calib_data_path,
+        activation_scope=activation_scope,
+        activation_mode=activation_mode)
 
 
 # ============================================================
@@ -616,7 +670,26 @@ def main():
                     help="Number of synthetic calibration samples for "
                          "--activation-quant (default: 4). More samples "
                          "= broader activation range coverage but slower "
-                         "calibration.")
+                         "calibration. Ignored when --calib-data is set.")
+    ap.add_argument("--calib-data", default=None,
+                    help="Path to .npz produced by gen_calib_data_real.py. "
+                         "When set, uses real-prompt activation samples "
+                         "for calibration (overrides synthetic). Stage 1 "
+                         "retry path; the synthetic calibration produced "
+                         "cos sim 0.108 vs W4 baseline (HOLD doc).")
+    ap.add_argument("--activation-scope", default="linear",
+                    choices=["linear", "all"],
+                    help="Op-type scope for INT8 activation quant. "
+                         "'linear' (default) only quantizes matmul-path "
+                         "linear ops (cml9 PR #2577 contribution). 'all' "
+                         "applies the global config including conv/add/"
+                         "pool. 'all' compounds error across residuals.")
+    ap.add_argument("--activation-mode", default="linear_symmetric",
+                    choices=["linear_symmetric", "linear"],
+                    help="Quantization mode. 'linear_symmetric' (default) "
+                         "uses zero_point=0, scale via max(|rmin|, |rmax|). "
+                         "'linear' is asymmetric (zero_point !=0). Asymmetric "
+                         "is generally tighter for non-zero-centered activs.")
     args = ap.parse_args()
 
     if args.ctx is None:
@@ -651,31 +724,46 @@ def main():
     else:
         print(f"Projections: nn.Conv2d(1×1) wrapper (current default)")
     if args.activation_quant:
-        print(f"Activations: INT8 linear_symmetric "
-              f"(calib samples={args.calib_samples})")
+        if args.calib_data:
+            print(f"Activations: INT8 linear_symmetric (scope={args.activation_scope}) "
+                  f"using REAL calibration data {args.calib_data}")
+        else:
+            print(f"Activations: INT8 linear_symmetric (scope={args.activation_scope}) "
+                  f"with {args.calib_samples} synthetic calib samples")
 
     do = (lambda n: args.only_chunk is None or args.only_chunk == n)
     use_linear = args.linear_projections
     act_q = args.activation_quant
+    cdp = args.calib_data
+    asc = args.activation_scope
+    amd = args.activation_mode
 
     if do(1):
         convert_chunk1(base, *boundaries[0], args.ctx,
                        str(out / "chunk_1.mlpackage"), args.nbits,
-                       use_linear=use_linear, activation_quant=act_q)
+                       use_linear=use_linear, activation_quant=act_q,
+                       calib_data_path=cdp, activation_scope=asc,
+                       activation_mode=amd)
     if do(2):
         convert_chunk2(base, *boundaries[1], args.ctx,
                        str(out / "chunk_2.mlpackage"), args.nbits,
-                       use_linear=use_linear, activation_quant=act_q)
+                       use_linear=use_linear, activation_quant=act_q,
+                       calib_data_path=cdp, activation_scope=asc,
+                       activation_mode=amd)
     if do(3):
         convert_chunk_shared(SWAStatefulChunk3, base, *boundaries[2], args.ctx,
                              str(out / "chunk_3.mlpackage"), args.nbits,
                              name="CHUNK 3", with_lm_head=False,
-                             use_linear=use_linear, activation_quant=act_q)
+                             use_linear=use_linear, activation_quant=act_q,
+                             calib_data_path=cdp, activation_scope=asc,
+                             activation_mode=amd)
     if do(4):
         convert_chunk_shared(SWAStatefulChunk4, base, *boundaries[3], args.ctx,
                              str(out / "chunk_4.mlpackage"), args.nbits,
                              name="CHUNK 4", with_lm_head=True,
-                             use_linear=use_linear, activation_quant=act_q)
+                             use_linear=use_linear, activation_quant=act_q,
+                             calib_data_path=cdp, activation_scope=asc,
+                             activation_mode=amd)
 
     print(f"\nartifacts under {out}")
     for p in sorted(out.iterdir()):
