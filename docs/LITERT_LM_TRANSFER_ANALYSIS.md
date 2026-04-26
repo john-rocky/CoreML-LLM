@@ -187,11 +187,12 @@ Why we're bigger:
 
 The PLE delta is the single-largest possible bundle-size win on this stack.
 **Follow-up probe ran on 2026-04-26 — see `docs/PLE_INT4_PROBE.md`.**
-TL;DR: INT4 g=32 saves ~980 MB at mean cos 0.99495 / min 0.98718 vs BF16
-(vs production INT8's 0.999937). Strict lossless is not achievable; INT4
-adds ~0.005 cos at the embedding step, which the W4A16 decoder noise
-floor (cos 0.949 vs FP16) almost certainly absorbs. End-to-end logits
-cos sim is the gating measurement, not yet run. Estimated 1-2 day port.
+TL;DR: per-row cos numbers were optimistic (INT4 g=32 mean cos 0.995 vs
+BF16); the e2e prefill test then **flipped ~35% of token argmaxes**
+even at g=8. PTQ INT4 PLE is **not viable** as a drop-in. Saving the
+~980 MB requires QAT or vocab pruning, both larger investments. The
+realistic quick win on this stack is tied-weight embedding↔lm_head
+dedup (-192 MB), not PLE compression.
 
 ---
 

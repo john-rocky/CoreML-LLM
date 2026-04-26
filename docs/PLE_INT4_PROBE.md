@@ -10,17 +10,30 @@ without quality regression vs the current W4A16 production point?
 
 - **Strict lossless: NO.** Production INT8 row-wise quantization is
   effectively lossless against BF16 ground truth (mean cos
-  **0.999937**, min 0.999291). INT4 cannot match that.
-- **Practical "ship-quality": likely YES at group=32**, mean cos
-  **0.994948**, min **0.987177** vs BF16. -0.005 cos vs INT8 baseline.
-  Saves **~980 MB on disk** (PLE 2.20 GB → 1.26 GB).
-- **Row-wise INT4 is too aggressive.** Min cos drops to **0.823137** —
-  ~1 in 100K vocab tokens get hit hard. Pick a grouped scheme.
-- **End-to-end validation still required** before shipping. The PLE-step
-  cos sim doesn't tell us how the error compounds through 35 transformer
-  layers + lm_head onto the final logit distribution. The W4 decoder
-  noise floor is already cos 0.949 vs FP16 — there's headroom, but
-  empirical e2e measurement is the gating step.
+  **0.999937**, min 0.999291). INT4 cannot match that at any
+  group size we tested.
+- **End-to-end test contradicts the per-row optimism.** Multi-step
+  prefill on 4 prompts × 16 positions: even at INT4 group=8 (the
+  finest group we tested), **token argmax flips ~35% of the time** vs
+  the production INT8 PLE. Smaller groups improve cos sim at the
+  embedding step but token agreement plateaus around 65% — meaning
+  the PLE perturbation compounds through 35 transformer layers more
+  aggressively than the 0.005 input-cos-drop suggests.
+- **INT4 PLE is NOT a viable PTQ drop-in.** Saving ~980 MB this way
+  trades the largest single bundle-size win against ~35% token
+  divergence in real prefill, and that ratio doesn't change with
+  finer group sizes (g=32, 16, 8 all sit in the 64-67% agreement
+  band).
+- **Paths forward that would actually work** (none of them "quick"):
+  (a) QAT — train the model to be robust to INT4 PLE, ~A100 + 3-5 d.
+  (b) LUT palettization (16-centroid kmeans per group) — more
+      expressive than absmax-symmetric, may close some of the gap
+      but unlikely to recover the full 35% argmax delta on its own.
+  (c) Vocab trim — drop the ~50K tail vocab entries that contribute
+      most of the PLE byte mass and rarely appear, saves storage
+      orthogonally to quant scheme.
+  (d) Tied-weight dedup (embedding ↔ lm_head, see §1 of the parent
+      transfer doc) — saves 192 MB without touching PLE.
 
 ## Method
 
@@ -117,43 +130,103 @@ fp16 scale × 262144 vocab) — small relative to the saving.
    not answer "what does INT4 do to the output token distribution?".
    That's the next experiment.
 
-## Recommendation
+## End-to-end measurement (the gating test)
 
-A follow-up branch could:
+Two scripts run the chunk_1→chunk_2→chunk_3→chunk_4 stateful chain
+twice per test (INT8 PLE vs INT4-grouped PLE), with the token
+embedding identical between runs so the only delta is the PLE input.
 
-1. Generate `embed_tokens_per_layer_q4_g32.bin` + grouped scales
-   (~1.26 GB on disk).
-2. Add an `EmbeddingLookup`-style INT4-grouped path in Swift
-   (`Data(...,options:.mappedIfSafe)` + group-aware dequant). The
-   per-token cost is essentially unchanged from the current INT8 path
-   — just smaller LUT to read.
-3. Run the existing `probe_w4a8_quality.py`-style 32-prompt cos sim
-   measurement against the FP16 baseline, comparing prod (W4A16 + INT8
-   PLE) vs candidate (W4A16 + INT4-g32 PLE). Gate at cos ≥ 0.945.
-4. If gate passes, ship behind a `LLM_PLE_INT4=1` sideload flag for an
-   iPhone session, then default-on if confirmed.
+### Test 1: fresh-state pos=0, 32 vocab tokens
+`scripts/probe_ple_int4_e2e.py` — 16 random + 16 worst-case (lowest
+PLE cos sim under INT4-g32) vocab IDs, each at position 0 with fresh
+MLState. INT4 g=32:
 
-Engineering: ~1-2 days.
-Bundle saving: ~980 MB (3.71 GB → 2.73 GB).
-Risk: low — falls within the W4A16 noise floor.
+| metric | value |
+|---|---:|
+| mean cos(per_layer_combined_out) | 0.996804 |
+| mean cos(hidden_states from chunk_4) | **0.943404** |
+| min cos(hidden_states from chunk_4) | 0.775465 |
+| **token_id argmax agreement** | **14/32 (43.8%)** |
 
-This is the largest single bundle-size win achievable on this stack
-without changing the model architecture.
+### Test 2: real prefill, 4 prompts × 16 positions, multiple group sizes
+`scripts/probe_ple_int4_e2e_prefill.py 32,16,8` — short token-ID
+prefill sequences (e.g. tokens 2..17, 40..55, 100..115, 200..215),
+T=1 prefill at each position, comparing both runs' chunk_4 outputs:
+
+| group | mean cos(plc) | mean cos(h4) | min cos(h4) | tok agreement |
+|---:|---:|---:|---:|---|
+| **32** | 0.996998 | 0.929457 | 0.735551 | 42/64 (**65.6%**) |
+| 16 | 0.997782 | 0.954497 | 0.794194 | 43/64 (67.2%) |
+| 8 | 0.998470 | 0.961482 | 0.824102 | 41/64 (64.1%) |
+
+Token agreement **plateaus at ~65%** across group sizes, even though
+input cos sim and h4 cos sim both improve monotonically as groups
+shrink. The argmax over 262K vocab tokens is sensitive enough that
+even a residual stream cos sim of 0.96 produces frequent argmax
+flips.
+
+### What this tells us
+
+The PLE input perturbation amplifies through the 35-layer transformer
+faster than per-row cos numbers suggested:
+
+- input PLE row cos sim: 0.995 (g=32)
+- chunk_1 plc output cos sim: 0.997 — slight smoothing from the
+  per-layer gate + projection
+- chunk_4 h4 cos sim: **0.93** — significant amplification
+- argmax token agreement: **65%** — argmax instability in a 262K-vocab
+  space
+
+Smaller groups (g=16, g=8) reduce the input perturbation but don't
+break out of the 65% argmax-agreement ceiling. This is consistent
+with the PLE's role as a *per-layer additive contribution to the
+residual stream*: the same tokenwise perturbation enters at every
+one of the 35 layers, so the compounding is structurally larger than
+"one perturbed input × one model".
+
+## Recommendation: NOT viable as a PTQ drop-in
+
+The original recommendation (INT4 g=32 + Swift dequant path, 1-2 day
+engineering, "low risk") is **withdrawn**. The empirical e2e numbers
+say it isn't ship-quality.
+
+If saving ~980 MB on the PLE table is a goal, the realistic options
+require investment beyond a runtime port:
+
+1. **Tied-weight dedup (the actual quick win — embedding ↔ lm_head)**.
+   Saves 192 MB at zero quality cost. ~1-3 days. See parent doc §0
+   item 1.
+2. **Vocab pruning**. Drop the rare ~50K tail vocab entries (262144 →
+   ~210K). Saves storage proportionally on PLE, embedding, and lm_head
+   simultaneously. Quality cost: depends on vocab usage frequency in
+   real workloads.
+3. **QAT for INT4 PLE**. Train the model to absorb INT4 PLE
+   perturbations. A100 + 3-5 days, mirrors the QAT path called out
+   in `STAGE1_W4A8_FINAL.md` for activation quant.
+4. **Don't try INT4 PLE.** Accept the 2.20 GB cost. The remaining
+   bundle delta against LiteRT-LM (1.50 GB) is mostly PLE; if we're
+   not going to attack PLE, accept being 1.68× LiteRT bundle size.
+
+The cheapest-to-most-impactful order is: 1 → 2 → 4 → 3.
 
 ## Where this leaves the broader picture
 
-After this branch:
-- Bundle 3.71 GB. After hypothetical INT4-g32 PLE: **2.73 GB**.
-- LiteRT-LM-equivalent: 2.21 GB. Remaining gap: ~0.52 GB, almost
-  entirely the embedding (384 → 104 MB) and a slightly tighter decoder
-  quant scheme (1.09 → 0.82 GB).
-- Closing the embedding gap requires either tied-weight dedup with
-  lm_head (-192 MB at most) or INT4 embedding with group quantization
-  (-192 MB). Both need their own quality probe.
+After this probe (INT4 PLE confirmed not viable as drop-in):
+- Bundle stays at **3.71 GB**. INT4 PLE shaves ~980 MB on disk but
+  flips ~35% of token argmaxes vs INT8 — not shippable.
+- The realistic quick-win path is tied-weight dedup (embedding ↔
+  lm_head, -192 MB, zero-quality-cost). Bundle floor without QAT or
+  vocab trim: **3.52 GB** (1.59× LiteRT).
+- Closing the rest of the LiteRT gap requires architecture work
+  (QAT for INT4 PLE) or vocab pruning.
 
-So: **INT4 PLE g=32 + tied embedding dedup, both validated, gets us
-within ~330 MB of LiteRT.** Beyond that requires graph-level
-restructuring.
+What we learned about LiteRT-LM specifically: their 1.28 GB PLE table
+must be using either (a) an INT4 LUT/palettization scheme that
+preserves more directional information than absmax-symmetric scaling,
+(b) QAT-trained INT4-friendly weights, or (c) a smaller PLE matrix
+(less per-layer dim, smaller vocab subset). Without a source-read of
+their `.litertlm` Embedder section internals, we can't tell which.
+Source comparison would be a separate research item.
 
 ## Reproduce
 
