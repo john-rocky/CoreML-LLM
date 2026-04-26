@@ -9,19 +9,24 @@ import coremltools as ct
 import argparse
 import os
 
-def load_model(path, compute_units):
-    """Load a CoreML model."""
+def load_model(path, compute_units, function_name=None):
+    """Load a CoreML model. Pass function_name for multifunction packages."""
     t0 = time.time()
-    m = ct.models.MLModel(path, compute_units=compute_units)
+    if function_name:
+        m = ct.models.MLModel(path, compute_units=compute_units,
+                              function_name=function_name)
+    else:
+        m = ct.models.MLModel(path, compute_units=compute_units)
     dt = time.time() - t0
-    print(f"  Loaded {os.path.basename(path)} in {dt:.1f}s")
+    fn_tag = f" [{function_name}]" if function_name else ""
+    print(f"  Loaded {os.path.basename(path)}{fn_tag} in {dt:.1f}s")
     return m
 
 def make_fp16(shape):
     return np.zeros(shape, dtype=np.float16)
 
 def benchmark_decode(chunks_dir, ctx, num_steps=50, compute_units=ct.ComputeUnit.CPU_AND_NE,
-                     wfa_mode=False, fw=2048):
+                     wfa_mode=False, fw=2048, function_name=None):
     """Run decode benchmark with per-chunk timing.
 
     wfa_mode: If True, use WFA input format (no update_mask, FW-sized full KV).
@@ -38,16 +43,17 @@ def benchmark_decode(chunks_dir, ctx, num_steps=50, compute_units=ct.ComputeUnit
     print(f"Compute units: {compute_units}")
     print(f"{'='*60}")
 
-    # Load models
+    # Load models — try .mlpackage, fall back to .mlmodelc.
     print("Loading models...")
-    c1 = load_model(os.path.join(chunks_dir, "chunk1.mlpackage"), compute_units)
-    c2 = load_model(os.path.join(chunks_dir, "chunk2.mlpackage"), compute_units)
-    c3 = load_model(os.path.join(chunks_dir, "chunk3.mlpackage"), compute_units)
-    # chunk4: try mlpackage first, fallback to mlmodelc
-    c4_path = os.path.join(chunks_dir, "chunk4.mlpackage")
-    if not os.path.exists(c4_path):
-        c4_path = os.path.join(chunks_dir, "chunk4.mlmodelc")
-    c4 = load_model(c4_path, compute_units)
+    def _resolve(name):
+        p = os.path.join(chunks_dir, f"{name}.mlpackage")
+        if not os.path.exists(p):
+            p = os.path.join(chunks_dir, f"{name}.mlmodelc")
+        return p
+    c1 = load_model(_resolve("chunk1"), compute_units, function_name)
+    c2 = load_model(_resolve("chunk2"), compute_units, function_name)
+    c3 = load_model(_resolve("chunk3"), compute_units, function_name)
+    c4 = load_model(_resolve("chunk4"), compute_units, function_name)
 
     # Persistent KV cache buffers
     kSliding1 = make_fp16((7, 1, W, max_hd))
@@ -204,10 +210,13 @@ def main():
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--cpu-only", action="store_true",
                         help="Use CPU only (no ANE)")
+    parser.add_argument("--function-name", type=str, default=None,
+                        help="For multifunction packages (e.g. decode_q1)")
     args = parser.parse_args()
 
     cu = ct.ComputeUnit.CPU_ONLY if args.cpu_only else ct.ComputeUnit.CPU_AND_NE
-    benchmark_decode(args.chunks_dir, args.ctx, args.steps, cu)
+    benchmark_decode(args.chunks_dir, args.ctx, args.steps, cu,
+                     function_name=args.function_name)
 
 
 if __name__ == "__main__":

@@ -817,3 +817,138 @@ class SWAStatefulChunk4Prefill(SWAStatefulChunk4):
             logits = torch.tanh(logits / self.softcap) * self.softcap
         token_id, token_logit = self.argmax(logits.squeeze(0))
         return token_id, token_logit, normed
+
+
+# ============================================================
+# 3-chunk variant: merged middle chunk (L8-24)
+# ============================================================
+#
+# 4-chunk → 3-chunk consolidation. Mirrors the recurrent
+# `MergedChunk23` (gemma4_swa_merged.py) but stateful: the merged
+# middle chunk owns KV state for L8-14 (sliding + full) and runs
+# L15-24 (KV-shared) internally using the kv13/kv14 producer aliases
+# WITHOUT round-tripping them through chunk boundaries. The final
+# chunk_3 (= old chunk_4 with lm_head + argmax) still needs the
+# kv13/kv14 alias inputs, so the merged chunk emits them as outputs.
+#
+# Layer split for E2B:
+#   chunk_1 :   L0-7    (own KV, computes PLE)        — same as 4-chunk
+#   chunk_2m :  L8-24   (merged: own KV L8-14 + KV-shared L15-24)
+#   chunk_3 :   L25-34  (KV-shared, lm_head, argmax)  — same as 4-chunk's chunk_4
+
+
+class SWAStatefulMergedChunk23(_StatefulChunkBase):
+    """Merged stateful chunk for L8-24. Owns KV state for L8-14, runs
+    L15-24 KV-shared internally. Eliminates the 4-chunk's chunk_2 →
+    chunk_3 hidden-state round-trip (~+5-10% Mac decode).
+    """
+    START_OWN, END_OWN = 8, 15      # own-KV layers (= old chunk_2)
+    START_SHARED, END_SHARED = 15, 25  # KV-shared layers (= old chunk_3)
+
+    def __init__(self, model: Gemma4Model, ctx: int = 2048,
+                 use_linear: bool = False):
+        # Init base with the OWN-KV span so the kv_cache_* buffers size
+        # to L8-14 only. KV-shared layers don't need state slots.
+        super().__init__(model, self.START_OWN, self.END_OWN, ctx)
+        self.layers_shared = nn.ModuleList([
+            model.layers[i] for i in range(self.START_SHARED, self.END_SHARED)
+        ])
+        if use_linear:
+            _swap_chunk_projections_to_linear(self.layers)
+            _swap_chunk_projections_to_linear(self.layers_shared)
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                per_layer_combined, cos_s, sin_s, cos_f, sin_f,
+                current_pos, ring_pos):
+        config = self.config
+        kv13_k = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        kv13_v = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        kv14_k = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+        kv14_v = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+
+        # OWN-KV span (L8-14): writes state, produces kv13/kv14 at
+        # L13/L14 internally.
+        for local_idx in range(self.END_OWN - self.START_OWN):
+            layer_idx = self.START_OWN + local_idx
+            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+             ) = _run_layer_swa_stateful(
+                self.layers[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                current_pos, ring_pos,
+                self.kv_cache_sliding, self.kv_cache_full,
+                self.sliding_map, self.full_map,
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+            )
+
+        # KV-SHARED span (L15-24): consumes kv13/kv14 internally.
+        zero_idx = torch.zeros(1, dtype=torch.int32)
+        dummy_state = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+        for local_idx in range(self.END_SHARED - self.START_SHARED):
+            layer_idx = self.START_SHARED + local_idx
+            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+             ) = _run_layer_swa_stateful(
+                self.layers_shared[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                zero_idx, zero_idx,
+                dummy_state, dummy_state,
+                {}, {},
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+            )
+
+        return hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+
+
+class SWAStatefulMergedChunk23Prefill(SWAStatefulMergedChunk23):
+    """T=N prefill variant of the merged middle chunk."""
+
+    def __init__(self, model, ctx=2048, use_linear=False, T: int = 8):
+        super().__init__(model, ctx, use_linear=use_linear)
+        self.T = T
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                per_layer_combined, cos_s, sin_s, cos_f, sin_f,
+                current_pos, ring_pos):
+        config = self.config
+        T = self.T
+        kv13_k = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        kv13_v = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        kv14_k = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+        kv14_v = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+
+        for local_idx in range(self.END_OWN - self.START_OWN):
+            layer_idx = self.START_OWN + local_idx
+            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+             ) = _run_layer_swa_stateful_prefill(
+                self.layers[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                current_pos, ring_pos,
+                self.kv_cache_sliding, self.kv_cache_full,
+                self.sliding_map, self.full_map,
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                T,
+            )
+
+        zero_idx = torch.zeros(1, dtype=torch.int32)
+        dummy_state = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+        for local_idx in range(self.END_SHARED - self.START_SHARED):
+            layer_idx = self.START_SHARED + local_idx
+            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+             ) = _run_layer_swa_stateful_prefill(
+                self.layers_shared[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                zero_idx, zero_idx,
+                dummy_state, dummy_state,
+                {}, {},
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                T,
+            )
+
+        return hidden_states, kv13_k, kv13_v, kv14_k, kv14_v

@@ -172,7 +172,7 @@ public final class Gemma4StatefulEngine {
         chunk3Prefill = nil
         chunk4Prefill = nil
         prefillT = 1
-        let candidates = [16, 8]
+        let candidates = [16, 8, 4]
         func openChunkPrefill(_ name: String, T: Int) -> MLModel? {
             let pcfg = MLModelConfiguration()
             pcfg.computeUnits = cfg.computeUnits
