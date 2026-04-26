@@ -26,10 +26,10 @@ you haven't.
 Concrete results:
 
 1. **Bundle size truth check.** The "148 MB W4A16" in `STAGE1_W4A8_FINAL.md`
-   is *only chunk_1*. The full Gemma 4 E2B stateful bundle is **4.10 GB**:
+   is *only chunk_1*. The full Gemma 4 E2B stateful bundle is **3.71 GB**:
    1.09 GB of mlmodelc decoder chunks + 2.20 GB external PLE + 384 MB
    external token embedding + ~30 MB sidecars (RoPE, projection, scales,
-   norm). LiteRT-LM `.litertlm` equivalent is ~2.21 GB — **we're 1.85×
+   norm). LiteRT-LM `.litertlm` equivalent is ~2.21 GB — **we're 1.68×
    bigger**, almost entirely due to the PLE table (2.20 GB INT8 vs 1.28 GB
    in LiteRT) and the token embedding (384 MB INT8 vs 104 MB in LiteRT).
 
@@ -158,7 +158,7 @@ Source: `/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/build/gemma4_statef
 | `cos_sliding.npy` / `sin_sliding.npy` | 4.00 MB each | FP32 | yes |
 | `model_config.json` | <1 KB | JSON | n/a |
 | `hf_model/` (tokenizer + config) | 31 MB | tokenizer.json, etc | n/a |
-| **Total** | **~4,108 MB** | | |
+| **Total** | **~3,798 MB (3.71 GB)** | | |
 
 ### 1.6 Comparison with LiteRT-LM `.litertlm` (per `LITERT_CONTAINER_ANALYSIS.md`)
 
@@ -169,7 +169,7 @@ Source: `/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/build/gemma4_statef
 | PLE | 2,240 MB INT8 | 1,284 MB | +956 MB (75% bigger) |
 | RoPE + projection + scales | ~57 MB | (in TFLite) | n/a |
 | Vision/audio + MTP drafter | (separate / not shipped) | 372 MB | n/a |
-| **Comparable subtotal** | **~3,772 MB** | **~2,206 MB** | **+1,566 MB (1.71×)** |
+| **Comparable subtotal** | **~3,715 MB** | **~2,206 MB** | **+1,509 MB (1.68×)** |
 
 Why we're bigger:
 - **PLE storage:** LiteRT likely uses fewer bits per element (INT4-grouped?)
@@ -186,8 +186,12 @@ Why we're bigger:
   using a tighter quant scheme (some W8, some W4) than our uniform W4 LUT.
 
 The PLE delta is the single-largest possible bundle-size win on this stack.
-Out of scope for this branch — it's an architectural rebuild, not a runtime
-port. Recording the number here for the next quantization-strategy session.
+**Follow-up probe ran on 2026-04-26 — see `docs/PLE_INT4_PROBE.md`.**
+TL;DR: INT4 g=32 saves ~980 MB at mean cos 0.99495 / min 0.98718 vs BF16
+(vs production INT8's 0.999937). Strict lossless is not achievable; INT4
+adds ~0.005 cos at the embedding step, which the W4A16 decoder noise
+floor (cos 0.949 vs FP16) almost certainly absorbs. End-to-end logits
+cos sim is the gating measurement, not yet run. Estimated 1-2 day port.
 
 ---
 
