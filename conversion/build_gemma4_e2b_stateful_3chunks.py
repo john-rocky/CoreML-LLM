@@ -49,6 +49,8 @@ from models.gemma4_swa_stateful_chunks import (
     SWAStatefulChunk1, SWAStatefulChunk1Prefill,
     SWAStatefulChunk4, SWAStatefulChunk4Prefill,
     SWAStatefulMergedChunk23, SWAStatefulMergedChunk23Prefill,
+    SWAStatefulChunk1Single, SWAStatefulChunk1PrefillSingle,
+    SWAStatefulMergedChunk23Single, SWAStatefulMergedChunk23PrefillSingle,
 )
 from build_gemma4_e2b_stateful_chunks import (
     _resolve_hf_dir, _audit_ane, _trace_and_convert_stateful,
@@ -190,6 +192,236 @@ def convert_chunk2_merged_prefill(base, ctx, T, out_path, nbits, *,
         chunk, sample, inputs, outputs, states, out_path, nbits)
 
 
+def convert_chunk1_single(base, c_start, c_end, ctx, out_path, nbits, *,
+                            use_linear=False):
+    print("\n" + "=" * 60)
+    print(f"CHUNK 1 SINGLE-BUFFER (L{c_start}-{c_end-1})")
+    print("=" * 60)
+    cfg = base.config
+    hidden = cfg.hidden_size
+    pld = cfg.hidden_size_per_layer_input
+    nlayers = cfg.num_hidden_layers
+    W = cfg.sliding_window
+    hd_s, hd_f = cfg.head_dim, cfg.global_head_dim
+    max_hd = hd_f
+    HKV = cfg.num_key_value_heads
+
+    chunk = SWAStatefulChunk1Single(base, c_start, c_end, ctx,
+                                      use_linear=use_linear).eval().to(MODEL_DTYPE)
+    no = max(chunk.num_own, 1)
+    sample = (
+        torch.zeros(1, 1, hidden, dtype=torch.float16),
+        torch.zeros(1, 1, 1, ctx, dtype=torch.float16),
+        torch.zeros(1, 1, 1, W, dtype=torch.float16),
+        torch.zeros(1, 1, nlayers * pld, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_f, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_f, dtype=torch.float16),
+        torch.zeros(1, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+    )
+    inputs = [
+        ct.TensorType(name="hidden_states",      shape=sample[0].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_full",   shape=sample[1].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_sliding", shape=sample[2].shape, dtype=fp16),
+        ct.TensorType(name="per_layer_raw",      shape=sample[3].shape, dtype=fp16),
+        ct.TensorType(name="cos_s",              shape=sample[4].shape, dtype=fp16),
+        ct.TensorType(name="sin_s",              shape=sample[5].shape, dtype=fp16),
+        ct.TensorType(name="cos_f",              shape=sample[6].shape, dtype=fp16),
+        ct.TensorType(name="sin_f",              shape=sample[7].shape, dtype=fp16),
+        ct.TensorType(name="current_pos",        shape=(1,),            dtype=np.int32),
+        ct.TensorType(name="ring_pos",           shape=(1,),            dtype=np.int32),
+    ]
+    outputs = [
+        ct.TensorType(name="hidden_states_out",       dtype=fp16),
+        ct.TensorType(name="per_layer_combined_out",  dtype=fp16),
+    ]
+    states = [
+        ct.StateType(
+            wrapped_type=ct.TensorType(
+                shape=(2 * no, HKV, ctx, max_hd), dtype=fp16),
+            name="kv_cache_unified",
+        ),
+    ]
+    _trace_and_convert_stateful(
+        chunk, sample, inputs, outputs, states, out_path, nbits)
+
+
+def convert_chunk1_prefill_single(base, c_start, c_end, ctx, T, out_path, nbits, *,
+                                    use_linear=False):
+    print("\n" + "-" * 60)
+    print(f"CHUNK 1 SINGLE-BUFFER PREFILL T={T} (L{c_start}-{c_end-1})")
+    print("-" * 60)
+    cfg = base.config
+    hidden = cfg.hidden_size
+    pld = cfg.hidden_size_per_layer_input
+    nlayers = cfg.num_hidden_layers
+    W = cfg.sliding_window
+    hd_s, hd_f = cfg.head_dim, cfg.global_head_dim
+    max_hd = hd_f
+    HKV = cfg.num_key_value_heads
+
+    chunk = SWAStatefulChunk1PrefillSingle(base, c_start, c_end, ctx,
+                                             use_linear=use_linear, T=T
+                                             ).eval().to(MODEL_DTYPE)
+    no = max(chunk.num_own, 1)
+    sample = (
+        torch.zeros(1, T, hidden, dtype=torch.float16),
+        torch.zeros(1, 1, T, ctx, dtype=torch.float16),
+        torch.zeros(1, 1, T, W, dtype=torch.float16),
+        torch.zeros(1, T, nlayers * pld, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_f, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_f, dtype=torch.float16),
+        torch.zeros(1, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+    )
+    inputs = [
+        ct.TensorType(name="hidden_states",      shape=sample[0].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_full",   shape=sample[1].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_sliding", shape=sample[2].shape, dtype=fp16),
+        ct.TensorType(name="per_layer_raw",      shape=sample[3].shape, dtype=fp16),
+        ct.TensorType(name="cos_s",              shape=sample[4].shape, dtype=fp16),
+        ct.TensorType(name="sin_s",              shape=sample[5].shape, dtype=fp16),
+        ct.TensorType(name="cos_f",              shape=sample[6].shape, dtype=fp16),
+        ct.TensorType(name="sin_f",              shape=sample[7].shape, dtype=fp16),
+        ct.TensorType(name="current_pos",        shape=(1,),            dtype=np.int32),
+        ct.TensorType(name="ring_pos",           shape=(1,),            dtype=np.int32),
+    ]
+    outputs = [
+        ct.TensorType(name="hidden_states_out",       dtype=fp16),
+        ct.TensorType(name="per_layer_combined_out",  dtype=fp16),
+    ]
+    states = [
+        ct.StateType(
+            wrapped_type=ct.TensorType(
+                shape=(2 * no, HKV, ctx, max_hd), dtype=fp16),
+            name="kv_cache_unified",
+        ),
+    ]
+    _trace_and_convert_stateful(
+        chunk, sample, inputs, outputs, states, out_path, nbits)
+
+
+def convert_chunk2_merged_single(base, ctx, out_path, nbits, *, use_linear=False):
+    print("\n" + "=" * 60)
+    print(f"CHUNK 2 MERGED SINGLE-BUFFER (L8-24)")
+    print("=" * 60)
+    cfg = base.config
+    hidden = cfg.hidden_size
+    pld = cfg.hidden_size_per_layer_input
+    nlayers = cfg.num_hidden_layers
+    W = cfg.sliding_window
+    hd_s, hd_f = cfg.head_dim, cfg.global_head_dim
+    max_hd = hd_f
+    HKV = cfg.num_key_value_heads
+
+    chunk = SWAStatefulMergedChunk23Single(base, ctx,
+                                             use_linear=use_linear).eval().to(MODEL_DTYPE)
+    no = max(chunk.num_own, 1)
+    sample = (
+        torch.zeros(1, 1, hidden, dtype=torch.float16),
+        torch.zeros(1, 1, 1, ctx, dtype=torch.float16),
+        torch.zeros(1, 1, 1, W, dtype=torch.float16),
+        torch.zeros(1, 1, nlayers * pld, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_f, dtype=torch.float16),
+        torch.zeros(1, 1, 1, hd_f, dtype=torch.float16),
+        torch.zeros(1, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+    )
+    inputs = [
+        ct.TensorType(name="hidden_states",      shape=sample[0].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_full",   shape=sample[1].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_sliding", shape=sample[2].shape, dtype=fp16),
+        ct.TensorType(name="per_layer_combined", shape=sample[3].shape, dtype=fp16),
+        ct.TensorType(name="cos_s",              shape=sample[4].shape, dtype=fp16),
+        ct.TensorType(name="sin_s",              shape=sample[5].shape, dtype=fp16),
+        ct.TensorType(name="cos_f",              shape=sample[6].shape, dtype=fp16),
+        ct.TensorType(name="sin_f",              shape=sample[7].shape, dtype=fp16),
+        ct.TensorType(name="current_pos",        shape=(1,),            dtype=np.int32),
+        ct.TensorType(name="ring_pos",           shape=(1,),            dtype=np.int32),
+    ]
+    outputs = [
+        ct.TensorType(name="hidden_states_out", dtype=fp16),
+        ct.TensorType(name="kv13_k",            dtype=fp16),
+        ct.TensorType(name="kv13_v",            dtype=fp16),
+        ct.TensorType(name="kv14_k",            dtype=fp16),
+        ct.TensorType(name="kv14_v",            dtype=fp16),
+    ]
+    states = [
+        ct.StateType(
+            wrapped_type=ct.TensorType(
+                shape=(2 * no, HKV, ctx, max_hd), dtype=fp16),
+            name="kv_cache_unified",
+        ),
+    ]
+    _trace_and_convert_stateful(
+        chunk, sample, inputs, outputs, states, out_path, nbits)
+
+
+def convert_chunk2_merged_prefill_single(base, ctx, T, out_path, nbits, *,
+                                            use_linear=False):
+    print("\n" + "-" * 60)
+    print(f"CHUNK 2 MERGED SINGLE-BUFFER PREFILL T={T} (L8-24)")
+    print("-" * 60)
+    cfg = base.config
+    hidden = cfg.hidden_size
+    pld = cfg.hidden_size_per_layer_input
+    nlayers = cfg.num_hidden_layers
+    W = cfg.sliding_window
+    hd_s, hd_f = cfg.head_dim, cfg.global_head_dim
+    max_hd = hd_f
+    HKV = cfg.num_key_value_heads
+
+    chunk = SWAStatefulMergedChunk23PrefillSingle(
+        base, ctx, use_linear=use_linear, T=T).eval().to(MODEL_DTYPE)
+    no = max(chunk.num_own, 1)
+    sample = (
+        torch.zeros(1, T, hidden, dtype=torch.float16),
+        torch.zeros(1, 1, T, ctx, dtype=torch.float16),
+        torch.zeros(1, 1, T, W, dtype=torch.float16),
+        torch.zeros(1, T, nlayers * pld, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_f, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_f, dtype=torch.float16),
+        torch.zeros(1, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+    )
+    inputs = [
+        ct.TensorType(name="hidden_states",      shape=sample[0].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_full",   shape=sample[1].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_sliding", shape=sample[2].shape, dtype=fp16),
+        ct.TensorType(name="per_layer_combined", shape=sample[3].shape, dtype=fp16),
+        ct.TensorType(name="cos_s",              shape=sample[4].shape, dtype=fp16),
+        ct.TensorType(name="sin_s",              shape=sample[5].shape, dtype=fp16),
+        ct.TensorType(name="cos_f",              shape=sample[6].shape, dtype=fp16),
+        ct.TensorType(name="sin_f",              shape=sample[7].shape, dtype=fp16),
+        ct.TensorType(name="current_pos",        shape=(1,),            dtype=np.int32),
+        ct.TensorType(name="ring_pos",           shape=(1,),            dtype=np.int32),
+    ]
+    outputs = [
+        ct.TensorType(name="hidden_states_out", dtype=fp16),
+        ct.TensorType(name="kv13_k",            dtype=fp16),
+        ct.TensorType(name="kv13_v",            dtype=fp16),
+        ct.TensorType(name="kv14_k",            dtype=fp16),
+        ct.TensorType(name="kv14_v",            dtype=fp16),
+    ]
+    states = [
+        ct.StateType(
+            wrapped_type=ct.TensorType(
+                shape=(2 * no, HKV, ctx, max_hd), dtype=fp16),
+            name="kv_cache_unified",
+        ),
+    ]
+    _trace_and_convert_stateful(
+        chunk, sample, inputs, outputs, states, out_path, nbits)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="gemma4-e2b",
@@ -202,6 +434,12 @@ def main():
     ap.add_argument("--prefill-batches", default="",
                     help="Comma-separated batch sizes (e.g. '8' or '8,16').")
     ap.add_argument("--linear-projections", action="store_true")
+    ap.add_argument("--single-buffer", action="store_true",
+                    help="Probe variant: collapse kv_cache_sliding + "
+                         "kv_cache_full into a single MLState (one buffer "
+                         "per chunk, layer-index in axis 0). Tests whether "
+                         "iPhone ANE multifunction T>1 accepts a unified "
+                         "state where it rejected the dual-state form.")
     args = ap.parse_args()
 
     if args.ctx is None:
@@ -260,25 +498,50 @@ def main():
             prefill_pkgs.append((T, ppkg))
         merge_multifunction(decode_pkg, prefill_pkgs, str(final_pkg))
 
+    use_single = args.single_buffer
+    if use_single:
+        print("Single-buffer probe: kv_cache_unified (no sliding/full split)")
+
     if do(1):
-        _build_one(
-            lambda p: convert_chunk1(base, *chunk1_range, args.ctx, p,
-                                       args.nbits, use_linear=use_linear),
-            lambda T, p: convert_chunk1_prefill(
-                base, *chunk1_range, args.ctx, T, p, args.nbits,
-                use_linear=use_linear),
-            "chunk_1",
-        )
+        if use_single:
+            _build_one(
+                lambda p: convert_chunk1_single(base, *chunk1_range, args.ctx, p,
+                                                  args.nbits, use_linear=use_linear),
+                lambda T, p: convert_chunk1_prefill_single(
+                    base, *chunk1_range, args.ctx, T, p, args.nbits,
+                    use_linear=use_linear),
+                "chunk_1",
+            )
+        else:
+            _build_one(
+                lambda p: convert_chunk1(base, *chunk1_range, args.ctx, p,
+                                           args.nbits, use_linear=use_linear),
+                lambda T, p: convert_chunk1_prefill(
+                    base, *chunk1_range, args.ctx, T, p, args.nbits,
+                    use_linear=use_linear),
+                "chunk_1",
+            )
     if do(2):
-        _build_one(
-            lambda p: convert_chunk2_merged(base, args.ctx, p,
-                                              args.nbits,
-                                              use_linear=use_linear),
-            lambda T, p: convert_chunk2_merged_prefill(
-                base, args.ctx, T, p, args.nbits,
-                use_linear=use_linear),
-            "chunk_2",
-        )
+        if use_single:
+            _build_one(
+                lambda p: convert_chunk2_merged_single(base, args.ctx, p,
+                                                         args.nbits,
+                                                         use_linear=use_linear),
+                lambda T, p: convert_chunk2_merged_prefill_single(
+                    base, args.ctx, T, p, args.nbits,
+                    use_linear=use_linear),
+                "chunk_2",
+            )
+        else:
+            _build_one(
+                lambda p: convert_chunk2_merged(base, args.ctx, p,
+                                                  args.nbits,
+                                                  use_linear=use_linear),
+                lambda T, p: convert_chunk2_merged_prefill(
+                    base, args.ctx, T, p, args.nbits,
+                    use_linear=use_linear),
+                "chunk_2",
+            )
     if do(3):
         # Final chunk = old chunk_4 (KV-shared L25-34 + lm_head + argmax)
         _build_one(
