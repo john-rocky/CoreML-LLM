@@ -182,10 +182,13 @@ final class LLMRunner {
         // share the same internal layout — Gemma4StatefulEngine handles
         // both transparently because the only difference is the MIL graph
         // inside each chunk_*.mlpackage.
+        // Require chunks 1-3 (chunk_4 is optional — the 3-chunk merged
+        // variant from build_gemma4_e2b_stateful_3chunks.py omits it,
+        // and Gemma4StatefulEngine auto-detects the chunk count).
         let gemma4StatefulDir = folder.appendingPathComponent("gemma4_e2b_stateful_chunks")
         let gemma4StatefulPresent = fm.fileExists(atPath:
             gemma4StatefulDir.appendingPathComponent("embed_tokens_q8.bin").path)
-            && (1...4).allSatisfy { i in
+            && (1...3).allSatisfy { i in
                 fm.fileExists(atPath:
                     gemma4StatefulDir.appendingPathComponent("chunk_\(i).mlpackage").path)
                 || fm.fileExists(atPath:

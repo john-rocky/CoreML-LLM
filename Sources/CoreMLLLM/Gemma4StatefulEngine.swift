@@ -61,6 +61,16 @@ public final class Gemma4StatefulEngine {
     private var chunk3: MLModel?
     private var chunk4: MLModel?
 
+    // 3-chunk mode (default when chunk_4 not present in the bundle):
+    //   chunk_1 (L0-7)  +  chunk_2 merged (L8-24)  +  chunk_3 (L25-34 + head)
+    // 4-chunk mode (legacy / 4-chunk Gemma4 stateful default):
+    //   chunk_1 + chunk_2 + chunk_3 + chunk_4 (head). The 3-chunk's
+    //   chunk_3 is structurally the same module as the 4-chunk's
+    //   chunk_4 — both KV-shared L25-34 + lm_head + argmax. Auto-
+    //   detected at load() by checking if chunk_4.{mlmodelc,mlpackage}
+    //   exists in the model directory.
+    private var is3Chunk: Bool = false
+
     // Multifunction prefill_bN variants. Non-nil only when the loaded
     // mlpackages were built with `--prefill-batches`. All four chunks
     // must carry the same N for batched dispatch to work — load() drops
@@ -72,9 +82,11 @@ public final class Gemma4StatefulEngine {
     private var chunk4Prefill: MLModel?
 
     /// True when the loaded bundle has functional `prefill_bN` chunks.
+    /// In 3-chunk mode chunk_4 is absent so it's not required.
     public var hasMultifunctionPrefill: Bool {
-        chunk1Prefill != nil && chunk2Prefill != nil
-            && chunk3Prefill != nil && chunk4Prefill != nil
+        let core = chunk1Prefill != nil && chunk2Prefill != nil
+            && chunk3Prefill != nil
+        return is3Chunk ? core : (core && chunk4Prefill != nil)
     }
 
     // Batched-prefill scratch (allocated lazily once T is known).
@@ -161,7 +173,22 @@ public final class Gemma4StatefulEngine {
         chunk1 = try openChunk("chunk_1")
         chunk2 = try openChunk("chunk_2")
         chunk3 = try openChunk("chunk_3")
-        chunk4 = try openChunk("chunk_4")
+
+        // 3-chunk mode: chunk_4 absent → chunk_3 IS the final lm_head
+        // chunk (3-chunk merged variant from
+        // build_gemma4_e2b_stateful_3chunks.py). Otherwise load chunk_4
+        // and run the legacy 4-chunk path.
+        let chunk4Mlc = modelDirectory.appendingPathComponent("chunk_4.mlmodelc")
+        let chunk4Pkg = modelDirectory.appendingPathComponent("chunk_4.mlpackage")
+        let has4 = FileManager.default.fileExists(atPath: chunk4Mlc.path)
+            || FileManager.default.fileExists(atPath: chunk4Pkg.path)
+        is3Chunk = !has4
+        if is3Chunk {
+            chunk4 = nil
+            print("[Gemma4Stateful] 3-chunk mode (chunk_4 absent — chunk_3 = merged final)")
+        } else {
+            chunk4 = try openChunk("chunk_4")
+        }
 
         // Probe each chunk for a `prefill_b<N>` function. Mirrors the
         // Qwen3-VL stateful generator pattern (Phase 2b multifunction).
@@ -192,13 +219,16 @@ public final class Gemma4StatefulEngine {
         for T in candidates {
             guard let p1 = openChunkPrefill("chunk_1", T: T),
                   let p2 = openChunkPrefill("chunk_2", T: T),
-                  let p3 = openChunkPrefill("chunk_3", T: T),
-                  let p4 = openChunkPrefill("chunk_4", T: T)
+                  let p3 = openChunkPrefill("chunk_3", T: T)
             else { continue }
-            chunk1Prefill = p1; chunk2Prefill = p2
-            chunk3Prefill = p3; chunk4Prefill = p4
+            if !is3Chunk {
+                guard let p4 = openChunkPrefill("chunk_4", T: T) else { continue }
+                chunk4Prefill = p4
+            }
+            chunk1Prefill = p1; chunk2Prefill = p2; chunk3Prefill = p3
             prefillT = T
-            print("[Gemma4Stateful] multifunction prefill_b\(T) loaded")
+            print("[Gemma4Stateful] multifunction prefill_b\(T) loaded "
+                  + "(\(is3Chunk ? "3-chunk" : "4-chunk"))")
             break
         }
 
@@ -402,10 +432,17 @@ public final class Gemma4StatefulEngine {
         p3map["hidden_states"] = h2
         let out3 = try await chunk3!.prediction(
             from: FeatureProvider(p3map), options: opts)
+        if is3Chunk {
+            // 3-chunk mode: chunk_3 IS the final lm_head + argmax chunk.
+            guard let tokFV = out3.featureValue(for: "token_id"),
+                  let tokArr = tokFV.multiArrayValue
+            else { throw CoreMLLLMError.modelNotFound("chunk_3 (3-chunk final) no token_id") }
+            return tokArr.dataPointer.bindMemory(to: Int32.self, capacity: 1)[0]
+        }
+
         guard let h3 = out3.featureValue(for: "hidden_states_out") else {
             throw CoreMLLLMError.modelNotFound("chunk_3 missing hidden_states_out")
         }
-
         var p4map = sharedInputs
         p4map["hidden_states"] = h3
         let out4 = try await chunk4!.prediction(
@@ -512,9 +549,12 @@ public final class Gemma4StatefulEngine {
                               opts: MLPredictionOptions) async throws -> Int32 {
         guard let mc = modelConfig,
               let c1 = chunk1Prefill, let c2 = chunk2Prefill,
-              let c3 = chunk3Prefill, let c4 = chunk4Prefill,
+              let c3 = chunk3Prefill,
               let embed = embedTokens, let perLayer = embedTokensPerLayer
         else { throw CoreMLLLMError.modelNotFound("prefill chunks not loaded") }
+        if !is3Chunk && chunk4Prefill == nil {
+            throw CoreMLLLMError.modelNotFound("prefill chunk_4 missing in 4-chunk mode")
+        }
 
         try ensureBatchScratch(T: T)
         let H = mc.hiddenSize
@@ -605,12 +645,19 @@ public final class Gemma4StatefulEngine {
         p3map["hidden_states"] = h2
         let out3 = try await c3.prediction(
             from: FeatureProvider(p3map), options: opts)
+        if is3Chunk {
+            // 3-chunk: chunk_3 is the final lm_head + argmax chunk.
+            guard let tokFV = out3.featureValue(for: "token_id"),
+                  let tokArr = tokFV.multiArrayValue
+            else { throw CoreMLLLMError.modelNotFound("prefill chunk_3 (3-chunk final) no token_id") }
+            return tokArr.dataPointer.bindMemory(to: Int32.self, capacity: 1)[0]
+        }
         guard let h3 = out3.featureValue(for: "hidden_states_out") else {
             throw CoreMLLLMError.modelNotFound("prefill chunk_3 missing output")
         }
         var p4map = shared
         p4map["hidden_states"] = h3
-        let out4 = try await c4.prediction(
+        let out4 = try await chunk4Prefill!.prediction(
             from: FeatureProvider(p4map), options: opts)
         guard let tokFV = out4.featureValue(for: "token_id"),
               let tokArr = tokFV.multiArrayValue
@@ -631,7 +678,10 @@ public final class Gemma4StatefulEngine {
                           eosTokenIds: Set<Int32> = [],
                           onToken: ((Int32) -> Void)? = nil
     ) async throws -> [Int32] {
-        guard let chunk1, chunk2 != nil, chunk3 != nil, chunk4 != nil else {
+        // 3-chunk mode: chunk_4 is intentionally nil. Require chunks 1/2/3
+        // always; require chunk_4 only in 4-chunk mode.
+        guard let chunk1, chunk2 != nil, chunk3 != nil,
+              (is3Chunk || chunk4 != nil) else {
             throw CoreMLLLMError.modelNotFound("Gemma4StatefulEngine: not loaded")
         }
         guard let mc = modelConfig else {
