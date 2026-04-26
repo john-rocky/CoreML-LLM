@@ -1,5 +1,10 @@
 # Stage 1 — W4A8 retry v3 with AWQ smoothing — HOLD
 
+> **For the canonical Stage 1 summary, read
+> `docs/STAGE1_W4A8_FINAL.md`. This doc is the v3 iteration record
+> (AWQ α=0.5/0.7 + FP16 baseline diagnostic + W8A8 SmoothQuant
+> follow-up) — kept for the trail.**
+
 **Date:** 2026-04-26
 **Branch:** `stage1-w4a8`
 **Verdict:** **HOLD v3** (AWQ assumption violated by cml9 W4 LUT precision)

@@ -1,5 +1,9 @@
 # Stage 1 — W4A8 retry with real-prompt calibration — HOLD v2
 
+> **For the canonical Stage 1 summary, read
+> `docs/STAGE1_W4A8_FINAL.md`. This doc is the v2 iteration record
+> (real-prompt calibration, cos 0.501) — kept for the trail.**
+
 **Date:** 2026-04-26
 **Branch:** `stage1-w4a8`
 **Verdict:** **HOLD v2** (real-calib + asymmetric mode still below cos sim 0.95 gate)

@@ -1,5 +1,10 @@
 # Stage 1 — W4A8 via cml9 `linear_quantize_activations` — HOLD
 
+> **For the canonical Stage 1 summary, read
+> `docs/STAGE1_W4A8_FINAL.md`. This doc is the v1 iteration record
+> (synthetic calibration, cos 0.108) — kept for the trail but the
+> conclusion is in the FINAL doc.**
+
 **Date:** 2026-04-26
 **Branch:** `stage1-w4a8`
 **Verdict:** **HOLD** (Mac chunk_1 quality regression)
