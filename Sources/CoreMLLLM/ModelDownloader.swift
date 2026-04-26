@@ -221,18 +221,21 @@ public final class ModelDownloader: NSObject {
             let experimental =
                 ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
                 || UserDefaults.standard.bool(forKey: "showExperimentalModels")
-            // gemma4e2bStatefulLinear is the Stage 3 ship default (text-only
-            // chat: 3-chunk merged + MLState + multifunction). Listed first
-            // so new users land on it. The legacy gemma4e2b bundle still
-            // ships for users who want vision/audio.
+            // gemma4e2b (multimodal 4-chunk legacy) is the default for
+            // image+audio+video. gemma4e2bStatefulLinear (Stage 3 ship,
+            // text-only) is listed second as the high-speed chat option:
+            // 3-chunk merged + MLState + cross-turn KV reuse + Mac
+            // multifunction prefill. Multimodal stateful is a follow-up
+            // stage — until it lands, vision/audio users stay on the
+            // legacy bundle.
             var list: [ModelInfo] = [
-                gemma4e2bStatefulLinear,
-                gemma4e2b, gemma4e4b, gemma4e2bFashion,
+                gemma4e2b, gemma4e2bStatefulLinear,
+                gemma4e4b, gemma4e2bFashion,
                 qwen25_05b, qwen35_08b, qwen35_2b,
                 qwen3vl_2b, qwen3vl_2b_stateful,
             ]
             if experimental {
-                list.insert(gemma4e2bEagle3, at: 3)  // after gemma4e4b
+                list.insert(gemma4e2bEagle3, at: 3)
                 list.insert(gemma4e2bLookaheadProbe, at: 4)
                 list.insert(gemma4e2bStateful, at: 5)        // Conv2d variant
             }
