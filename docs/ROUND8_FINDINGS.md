@@ -23,8 +23,8 @@ re-confirms the existing roadmap.
 
 | # | Candidate | Effort | Effect (decode) | Risk | Status |
 |---|---|---|---:|---|---|
-| 1 | Joint compression: INT8 LUT entries | 1-3 days | +1-2 tok/s | low | NEW |
-| 2 | PALU low-rank K/V projection | 4-6 days | +5-8 tok/s | low ANE compat | NEW |
+| 1 | ~~Joint compression: INT8 LUT entries~~ | ~~1-3 days~~ | ~~+1-2 tok/s~~ | ~~low~~ | **DEAD 2026-04-26** — Mac probe `SESSION_2026_04_26_ROUND8_INT8_LUT_PROBE.md` shows ANE -6.2pt, latency +3.4 %, cos 0.83 (FAIL), size unchanged |
+| 2 | PALU low-rank K/V projection | 4-6 days | +5-8 tok/s | low ANE compat | NEW — headline lead |
 | 3 | Joint sparse + palettized POC | 2-3 days | binary, 0 or significant | medium | ALIVE in `COREMLTOOLS_AND_IOS18.md` §7.4 |
 
 All three are independent, single-function (no multifunction PTQ
@@ -33,7 +33,16 @@ different sessions. **PALU is the highest-effect new lead from this round.**
 
 ---
 
-## 1. Joint compression: INT8 LUT entries — NEW
+## 1. Joint compression: INT8 LUT entries — **DEAD (2026-04-26)**
+
+> Mac probe `docs/SESSION_2026_04_26_ROUND8_INT8_LUT_PROBE.md` disproves
+> drop-in viability. Build path works (cml9 accepts the API), but on
+> Gemma 4 E2B chunk_1: 73 INT8-dequant ops fall off ANE (CPU/GPU),
+> bundle size unchanged (W4 indices dominate), Mac latency +3.4 %, cos
+> sim 0.83 vs gate ≥ 0.95. Failure matches the predicted top failure
+> mode in this section. Section retained for the API reference; do not
+> re-attempt without a cml/iOS update that fuses `constexpr_lut_to_dense`
+> with INT8 LUT entries on ANE.
 
 - **Source:** Apple official docs.
   https://apple.github.io/coremltools/docs-guides/source/opt-joint-compression.html
@@ -172,19 +181,25 @@ different sessions. **PALU is the highest-effect new lead from this round.**
 
 ---
 
-## Recommended ordering for downstream sessions
+## Recommended ordering for downstream sessions (post-2026-04-26 update)
 
-Run the three candidates above in dependency-free parallel:
+#1 INT8 LUT is dead per Mac probe. Two candidates remain:
 
 | Session | Branch | Candidate | First go/no-go gate |
 |---|---|---|---|
-| A | `feat/joint-int8-lut` | #1 INT8 LUT entries | Mac chunk_1 build with `joint_compression=True`; ANE placement audit; cos sim vs W4 LUT FP16 reference |
+| ~~A~~ | ~~`feat/joint-int8-lut`~~ | ~~#1 INT8 LUT entries~~ | **CLOSED 2026-04-26 — ANE rejects INT8 LUT dequant; latency regression. See SESSION_2026_04_26_ROUND8_INT8_LUT_PROBE.md.** |
 | B | `feat/joint-sparse-palettized` | #3 Joint sparse + palettized | Mac chunk_1 build with N:M (2:4) sparse + W4 LUT; ANE placement audit; if `non-ANE op(s) > 5 %` → fall back; cos sim vs W4 LUT |
 | C | `feat/palu-low-rank-kv` | #2 PALU | PyTorch reference run (Mac, no ANE) of PALU on Gemma 4 E2B HF model; verify accuracy holds at rank-r per paper; only then proceed to MIL graph rewrite |
 
 Cross-session protocol per `docs/ROADMAP_2026_04_26.md` §1: each
 session adds a line to `docs/INFLIGHT.md`; rebase onto current main;
 PR-or-fast-forward merge.
+
+**Mac probe convention for sibling candidates:** the probe pattern in
+`docs/SESSION_2026_04_26_ROUND8_INT8_LUT_PROBE.md` (build + ANE audit
++ Mac latency + cos sim) takes ~12 min on M3 16 GB, ~5 min on Mac
+Studio. Run it before any iPhone deploy to catch ANE-fallback failure
+modes early.
 
 ---
 

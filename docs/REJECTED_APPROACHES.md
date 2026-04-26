@@ -107,6 +107,7 @@ targets / nonexistent "CoreML-friendly" claims). See memory
 | AFM-style cross-block KV sharing (5:3) | Gemma 4 E2B already shares 20/35 layers — more aggressive than AFM's 37.5 % | `CPU_BOTTLENECK_INVESTIGATION.md:150`, `ROUND8_FINDINGS.md` |
 | Cross-Layer Attention (CLA), Tensor Product Attention (TPA) | Both require fine-tuning ~1B+ tokens; bundle with W2-QAT campaign rather than separate workstreams | `ROUND8_FINDINGS.md` |
 | `reshapeFrequency = .infrequent` standalone hint | Tried, deleted. `LLM_PREFIX_CACHE=1` combo reproducibly triggers `MILCompilerForANE: failed to compile ANEF` on iPhone 17 Pro / iOS 26 | `Sources/CoreMLLLM/ChunkedEngine.swift:300-305` |
+| **Joint compression: INT8 LUT entries** (Apple `linear_quantize_weights(joint_compression=True)`) | **Mac probe 2026-04-26**: cml9 accepts the API, but 73 INT8-dequant ops fall off ANE (92.9 → 86.7 %), Mac latency +3.4 %, cos sim 0.83 vs gate ≥0.95, bundle size unchanged (W4 indices dominate). Failure matches predicted top failure mode in ROUND8_FINDINGS §1. The `--joint-int8-lut` converter flag is kept in tree (default OFF) for future cml/iOS retry. | `docs/SESSION_2026_04_26_ROUND8_INT8_LUT_PROBE.md` |
 
 ---
 

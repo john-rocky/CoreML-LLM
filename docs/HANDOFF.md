@@ -80,7 +80,7 @@ all dependency-free for parallel session execution:
 
 | Branch | Candidate | Effort | Effect (decode) |
 |---|---|---|---:|
-| `feat/joint-int8-lut` | Joint compression: INT8 LUT entries (Apple official) | 1-3 days | +1-2 tok/s |
+| ~~`feat/joint-int8-lut`~~ | ~~Joint compression: INT8 LUT entries~~ | — | **DEAD 2026-04-26** Mac probe (`SESSION_2026_04_26_ROUND8_INT8_LUT_PROBE.md`): ANE -6.2pt, latency +3.4 %, cos 0.83 |
 | `feat/joint-sparse-palettized` | Joint sparse + palettized POC (`COREMLTOOLS_AND_IOS18.md` §7.4) | 2-3 days | binary, 0 or significant |
 | `feat/palu-low-rank-kv` | PALU low-rank K/V projection (arXiv 2407.21118, ICLR 2025) | 4-6 days | **+5-8 tok/s** |
 

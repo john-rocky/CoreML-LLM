@@ -51,7 +51,8 @@ sys.path.insert(0, ROOT)
 import coremltools as ct
 from coremltools.optimize.coreml import (
     OpPalettizerConfig, OptimizationConfig, palettize_weights,
-    linear_quantize_activations,
+    linear_quantize_activations, linear_quantize_weights,
+    OpLinearQuantizerConfig,
 )
 from coremltools.optimize.coreml.experimental import (
     OpActivationLinearQuantizerConfig,
@@ -339,6 +340,7 @@ def _trace_and_convert_stateful(
     calib_data_path: str | None = None,
     activation_scope: str = "linear",
     activation_mode: str = "linear_symmetric",
+    joint_int8_lut: bool = False,
 ):
     """Trace + ct.convert with StateType, save, optionally palettize, audit."""
     t = time.time()
@@ -371,6 +373,17 @@ def _trace_and_convert_stateful(
         )
         mlmodel = palettize_weights(mlmodel, OptimizationConfig(global_config=op_cfg))
         print(f"    palettized int{quantize_nbits} in {time.time()-t:.1f}s")
+        if joint_int8_lut:
+            t = time.time()
+            jq_cfg = OpLinearQuantizerConfig(
+                mode="linear_symmetric", dtype="int8",
+                granularity="per_tensor", weight_threshold=2048,
+            )
+            mlmodel = linear_quantize_weights(
+                mlmodel, OptimizationConfig(global_config=jq_cfg),
+                joint_compression=True,
+            )
+            print(f"    joint INT8-LUT quantized in {time.time()-t:.1f}s")
 
     if activation_quant:
         t = time.time()
@@ -431,7 +444,8 @@ def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits, *,
                    use_linear=False, activation_quant=False,
                    calib_data_path=None, activation_scope="linear",
                    activation_mode="linear_symmetric",
-                   awq_calib_data_path=None, awq_alpha=0.5):
+                   awq_calib_data_path=None, awq_alpha=0.5,
+                   joint_int8_lut=False):
     print("\n" + "=" * 60)
     print(f"CHUNK 1 (L{c_start}-{c_end-1}) — own KV state, computes PLE")
     print("=" * 60)
@@ -498,7 +512,8 @@ def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits, *,
         activation_quant=activation_quant,
         calib_data_path=calib_data_path,
         activation_scope=activation_scope,
-        activation_mode=activation_mode)
+        activation_mode=activation_mode,
+        joint_int8_lut=joint_int8_lut)
 
 
 def convert_chunk2(base, c_start, c_end, ctx, out_path, nbits, *,
@@ -703,6 +718,11 @@ def main():
                          "Redistributes activation outliers into weights "
                          "so cml9 INT8 activation quant has tighter range "
                          "to fit. Requires --calib-data.")
+    ap.add_argument("--joint-int8-lut", action="store_true",
+                    help="Round 8 lever: after palettize_weights, run "
+                         "linear_quantize_weights(joint_compression=True) so "
+                         "the LUT entries are INT8 instead of FP16. Per "
+                         "Apple opt-joint-compression.html. ROUND8_FINDINGS.md.")
     ap.add_argument("--awq-alpha", type=float, default=0.5,
                     help="AWQ scaling exponent. 0=no migration, 1=full "
                          "outlier migration into weights. Default 0.5 "
@@ -766,7 +786,8 @@ def main():
                        use_linear=use_linear, activation_quant=act_q,
                        calib_data_path=cdp, activation_scope=asc,
                        activation_mode=amd,
-                       awq_calib_data_path=awq_path, awq_alpha=awq_alpha)
+                       awq_calib_data_path=awq_path, awq_alpha=awq_alpha,
+                       joint_int8_lut=args.joint_int8_lut)
     if do(2):
         convert_chunk2(base, *boundaries[1], args.ctx,
                        str(out / "chunk_2.mlpackage"), args.nbits,
