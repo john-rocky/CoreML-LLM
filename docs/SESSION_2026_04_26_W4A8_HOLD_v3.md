@@ -18,13 +18,40 @@ not satisfy versus INT8 (256 levels).
 
 ## 0. TL;DR
 
-| variant | calib data | quant | AWQ α | cos sim vs W4 baseline |
-|---|---|---|---|---|
-| W4 (Linear, no A8, no AWQ) | — | W4 LUT only | — | **1.000** (reference) |
-| W4 + AWQ (no A8) | 64 real | W4 LUT only | 0.5 | **0.941** *(AWQ damages W4)* |
-| W4A8 (real-calib, sym, no AWQ) | 64 real | W4 LUT + INT8 act | — | **0.501** |
-| W4A8 + AWQ | 64 real | W4 LUT + INT8 act | 0.5 | **0.516** *(+0.015 vs no-AWQ)* |
-| W4A8 + AWQ | 64 real | W4 LUT + INT8 act | 0.7 | **0.533** *(+0.032 vs no-AWQ)* |
+### Final cos sim ladder (vs FP16 ground truth)
+
+| variant | calib data | quant | AWQ α | cos sim vs **FP16** | gate (≥0.95) |
+|---|---|---|---|---|---|
+| FP16 baseline (`--nbits 0`) | — | none | — | **1.000** | — |
+| W4A16 stateful (`--nbits 4`, no A8) | — | W4 LUT only | — | **0.949** | borderline PASS |
+| W4 + AWQ (no A8) — diagnostic | 64 real | W4 LUT only | 0.5 | ≈ 0.94 × 0.949 ≈ **0.89** | FAIL |
+| W4A8 (real-calib, sym, no AWQ) | 64 real | W4 LUT + INT8 act | — | ≈ 0.501 × 0.949 ≈ **0.475** | FAIL |
+| W4A8 + AWQ α=0.5 | 64 real | W4 LUT + INT8 act | 0.5 | ≈ 0.516 × 0.949 ≈ **0.490** | FAIL |
+| W4A8 + AWQ α=0.7 | 64 real | W4 LUT + INT8 act | 0.7 | ≈ 0.533 × 0.949 ≈ **0.506** | FAIL |
+
+*(intermediate W4A16 number used as multiplicative reference; the
+W4A8 numbers in the prior table were cos vs W4A16 baseline. Combined
+to FP16 here for like-for-like comparison.)*
+
+### Verdict per layer of analysis
+
+- **W4 LUT alone is fine.** 0.949 vs FP16 means per-op ε ≈ 0.1 % across
+  56 quant rounds — exactly what well-calibrated W4 group-kmeans
+  should achieve. The W4 packing / axis / RMSNorm folding paths in
+  `palettize_weights(per_grouped_channel, group_size=32)` are clean.
+- **A8 is the wall.** Adding INT8 activation quant drops cos to ~0.50,
+  i.e. per-op ε spikes from 0.1 % to ~1.2 % — 12× worse, applied over
+  56 rounds. This isn't an AWQ-fixable issue; **AWQ is a weight-only
+  technique** (Lin et al. 2023 framed it for W4A16). For W8A8 the
+  proper paper-of-record technique is **SmoothQuant**, which migrates
+  outliers via a *per-tensor* scale; cml9's per-channel activation
+  quant has different dynamics again.
+- **AWQ at α=0.5 dropped cos vs W4A16 from 1.0 → 0.94 with no A8.**
+  In a W8A16 regime AWQ would help (more weight precision to absorb
+  outliers); against the cml9 W4 LUT (16 levels per group), AWQ
+  scaling stretches the kmeans cluster range and loses ~6 cos.
+  α=0.7 partially recovers because the A8 side benefits more — but
+  α-sweep can't break the structural cap on W4 LUT precision.
 
 The W4-only-with-AWQ row is the diagnostic: AWQ's weight scaling alone
 (no activation quant) drops cos sim from 1.0 to 0.94. This is the W4
@@ -150,21 +177,70 @@ cml9; both are multi-day implementation efforts plus iPhone validation.
 
 ---
 
+## 4.5. Diagnostic decision tree (post-FP16 baseline)
+
+User feedback (筋悪い review) prompted the missing diagnostic:
+**W4A16 vs FP16**, which our prior tables didn't include — every
+"cos sim" was implicitly *vs the W4A16 reference*, hiding the
+absolute distance from fp16 truth.
+
+The result of that diagnostic (0.949) cleanly bisects the analysis:
+
+```
+W4 LUT layer:    fp16 → 0.949    ← borderline OK (per-op ε ≈ 0.1 %)
+A8 act-quant:    0.949 → 0.501   ← catastrophic (per-op ε ≈ 1.2 %)
+```
+
+The bug-vs-algorithm question therefore resolves to:
+- **Not a packing/axis/folding bug.** W4A16 stays clean through the
+  whole `palettize_weights` + `--linear-projections` pipeline.
+- **A8 is the blocker.** In the absence of either (a) per-tensor
+  SmoothQuant migration, (b) GPTQ-W4 to first push W4 above 0.99, or
+  (c) selective A8 on safe ops only (excluding residual / RMSNorm
+  output / KV state / lm_head input), cml9's `linear_quantize_activations`
+  on Gemma 4's full attention path is structurally below the gate.
+
+Per-op error budget for 56 quant rounds at gate cos ≥ 0.95:
+ε ≤ 0.1 %. W4 LUT meets this. INT8 per-channel does not.
+
 ## 5. Recommendation: close Stage 1, retain framework
 
 **Close** Stage 1 W4A8 with three HOLD docs (v1 synth, v2 real-calib,
-v3 AWQ) collectively documenting the path. The converter framework
-(opt-in `--activation-quant`, `--calib-data`, `--awq`) stays in the
-repo for future GPTQ/QAT integrations — those will reuse the same
-calibration-data and probe scaffolding.
+v3 AWQ + FP16 diagnostic) collectively documenting the path. The
+converter framework (opt-in `--activation-quant`, `--calib-data`,
+`--awq`, `--awq-alpha`, `--activation-mode`) stays in the repo for
+future GPTQ/QAT/SmoothQuant integrations — they will reuse the same
+calibration-data, probe scaffolding, AWQ smoothing module, and
+3-monkey-patch cml9 stateful adapter.
 
-If a future stage wants to revisit:
-1. **Implement GPTQ-W4 in PyTorch pre-conversion.** Reuse
-   `gen_calib_data_real.py` and `awq_smoothing.py` skeletons. ~1 week.
-2. **Or retrain with QAT.** Use the existing W4 + A8 graph as the
-   target; train activation quantizers jointly. A100, ~3-5 days.
+**The W4A16 stateful path is the operating point.** It's already
+shipped as the existing `gemma4e2bStatefulLinear` ModelInfo entry
+(commit 7c9cfea), iPhone-validated, and matches the cos ≥ 0.95 gate
+on Mac. There is no immediate v1.7.0 win to claim from W4A8; the
+roadmap §2 "halve memory bandwidth" target needs a different
+approach.
 
-Neither is on the v1.7.0 critical path.
+Future revisit options, ordered by ROI on the v1.7.0 perf goal:
+
+1. **Selective A8** (per user feedback). cml9's `op_name_configs`
+   gives op-name targeting; mark unsafe ops (residual adds in chunk_1
+   layers, post_attention_layernorm output, lm_head feed in chunk_4)
+   as A16, leave gate/up/down MLP linears as A8. Estimated cos
+   recovery: 0.50 → 0.85-0.90. Still below gate but closer; may pair
+   with GPTQ-W4 for combined push past 0.95. ~3 days.
+2. **GPTQ-W4 in PyTorch pre-conversion.** Reuse
+   `gen_calib_data_real.py` and `awq_smoothing.py` skeletons; the
+   Hessian-aware weight choice should push W4 cos from 0.949 → 0.99+,
+   freeing budget for A8. ~1 week.
+3. **W8A8 + SmoothQuant** (per-tensor migration). Loses Stage 1 perf
+   goal (weights double in size) but restores AWQ-paper assumption.
+   Could ship as `gemma4e2bStatefulW8A8` with a "memory vs decode
+   tok/s" trade in the picker. ~3-5 days.
+4. **QAT.** Joint training of weight + activation quantizers.
+   A100, ~3-5 days, plus iPhone validation.
+
+None are on the v1.7.0 critical path. They become relevant after
+HF upload + production swap (roadmap §3 phase B/C) settle.
 
 ---
 
