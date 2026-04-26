@@ -17,6 +17,7 @@ Categories:
 5. [Prefill / KV layout](#prefill--kv-layout)
 6. [Diagnostic hypotheses refuted](#diagnostic-hypotheses-refuted)
 7. [Round 7 candidates rejected](#round-7-candidates-rejected)
+8. [Round 8 candidates rejected](#round-8-candidates-rejected)
 
 Revisit rules: if you want to retry something below, you must (a) cite a
 new upstream result or API change, (b) link the reproduction harness, and
@@ -94,6 +95,18 @@ SCAP, R-Sparse survived a 2026-04-21 source-read; **xKV and the other
 candidates were rejected** (fabricated benchmark numbers / wrong hardware
 targets / nonexistent "CoreML-friendly" claims). See memory
 `feedback_agent_hallucination_verify.md` for the verification process.
+
+## Round 8 candidates rejected
+
+`ROUND8_FINDINGS.md` (2026-04-26) has the full receipts.
+
+| Approach | Why dead | Source |
+|---|---|---|
+| TurboQuant 3-bit KV (Walsh-Hadamard) | ANE forces FP16 decomp regardless of stored precision; Hadamard has no native ANE op | `SPEED_8K.md:34`, `UNEXPLORED_SOURCES.md:183`, `ROUND8_FINDINGS.md` |
+| Spark Transformer (NeurIPS 2025, 2506.06644) | Production version of Gemma 3n's training-time activation sparsity, but Gemma 4 E2B does NOT inherit `activation_sparsity_pattern`. Static-mask offline variant collapses to ROUND7 R7-2/R7-4 territory | `ROUND7_FINDINGS.md:102-130`, `ROUND8_FINDINGS.md` |
+| AFM-style cross-block KV sharing (5:3) | Gemma 4 E2B already shares 20/35 layers — more aggressive than AFM's 37.5 % | `CPU_BOTTLENECK_INVESTIGATION.md:150`, `ROUND8_FINDINGS.md` |
+| Cross-Layer Attention (CLA), Tensor Product Attention (TPA) | Both require fine-tuning ~1B+ tokens; bundle with W2-QAT campaign rather than separate workstreams | `ROUND8_FINDINGS.md` |
+| `reshapeFrequency = .infrequent` standalone hint | Tried, deleted. `LLM_PREFIX_CACHE=1` combo reproducibly triggers `MILCompilerForANE: failed to compile ANEF` on iPhone 17 Pro / iOS 26 | `Sources/CoreMLLLM/ChunkedEngine.swift:300-305` |
 
 ---
 

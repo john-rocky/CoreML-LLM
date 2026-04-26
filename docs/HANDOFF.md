@@ -72,6 +72,21 @@ None of these are on the current critical path.
 
 ## What is alive
 
+### Round 8 decode-side leads (2026-04-26) — **3 candidates for parallel sessions**
+
+`docs/ROUND8_FINDINGS.md` documents three drafter-excluded decode levers
+ranked by ROI, all single-function (no multifunction PTQ constraint),
+all dependency-free for parallel session execution:
+
+| Branch | Candidate | Effort | Effect (decode) |
+|---|---|---|---:|
+| `feat/joint-int8-lut` | Joint compression: INT8 LUT entries (Apple official) | 1-3 days | +1-2 tok/s |
+| `feat/joint-sparse-palettized` | Joint sparse + palettized POC (`COREMLTOOLS_AND_IOS18.md` §7.4) | 2-3 days | binary, 0 or significant |
+| `feat/palu-low-rank-kv` | PALU low-rank K/V projection (arXiv 2407.21118, ICLR 2025) | 4-6 days | **+5-8 tok/s** |
+
+**PALU is the highest-effect new lead.** Read `ROUND8_FINDINGS.md`
+before claiming a branch.
+
 ### GPU prefill via MLX-Swift (item 27) — **CURRENT FOCUS**
 
 | Axis | Current | Projected |
