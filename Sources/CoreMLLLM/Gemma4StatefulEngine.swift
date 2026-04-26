@@ -23,11 +23,14 @@
 // LEFT-aligned: first (pos+1) slots valid for pos<W, all W slots
 // valid for pos>=W. (The recurrent shift build was right-aligned.)
 //
-// Phase 1 scope:
-//  - per-generate fresh MLState (no cross-turn reuse — that ports the
-//    v1.6.0 LCP-match logic, slated for Phase 2)
-//  - T=1 prefill loop and T=1 decode loop (no multifunction prefill_bN
-//    yet — slow but correct, mirrors Qwen3-VL Phase 1 → v1.5.0)
+// Phase 2b scope:
+//  - cross-turn KV reuse via LCP-match (Phase 2a, b5fef64)
+//  - multifunction `prefill_bN` (Phase 2b) — when the loaded mlpackages
+//    carry a `prefill_b<T>` function on every chunk, prefill batches T
+//    tokens per forward and falls back to T=1 for the tail (or when a
+//    sliding-cache wrap would split the write)
+//  - T=1 decode loop (multifunction decode is not pursued — decode is
+//    bandwidth-bound, batching gives no win)
 //  - text-only (vision/audio stays on the existing CoreMLLLM path)
 
 import Accelerate
@@ -57,6 +60,53 @@ public final class Gemma4StatefulEngine {
     private var chunk2: MLModel?
     private var chunk3: MLModel?
     private var chunk4: MLModel?
+
+    // 1-chunk mode (single mlpackage all-in-one):
+    //   model.mlpackage = entire 35-layer model + lm_head + argmax,
+    //   one unified MLState (kv_cache_unified). Auto-detected at
+    //   load() when model.{mlmodelc,mlpackage} is present.
+    private var is1Chunk: Bool = false
+    private var model1Chunk: MLModel?
+    private var model1ChunkPrefill: MLModel?
+    private var model1ChunkState: MLState?
+
+    // 3-chunk mode (default when chunk_4 not present in the bundle):
+    //   chunk_1 (L0-7)  +  chunk_2 merged (L8-24)  +  chunk_3 (L25-34 + head)
+    // 4-chunk mode (legacy / 4-chunk Gemma4 stateful default):
+    //   chunk_1 + chunk_2 + chunk_3 + chunk_4 (head). The 3-chunk's
+    //   chunk_3 is structurally the same module as the 4-chunk's
+    //   chunk_4 — both KV-shared L25-34 + lm_head + argmax. Auto-
+    //   detected at load() by checking if chunk_4.{mlmodelc,mlpackage}
+    //   exists in the model directory.
+    private var is3Chunk: Bool = false
+
+    // Multifunction prefill_bN variants. Non-nil only when the loaded
+    // mlpackages were built with `--prefill-batches`. All four chunks
+    // must carry the same N for batched dispatch to work — load() drops
+    // any partial set. T=1 fallback always available via chunk{1..4}.
+    private var prefillT: Int = 1
+    private var chunk1Prefill: MLModel?
+    private var chunk2Prefill: MLModel?
+    private var chunk3Prefill: MLModel?
+    private var chunk4Prefill: MLModel?
+
+    /// True when the loaded bundle has functional `prefill_bN` chunks.
+    public var hasMultifunctionPrefill: Bool {
+        if is1Chunk { return model1ChunkPrefill != nil }
+        let core = chunk1Prefill != nil && chunk2Prefill != nil
+            && chunk3Prefill != nil
+        return is3Chunk ? core : (core && chunk4Prefill != nil)
+    }
+
+    // Batched-prefill scratch (allocated lazily once T is known).
+    private var batchHidden: MLMultiArray?
+    private var batchPerLayerRaw: MLMultiArray?
+    private var batchMaskFull: MLMultiArray?
+    private var batchMaskSliding: MLMultiArray?
+    private var batchCosS: MLMultiArray?
+    private var batchSinS: MLMultiArray?
+    private var batchCosF: MLMultiArray?
+    private var batchSinF: MLMultiArray?
 
     private var embedTokens: EmbeddingLookup?
     private var embedTokensPerLayer: EmbeddingLookup?
@@ -101,6 +151,7 @@ public final class Gemma4StatefulEngine {
     public func resetPersistedState() {
         persistedState1 = nil
         persistedState2 = nil
+        model1ChunkState = nil
         persistedInputIds = []
         persistedPosition = 0
     }
@@ -129,10 +180,149 @@ public final class Gemma4StatefulEngine {
             }
             throw CoreMLLLMError.modelNotFound("\(name).mlmodelc/.mlpackage not found in \(modelDirectory.path)")
         }
+        // 1-chunk mode probe: model.{mlmodelc,mlpackage} present?
+        let model1ChunkMlc = modelDirectory.appendingPathComponent("model.mlmodelc")
+        let model1ChunkPkg = modelDirectory.appendingPathComponent("model.mlpackage")
+        let has1ChunkModel = FileManager.default.fileExists(atPath: model1ChunkMlc.path)
+            || FileManager.default.fileExists(atPath: model1ChunkPkg.path)
+        if has1ChunkModel {
+            is1Chunk = true
+            // Prefer .mlpackage over a possibly-stale .mlmodelc — the
+            // 35-layer single graph hits Mac↔iPhone ANE incompatibility
+            // when compiled on Mac (E5RT "must re-compile the E5 bundle"
+            // observed). Forcing iPhone-side compile via .mlpackage
+            // avoids the Mac ANEF artifact mismatch.
+            let pkg = modelDirectory.appendingPathComponent("model.mlpackage")
+            let compiledURL: URL
+            if FileManager.default.fileExists(atPath: pkg.path) {
+                print("[Gemma4Stateful] 1-chunk mode (compiling model.mlpackage on device)")
+                compiledURL = try await MLModel.compileModel(at: pkg)
+            } else {
+                print("[Gemma4Stateful] 1-chunk mode (loading model.mlmodelc)")
+                compiledURL = modelDirectory.appendingPathComponent("model.mlmodelc")
+            }
+            model1Chunk = try MLModel(contentsOf: compiledURL, configuration: mcfg)
+            // Probe prefill_b<N> by re-loading the same compiled URL
+            // with a per-function configuration.
+            for T in [16, 8, 4] {
+                let pcfg = MLModelConfiguration()
+                pcfg.computeUnits = cfg.computeUnits
+                pcfg.functionName = "prefill_b\(T)"
+                if let pm = try? MLModel(contentsOf: compiledURL, configuration: pcfg) {
+                    model1ChunkPrefill = pm
+                    prefillT = T
+                    print("[Gemma4Stateful] multifunction prefill_b\(T) loaded (1-chunk)")
+                    break
+                }
+            }
+            // EmbeddingLookup + RoPE sidecars are still needed for input prep.
+            embedTokens = try EmbeddingLookup(
+                dataURL: modelDirectory.appendingPathComponent("embed_tokens_q8.bin"),
+                scalesURL: modelDirectory.appendingPathComponent("embed_tokens_scales.bin"),
+                vocabSize: mc.vocabSize, dim: mc.hiddenSize, scale: mc.embedScale)
+            embedTokensPerLayer = try EmbeddingLookup(
+                dataURL: modelDirectory.appendingPathComponent("embed_tokens_per_layer_q8.bin"),
+                scalesURL: modelDirectory.appendingPathComponent("embed_tokens_per_layer_scales.bin"),
+                vocabSize: mc.vocabSize,
+                dim: mc.numLayers * mc.perLayerDim,
+                scale: mc.perLayerEmbedScale)
+            cosSlidingTable = try? Data(
+                contentsOf: modelDirectory.appendingPathComponent("cos_sliding.npy"),
+                options: .mappedIfSafe)
+            sinSlidingTable = try? Data(
+                contentsOf: modelDirectory.appendingPathComponent("sin_sliding.npy"),
+                options: .mappedIfSafe)
+            cosFullTable = try? Data(
+                contentsOf: modelDirectory.appendingPathComponent("cos_full.npy"),
+                options: .mappedIfSafe)
+            sinFullTable = try? Data(
+                contentsOf: modelDirectory.appendingPathComponent("sin_full.npy"),
+                options: .mappedIfSafe)
+            let ctx = mc.contextLength
+            let W = mc.slidingWindow
+            maskFull = try MLMultiArray(
+                shape: [1, 1, 1, NSNumber(value: ctx)], dataType: .float16)
+            maskSliding = try MLMultiArray(
+                shape: [1, 1, 1, NSNumber(value: W)], dataType: .float16)
+            posScratch = try MLMultiArray(shape: [1], dataType: .int32)
+            ringScratch = try MLMultiArray(shape: [1], dataType: .int32)
+            fvMaskFull = MLFeatureValue(multiArray: maskFull)
+            fvMaskSliding = MLFeatureValue(multiArray: maskSliding)
+            fvPos = MLFeatureValue(multiArray: posScratch)
+            fvRing = MLFeatureValue(multiArray: ringScratch)
+            return
+        }
+
         chunk1 = try openChunk("chunk_1")
         chunk2 = try openChunk("chunk_2")
         chunk3 = try openChunk("chunk_3")
-        chunk4 = try openChunk("chunk_4")
+
+        // 3-chunk mode detection. Two signals (either is sufficient):
+        //  1. chunk_4 absent in the bundle (clean install of 3-chunk).
+        //  2. chunk_3's output schema contains `token_id` — meaning
+        //     chunk_3 IS the final lm_head + argmax chunk (3-chunk
+        //     merged final). This catches the case where chunk_4 from
+        //     a prior 4-chunk install was not deleted but chunks 1-3
+        //     were overwritten with the 3-chunk variant.
+        let chunk4Mlc = modelDirectory.appendingPathComponent("chunk_4.mlmodelc")
+        let chunk4Pkg = modelDirectory.appendingPathComponent("chunk_4.mlpackage")
+        let has4 = FileManager.default.fileExists(atPath: chunk4Mlc.path)
+            || FileManager.default.fileExists(atPath: chunk4Pkg.path)
+        let chunk3HasLmHead: Bool = {
+            guard let c3 = chunk3 else { return false }
+            let outs = c3.modelDescription.outputDescriptionsByName.keys
+            return outs.contains("token_id")
+        }()
+        is3Chunk = !has4 || chunk3HasLmHead
+        if is3Chunk {
+            let reason = !has4 ? "chunk_4 absent" : "chunk_3 has token_id output"
+            print("[Gemma4Stateful] 3-chunk mode (\(reason) — chunk_3 = merged final)")
+            chunk4 = nil
+        } else {
+            chunk4 = try openChunk("chunk_4")
+        }
+
+        // Probe each chunk for a `prefill_b<N>` function. Mirrors the
+        // Qwen3-VL stateful generator pattern (Phase 2b multifunction).
+        // Try N candidates in descending order of preference; first
+        // success that loads on ALL four chunks wins.
+        chunk1Prefill = nil
+        chunk2Prefill = nil
+        chunk3Prefill = nil
+        chunk4Prefill = nil
+        prefillT = 1
+        let candidates = [16, 8, 4]
+        func openChunkPrefill(_ name: String, T: Int) -> MLModel? {
+            let pcfg = MLModelConfiguration()
+            pcfg.computeUnits = cfg.computeUnits
+            pcfg.functionName = "prefill_b\(T)"
+            let mlc = modelDirectory.appendingPathComponent("\(name).mlmodelc")
+            if FileManager.default.fileExists(atPath: mlc.path) {
+                return try? MLModel(contentsOf: mlc, configuration: pcfg)
+            }
+            let pkg = modelDirectory.appendingPathComponent("\(name).mlpackage")
+            if FileManager.default.fileExists(atPath: pkg.path) {
+                if let compiled = try? MLModel.compileModel(at: pkg) {
+                    return try? MLModel(contentsOf: compiled, configuration: pcfg)
+                }
+            }
+            return nil
+        }
+        for T in candidates {
+            guard let p1 = openChunkPrefill("chunk_1", T: T),
+                  let p2 = openChunkPrefill("chunk_2", T: T),
+                  let p3 = openChunkPrefill("chunk_3", T: T)
+            else { continue }
+            if !is3Chunk {
+                guard let p4 = openChunkPrefill("chunk_4", T: T) else { continue }
+                chunk4Prefill = p4
+            }
+            chunk1Prefill = p1; chunk2Prefill = p2; chunk3Prefill = p3
+            prefillT = T
+            print("[Gemma4Stateful] multifunction prefill_b\(T) loaded "
+                  + "(\(is3Chunk ? "3-chunk" : "4-chunk"))")
+            break
+        }
 
         embedTokens = try EmbeddingLookup(
             dataURL: modelDirectory.appendingPathComponent("embed_tokens_q8.bin"),
@@ -247,6 +437,106 @@ public final class Gemma4StatefulEngine {
     /// Run one T=1 step through chunks 1→2→3→4. State buffers are
     /// updated in-place by the chunk graphs (slice_update).
     /// Returns the next token id from chunk_4's argmax.
+    // MARK: - 1-chunk single-prediction helpers
+
+    /// Single-mlpackage step. Inputs identical to chunk_1's signature
+    /// (hidden + per_layer_raw + masks + RoPE + positions); output is
+    /// chunk_3's final token_id directly.
+    private func step1Chunk(token: Int32, position: Int,
+                              state: MLState,
+                              opts: MLPredictionOptions) async throws -> Int32 {
+        guard let mc = modelConfig, let m = model1Chunk else {
+            throw CoreMLLLMError.modelNotFound("1-chunk model not loaded")
+        }
+        let hidden = try embedTokens!.lookup(
+            Int(token), shape: [1, 1, NSNumber(value: mc.hiddenSize)])
+        let perLayerRaw = try embedTokensPerLayer!.lookup(
+            Int(token),
+            shape: [1, 1, NSNumber(value: mc.numLayers * mc.perLayerDim)])
+        fillFullCausalMask(position: position)
+        fillSlidingCausalMask(position: position)
+        setPos(position)
+        setRing(position)
+        let cosS = try lookupRoPE(table: cosSlidingTable, position: position, dim: 256)
+        let sinS = try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
+        let cosF = try lookupRoPE(table: cosFullTable,    position: position, dim: 512)
+        let sinF = try lookupRoPE(table: sinFullTable,    position: position, dim: 512)
+
+        let p = FeatureProvider([
+            "hidden_states":      MLFeatureValue(multiArray: hidden),
+            "causal_mask_full":   fvMaskFull,
+            "causal_mask_sliding": fvMaskSliding,
+            "per_layer_raw":      MLFeatureValue(multiArray: perLayerRaw),
+            "cos_s": MLFeatureValue(multiArray: cosS),
+            "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF),
+            "sin_f": MLFeatureValue(multiArray: sinF),
+            "current_pos": fvPos,
+            "ring_pos":    fvRing,
+        ])
+        let out = try await m.prediction(from: p, using: state, options: opts)
+        guard let tokFV = out.featureValue(for: "token_id"),
+              let tokArr = tokFV.multiArrayValue
+        else { throw CoreMLLLMError.modelNotFound("1-chunk no token_id") }
+        return tokArr.dataPointer.bindMemory(to: Int32.self, capacity: 1)[0]
+    }
+
+    /// 1-chunk batched prefill (T tokens through model.prefill_b<T>).
+    private func prefillStep1Chunk(inputIds: [Int32], startBatch: Int,
+                                     position: Int, T: Int, state: MLState,
+                                     opts: MLPredictionOptions) async throws -> Int32 {
+        guard let mc = modelConfig, let m = model1ChunkPrefill,
+              let embed = embedTokens, let perLayer = embedTokensPerLayer
+        else { throw CoreMLLLMError.modelNotFound("1-chunk prefill not loaded") }
+        try ensureBatchScratch(T: T)
+        let H = mc.hiddenSize
+        let PL = mc.numLayers * mc.perLayerDim
+        let hPtr = batchHidden!.dataPointer.bindMemory(
+            to: UInt16.self, capacity: T * H)
+        let plPtr = batchPerLayerRaw!.dataPointer.bindMemory(
+            to: UInt16.self, capacity: T * PL)
+        for t in 0..<T {
+            let tok = Int(inputIds[startBatch + t])
+            let row = try embed.lookup(tok, shape: [1, 1, NSNumber(value: H)])
+            memcpy(hPtr.advanced(by: t * H),
+                   row.dataPointer, H * MemoryLayout<UInt16>.stride)
+            let plRow = try perLayer.lookup(
+                tok, shape: [1, 1, NSNumber(value: PL)])
+            memcpy(plPtr.advanced(by: t * PL),
+                   plRow.dataPointer, PL * MemoryLayout<UInt16>.stride)
+        }
+        fillBatchMasks(startPos: position, T: T)
+        fillBatchRoPE(table: cosSlidingTable, dst: batchCosS!,
+                      startPos: position, T: T, dim: 256)
+        fillBatchRoPE(table: sinSlidingTable, dst: batchSinS!,
+                      startPos: position, T: T, dim: 256)
+        fillBatchRoPE(table: cosFullTable, dst: batchCosF!,
+                      startPos: position, T: T, dim: 512)
+        fillBatchRoPE(table: sinFullTable, dst: batchSinF!,
+                      startPos: position, T: T, dim: 512)
+        setPos(position)
+        setRing(position)
+        let p = FeatureProvider([
+            "hidden_states":      MLFeatureValue(multiArray: batchHidden!),
+            "causal_mask_full":   MLFeatureValue(multiArray: batchMaskFull!),
+            "causal_mask_sliding": MLFeatureValue(multiArray: batchMaskSliding!),
+            "per_layer_raw":      MLFeatureValue(multiArray: batchPerLayerRaw!),
+            "cos_s": MLFeatureValue(multiArray: batchCosS!),
+            "sin_s": MLFeatureValue(multiArray: batchSinS!),
+            "cos_f": MLFeatureValue(multiArray: batchCosF!),
+            "sin_f": MLFeatureValue(multiArray: batchSinF!),
+            "current_pos": fvPos,
+            "ring_pos":    fvRing,
+        ])
+        let out = try await m.prediction(from: p, using: state, options: opts)
+        guard let tokFV = out.featureValue(for: "token_id"),
+              let tokArr = tokFV.multiArrayValue
+        else { throw CoreMLLLMError.modelNotFound("1-chunk prefill no token_id") }
+        return tokArr.dataPointer.bindMemory(to: Int32.self, capacity: 1)[0]
+    }
+
+    // MARK: - 4-chunk / 3-chunk step
+
     private func step(token: Int32, position: Int,
                        states: (s1: MLState, s2: MLState),
                        opts: MLPredictionOptions) async throws -> Int32 {
@@ -334,10 +624,17 @@ public final class Gemma4StatefulEngine {
         p3map["hidden_states"] = h2
         let out3 = try await chunk3!.prediction(
             from: FeatureProvider(p3map), options: opts)
+        if is3Chunk {
+            // 3-chunk mode: chunk_3 IS the final lm_head + argmax chunk.
+            guard let tokFV = out3.featureValue(for: "token_id"),
+                  let tokArr = tokFV.multiArrayValue
+            else { throw CoreMLLLMError.modelNotFound("chunk_3 (3-chunk final) no token_id") }
+            return tokArr.dataPointer.bindMemory(to: Int32.self, capacity: 1)[0]
+        }
+
         guard let h3 = out3.featureValue(for: "hidden_states_out") else {
             throw CoreMLLLMError.modelNotFound("chunk_3 missing hidden_states_out")
         }
-
         var p4map = sharedInputs
         p4map["hidden_states"] = h3
         let out4 = try await chunk4!.prediction(
@@ -345,6 +642,218 @@ public final class Gemma4StatefulEngine {
         guard let tokFV = out4.featureValue(for: "token_id"),
               let tokArr = tokFV.multiArrayValue
         else { throw CoreMLLLMError.modelNotFound("chunk_4 no token_id") }
+        return tokArr.dataPointer.bindMemory(to: Int32.self, capacity: 1)[0]
+    }
+
+    // MARK: - Batched-prefill plumbing (Phase 2b multifunction)
+
+    /// Allocate per-T scratch (hidden / per_layer_raw / mask / RoPE).
+    /// Re-entrant — cheaper than re-allocating each call.
+    private func ensureBatchScratch(T: Int) throws {
+        guard let mc = modelConfig else { return }
+        let H = mc.hiddenSize
+        let PL = mc.numLayers * mc.perLayerDim
+        let ctx = mc.contextLength
+        let W = mc.slidingWindow
+        let hdS = 256
+        let hdF = 512
+        if batchHidden == nil || batchHidden!.shape[1].intValue != T {
+            batchHidden = try MLMultiArray(
+                shape: [1, NSNumber(value: T), NSNumber(value: H)],
+                dataType: .float16)
+            batchPerLayerRaw = try MLMultiArray(
+                shape: [1, NSNumber(value: T), NSNumber(value: PL)],
+                dataType: .float16)
+            batchMaskFull = try MLMultiArray(
+                shape: [1, 1, NSNumber(value: T), NSNumber(value: ctx)],
+                dataType: .float16)
+            batchMaskSliding = try MLMultiArray(
+                shape: [1, 1, NSNumber(value: T), NSNumber(value: W)],
+                dataType: .float16)
+            batchCosS = try MLMultiArray(
+                shape: [1, 1, NSNumber(value: T), NSNumber(value: hdS)],
+                dataType: .float16)
+            batchSinS = try MLMultiArray(
+                shape: [1, 1, NSNumber(value: T), NSNumber(value: hdS)],
+                dataType: .float16)
+            batchCosF = try MLMultiArray(
+                shape: [1, 1, NSNumber(value: T), NSNumber(value: hdF)],
+                dataType: .float16)
+            batchSinF = try MLMultiArray(
+                shape: [1, 1, NSNumber(value: T), NSNumber(value: hdF)],
+                dataType: .float16)
+        }
+    }
+
+    /// Fill T-row causal masks for the prefill window starting at `startPos`.
+    private func fillBatchMasks(startPos: Int, T: Int) {
+        let ctx = modelConfig!.contextLength
+        let W = modelConfig!.slidingWindow
+        let neg = Float16(-65504).bitPattern
+        let mf = batchMaskFull!.dataPointer.bindMemory(
+            to: UInt16.self, capacity: T * ctx)
+        let ms = batchMaskSliding!.dataPointer.bindMemory(
+            to: UInt16.self, capacity: T * W)
+        for t in 0..<T {
+            let p = startPos + t
+            // Full mask row: positions [0, p] valid.
+            let full = min(max(p, 0), ctx - 1)
+            for i in 0..<ctx { mf[t * ctx + i] = i <= full ? 0 : neg }
+            // Sliding LEFT-aligned: first (p+1) slots valid for p<W,
+            // all W for p>=W. (Same rule as the T=1 path.)
+            let valid = min(p + 1, W)
+            for i in 0..<W { ms[t * W + i] = i < valid ? 0 : neg }
+        }
+    }
+
+    /// Copy T RoPE rows from the sidecar table into a (1,1,T,dim) buffer.
+    private func fillBatchRoPE(table: Data?, dst: MLMultiArray,
+                                startPos: Int, T: Int, dim: Int) {
+        let p = dst.dataPointer.bindMemory(to: UInt16.self, capacity: T * dim)
+        guard let table else { memset(p, 0, T * dim * 2); return }
+        var headerSize = 128
+        table.withUnsafeBytes { raw in
+            let b = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            headerSize = 10 + (Int(b[8]) | (Int(b[9]) << 8))
+        }
+        let rowBytes = dim * MemoryLayout<UInt16>.stride
+        for t in 0..<T {
+            let pos = startPos + t
+            let offset = headerSize + pos * rowBytes
+            if offset + rowBytes <= table.count {
+                _ = table.withUnsafeBytes { raw in
+                    memcpy(p.advanced(by: t * dim),
+                           raw.baseAddress!.advanced(by: offset), rowBytes)
+                }
+            } else {
+                memset(p.advanced(by: t * dim), 0, rowBytes)
+            }
+        }
+    }
+
+    /// Run one T=N prefill window through the four chunk prefill_bN
+    /// functions. Consumes `inputIds[startPos ..< startPos+T]` at
+    /// sequence positions `[position, position+T)`. State buffers
+    /// advance T slots. Returns the chunk_4 argmax for the LAST batch
+    /// position (the prefill's auto-emitted next token).
+    private func prefillStep(inputIds: [Int32], startBatch: Int, position: Int,
+                              T: Int, states: (s1: MLState, s2: MLState),
+                              opts: MLPredictionOptions) async throws -> Int32 {
+        guard let mc = modelConfig,
+              let c1 = chunk1Prefill, let c2 = chunk2Prefill,
+              let c3 = chunk3Prefill,
+              let embed = embedTokens, let perLayer = embedTokensPerLayer
+        else { throw CoreMLLLMError.modelNotFound("prefill chunks not loaded") }
+        if !is3Chunk && chunk4Prefill == nil {
+            throw CoreMLLLMError.modelNotFound("prefill chunk_4 missing in 4-chunk mode")
+        }
+
+        try ensureBatchScratch(T: T)
+        let H = mc.hiddenSize
+        let PL = mc.numLayers * mc.perLayerDim
+
+        // 1) Hidden + per_layer_raw: T embed lookups, packed into batch buffer.
+        let hPtr = batchHidden!.dataPointer.bindMemory(
+            to: UInt16.self, capacity: T * H)
+        let plPtr = batchPerLayerRaw!.dataPointer.bindMemory(
+            to: UInt16.self, capacity: T * PL)
+        for t in 0..<T {
+            let tok = Int(inputIds[startBatch + t])
+            let row = try embed.lookup(tok, shape: [1, 1, NSNumber(value: H)])
+            memcpy(hPtr.advanced(by: t * H),
+                   row.dataPointer, H * MemoryLayout<UInt16>.stride)
+            let plRow = try perLayer.lookup(
+                tok, shape: [1, 1, NSNumber(value: PL)])
+            memcpy(plPtr.advanced(by: t * PL),
+                   plRow.dataPointer, PL * MemoryLayout<UInt16>.stride)
+        }
+
+        // 2) Position-dependent scratch.
+        fillBatchMasks(startPos: position, T: T)
+        fillBatchRoPE(table: cosSlidingTable, dst: batchCosS!,
+                      startPos: position, T: T, dim: 256)
+        fillBatchRoPE(table: sinSlidingTable, dst: batchSinS!,
+                      startPos: position, T: T, dim: 256)
+        fillBatchRoPE(table: cosFullTable, dst: batchCosF!,
+                      startPos: position, T: T, dim: 512)
+        fillBatchRoPE(table: sinFullTable, dst: batchSinF!,
+                      startPos: position, T: T, dim: 512)
+        setPos(position)
+        setRing(position)
+
+        let fvHidden = MLFeatureValue(multiArray: batchHidden!)
+        let fvPLR = MLFeatureValue(multiArray: batchPerLayerRaw!)
+        let fvMF = MLFeatureValue(multiArray: batchMaskFull!)
+        let fvMS = MLFeatureValue(multiArray: batchMaskSliding!)
+        let fvCS = MLFeatureValue(multiArray: batchCosS!)
+        let fvSS = MLFeatureValue(multiArray: batchSinS!)
+        let fvCF = MLFeatureValue(multiArray: batchCosF!)
+        let fvSF = MLFeatureValue(multiArray: batchSinF!)
+
+        // 3) Chunk 1
+        let p1 = FeatureProvider([
+            "hidden_states":      fvHidden,
+            "causal_mask_full":   fvMF,
+            "causal_mask_sliding": fvMS,
+            "per_layer_raw":      fvPLR,
+            "cos_s": fvCS, "sin_s": fvSS,
+            "cos_f": fvCF, "sin_f": fvSF,
+            "current_pos": fvPos, "ring_pos": fvRing,
+        ])
+        let out1 = try await c1.prediction(from: p1, using: states.s1, options: opts)
+        guard let h1 = out1.featureValue(for: "hidden_states_out"),
+              let plc = out1.featureValue(for: "per_layer_combined_out")
+        else { throw CoreMLLLMError.modelNotFound("prefill chunk_1 missing outputs") }
+
+        // 4) Chunk 2
+        let p2 = FeatureProvider([
+            "hidden_states":      h1,
+            "causal_mask_full":   fvMF,
+            "causal_mask_sliding": fvMS,
+            "per_layer_combined": plc,
+            "cos_s": fvCS, "sin_s": fvSS,
+            "cos_f": fvCF, "sin_f": fvSF,
+            "current_pos": fvPos, "ring_pos": fvRing,
+        ])
+        let out2 = try await c2.prediction(from: p2, using: states.s2, options: opts)
+        guard let h2 = out2.featureValue(for: "hidden_states_out"),
+              let kv13k = out2.featureValue(for: "kv13_k"),
+              let kv13v = out2.featureValue(for: "kv13_v"),
+              let kv14k = out2.featureValue(for: "kv14_k"),
+              let kv14v = out2.featureValue(for: "kv14_v")
+        else { throw CoreMLLLMError.modelNotFound("prefill chunk_2 missing outputs") }
+
+        // 5) Chunks 3 + 4
+        var shared: [String: MLFeatureValue] = [
+            "causal_mask_full":   fvMF,
+            "causal_mask_sliding": fvMS,
+            "per_layer_combined": plc,
+            "cos_s": fvCS, "sin_s": fvSS,
+            "cos_f": fvCF, "sin_f": fvSF,
+            "kv13_k": kv13k, "kv13_v": kv13v,
+            "kv14_k": kv14k, "kv14_v": kv14v,
+        ]
+        var p3map = shared
+        p3map["hidden_states"] = h2
+        let out3 = try await c3.prediction(
+            from: FeatureProvider(p3map), options: opts)
+        if is3Chunk {
+            // 3-chunk: chunk_3 is the final lm_head + argmax chunk.
+            guard let tokFV = out3.featureValue(for: "token_id"),
+                  let tokArr = tokFV.multiArrayValue
+            else { throw CoreMLLLMError.modelNotFound("prefill chunk_3 (3-chunk final) no token_id") }
+            return tokArr.dataPointer.bindMemory(to: Int32.self, capacity: 1)[0]
+        }
+        guard let h3 = out3.featureValue(for: "hidden_states_out") else {
+            throw CoreMLLLMError.modelNotFound("prefill chunk_3 missing output")
+        }
+        var p4map = shared
+        p4map["hidden_states"] = h3
+        let out4 = try await chunk4Prefill!.prediction(
+            from: FeatureProvider(p4map), options: opts)
+        guard let tokFV = out4.featureValue(for: "token_id"),
+              let tokArr = tokFV.multiArrayValue
+        else { throw CoreMLLLMError.modelNotFound("prefill chunk_4 no token_id") }
         return tokArr.dataPointer.bindMemory(to: Int32.self, capacity: 1)[0]
     }
 
@@ -361,7 +870,15 @@ public final class Gemma4StatefulEngine {
                           eosTokenIds: Set<Int32> = [],
                           onToken: ((Int32) -> Void)? = nil
     ) async throws -> [Int32] {
-        guard let chunk1, chunk2 != nil, chunk3 != nil, chunk4 != nil else {
+        if is1Chunk {
+            return try await generate1Chunk(
+                inputIds: inputIds, maxNewTokens: maxNewTokens,
+                eosTokenIds: eosTokenIds, onToken: onToken)
+        }
+        // 3-chunk mode: chunk_4 is intentionally nil. Require chunks 1/2/3
+        // always; require chunk_4 only in 4-chunk mode.
+        guard let chunk1, chunk2 != nil, chunk3 != nil,
+              (is3Chunk || chunk4 != nil) else {
             throw CoreMLLLMError.modelNotFound("Gemma4StatefulEngine: not loaded")
         }
         guard let mc = modelConfig else {
@@ -420,15 +937,36 @@ public final class Gemma4StatefulEngine {
         var prefillPredicted: Int32 = 0
 
         let t0 = CFAbsoluteTimeGetCurrent()
-        // T=1 prefill from the resume boundary — multifunction prefill_bN
-        // is Phase 2b.
-        for j in resumeAt..<inputIds.count {
+        // Phase 2b — batched prefill with multifunction `prefill_bN` when
+        // available. Constraint: ring_pos+T <= W (no mid-batch wrap on the
+        // sliding cache). For position < W we never wrap; once position
+        // crosses W we fall back to T=1 for any window that would wrap.
+        var i = resumeAt
+        var batchedSteps = 0
+        var t1Steps = 0
+        let W = mc.slidingWindow
+        if hasMultifunctionPrefill {
+            let T = prefillT
+            while i + T <= inputIds.count {
+                let ringStart = position % W
+                if ringStart + T > W { break }   // wrap — fall back to T=1
+                prefillPredicted = try await prefillStep(
+                    inputIds: inputIds, startBatch: i, position: position,
+                    T: T, states: (state1, state2), opts: opts)
+                lastToken = inputIds[i + T - 1]
+                position += T
+                i += T
+                batchedSteps += 1
+            }
+        }
+        for j in i..<inputIds.count {
             let tok = inputIds[j]
             prefillPredicted = try await step(
                 token: tok, position: position,
                 states: (state1, state2), opts: opts)
             lastToken = tok
             position += 1
+            t1Steps += 1
         }
         let prefillEnd = CFAbsoluteTimeGetCurrent()
 
@@ -474,12 +1012,137 @@ public final class Gemma4StatefulEngine {
             lastDecodeTokensPerSecond = Double(decoded.count - 1) / (decodeMs / 1000)
         }
         let resumeTag = resumeAt > 0 ? " [resumed L=\(resumeAt)]" : ""
+        let mfTag = hasMultifunctionPrefill
+            ? " [batched=\(batchedSteps)x\(prefillT) t1=\(t1Steps)]"
+            : ""
         print("[Gemma4Stateful] prefill \(prefillTokCount) tok in "
-              + String(format: "%.0fms (%.1f tok/s)%@ | decode %d tok in %.0fms (%.1f tok/s)",
+              + String(format: "%.0fms (%.1f tok/s)%@%@ | decode %d tok in %.0fms (%.1f tok/s)",
                         prefillMs,
                         Double(max(prefillTokCount, 1))
                             / max(prefillMs / 1000, 1e-3),
-                        resumeTag,
+                        resumeTag, mfTag,
+                        decoded.count, decodeMs, lastDecodeTokensPerSecond))
+        return decoded
+    }
+
+    // MARK: - 1-chunk generate (single mlpackage / single MLState)
+
+    private func generate1Chunk(inputIds: [Int32], maxNewTokens: Int,
+                                  eosTokenIds: Set<Int32>,
+                                  onToken: ((Int32) -> Void)?
+    ) async throws -> [Int32] {
+        guard let m1 = model1Chunk else {
+            throw CoreMLLLMError.modelNotFound("1-chunk model not loaded")
+        }
+        guard let mc = modelConfig else {
+            throw CoreMLLLMError.modelNotFound("no config")
+        }
+        if inputIds.isEmpty { return [] }
+        if inputIds.count >= mc.contextLength {
+            throw CoreMLLLMError.modelNotFound(
+                "prompt (\(inputIds.count) tok) >= ctx (\(mc.contextLength))")
+        }
+
+        // Cross-turn resume: in 1-chunk mode the persisted state lives in
+        // model1ChunkState. Persisted prefix must be a STRICT prefix.
+        var resumeAt = 0
+        if let _ = model1ChunkState, !persistedInputIds.isEmpty {
+            let cap = min(persistedInputIds.count, inputIds.count)
+            var l = 0
+            while l < cap && persistedInputIds[l] == inputIds[l] { l += 1 }
+            if l == persistedInputIds.count && l < inputIds.count && l > 0 {
+                resumeAt = l
+            }
+        }
+
+        let state: MLState
+        if resumeAt > 0, let s = model1ChunkState {
+            state = s
+            print("[Gemma4Stateful 1c] RESUME L=\(resumeAt) "
+                  + "(persisted=\(persistedInputIds.count), new=\(inputIds.count))")
+            persistedInputIds = []
+            persistedPosition = 0
+        } else {
+            state = m1.makeState()
+            model1ChunkState = state
+            persistedInputIds = []
+            persistedPosition = 0
+        }
+        let opts = MLPredictionOptions()
+
+        var position = resumeAt
+        var lastToken: Int32 = inputIds[max(resumeAt - 1, 0)]
+        var prefillPredicted: Int32 = 0
+        var batchedSteps = 0
+        var t1Steps = 0
+        let W = mc.slidingWindow
+
+        let t0 = CFAbsoluteTimeGetCurrent()
+        var i = resumeAt
+        if hasMultifunctionPrefill {
+            let T = prefillT
+            while i + T <= inputIds.count {
+                let ringStart = position % W
+                if ringStart + T > W { break }
+                prefillPredicted = try await prefillStep1Chunk(
+                    inputIds: inputIds, startBatch: i, position: position,
+                    T: T, state: state, opts: opts)
+                lastToken = inputIds[i + T - 1]
+                position += T
+                i += T
+                batchedSteps += 1
+            }
+        }
+        for j in i..<inputIds.count {
+            let tok = inputIds[j]
+            prefillPredicted = try await step1Chunk(
+                token: tok, position: position, state: state, opts: opts)
+            lastToken = tok
+            position += 1
+            t1Steps += 1
+        }
+        let prefillEnd = CFAbsoluteTimeGetCurrent()
+
+        var decoded: [Int32] = []
+        if maxNewTokens > 0 && inputIds.count > resumeAt {
+            decoded.append(prefillPredicted)
+            onToken?(prefillPredicted)
+            lastToken = prefillPredicted
+        }
+        while decoded.count < maxNewTokens {
+            if eosTokenIds.contains(lastToken) { break }
+            if position >= mc.contextLength { break }
+            let next = try await step1Chunk(
+                token: lastToken, position: position, state: state, opts: opts)
+            decoded.append(next)
+            onToken?(next)
+            lastToken = next
+            position += 1
+        }
+        let t1 = CFAbsoluteTimeGetCurrent()
+
+        let consumed = decoded.dropLast()
+        var newPersisted = inputIds
+        newPersisted.append(contentsOf: consumed)
+        persistedInputIds = newPersisted
+        persistedPosition = newPersisted.count
+
+        let prefillTokCount = inputIds.count - resumeAt
+        let prefillMs = (prefillEnd - t0) * 1000
+        let decodeMs = (t1 - prefillEnd) * 1000
+        if decodeMs > 0 && decoded.count > 1 {
+            lastDecodeTokensPerSecond = Double(decoded.count - 1) / (decodeMs / 1000)
+        }
+        let resumeTag = resumeAt > 0 ? " [resumed L=\(resumeAt)]" : ""
+        let mfTag = hasMultifunctionPrefill
+            ? " [batched=\(batchedSteps)x\(prefillT) t1=\(t1Steps)]"
+            : ""
+        print("[Gemma4Stateful 1c] prefill \(prefillTokCount) tok in "
+              + String(format: "%.0fms (%.1f tok/s)%@%@ | decode %d tok in %.0fms (%.1f tok/s)",
+                        prefillMs,
+                        Double(max(prefillTokCount, 1))
+                            / max(prefillMs / 1000, 1e-3),
+                        resumeTag, mfTag,
                         decoded.count, decodeMs, lastDecodeTokensPerSecond))
         return decoded
     }

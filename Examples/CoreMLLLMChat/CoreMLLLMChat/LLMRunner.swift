@@ -182,15 +182,24 @@ final class LLMRunner {
         // share the same internal layout — Gemma4StatefulEngine handles
         // both transparently because the only difference is the MIL graph
         // inside each chunk_*.mlpackage.
+        // Require either:
+        //  - chunks 1-3 (3-chunk or 4-chunk bundle — chunk_4 optional)
+        //  - model.{mlpackage,mlmodelc} (1-chunk all-in-one)
+        // Gemma4StatefulEngine auto-detects which mode at load().
         let gemma4StatefulDir = folder.appendingPathComponent("gemma4_e2b_stateful_chunks")
+        let hasChunks = (1...3).allSatisfy { i in
+            fm.fileExists(atPath:
+                gemma4StatefulDir.appendingPathComponent("chunk_\(i).mlpackage").path)
+            || fm.fileExists(atPath:
+                gemma4StatefulDir.appendingPathComponent("chunk_\(i).mlmodelc").path)
+        }
+        let has1Chunk = fm.fileExists(atPath:
+            gemma4StatefulDir.appendingPathComponent("model.mlpackage").path)
+            || fm.fileExists(atPath:
+                gemma4StatefulDir.appendingPathComponent("model.mlmodelc").path)
         let gemma4StatefulPresent = fm.fileExists(atPath:
             gemma4StatefulDir.appendingPathComponent("embed_tokens_q8.bin").path)
-            && (1...4).allSatisfy { i in
-                fm.fileExists(atPath:
-                    gemma4StatefulDir.appendingPathComponent("chunk_\(i).mlpackage").path)
-                || fm.fileExists(atPath:
-                    gemma4StatefulDir.appendingPathComponent("chunk_\(i).mlmodelc").path)
-            }
+            && (hasChunks || has1Chunk)
         if gemma4StatefulPresent {
             try await loadGemma4Stateful(folder: gemma4StatefulDir)
             return

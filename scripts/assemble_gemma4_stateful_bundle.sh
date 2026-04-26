@@ -31,9 +31,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SRC_CHUNKS="/tmp/gemma4-e2b-stateful"
-STAGING="/Users/majimadaisuke/Downloads/coreml-llm-artifacts/staging-2k-fast-prefill/gemma4-e2b"
-OUT_PARENT="$ROOT/build/gemma4_stateful"
+SRC_CHUNKS="${SRC_CHUNKS:-/tmp/gemma4-e2b-stateful}"
+STAGING="${STAGING:-/Users/majimadaisuke/Downloads/coreml-llm-artifacts/staging-2k-fast-prefill/gemma4-e2b}"
+OUT_PARENT="${OUT_PARENT:-$ROOT/build/gemma4_stateful}"
 OUT="$OUT_PARENT/gemma4_e2b_stateful_chunks"
 
 # Sanity
@@ -43,9 +43,19 @@ for d in "$SRC_CHUNKS" "$STAGING"; do
         exit 1
     fi
 done
-for c in chunk_1 chunk_2 chunk_3 chunk_4; do
-    if [[ ! -d "$SRC_CHUNKS/${c}.mlpackage" ]]; then
-        echo "[error] $SRC_CHUNKS/${c}.mlpackage missing — run build_gemma4_e2b_stateful_chunks.py first" >&2
+# Auto-detect chunk count: 3-chunk merged vs 4-chunk default. Set
+# CHUNKS env to override, e.g. `CHUNKS="chunk_1 chunk_2 chunk_3"`.
+if [[ -z "${CHUNKS:-}" ]]; then
+    if [[ -d "$SRC_CHUNKS/chunk_4.mlpackage" || -d "$SRC_CHUNKS/chunk_4.mlmodelc" ]]; then
+        CHUNKS="chunk_1 chunk_2 chunk_3 chunk_4"
+    else
+        CHUNKS="chunk_1 chunk_2 chunk_3"
+    fi
+fi
+echo "[info] chunks: $CHUNKS"
+for c in $CHUNKS; do
+    if [[ ! -d "$SRC_CHUNKS/${c}.mlpackage" && ! -d "$SRC_CHUNKS/${c}.mlmodelc" ]]; then
+        echo "[error] $SRC_CHUNKS/${c}.{mlpackage,mlmodelc} missing" >&2
         exit 1
     fi
 done
@@ -54,7 +64,7 @@ rm -rf "$OUT_PARENT"
 mkdir -p "$OUT"
 
 # 1. Compile chunks .mlpackage → .mlmodelc into the bundle dir
-for c in chunk_1 chunk_2 chunk_3 chunk_4; do
+for c in $CHUNKS; do
     echo "[compile] $c"
     if [[ -d "$SRC_CHUNKS/${c}.mlmodelc" ]]; then
         cp -R "$SRC_CHUNKS/${c}.mlmodelc" "$OUT/${c}.mlmodelc"

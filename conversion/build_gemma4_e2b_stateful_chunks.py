@@ -49,6 +49,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
 import coremltools as ct
+from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
 from coremltools.optimize.coreml import (
     OpPalettizerConfig, OptimizationConfig, palettize_weights,
     linear_quantize_activations, linear_quantize_weights,
@@ -65,6 +66,8 @@ from models.gemma4_swa_chunks import compute_chunk_boundaries
 from models.gemma4_swa_stateful_chunks import (
     SWAStatefulChunk1, SWAStatefulChunk2,
     SWAStatefulChunk3, SWAStatefulChunk4,
+    SWAStatefulChunk1Prefill, SWAStatefulChunk2Prefill,
+    SWAStatefulChunk3Prefill, SWAStatefulChunk4Prefill,
 )
 
 
@@ -653,6 +656,220 @@ def convert_chunk_shared(chunk_cls, base, c_start, c_end, ctx,
 
 
 # ============================================================
+# T=N prefill converters (multifunction `prefill_bN`)
+# ============================================================
+
+def convert_chunk1_prefill(base, c_start, c_end, ctx, T, out_path, nbits, *,
+                            use_linear=False):
+    print("\n" + "-" * 60)
+    print(f"CHUNK 1 PREFILL T={T} (L{c_start}-{c_end-1})")
+    print("-" * 60)
+    cfg = base.config
+    hidden = cfg.hidden_size
+    pld = cfg.hidden_size_per_layer_input
+    nlayers = cfg.num_hidden_layers
+    W = cfg.sliding_window
+    hd_s, hd_f = cfg.head_dim, cfg.global_head_dim
+    max_hd = hd_f
+    HKV = cfg.num_key_value_heads
+
+    chunk = SWAStatefulChunk1Prefill(base, c_start, c_end, ctx,
+                                       use_linear=use_linear, T=T
+                                       ).eval().to(MODEL_DTYPE)
+    ns, nf = max(chunk.num_sliding, 1), max(chunk.num_full, 1)
+
+    sample = (
+        torch.zeros(1, T, hidden, dtype=torch.float16),
+        torch.zeros(1, 1, T, ctx, dtype=torch.float16),
+        torch.zeros(1, 1, T, W, dtype=torch.float16),
+        torch.zeros(1, T, nlayers * pld, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_f, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_f, dtype=torch.float16),
+        torch.zeros(1, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+    )
+    inputs = [
+        ct.TensorType(name="hidden_states",      shape=sample[0].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_full",   shape=sample[1].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_sliding", shape=sample[2].shape, dtype=fp16),
+        ct.TensorType(name="per_layer_raw",      shape=sample[3].shape, dtype=fp16),
+        ct.TensorType(name="cos_s",              shape=sample[4].shape, dtype=fp16),
+        ct.TensorType(name="sin_s",              shape=sample[5].shape, dtype=fp16),
+        ct.TensorType(name="cos_f",              shape=sample[6].shape, dtype=fp16),
+        ct.TensorType(name="sin_f",              shape=sample[7].shape, dtype=fp16),
+        ct.TensorType(name="current_pos",        shape=(1,),            dtype=np.int32),
+        ct.TensorType(name="ring_pos",           shape=(1,),            dtype=np.int32),
+    ]
+    outputs = [
+        ct.TensorType(name="hidden_states_out",       dtype=fp16),
+        ct.TensorType(name="per_layer_combined_out",  dtype=fp16),
+    ]
+    states = [
+        ct.StateType(
+            wrapped_type=ct.TensorType(
+                shape=(2 * ns, HKV, W, max_hd), dtype=fp16),
+            name="kv_cache_sliding",
+        ),
+        ct.StateType(
+            wrapped_type=ct.TensorType(
+                shape=(2 * nf, HKV, ctx, max_hd), dtype=fp16),
+            name="kv_cache_full",
+        ),
+    ]
+    _trace_and_convert_stateful(
+        chunk, sample, inputs, outputs, states, out_path, nbits)
+
+
+def convert_chunk2_prefill(base, c_start, c_end, ctx, T, out_path, nbits, *,
+                            use_linear=False):
+    print("\n" + "-" * 60)
+    print(f"CHUNK 2 PREFILL T={T} (L{c_start}-{c_end-1})")
+    print("-" * 60)
+    cfg = base.config
+    hidden = cfg.hidden_size
+    pld = cfg.hidden_size_per_layer_input
+    nlayers = cfg.num_hidden_layers
+    W = cfg.sliding_window
+    hd_s, hd_f = cfg.head_dim, cfg.global_head_dim
+    max_hd = hd_f
+    HKV = cfg.num_key_value_heads
+
+    chunk = SWAStatefulChunk2Prefill(base, c_start, c_end, ctx,
+                                       use_linear=use_linear, T=T
+                                       ).eval().to(MODEL_DTYPE)
+    ns, nf = max(chunk.num_sliding, 1), max(chunk.num_full, 1)
+
+    sample = (
+        torch.zeros(1, T, hidden, dtype=torch.float16),
+        torch.zeros(1, 1, T, ctx, dtype=torch.float16),
+        torch.zeros(1, 1, T, W, dtype=torch.float16),
+        torch.zeros(1, T, nlayers * pld, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_f, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_f, dtype=torch.float16),
+        torch.zeros(1, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+    )
+    inputs = [
+        ct.TensorType(name="hidden_states",      shape=sample[0].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_full",   shape=sample[1].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_sliding", shape=sample[2].shape, dtype=fp16),
+        ct.TensorType(name="per_layer_combined", shape=sample[3].shape, dtype=fp16),
+        ct.TensorType(name="cos_s",              shape=sample[4].shape, dtype=fp16),
+        ct.TensorType(name="sin_s",              shape=sample[5].shape, dtype=fp16),
+        ct.TensorType(name="cos_f",              shape=sample[6].shape, dtype=fp16),
+        ct.TensorType(name="sin_f",              shape=sample[7].shape, dtype=fp16),
+        ct.TensorType(name="current_pos",        shape=(1,),            dtype=np.int32),
+        ct.TensorType(name="ring_pos",           shape=(1,),            dtype=np.int32),
+    ]
+    outputs = [
+        ct.TensorType(name="hidden_states_out", dtype=fp16),
+        ct.TensorType(name="kv13_k",            dtype=fp16),
+        ct.TensorType(name="kv13_v",            dtype=fp16),
+        ct.TensorType(name="kv14_k",            dtype=fp16),
+        ct.TensorType(name="kv14_v",            dtype=fp16),
+    ]
+    states = [
+        ct.StateType(
+            wrapped_type=ct.TensorType(
+                shape=(2 * ns, HKV, W, max_hd), dtype=fp16),
+            name="kv_cache_sliding",
+        ),
+        ct.StateType(
+            wrapped_type=ct.TensorType(
+                shape=(2 * nf, HKV, ctx, max_hd), dtype=fp16),
+            name="kv_cache_full",
+        ),
+    ]
+    _trace_and_convert_stateful(
+        chunk, sample, inputs, outputs, states, out_path, nbits)
+
+
+def convert_chunk_shared_prefill(chunk_cls, base, c_start, c_end, ctx, T,
+                                  out_path, nbits, name, with_lm_head, *,
+                                  use_linear=False):
+    print("\n" + "-" * 60)
+    print(f"{name} PREFILL T={T} (L{c_start}-{c_end-1})"
+          + (" + lm_head" if with_lm_head else ""))
+    print("-" * 60)
+    cfg = base.config
+    hidden = cfg.hidden_size
+    pld = cfg.hidden_size_per_layer_input
+    nlayers = cfg.num_hidden_layers
+    W = cfg.sliding_window
+    hd_s, hd_f = cfg.head_dim, cfg.global_head_dim
+    HKV = cfg.num_key_value_heads
+
+    chunk = chunk_cls(base, c_start, c_end,
+                      use_linear=use_linear, T=T).eval().to(MODEL_DTYPE)
+    sample = (
+        torch.zeros(1, T, hidden, dtype=torch.float16),
+        torch.zeros(1, 1, T, ctx, dtype=torch.float16),
+        torch.zeros(1, 1, T, W, dtype=torch.float16),
+        torch.zeros(1, T, nlayers * pld, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_s, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_f, dtype=torch.float16),
+        torch.zeros(1, 1, T, hd_f, dtype=torch.float16),
+        torch.zeros(1, HKV, W, hd_s, dtype=torch.float16),
+        torch.zeros(1, HKV, W, hd_s, dtype=torch.float16),
+        torch.zeros(1, HKV, ctx, hd_f, dtype=torch.float16),
+        torch.zeros(1, HKV, ctx, hd_f, dtype=torch.float16),
+    )
+    inputs = [
+        ct.TensorType(name="hidden_states",      shape=sample[0].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_full",   shape=sample[1].shape, dtype=fp16),
+        ct.TensorType(name="causal_mask_sliding", shape=sample[2].shape, dtype=fp16),
+        ct.TensorType(name="per_layer_combined", shape=sample[3].shape, dtype=fp16),
+        ct.TensorType(name="cos_s",              shape=sample[4].shape, dtype=fp16),
+        ct.TensorType(name="sin_s",              shape=sample[5].shape, dtype=fp16),
+        ct.TensorType(name="cos_f",              shape=sample[6].shape, dtype=fp16),
+        ct.TensorType(name="sin_f",              shape=sample[7].shape, dtype=fp16),
+        ct.TensorType(name="kv13_k",             shape=sample[8].shape, dtype=fp16),
+        ct.TensorType(name="kv13_v",             shape=sample[9].shape, dtype=fp16),
+        ct.TensorType(name="kv14_k",             shape=sample[10].shape, dtype=fp16),
+        ct.TensorType(name="kv14_v",             shape=sample[11].shape, dtype=fp16),
+    ]
+    if with_lm_head:
+        outputs = [
+            ct.TensorType(name="token_id",     dtype=np.int32),
+            ct.TensorType(name="token_logit",  dtype=fp16),
+            ct.TensorType(name="hidden_normed", dtype=fp16),
+        ]
+    else:
+        outputs = [ct.TensorType(name="hidden_states_out", dtype=fp16)]
+    _trace_and_convert_stateful(
+        chunk, sample, inputs, outputs, state_specs=[],
+        out_path=out_path, quantize_nbits=nbits)
+
+
+def merge_multifunction(decode_pkg, prefill_pkgs, out_path):
+    """Merge a T=1 decode mlpackage and one or more T=N prefill
+    mlpackages into a single multifunction package. `prefill_pkgs` is
+    a list of (T, path) tuples; functions are named `prefill_b<T>`.
+    Default function = `infer` (T=1)."""
+    print(f"\n--- merging into multifunction → {Path(out_path).name} ---")
+    desc = MultiFunctionDescriptor()
+    desc.add_function(str(decode_pkg), src_function_name="main",
+                       target_function_name="infer")
+    for T, ppath in prefill_pkgs:
+        desc.add_function(str(ppath), src_function_name="main",
+                           target_function_name=f"prefill_b{T}")
+    desc.default_function_name = "infer"
+    out_path = Path(out_path)
+    if out_path.exists():
+        shutil.rmtree(out_path)
+    save_multifunction(desc, str(out_path))
+    size_mb = sum(f.stat().st_size for f in out_path.rglob('*')
+                   if f.is_file()) / 1024 / 1024
+    print(f"  multifunction size: {size_mb:.1f} MB")
+    _audit_ane(str(out_path))
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -672,6 +889,13 @@ def main():
                     help="Smoke test: convert only one chunk and stop. "
                          "Useful for first runs on Mac Studio to validate "
                          "the conversion path before committing to all 4.")
+    ap.add_argument("--prefill-batches", default="",
+                    help="Comma-separated batch sizes for the multifunction "
+                         "prefill_bN functions (e.g. '8' or '8,16'). When "
+                         "set, each chunk mlpackage carries `infer` (T=1) "
+                         "plus one `prefill_b<T>` function per N. Engine "
+                         "dispatches T=N when input length permits and "
+                         "falls back to T=1 for the tail.")
     ap.add_argument("--linear-projections", action="store_true",
                     help="Plan-3 (cml9 PR #2577) variant: replace every "
                          "Conv2d(1×1) projection with shape-equivalent "
@@ -780,34 +1004,96 @@ def main():
         raise SystemExit("--awq requires --calib-data PATH "
                          "(reuses the same .npz for activation stats)")
 
+    prefill_Ts = [int(x) for x in args.prefill_batches.split(",") if x.strip()]
+    if prefill_Ts:
+        for T in prefill_Ts:
+            if T <= 0 or T > cfg.sliding_window:
+                raise SystemExit(
+                    f"--prefill-batches T={T} invalid: must be 1..W ({cfg.sliding_window})")
+        print(f"Multifunction prefill batches: {prefill_Ts}")
+        intermediate = out / "_mf_intermediate"
+        intermediate.mkdir(parents=True, exist_ok=True)
+    else:
+        intermediate = None
+
+    def _build_one(idx, decode_fn, prefill_fn, final_name):
+        """Build the T=1 mlpackage; if prefill_Ts non-empty, also build
+        each T=N variant and merge into a multifunction final_name."""
+        final_pkg = out / f"{final_name}.mlpackage"
+        if not prefill_Ts:
+            decode_fn(str(final_pkg))
+            return
+        decode_pkg = intermediate / f"{final_name}_infer.mlpackage"
+        decode_fn(str(decode_pkg))
+        prefill_pkgs = []
+        for T in prefill_Ts:
+            ppkg = intermediate / f"{final_name}_prefill_b{T}.mlpackage"
+            prefill_fn(T, str(ppkg))
+            prefill_pkgs.append((T, ppkg))
+        merge_multifunction(decode_pkg, prefill_pkgs, str(final_pkg))
+
+    # T=1 lambdas pass through W4A8/AWQ/joint-INT8-LUT args (Stage 1
+    # opt-in tooling, HOLD verdict — closed but kept). T=N prefill
+    # lambdas use only --linear-projections; W4A8 is incompatible with
+    # the multifunction prefill path (and Stage 1 is HOLD anyway).
     if do(1):
-        convert_chunk1(base, *boundaries[0], args.ctx,
-                       str(out / "chunk_1.mlpackage"), args.nbits,
-                       use_linear=use_linear, activation_quant=act_q,
-                       calib_data_path=cdp, activation_scope=asc,
-                       activation_mode=amd,
-                       awq_calib_data_path=awq_path, awq_alpha=awq_alpha,
-                       joint_int8_lut=args.joint_int8_lut)
+        _build_one(
+            1,
+            lambda p: convert_chunk1(
+                base, *boundaries[0], args.ctx, p, args.nbits,
+                use_linear=use_linear, activation_quant=act_q,
+                calib_data_path=cdp, activation_scope=asc,
+                activation_mode=amd,
+                awq_calib_data_path=awq_path, awq_alpha=awq_alpha,
+                joint_int8_lut=args.joint_int8_lut),
+            lambda T, p: convert_chunk1_prefill(
+                base, *boundaries[0], args.ctx, T, p, args.nbits,
+                use_linear=use_linear),
+            "chunk_1",
+        )
     if do(2):
-        convert_chunk2(base, *boundaries[1], args.ctx,
-                       str(out / "chunk_2.mlpackage"), args.nbits,
-                       use_linear=use_linear, activation_quant=act_q,
-                       calib_data_path=cdp, activation_scope=asc,
-                       activation_mode=amd)
+        _build_one(
+            2,
+            lambda p: convert_chunk2(
+                base, *boundaries[1], args.ctx, p, args.nbits,
+                use_linear=use_linear, activation_quant=act_q,
+                calib_data_path=cdp, activation_scope=asc,
+                activation_mode=amd),
+            lambda T, p: convert_chunk2_prefill(
+                base, *boundaries[1], args.ctx, T, p, args.nbits,
+                use_linear=use_linear),
+            "chunk_2",
+        )
     if do(3):
-        convert_chunk_shared(SWAStatefulChunk3, base, *boundaries[2], args.ctx,
-                             str(out / "chunk_3.mlpackage"), args.nbits,
-                             name="CHUNK 3", with_lm_head=False,
-                             use_linear=use_linear, activation_quant=act_q,
-                             calib_data_path=cdp, activation_scope=asc,
-                             activation_mode=amd)
+        _build_one(
+            3,
+            lambda p: convert_chunk_shared(
+                SWAStatefulChunk3, base, *boundaries[2], args.ctx, p,
+                args.nbits, name="CHUNK 3", with_lm_head=False,
+                use_linear=use_linear, activation_quant=act_q,
+                calib_data_path=cdp, activation_scope=asc,
+                activation_mode=amd),
+            lambda T, p: convert_chunk_shared_prefill(
+                SWAStatefulChunk3Prefill, base, *boundaries[2], args.ctx, T,
+                p, args.nbits, name="CHUNK 3", with_lm_head=False,
+                use_linear=use_linear),
+            "chunk_3",
+        )
     if do(4):
-        convert_chunk_shared(SWAStatefulChunk4, base, *boundaries[3], args.ctx,
-                             str(out / "chunk_4.mlpackage"), args.nbits,
-                             name="CHUNK 4", with_lm_head=True,
-                             use_linear=use_linear, activation_quant=act_q,
-                             calib_data_path=cdp, activation_scope=asc,
-                             activation_mode=amd)
+        _build_one(
+            4,
+            lambda p: convert_chunk_shared(
+                SWAStatefulChunk4, base, *boundaries[3], args.ctx, p,
+                args.nbits, name="CHUNK 4", with_lm_head=True,
+                use_linear=use_linear, activation_quant=act_q,
+                calib_data_path=cdp, activation_scope=asc,
+                activation_mode=amd),
+            lambda T, p: convert_chunk_shared_prefill(
+                SWAStatefulChunk4Prefill, base, *boundaries[3], args.ctx, T,
+                p, args.nbits, name="CHUNK 4", with_lm_head=True,
+                use_linear=use_linear),
+            "chunk_4",
+        )
 
     print(f"\nartifacts under {out}")
     for p in sorted(out.iterdir()):
