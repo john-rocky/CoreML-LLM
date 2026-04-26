@@ -1448,3 +1448,197 @@ class SWAStatefulMergedChunk23PrefillSingle(SWAStatefulMergedChunk23Single):
                 T,
             )
         return hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+
+
+# ============================================================
+# 1-chunk all-in-one (Qwen3-VL pattern, single mlpackage)
+# ============================================================
+#
+# Entire 35-layer Gemma 4 E2B (PLE compute + own-KV L0-14 + KV-shared
+# L15-34 + final norm + lm_head + argmax) packaged as ONE mlpackage.
+# Single MLState (kv_cache_unified) covers all 15 own-KV layers
+# (L0-14, the sliding + full producers). KV-shared layers L15-34 read
+# kv13/kv14 from the producers' own state slice internally — never
+# leave the graph.
+#
+# Inputs (T=1 decode):
+#   hidden_states (1, 1, hidden), per_layer_raw (1, 1, num_layers*pld),
+#   causal_mask_full (1, 1, 1, ctx), causal_mask_sliding (1, 1, 1, W),
+#   cos_s/sin_s (1, 1, 1, hd_s), cos_f/sin_f (1, 1, 1, hd_f),
+#   current_pos (1,), ring_pos (1,)
+# Outputs: token_id (1,), token_logit (1,), hidden_normed (1,1,hidden)
+# State: kv_cache_unified (2*15, HKV, ctx, max_hd)
+#
+# Risks: Mac conversion time (35 layers in one MIL pipeline), Mac/
+# iPhone ANE compile size limits, single mlpackage ~1.1 GB. Worth
+# testing because Qwen3-VL ships this pattern (28 layers, single
+# state) and our T=8 multifunction failure on iPhone may be cured by
+# eliminating the chunk-level dual-state plumbing.
+
+
+class SWAStatefulModel1Chunk(_StatefulSingleChunkBase):
+    """All 35 layers + lm_head in one chunk. Own-KV L0-14, KV-shared
+    L15-34. Output is a single token (last position only)."""
+    OWN_START, OWN_END = 0, 15           # L0-14 own KV (sliding+full producers)
+    SHARED_START, SHARED_END = 15, 35    # L15-34 KV-shared (internal alias)
+
+    def __init__(self, model: Gemma4Model, ctx: int = 2048,
+                 use_linear: bool = False):
+        # Init base with own-KV span; layers list = own-KV layers only.
+        super().__init__(model, self.OWN_START, self.OWN_END, ctx)
+        self.layers_shared = nn.ModuleList([
+            model.layers[i] for i in range(self.SHARED_START, self.SHARED_END)
+        ])
+        # PLE compute (was in chunk_1)
+        self.per_layer_model_projection = model.per_layer_model_projection
+        self.per_layer_projection_norm = model.per_layer_projection_norm
+        self.per_layer_model_projection_scale = model.per_layer_model_projection_scale
+        self.per_layer_input_scale = model.per_layer_input_scale
+        self.per_layer_dim = model.config.hidden_size_per_layer_input
+        self.num_layers_total = model.config.num_hidden_layers
+        # Final norm + lm_head + argmax (was in chunk_4)
+        self.norm = model.norm
+        self.lm_head = nn.Conv2d(model.lm_head.in_channels,
+                                  model.lm_head.out_channels,
+                                  kernel_size=1, bias=False)
+        self.lm_head.weight.data = model.lm_head.weight.data.clone()
+        self.argmax = model.argmax
+        self.softcap = model.softcap
+        if use_linear:
+            _swap_chunk_projections_to_linear(self.layers)
+            _swap_chunk_projections_to_linear(self.layers_shared)
+            self.per_layer_model_projection = _replace_conv2d_with_linear(
+                self.per_layer_model_projection)
+            self.lm_head = _replace_conv2d_with_linear(self.lm_head)
+
+    def _compute_ple(self, hidden_states, per_layer_raw):
+        h = hidden_states.to(MODEL_DTYPE)
+        proj = _project(self.per_layer_model_projection, h) \
+               * self.per_layer_model_projection_scale
+        proj_grouped = proj.view(1, self.num_layers_total, self.per_layer_dim)
+        norm_w = self.per_layer_projection_norm.weight
+        eps = float(self.per_layer_projection_norm.eps)
+        doubled = torch.cat([proj_grouped, -proj_grouped], dim=-1)
+        normed = F.layer_norm(doubled, normalized_shape=(2 * self.per_layer_dim,),
+                              weight=None, bias=None, eps=eps)
+        normed, _ = torch.chunk(normed, 2, dim=-1)
+        proj_normed = (normed * norm_w).view(
+            1, 1, self.num_layers_total * self.per_layer_dim)
+        return (proj_normed + per_layer_raw) * self.per_layer_input_scale
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                per_layer_raw, cos_s, sin_s, cos_f, sin_f,
+                current_pos, ring_pos):
+        config = self.config
+        per_layer_combined = self._compute_ple(hidden_states, per_layer_raw)
+        kv13_k = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        kv13_v = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        kv14_k = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+        kv14_v = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+        # Own-KV span
+        for local_idx in range(self.OWN_END - self.OWN_START):
+            layer_idx = self.OWN_START + local_idx
+            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+             ) = _run_layer_swa_stateful_single(
+                self.layers[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                current_pos, ring_pos,
+                self.kv_cache_unified, self.own_map,
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+            )
+        # KV-shared span
+        zero_idx = torch.zeros(1, dtype=torch.int32)
+        dummy = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+        for local_idx in range(self.SHARED_END - self.SHARED_START):
+            layer_idx = self.SHARED_START + local_idx
+            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+             ) = _run_layer_swa_stateful_single(
+                self.layers_shared[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                zero_idx, zero_idx,
+                dummy, {},
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+            )
+        # Final norm + lm_head + argmax
+        normed = self.norm(hidden_states)
+        logits = _project(self.lm_head, normed.to(MODEL_DTYPE))
+        if self.softcap > 0:
+            logits = torch.tanh(logits / self.softcap) * self.softcap
+        token_id, token_logit = self.argmax(logits.squeeze(0))
+        return token_id, token_logit, normed
+
+
+class SWAStatefulModel1ChunkPrefill(SWAStatefulModel1Chunk):
+    """T=N prefill variant — same all-in-one structure, lm_head on
+    last position only (T-1 intermediates discarded)."""
+
+    def __init__(self, model, ctx=2048, use_linear=False, T: int = 8):
+        super().__init__(model, ctx, use_linear=use_linear)
+        self.T = T
+
+    def _compute_ple_prefill(self, hidden_states, per_layer_raw):
+        T = self.T
+        h = hidden_states.to(MODEL_DTYPE)
+        proj = _project(self.per_layer_model_projection, h) \
+               * self.per_layer_model_projection_scale
+        proj_grouped = proj.view(1, T, self.num_layers_total, self.per_layer_dim)
+        norm_w = self.per_layer_projection_norm.weight
+        eps = float(self.per_layer_projection_norm.eps)
+        doubled = torch.cat([proj_grouped, -proj_grouped], dim=-1)
+        normed = F.layer_norm(doubled, normalized_shape=(2 * self.per_layer_dim,),
+                              weight=None, bias=None, eps=eps)
+        normed, _ = torch.chunk(normed, 2, dim=-1)
+        proj_normed = (normed * norm_w).view(
+            1, T, self.num_layers_total * self.per_layer_dim)
+        return (proj_normed + per_layer_raw) * self.per_layer_input_scale
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                per_layer_raw, cos_s, sin_s, cos_f, sin_f,
+                current_pos, ring_pos):
+        config = self.config
+        T = self.T
+        per_layer_combined = self._compute_ple_prefill(hidden_states, per_layer_raw)
+        kv13_k = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        kv13_v = torch.zeros(1, 1, 1, config.head_dim, dtype=MODEL_DTYPE)
+        kv14_k = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+        kv14_v = torch.zeros(1, 1, 1, config.global_head_dim, dtype=MODEL_DTYPE)
+        for local_idx in range(self.OWN_END - self.OWN_START):
+            layer_idx = self.OWN_START + local_idx
+            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+             ) = _run_layer_swa_stateful_prefill_single(
+                self.layers[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                current_pos, ring_pos,
+                self.kv_cache_unified, self.own_map,
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                T,
+            )
+        zero_idx = torch.zeros(1, dtype=torch.int32)
+        dummy = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+        for local_idx in range(self.SHARED_END - self.SHARED_START):
+            layer_idx = self.SHARED_START + local_idx
+            (hidden_states, kv13_k, kv13_v, kv14_k, kv14_v
+             ) = _run_layer_swa_stateful_prefill_single(
+                self.layers_shared[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                zero_idx, zero_idx,
+                dummy, {},
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                T,
+            )
+        # lm_head on LAST position only.
+        last = hidden_states[:, T-1:T, :]
+        normed = self.norm(last)
+        logits = _project(self.lm_head, normed.to(MODEL_DTYPE))
+        if self.softcap > 0:
+            logits = torch.tanh(logits / self.softcap) * self.softcap
+        token_id, token_logit = self.argmax(logits.squeeze(0))
+        return token_id, token_logit, normed
