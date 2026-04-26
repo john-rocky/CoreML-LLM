@@ -430,7 +430,8 @@ def _trace_and_convert_stateful(
 def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits, *,
                    use_linear=False, activation_quant=False,
                    calib_data_path=None, activation_scope="linear",
-                   activation_mode="linear_symmetric"):
+                   activation_mode="linear_symmetric",
+                   awq_calib_data_path=None, awq_alpha=0.5):
     print("\n" + "=" * 60)
     print(f"CHUNK 1 (L{c_start}-{c_end-1}) — own KV state, computes PLE")
     print("=" * 60)
@@ -446,6 +447,11 @@ def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits, *,
     chunk = SWAStatefulChunk1(base, c_start, c_end, ctx,
                                use_linear=use_linear).eval().to(MODEL_DTYPE)
     ns, nf = max(chunk.num_sliding, 1), max(chunk.num_full, 1)
+
+    if awq_calib_data_path:
+        from awq_smoothing import apply_awq_to_chunk
+        print(f"  Applying AWQ smoothing (alpha={awq_alpha}) before trace...")
+        apply_awq_to_chunk(chunk, awq_calib_data_path, alpha=awq_alpha)
 
     sample = (
         torch.zeros(1, 1, hidden, dtype=torch.float16),                  # hidden_states
@@ -690,6 +696,17 @@ def main():
                          "uses zero_point=0, scale via max(|rmin|, |rmax|). "
                          "'linear' is asymmetric (zero_point !=0). Asymmetric "
                          "is generally tighter for non-zero-centered activs.")
+    ap.add_argument("--awq", action="store_true",
+                    help="Stage 1 v3: apply AWQ-style per-channel "
+                         "smoothing (q/k/v at input_layernorm; gate/up at "
+                         "pre_feedforward_layernorm) BEFORE conversion. "
+                         "Redistributes activation outliers into weights "
+                         "so cml9 INT8 activation quant has tighter range "
+                         "to fit. Requires --calib-data.")
+    ap.add_argument("--awq-alpha", type=float, default=0.5,
+                    help="AWQ scaling exponent. 0=no migration, 1=full "
+                         "outlier migration into weights. Default 0.5 "
+                         "(AWQ paper sweet spot).")
     args = ap.parse_args()
 
     if args.ctx is None:
@@ -737,13 +754,19 @@ def main():
     cdp = args.calib_data
     asc = args.activation_scope
     amd = args.activation_mode
+    awq_path = args.calib_data if args.awq else None
+    awq_alpha = args.awq_alpha
+    if args.awq and not args.calib_data:
+        raise SystemExit("--awq requires --calib-data PATH "
+                         "(reuses the same .npz for activation stats)")
 
     if do(1):
         convert_chunk1(base, *boundaries[0], args.ctx,
                        str(out / "chunk_1.mlpackage"), args.nbits,
                        use_linear=use_linear, activation_quant=act_q,
                        calib_data_path=cdp, activation_scope=asc,
-                       activation_mode=amd)
+                       activation_mode=amd,
+                       awq_calib_data_path=awq_path, awq_alpha=awq_alpha)
     if do(2):
         convert_chunk2(base, *boundaries[1], args.ctx,
                        str(out / "chunk_2.mlpackage"), args.nbits,
