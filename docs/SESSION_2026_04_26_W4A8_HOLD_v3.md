@@ -20,14 +20,15 @@ not satisfy versus INT8 (256 levels).
 
 ### Final cos sim ladder (vs FP16 ground truth)
 
-| variant | calib data | quant | AWQ α | cos sim vs **FP16** | gate (≥0.95) |
+| variant | weights | activations | size | cos vs **FP16** | gate (≥0.95) |
 |---|---|---|---|---|---|
-| FP16 baseline (`--nbits 0`) | — | none | — | **1.000** | — |
-| W4A16 stateful (`--nbits 4`, no A8) | — | W4 LUT only | — | **0.949** | borderline PASS |
-| W4 + AWQ (no A8) — diagnostic | 64 real | W4 LUT only | 0.5 | ≈ 0.94 × 0.949 ≈ **0.89** | FAIL |
-| W4A8 (real-calib, sym, no AWQ) | 64 real | W4 LUT + INT8 act | — | ≈ 0.501 × 0.949 ≈ **0.475** | FAIL |
-| W4A8 + AWQ α=0.5 | 64 real | W4 LUT + INT8 act | 0.5 | ≈ 0.516 × 0.949 ≈ **0.490** | FAIL |
-| W4A8 + AWQ α=0.7 | 64 real | W4 LUT + INT8 act | 0.7 | ≈ 0.533 × 0.949 ≈ **0.506** | FAIL |
+| FP16 baseline (`--nbits 0`) | FP16 | FP16 | 592 MB | **1.000** | — |
+| **W4A16 stateful** (current production) | W4 LUT | FP16 | 148 MB | **0.949** | borderline PASS |
+| W4 + AWQ α=0.5 (no A8) — diagnostic | W4 LUT (smoothed) | FP16 | 148 MB | ≈ **0.89** | FAIL |
+| W4A8 (real-calib, sym, no AWQ) | W4 LUT | INT8 (sym) | 148 MB | ≈ **0.475** | FAIL |
+| W4A8 + AWQ α=0.5 | W4 LUT (smoothed) | INT8 (sym) | 148 MB | ≈ **0.490** | FAIL |
+| W4A8 + AWQ α=0.7 | W4 LUT (smoothed) | INT8 (sym) | 148 MB | ≈ **0.506** | FAIL |
+| **W8A8 + SmoothQuant α=0.5** | W8 LUT (smoothed) | INT8 (sym) | **299 MB** | **0.574** | FAIL |
 
 *(intermediate W4A16 number used as multiplicative reference; the
 W4A8 numbers in the prior table were cos vs W4A16 baseline. Combined
@@ -39,19 +40,21 @@ to FP16 here for like-for-like comparison.)*
   56 quant rounds — exactly what well-calibrated W4 group-kmeans
   should achieve. The W4 packing / axis / RMSNorm folding paths in
   `palettize_weights(per_grouped_channel, group_size=32)` are clean.
-- **A8 is the wall.** Adding INT8 activation quant drops cos to ~0.50,
-  i.e. per-op ε spikes from 0.1 % to ~1.2 % — 12× worse, applied over
-  56 rounds. This isn't an AWQ-fixable issue; **AWQ is a weight-only
-  technique** (Lin et al. 2023 framed it for W4A16). For W8A8 the
-  proper paper-of-record technique is **SmoothQuant**, which migrates
-  outliers via a *per-tensor* scale; cml9's per-channel activation
-  quant has different dynamics again.
-- **AWQ at α=0.5 dropped cos vs W4A16 from 1.0 → 0.94 with no A8.**
-  In a W8A16 regime AWQ would help (more weight precision to absorb
-  outliers); against the cml9 W4 LUT (16 levels per group), AWQ
-  scaling stretches the kmeans cluster range and loses ~6 cos.
-  α=0.7 partially recovers because the A8 side benefits more — but
-  α-sweep can't break the structural cap on W4 LUT precision.
+- **A8 is the wall — confirmed at W8 too.** Adding INT8 activation
+  quant drops cos to ~0.5 regardless of weight precision. With W4 LUT
+  weights (the AWQ-paper-violating regime) cos lands at ~0.49-0.51.
+  With W8 LUT weights + SmoothQuant migration (the AWQ/SmoothQuant
+  paper *assumed* regime) cos lands at **0.574** — better, but still
+  catastrophically below the 0.95 gate. The +0.07 cos gain from
+  doubling weight precision *plus* using the proper migration tool
+  is not enough to overcome the A8 step itself.
+- **AWQ is a weight-only technique** (Lin et al. 2023 framed it for
+  W4A16). It nudges A8 quant marginally (+0.015 at α=0.5, +0.032 at
+  α=0.7) when the regime allows; it's not the lever to crack A8 on
+  Gemma 4 attention.
+- **A8 quantization on Gemma 4 in cml9 PTQ is structurally inadequate**
+  for the residual + attention compute path. The fix needs joint
+  training (QAT) — not any combination of PTQ techniques cml9 ships.
 
 The W4-only-with-AWQ row is the diagnostic: AWQ's weight scaling alone
 (no activation quant) drops cos sim from 1.0 to 0.94. This is the W4
@@ -176,6 +179,44 @@ GPTQ-W4 or QAT-W4 is the technically right answer but neither is in
 cml9; both are multi-day implementation efforts plus iPhone validation.
 
 ---
+
+## 4.6. W8A8 + SmoothQuant follow-up (final A8 attempt)
+
+After the FP16-baseline diagnostic, the user (code review) identified
+AWQ as a weight-only technique by design and prescribed
+**W8A8 + SmoothQuant** as the proper-regime test. SmoothQuant
+(Xiao et al. 2022) shares AWQ's smoothing formula
+`s_i = activation_max[i]^α / weight_max[i]^(1-α)` but is intended for
+W8A8 (Lin et al.'s AWQ extension to A8 was not the paper's domain).
+
+We re-built chunk_1 with `--nbits 8 --linear-projections
+--activation-quant --awq --awq-alpha 0.5` (our `--awq` flag
+implements the same smoothing formula; semantics shifts to
+SmoothQuant when paired with W8). cml9 W8 LUT (256 cluster centers
+per group) is much closer to "real" W8 INT8 than W4's 16 — close
+enough to test the regime hypothesis.
+
+**Result:**
+
+| variant | weights | activations | size | cos vs FP16 |
+|---|---|---|---|---|
+| W4A8 + AWQ α=0.7 | W4 LUT smoothed | INT8 sym | 148 MB | 0.506 |
+| **W8A8 + SmoothQuant α=0.5** | **W8 LUT smoothed** | **INT8 sym** | **299 MB** | **0.574** |
+
+W8 + proper migration improved cos by +0.07 over W4 + AWQ. **Not
+enough** — gate is still 0.4 cos away. Build size doubled (which
+defeats Stage 1's perf rationale, but we ran the test for analytical
+completeness).
+
+This is the cleanest signal yet: even in AWQ/SmoothQuant's *paper
+domain*, A8 on Gemma 4 attention path with cml9 PTQ does not
+recover quality. The structural blocker is the activation-quant step
+itself (per-tensor scales picking up the residual / attention
+outliers), not the migration math nor the weight quantization
+precision.
+
+**Stage 1 W4A8 is closed.** Path forward is QAT (joint training of
+weight + activation quantizers), not any PTQ combination.
 
 ## 4.5. Diagnostic decision tree (post-FP16 baseline)
 
