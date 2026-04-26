@@ -75,6 +75,17 @@ final class LLMRunner {
     private var cachedVisionImage: CGImage?
     private var cachedVisionFeatures: Qwen3VL2BVisionFeatures?
 
+    // Gemma 4 stateful multimodal caches. Same idea as Qwen3-VL stateful:
+    // skip vision encoder run when the user asks a follow-up about the
+    // SAME image (and let cross-turn KV resume hit the fast path because
+    // inputIds + features are bit-identical to the persisted state).
+    private var cachedGemma4Image: CGImage?
+    private var cachedGemma4ImageFeatures: MLMultiArray?
+    private var cachedGemma4ImageTokens: Int = 0
+    private var cachedGemma4AudioSig: Int = 0  // hash of the PCM array
+    private var cachedGemma4AudioFeatures: MLMultiArray?
+    private var cachedGemma4AudioTokens: Int = 0
+
     // MARK: - Loading
 
     func loadModel(from url: URL) async throws {
@@ -98,6 +109,12 @@ final class LLMRunner {
             gemma4StatefulTokenizer = nil
             cachedVisionImage = nil
             cachedVisionFeatures = nil
+            cachedGemma4Image = nil
+            cachedGemma4ImageFeatures = nil
+            cachedGemma4ImageTokens = 0
+            cachedGemma4AudioSig = 0
+            cachedGemma4AudioFeatures = nil
+            cachedGemma4AudioTokens = 0
             isLoaded = false
             modelName = ""
             hasVision = false
@@ -283,7 +300,8 @@ final class LLMRunner {
                 messages: messages, image: image)
         }
         if gemma4StatefulEngine != nil {
-            return try await generateGemma4Stateful(messages: messages)
+            return try await generateGemma4Stateful(
+                messages: messages, image: image, audio: audio)
         }
         if qwen3vl2bGenerator != nil {
             return try await generateQwen3VL2B(messages: messages, image: image)
@@ -372,6 +390,30 @@ final class LLMRunner {
         gemma4StatefulEngine?.resetPersistedState()
         cachedVisionImage = nil
         cachedVisionFeatures = nil
+        cachedGemma4Image = nil
+        cachedGemma4ImageFeatures = nil
+        cachedGemma4ImageTokens = 0
+        cachedGemma4AudioSig = 0
+        cachedGemma4AudioFeatures = nil
+        cachedGemma4AudioTokens = 0
+    }
+
+    /// Cheap content-derived signature for an audio PCM buffer. Used by
+    /// the Gemma 4 stateful path to decide whether the user re-attached
+    /// the SAME audio (cache hit) or a new one (re-encode + drop KV).
+    /// Float bit patterns at 4 strategic offsets + length give a
+    /// per-clip signature that's stable across struct copies and
+    /// reasonably collision-resistant for chat-length clips.
+    private func audioSignature(_ samples: [Float]) -> Int {
+        let n = samples.count
+        if n == 0 { return 0 }
+        var h = n
+        let probes = [0, n / 4, n / 2, n - 1].map { max(0, min(n - 1, $0)) }
+        for idx in probes {
+            let bits = Int(samples[idx].bitPattern)
+            h = h &* 0x9E3779B1 &+ bits
+        }
+        return h
     }
 
     // MARK: - Qwen3.5 dispatch
@@ -854,14 +896,23 @@ final class LLMRunner {
         let parent = folder.deletingLastPathComponent().lastPathComponent
         let variantTag = parent.contains("linear") ? " (Linear)" : ""
         modelName = "Gemma 4 E2B (stateful)\(variantTag)"
-        hasVision = false
-        hasAudio = false
+        // Stage 6: surface multimodal capabilities to the UI based on
+        // which encoders the engine probed at load(). vision_video is
+        // implied by hasVision (the still-image encoder can pool to
+        // 64 tokens/frame as a fallback when no video tower is shipped).
+        hasVision = engine.hasVision
+        hasAudio = engine.hasAudio
         isLoaded = true
         loadingStatus = "Ready"
-        print("[LLMRunner] Gemma 4 E2B stateful loaded — \(modelName) at \(folder.lastPathComponent)")
+        let mmTag = (engine.hasVision || engine.hasAudio)
+            ? " [vision=\(engine.hasVision) audio=\(engine.hasAudio)]"
+            : ""
+        print("[LLMRunner] Gemma 4 E2B stateful loaded — \(modelName)\(mmTag) at \(folder.lastPathComponent)")
     }
 
-    private func generateGemma4Stateful(messages: [ChatMessage])
+    private func generateGemma4Stateful(messages: [ChatMessage],
+                                         image: CGImage? = nil,
+                                         audio: [Float]? = nil)
         async throws -> AsyncStream<String>
     {
         guard let engine = gemma4StatefulEngine,
@@ -874,21 +925,98 @@ final class LLMRunner {
         isGenerating = true
         tokensPerSecond = 0
 
-        // Build the Gemma 4 prompt manually — the tokenizer config in the
-        // bundle has no chat_template, and Gemma 4 uses different turn
-        // markers than Gemma 2/3 (`<|turn>` / `<turn|>` vs the older
-        // `<start_of_turn>` / `<end_of_turn>`). Mirrors CoreMLLLM.swift's
-        // buildGemmaPrompt path so the model sees the same token sequence
-        // it was trained on.
+        // ----- Stage 6: multimodal feature extraction & cache -----
+        //
+        // Image: reuse cached features when the user passes the same
+        // CGImage instance back (chat follow-up about the same image).
+        // Different image → encode anew + invalidate persisted KV
+        // (encoder output drives prefill hidden state at image-pad
+        // positions; stale KV would point at the wrong image).
+        var imageFeatures: MLMultiArray? = nil
+        var imageNumTokens = 0
+        if let image, engine.hasVision {
+            if let cachedImg = cachedGemma4Image, cachedImg === image,
+               let f = cachedGemma4ImageFeatures {
+                imageFeatures = f
+                imageNumTokens = cachedGemma4ImageTokens
+            } else {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                let f = try engine.processImage(image)
+                let dt = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                print("[Gemma4Stateful/Vision] encode: \(String(format: "%.1f", dt)) ms")
+                imageFeatures = f
+                imageNumTokens = 256  // still-image encoder emits 256 soft tokens
+                cachedGemma4Image = image
+                cachedGemma4ImageFeatures = f
+                cachedGemma4ImageTokens = 256
+                // New image → drop persisted KV; the next prefill
+                // recomputes from scratch with the new vision splice.
+                engine.resetPersistedState()
+            }
+        } else if image == nil, let f = cachedGemma4ImageFeatures {
+            // No new image but a previously-cached one exists →
+            // text-only follow-up about it. Reuse cached features and
+            // let cross-turn KV resume short-circuit the re-prefill.
+            imageFeatures = f
+            imageNumTokens = cachedGemma4ImageTokens
+        }
+
+        // Audio: hash-based cache (PCM arrays don't have stable
+        // identity). Cheap signature = count XOR first/middle/last
+        // sample bits. Identical capture → cache hit; new clip → re-
+        // encode + drop persisted KV.
+        var audioFeatures: MLMultiArray? = nil
+        var audioNumTokens = 0
+        if let audio, engine.hasAudio, !audio.isEmpty {
+            let sig = audioSignature(audio)
+            if sig == cachedGemma4AudioSig, let f = cachedGemma4AudioFeatures {
+                audioFeatures = f
+                audioNumTokens = cachedGemma4AudioTokens
+            } else {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                let (f, n) = try engine.processAudio(audio)
+                let dt = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                print("[Gemma4Stateful/Audio] encode: \(String(format: "%.1f", dt)) ms tokens=\(n)")
+                audioFeatures = f
+                audioNumTokens = n
+                cachedGemma4AudioSig = sig
+                cachedGemma4AudioFeatures = f
+                cachedGemma4AudioTokens = n
+                engine.resetPersistedState()
+            }
+        } else if audio == nil, let f = cachedGemma4AudioFeatures {
+            audioFeatures = f
+            audioNumTokens = cachedGemma4AudioTokens
+        }
+
+        // Build the Gemma 4 prompt manually — the tokenizer config in
+        // the bundle has no chat_template, and Gemma 4 uses different
+        // turn markers than Gemma 2/3 (`<|turn>` / `<turn|>` vs the
+        // older `<start_of_turn>` / `<end_of_turn>`). Mirrors
+        // CoreMLLLM.swift's buildGemmaPrompt; image / audio blocks land
+        // on the LAST user turn so the persisted prefix from earlier
+        // turns stays a strict prefix of the new prompt (cross-turn
+        // KV resume keeps working).
+        let imageBlock = imageFeatures != nil
+            ? "<|image>" + String(repeating: "<|image|>", count: imageNumTokens) + "<image|>"
+            : ""
+        let audioBlock = (audioFeatures != nil && audioNumTokens > 0)
+            ? "<|audio>" + String(repeating: "<|audio|>", count: audioNumTokens) + "<audio|>"
+            : ""
+        let lastUserIdx = messages.lastIndex { $0.role == .user }
         var prompt = "<bos>"
-        for m in messages {
+        for (i, m) in messages.enumerated() {
             switch m.role {
             case .user:
-                prompt += "<|turn>user\n\(m.content)<turn|>\n"
+                let isLast = i == lastUserIdx
+                var mediaPrefix = ""
+                if isLast && !imageBlock.isEmpty { mediaPrefix += imageBlock + "\n" }
+                if isLast && !audioBlock.isEmpty { mediaPrefix += audioBlock + "\n" }
+                prompt += "<|turn>user\n\(mediaPrefix)\(m.content)<turn|>\n"
             case .assistant:
                 prompt += "<|turn>model\n\(m.content)<turn|>\n"
             case .system:
-                continue  // skip UI status messages ("Model loaded!" etc.)
+                continue
             }
         }
         prompt += "<|turn>model\n"
@@ -921,6 +1049,10 @@ final class LLMRunner {
                 do {
                     _ = try await engine.generate(
                         inputIds: inputIdsInt32,
+                        imageFeatures: imageFeatures,
+                        imageNumTokens: imageNumTokens,
+                        audioFeatures: audioFeatures,
+                        audioNumTokens: audioNumTokens,
                         maxNewTokens: 256,
                         eosTokenIds: eosSet,
                         onToken: { tokenId in

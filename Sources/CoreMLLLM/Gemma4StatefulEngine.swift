@@ -34,6 +34,7 @@
 //  - text-only (vision/audio stays on the existing CoreMLLLM path)
 
 import Accelerate
+import CoreGraphics
 import CoreML
 import Foundation
 
@@ -138,6 +139,72 @@ public final class Gemma4StatefulEngine {
     private var persistedState2: MLState?
     private var persistedInputIds: [Int32] = []
     private var persistedPosition: Int = 0
+
+    // MARK: - Multimodal (Stage 6)
+    //
+    // Gemma 4 reserves three placeholder token IDs that the engine swaps
+    // for vision/audio encoder output rows during prefill. Image-pad
+    // (256 per still image) and video-pad (64 per frame) share the
+    // imageFeatures buffer; audio-pad uses a separate audioFeatures
+    // buffer. Per-layer-raw is forced to zero at these positions so the
+    // chunks compute per_layer_combined entirely from the spliced hidden
+    // state — matches the legacy ChunkedEngine pattern. (Gemma 4 does
+    // NOT use DeepStack; the handoff doc's DS premise was a Qwen3-VL
+    // confusion. See docs/SESSION_2026_04_27_STAGE6_MULTIMODAL.md.)
+    private static let IMAGE_TOKEN_ID: Int32 = 258880
+    private static let AUDIO_TOKEN_ID: Int32 = 258881
+    private static let VIDEO_TOKEN_ID: Int32 = 258884
+
+    // Still-image vision encoder. Default GPU; LLM_VISION_FORCE_ANE=1
+    // opts into vision.ane.* for benchmarking (mirrors legacy CoreMLLLM).
+    private var visionModelURL: URL?
+    private var visionConfig: MLModelConfiguration?
+    private var visionModel: MLModel?
+    private var visionUsesANEBuild: Bool = false
+
+    // Video-grade vision encoder (64 tokens/frame). GPU only.
+    private var videoVisionModelURL: URL?
+    private var videoVisionConfig: MLModelConfiguration?
+    private var videoVisionModel: MLModel?
+
+    // Audio (Conformer 12-layer). GPU. Sidecars are loaded eagerly at
+    // engine load(); the encoder MLModel is loaded lazily on first call.
+    private var audioModelURL: URL?
+    private var audioConfig: MLModelConfiguration?
+    private var audioModel: MLModel?
+    private var melFilterbank: [Float]?
+    private var audioProjection: AudioProcessor.ProjectionWeights?
+    private var audioMelFrames: Int = 200
+    private var audioNumTokensConfig: Int = 188
+    private var audioMelFloor: Float = 0.001
+
+    /// True when vision.{mlmodelc,mlpackage,ane.*} was found at load.
+    public var hasVision: Bool { visionModelURL != nil }
+    /// True when vision_video.{mlmodelc,mlpackage} was found at load.
+    public var hasVideoVision: Bool { videoVisionModelURL != nil }
+    /// True when audio.{mlmodelc,mlpackage} was found at load.
+    public var hasAudio: Bool { audioModelURL != nil }
+    /// Audio token count from sidecar config (default 188).
+    public var defaultAudioNumTokens: Int { audioNumTokensConfig }
+
+    // Per-call multimodal state. Bound by generate(...) on entry, cleared
+    // via defer on exit so a subsequent text-only generate doesn't read
+    // stale features. step()/prefillStep() consult these to decide
+    // whether to splice an encoder row over the embed_tokens lookup.
+    private var mmImageFeatures: MLMultiArray?
+    private var mmImageNumTokens: Int = 0
+    private var mmAudioFeatures: MLMultiArray?
+    private var mmAudioNumTokens: Int = 0
+    private var mmImageIdx: Int = 0
+    private var mmAudioIdx: Int = 0
+    // Vision-aware mask group ids — index by ABSOLUTE prompt position;
+    // -1 = text/audio (causal-only), 0/1/2/... = contiguous run id of
+    // image-pad / video-pad tokens (bidirectional within run).
+    private var mmVisionGroupIds: [Int]?
+    // Reusable PLR=0 scratch (T=1 path) — vision/audio positions get
+    // per-layer-raw zeroed because the chunks recompute per_layer_combined
+    // from hidden alone for those tokens.
+    private var prlZerosT1: MLMultiArray?
 
     public init(config: Config = Config()) {
         self.cfg = config
@@ -250,6 +317,7 @@ public final class Gemma4StatefulEngine {
             fvMaskSliding = MLFeatureValue(multiArray: maskSliding)
             fvPos = MLFeatureValue(multiArray: posScratch)
             fvRing = MLFeatureValue(multiArray: ringScratch)
+            loadMultimodalEncoders(modelDirectory: modelDirectory)
             return
         }
 
@@ -361,6 +429,329 @@ public final class Gemma4StatefulEngine {
         fvMaskSliding = MLFeatureValue(multiArray: maskSliding)
         fvPos = MLFeatureValue(multiArray: posScratch)
         fvRing = MLFeatureValue(multiArray: ringScratch)
+        loadMultimodalEncoders(modelDirectory: modelDirectory)
+    }
+
+    // MARK: - Multimodal encoder loading (Stage 6)
+
+    /// Probe optional vision / video / audio encoders and load configs +
+    /// sidecars. The MLModel instances themselves are loaded lazily on
+    /// first use so text-only chats don't pay the encoder compile cost.
+    /// Vision encoder gets a background prewarm so the first user image
+    /// prompt doesn't pay the ~30 s graph compile on the critical path.
+    private func loadMultimodalEncoders(modelDirectory: URL) {
+        let forceANE = ProcessInfo.processInfo.environment["LLM_VISION_FORCE_ANE"] == "1"
+        let visionANEv2Compiled = modelDirectory.appendingPathComponent("vision.ane.v2.mlmodelc")
+        let visionANECompiled = modelDirectory.appendingPathComponent("vision.ane.mlmodelc")
+        let visionANEPkg = modelDirectory.appendingPathComponent("vision.ane.mlpackage")
+        let visionCompiled = modelDirectory.appendingPathComponent("vision.mlmodelc")
+        let visionPkg = modelDirectory.appendingPathComponent("vision.mlpackage")
+        if forceANE, FileManager.default.fileExists(atPath: visionANEv2Compiled.path) {
+            visionModelURL = visionANEv2Compiled; visionUsesANEBuild = true
+        } else if forceANE, FileManager.default.fileExists(atPath: visionANECompiled.path) {
+            visionModelURL = visionANECompiled; visionUsesANEBuild = true
+        } else if forceANE, FileManager.default.fileExists(atPath: visionANEPkg.path) {
+            visionModelURL = visionANEPkg; visionUsesANEBuild = true
+        } else if FileManager.default.fileExists(atPath: visionCompiled.path) {
+            visionModelURL = visionCompiled
+        } else if FileManager.default.fileExists(atPath: visionPkg.path) {
+            visionModelURL = visionPkg
+        } else if FileManager.default.fileExists(atPath: visionANEv2Compiled.path) {
+            visionModelURL = visionANEv2Compiled; visionUsesANEBuild = true
+        } else if FileManager.default.fileExists(atPath: visionANECompiled.path) {
+            visionModelURL = visionANECompiled; visionUsesANEBuild = true
+        } else if FileManager.default.fileExists(atPath: visionANEPkg.path) {
+            visionModelURL = visionANEPkg; visionUsesANEBuild = true
+        }
+        if let url = visionModelURL {
+            let cfg = MLModelConfiguration()
+            cfg.computeUnits = visionUsesANEBuild ? .cpuAndNeuralEngine : .cpuAndGPU
+            visionConfig = cfg
+            print("[Gemma4Stateful/Vision] selected \(url.lastPathComponent) → \(visionUsesANEBuild ? "ANE" : "GPU")")
+            prewarmVisionInBackground()
+        }
+
+        let videoVisionCompiled = modelDirectory.appendingPathComponent("vision_video.mlmodelc")
+        let videoVisionPkg = modelDirectory.appendingPathComponent("vision_video.mlpackage")
+        if FileManager.default.fileExists(atPath: videoVisionCompiled.path) {
+            videoVisionModelURL = videoVisionCompiled
+        } else if FileManager.default.fileExists(atPath: videoVisionPkg.path) {
+            videoVisionModelURL = videoVisionPkg
+        }
+        if videoVisionModelURL != nil {
+            let cfg = MLModelConfiguration()
+            cfg.computeUnits = .cpuAndGPU
+            videoVisionConfig = cfg
+        }
+
+        let audioCompiled = modelDirectory.appendingPathComponent("audio.mlmodelc")
+        let audioPkg = modelDirectory.appendingPathComponent("audio.mlpackage")
+        if FileManager.default.fileExists(atPath: audioCompiled.path) {
+            audioModelURL = audioCompiled
+        } else if FileManager.default.fileExists(atPath: audioPkg.path) {
+            audioModelURL = audioPkg
+        }
+        if audioModelURL != nil {
+            let cfg = MLModelConfiguration()
+            cfg.computeUnits = .cpuAndGPU
+            audioConfig = cfg
+
+            let melURL = modelDirectory.appendingPathComponent("mel_filterbank.bin")
+            if FileManager.default.fileExists(atPath: melURL.path) {
+                melFilterbank = try? AudioProcessor.loadMelFilterbank(from: melURL)
+            }
+            let projURL = modelDirectory.appendingPathComponent("output_proj_weight.npy")
+            if FileManager.default.fileExists(atPath: projURL.path) {
+                audioProjection = try? AudioProcessor.ProjectionWeights.load(from: modelDirectory)
+            }
+            let audioConfURL = modelDirectory.appendingPathComponent("audio_config.json")
+            if let data = try? Data(contentsOf: audioConfURL),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                audioMelFrames = json["mel_frames"] as? Int ?? 200
+                audioNumTokensConfig = json["num_tokens"] as? Int ?? 188
+                if let mf = json["log_offset"] as? Double {
+                    audioMelFloor = Float(mf)
+                } else if let mf = json["mel_floor"] as? Double {
+                    audioMelFloor = Float(mf)
+                }
+            }
+        }
+
+        if hasVision || hasAudio || hasVideoVision {
+            print("[Gemma4Stateful] multimodal encoders: vision=\(hasVision) " +
+                  "video=\(hasVideoVision) audio=\(hasAudio)")
+        }
+    }
+
+    /// Background prewarm of the GPU vision encoder. ANE builds compile
+    /// fast (no warmup needed); the GPU graph compile is ~30 s on first
+    /// call, which would otherwise land on TTFT for the first image
+    /// prompt. Submits a dummy 48×48 patch grid so the live forward is
+    /// hot. Runs on .utility queue so text-only chats aren't blocked.
+    private func prewarmVisionInBackground() {
+        guard let url = visionModelURL, let cfg = visionConfig,
+              !visionUsesANEBuild else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            do {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                let m = try MLModel(contentsOf: url, configuration: cfg)
+                self?.visionModel = m
+                let pd = 16 * 16 * 3
+                let total = 2520
+                let pv = try MLMultiArray(
+                    shape: [1, NSNumber(value: total), NSNumber(value: pd)],
+                    dataType: .float32)
+                let pid = try MLMultiArray(
+                    shape: [1, NSNumber(value: total), 2], dataType: .int32)
+                let pidp = pid.dataPointer.bindMemory(
+                    to: Int32.self, capacity: total * 2)
+                var k = 0
+                for py in 0..<48 {
+                    for px in 0..<48 {
+                        pidp[k * 2] = Int32(px)
+                        pidp[k * 2 + 1] = Int32(py)
+                        k += 1
+                    }
+                }
+                for i in (48 * 48)..<total {
+                    pidp[i * 2] = -1
+                    pidp[i * 2 + 1] = -1
+                }
+                let input = try MLDictionaryFeatureProvider(dictionary: [
+                    "pixel_values": MLFeatureValue(multiArray: pv),
+                    "pixel_position_ids": MLFeatureValue(multiArray: pid),
+                ])
+                _ = try? m.prediction(from: input)
+                let dt = CFAbsoluteTimeGetCurrent() - t0
+                print("[Gemma4Stateful/Vision] prewarm done in \(String(format: "%.1f", dt))s")
+            } catch {
+                print("[Gemma4Stateful/Vision] prewarm failed: \(error)")
+            }
+        }
+    }
+
+    // MARK: - Multimodal feature extraction (Stage 6)
+
+    /// Encode `image` → (1, 256, hidden) features ready to splice at
+    /// IMAGE_TOKEN_ID positions. Lazy-loads the vision model on first
+    /// call (background prewarm usually has it loaded already).
+    public func processImage(_ image: CGImage) throws -> MLMultiArray {
+        if visionModel == nil, let url = visionModelURL, let cfg = visionConfig {
+            visionModel = try MLModel(contentsOf: url, configuration: cfg)
+        }
+        guard let vm = visionModel else { throw CoreMLLLMError.visionNotAvailable }
+        return visionUsesANEBuild
+            ? try ImageProcessor.processANE(image, with: vm)
+            : try ImageProcessor.process(image, with: vm)
+    }
+
+    /// Encode a single video frame at 64 tokens via vision_video.mlmodelc
+    /// when present. Throws if no video encoder is loaded — caller is
+    /// expected to fall back to 2×2 pooling of `processImage`'s output.
+    public func processVideoFrame(_ image: CGImage) throws -> MLMultiArray {
+        if videoVisionModel == nil, let url = videoVisionModelURL, let cfg = videoVisionConfig {
+            videoVisionModel = try MLModel(contentsOf: url, configuration: cfg)
+        }
+        guard let vm = videoVisionModel else { throw CoreMLLLMError.visionNotAvailable }
+        return try ImageProcessor.processVideoFrame(image, with: vm)
+    }
+
+    /// Encode 16 kHz mono PCM → (audio features, actual token count).
+    /// Token count is bounded by the encoder's static input size and the
+    /// real audio length, matching HF Gemma4AudioFeatureExtractor.
+    public func processAudio(_ samples: [Float]) throws -> (MLMultiArray, Int) {
+        if audioModel == nil, let url = audioModelURL, let cfg = audioConfig {
+            audioModel = try MLModel(contentsOf: url, configuration: cfg)
+        }
+        guard let am = audioModel else { throw CoreMLLLMError.audioNotAvailable }
+        guard let mel = melFilterbank else { throw CoreMLLLMError.audioNotAvailable }
+
+        // pad-left + unfold → mel frames; 2× Conv2d stride 2 → tokens.
+        let padLeft = 160
+        let paddedLen = padLeft + samples.count
+        let unfoldSize = 321
+        let actualMelFrames = max(0, (paddedLen - unfoldSize) / 160 + 1)
+        let afterConv1 = (actualMelFrames + 1) / 2
+        let actualTokens = min((afterConv1 + 1) / 2, audioNumTokensConfig)
+
+        let features = try AudioProcessor.process(
+            samples, with: am, melFilterbank: mel,
+            targetFrames: audioMelFrames, projection: audioProjection,
+            melFloor: audioMelFloor)
+        return (features, actualTokens)
+    }
+
+    // MARK: - Multimodal mask + splice helpers (Stage 6)
+
+    /// Compute vision-group ids over the prompt. Each contiguous run of
+    /// image-pad / video-pad tokens forms one bidirectional group; text
+    /// and audio positions get -1 (causal-only). Mirrors HF Gemma 4
+    /// `token_type_ids_mask_function`. Audio doesn't form a vision
+    /// group because Gemma 4 audio attention is causal even within an
+    /// audio span (different from vision).
+    private func computeVisionGroupIds(inputIds: [Int32]) -> [Int] {
+        var ids = [Int](repeating: -1, count: inputIds.count)
+        var current = -1
+        var prev = false
+        for i in 0..<inputIds.count {
+            let isVision = inputIds[i] == Self.IMAGE_TOKEN_ID
+                || inputIds[i] == Self.VIDEO_TOKEN_ID
+            if isVision {
+                if !prev { current += 1 }
+                ids[i] = current
+            }
+            prev = isVision
+        }
+        return ids
+    }
+
+    /// Reusable per-layer-raw=0 scratch for T=1 multimodal positions.
+    private func prlZerosT1Buffer() throws -> MLMultiArray {
+        if let buf = prlZerosT1 { return buf }
+        guard let mc = modelConfig else {
+            throw CoreMLLLMError.modelNotFound("no config")
+        }
+        let dim = mc.numLayers * mc.perLayerDim
+        let arr = try MLMultiArray(
+            shape: [1, 1, NSNumber(value: dim)], dataType: .float16)
+        memset(arr.dataPointer, 0, dim * MemoryLayout<UInt16>.stride)
+        prlZerosT1 = arr
+        return arr
+    }
+
+    /// Splice an encoder row over the embed lookup for IMAGE/VIDEO/AUDIO
+    /// placeholder tokens. Returns nil for text tokens (caller falls back
+    /// to embed_tokens.lookup). Advances the matching multimodal counter.
+    private func multimodalSpliceT1(token: Int32) -> MLMultiArray? {
+        guard let mc = modelConfig else { return nil }
+        if (token == Self.IMAGE_TOKEN_ID || token == Self.VIDEO_TOKEN_ID),
+           let img = mmImageFeatures, mmImageIdx < mmImageNumTokens {
+            let row = ImageProcessor.sliceFeature(
+                img, at: mmImageIdx, hiddenSize: mc.hiddenSize)
+            mmImageIdx += 1
+            return row
+        }
+        if token == Self.AUDIO_TOKEN_ID,
+           let aud = mmAudioFeatures, mmAudioIdx < mmAudioNumTokens {
+            let row = AudioProcessor.sliceFeature(
+                aud, at: mmAudioIdx, hiddenSize: mc.hiddenSize)
+            mmAudioIdx += 1
+            return row
+        }
+        return nil
+    }
+
+    /// Vision-aware T=1 full causal mask. Each pair (p, i) is unmasked
+    /// when either i ≤ p (causal) or both share a vision group.
+    private func fillFullCausalMaskVisionAware(position p: Int, groupIds: [Int]) {
+        let ctx = modelConfig!.contextLength
+        let neg = Float16(-65504).bitPattern
+        let mp = maskFull.dataPointer.bindMemory(to: UInt16.self, capacity: ctx)
+        let pGroup = (p < groupIds.count) ? groupIds[p] : -1
+        let pClamped = min(max(p, 0), ctx - 1)
+        for i in 0..<ctx {
+            let causal = i <= pClamped
+            let sameGroup = pGroup >= 0 && i < groupIds.count && groupIds[i] == pGroup
+            mp[i] = (causal || sameGroup) ? 0 : neg
+        }
+    }
+
+    /// Vision-aware T=1 sliding mask. For p < W slot i maps to absolute
+    /// position i; for p ≥ W the ring is fully populated and we keep
+    /// strict-all-valid (vision-group unmask is moot because groups
+    /// fit comfortably inside W=512 — image=256, video=64×frame).
+    private func fillSlidingCausalMaskVisionAware(position p: Int, groupIds: [Int]) {
+        let W = modelConfig!.slidingWindow
+        let neg = Float16(-65504).bitPattern
+        let mp = maskSliding.dataPointer.bindMemory(to: UInt16.self, capacity: W)
+        if p >= W {
+            for i in 0..<W { mp[i] = 0 }
+            return
+        }
+        let pGroup = (p < groupIds.count) ? groupIds[p] : -1
+        let valid = min(p + 1, W)
+        for i in 0..<W {
+            let causal = i < valid
+            let sameGroup = pGroup >= 0 && i < groupIds.count && groupIds[i] == pGroup
+            mp[i] = (causal || sameGroup) ? 0 : neg
+        }
+    }
+
+    /// Vision-aware T-row prefill masks. Same shape as fillBatchMasks
+    /// but unmasks within-vision-group attention so image-pad spans
+    /// attend bidirectionally. Optimization E: keeps the multifunction
+    /// prefill_b8 win on vision turns (else we'd fall back to T=1, ≈8×
+    /// slower for the 256-token image span).
+    private func fillBatchMasksVisionAware(startPos: Int, T: Int, groupIds: [Int]) {
+        let ctx = modelConfig!.contextLength
+        let W = modelConfig!.slidingWindow
+        let neg = Float16(-65504).bitPattern
+        let mf = batchMaskFull!.dataPointer.bindMemory(
+            to: UInt16.self, capacity: T * ctx)
+        let ms = batchMaskSliding!.dataPointer.bindMemory(
+            to: UInt16.self, capacity: T * W)
+        for t in 0..<T {
+            let p = startPos + t
+            let pGroup = (p < groupIds.count) ? groupIds[p] : -1
+            let pClamped = min(max(p, 0), ctx - 1)
+            // Full mask
+            for i in 0..<ctx {
+                let causal = i <= pClamped
+                let sameGroup = pGroup >= 0 && i < groupIds.count && groupIds[i] == pGroup
+                mf[t * ctx + i] = (causal || sameGroup) ? 0 : neg
+            }
+            // Sliding mask
+            if p < W {
+                let valid = min(p + 1, W)
+                for i in 0..<W {
+                    let causal = i < valid
+                    let sameGroup = pGroup >= 0 && i < groupIds.count && groupIds[i] == pGroup
+                    ms[t * W + i] = (causal || sameGroup) ? 0 : neg
+                }
+            } else {
+                for i in 0..<W { ms[t * W + i] = 0 }
+            }
+        }
     }
 
     // MARK: - Mask + position helpers
@@ -543,16 +934,35 @@ public final class Gemma4StatefulEngine {
         guard let mc = modelConfig else {
             throw CoreMLLLMError.modelNotFound("not loaded")
         }
-        // 1) Embed lookups (full hidden + per-layer raw).
-        let hidden = try embedTokens!.lookup(
-            Int(token), shape: [1, 1, NSNumber(value: mc.hiddenSize)])
-        let perLayerRaw = try embedTokensPerLayer!.lookup(
-            Int(token),
-            shape: [1, 1, NSNumber(value: mc.numLayers * mc.perLayerDim)])
+        // 1) Embed lookups (full hidden + per-layer raw). Multimodal
+        //    placeholder tokens splice an encoder feature row instead
+        //    and force per_layer_raw=0 so the chunks compute
+        //    per_layer_combined entirely from the spliced hidden.
+        let hidden: MLMultiArray
+        let perLayerRaw: MLMultiArray
+        if let mmRow = multimodalSpliceT1(token: token) {
+            hidden = mmRow
+            perLayerRaw = try prlZerosT1Buffer()
+        } else {
+            hidden = try embedTokens!.lookup(
+                Int(token), shape: [1, 1, NSNumber(value: mc.hiddenSize)])
+            perLayerRaw = try embedTokensPerLayer!.lookup(
+                Int(token),
+                shape: [1, 1, NSNumber(value: mc.numLayers * mc.perLayerDim)])
+        }
 
-        // 2) Position-dependent scratch (mask + RoPE + indices).
-        fillFullCausalMask(position: position)
-        fillSlidingCausalMask(position: position)
+        // 2) Position-dependent scratch (mask + RoPE + indices). Vision-
+        //    aware mask when the prompt contains image/video groups so
+        //    in-group positions attend bidirectionally — matches HF
+        //    Gemma 4 `token_type_ids_mask_function` and the legacy
+        //    ChunkedEngine vision prefill.
+        if let groupIds = mmVisionGroupIds {
+            fillFullCausalMaskVisionAware(position: position, groupIds: groupIds)
+            fillSlidingCausalMaskVisionAware(position: position, groupIds: groupIds)
+        } else {
+            fillFullCausalMask(position: position)
+            fillSlidingCausalMask(position: position)
+        }
         setPos(position)
         setRing(position)
         // ModelConfig doesn't carry head_dim/global_head_dim; Gemma 4
@@ -752,24 +1162,58 @@ public final class Gemma4StatefulEngine {
         let H = mc.hiddenSize
         let PL = mc.numLayers * mc.perLayerDim
 
-        // 1) Hidden + per_layer_raw: T embed lookups, packed into batch buffer.
+        // 1) Hidden + per_layer_raw: pack T rows into the batch buffer.
+        //    Multimodal placeholder tokens splice an encoder row over
+        //    the embed lookup and zero per_layer_raw at that position.
         let hPtr = batchHidden!.dataPointer.bindMemory(
             to: UInt16.self, capacity: T * H)
         let plPtr = batchPerLayerRaw!.dataPointer.bindMemory(
             to: UInt16.self, capacity: T * PL)
+        let imgRowPtr = mmImageFeatures?.dataPointer.bindMemory(
+            to: UInt16.self, capacity: mmImageFeatures?.count ?? 0)
+        let audRowPtr = mmAudioFeatures?.dataPointer.bindMemory(
+            to: UInt16.self, capacity: mmAudioFeatures?.count ?? 0)
         for t in 0..<T {
-            let tok = Int(inputIds[startBatch + t])
-            let row = try embed.lookup(tok, shape: [1, 1, NSNumber(value: H)])
-            memcpy(hPtr.advanced(by: t * H),
-                   row.dataPointer, H * MemoryLayout<UInt16>.stride)
-            let plRow = try perLayer.lookup(
-                tok, shape: [1, 1, NSNumber(value: PL)])
-            memcpy(plPtr.advanced(by: t * PL),
-                   plRow.dataPointer, PL * MemoryLayout<UInt16>.stride)
+            let tokInt32 = inputIds[startBatch + t]
+            let tok = Int(tokInt32)
+            if let imgPtr = imgRowPtr,
+               (tokInt32 == Self.IMAGE_TOKEN_ID || tokInt32 == Self.VIDEO_TOKEN_ID),
+               mmImageIdx < mmImageNumTokens {
+                memcpy(hPtr.advanced(by: t * H),
+                       imgPtr.advanced(by: mmImageIdx * H),
+                       H * MemoryLayout<UInt16>.stride)
+                memset(plPtr.advanced(by: t * PL), 0,
+                       PL * MemoryLayout<UInt16>.stride)
+                mmImageIdx += 1
+            } else if let audPtr = audRowPtr,
+                      tokInt32 == Self.AUDIO_TOKEN_ID,
+                      mmAudioIdx < mmAudioNumTokens {
+                memcpy(hPtr.advanced(by: t * H),
+                       audPtr.advanced(by: mmAudioIdx * H),
+                       H * MemoryLayout<UInt16>.stride)
+                memset(plPtr.advanced(by: t * PL), 0,
+                       PL * MemoryLayout<UInt16>.stride)
+                mmAudioIdx += 1
+            } else {
+                let row = try embed.lookup(tok, shape: [1, 1, NSNumber(value: H)])
+                memcpy(hPtr.advanced(by: t * H),
+                       row.dataPointer, H * MemoryLayout<UInt16>.stride)
+                let plRow = try perLayer.lookup(
+                    tok, shape: [1, 1, NSNumber(value: PL)])
+                memcpy(plPtr.advanced(by: t * PL),
+                       plRow.dataPointer, PL * MemoryLayout<UInt16>.stride)
+            }
         }
 
-        // 2) Position-dependent scratch.
-        fillBatchMasks(startPos: position, T: T)
+        // 2) Position-dependent scratch. Optimization E: vision-aware
+        //    mask preserves the multifunction prefill_b8 win on vision
+        //    turns (else we'd fall back to T=1, ≈8× slower for the
+        //    256-token image span).
+        if let groupIds = mmVisionGroupIds {
+            fillBatchMasksVisionAware(startPos: position, T: T, groupIds: groupIds)
+        } else {
+            fillBatchMasks(startPos: position, T: T)
+        }
         fillBatchRoPE(table: cosSlidingTable, dst: batchCosS!,
                       startPos: position, T: T, dim: 256)
         fillBatchRoPE(table: sinSlidingTable, dst: batchSinS!,
@@ -866,10 +1310,36 @@ public final class Gemma4StatefulEngine {
     /// prefix of `inputIds` and both states are still bound, skip prefill
     /// of the matching prefix and resume at the LCP boundary. Otherwise
     /// allocate fresh states and start from scratch.
-    public func generate(inputIds: [Int32], maxNewTokens: Int = 64,
+    public func generate(inputIds: [Int32],
+                          imageFeatures: MLMultiArray? = nil,
+                          imageNumTokens: Int = 0,
+                          audioFeatures: MLMultiArray? = nil,
+                          audioNumTokens: Int = 0,
+                          maxNewTokens: Int = 64,
                           eosTokenIds: Set<Int32> = [],
                           onToken: ((Int32) -> Void)? = nil
     ) async throws -> [Int32] {
+        // Bind multimodal state for the duration of this call. step()
+        // and prefillStep() consult these to decide whether to splice
+        // an encoder row over the embed lookup. defer clears them so a
+        // subsequent text-only generate doesn't read stale features.
+        mmImageFeatures = imageFeatures
+        mmImageNumTokens = imageNumTokens
+        mmAudioFeatures = audioFeatures
+        mmAudioNumTokens = audioNumTokens
+        mmImageIdx = 0
+        mmAudioIdx = 0
+        let hasMultimodal = imageFeatures != nil || audioFeatures != nil
+        mmVisionGroupIds = hasMultimodal ? computeVisionGroupIds(inputIds: inputIds) : nil
+        defer {
+            mmImageFeatures = nil
+            mmAudioFeatures = nil
+            mmImageNumTokens = 0
+            mmAudioNumTokens = 0
+            mmImageIdx = 0
+            mmAudioIdx = 0
+            mmVisionGroupIds = nil
+        }
         if is1Chunk {
             return try await generate1Chunk(
                 inputIds: inputIds, maxNewTokens: maxNewTokens,
@@ -904,6 +1374,22 @@ public final class Gemma4StatefulEngine {
             while l < cap && persistedInputIds[l] == inputIds[l] { l += 1 }
             if l == persistedInputIds.count && l < inputIds.count && l > 0 {
                 resumeAt = l
+            }
+        }
+
+        // Advance multimodal counters past the resumed prefix so the
+        // first new token splices the correct encoder row. Caller is
+        // responsible for resetPersistedState() when image/audio
+        // changes (LLMRunner does this on attachment fingerprint
+        // mismatch); the engine assumes consistent features here.
+        if resumeAt > 0 && hasMultimodal {
+            for j in 0..<resumeAt {
+                let t = inputIds[j]
+                if t == Self.IMAGE_TOKEN_ID || t == Self.VIDEO_TOKEN_ID {
+                    mmImageIdx += 1
+                } else if t == Self.AUDIO_TOKEN_ID {
+                    mmAudioIdx += 1
+                }
             }
         }
 
