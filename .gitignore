@@ -45,3 +45,6 @@ output/
 Examples/CoreMLLLMChat/gemma4-e2b/
 .claude/
 *.mlpkg
+
+# W4A8 calibration data — regeneratable from gen_calib_data_real.py
+conversion/calibration_data/

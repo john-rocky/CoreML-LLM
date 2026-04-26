@@ -8,6 +8,19 @@ stage / hot file.
 Format: one line per active claim.
 `branch | session-id | started UTC | task`
 
+## Special claims
+
+- **`iphone-push`** — the iPhone is a single USB device. Before
+  `xcrun devicectl device copy to ...`, append a claim with
+  `branch=iphone-push`, do the push, remove the claim. Other sessions
+  that need the iPhone busy-wait on the file (e.g. `until ! grep -q
+  "^iphone-push" docs/INFLIGHT.md; do sleep 30; done`) before claiming
+  it themselves. Push usually 2-3 minutes per ~3.7 GB bundle.
+- **`mac-build-heavy`** — Stage 3 (multifunction prefill_bN) peaks
+  ~30-40 GB RAM and saturates more cores than the other stages.
+  Optional claim if RAM is tight; remove on build done. Other stages
+  can ignore unless RAM-constrained.
+
 ---
 
 (empty — no active claims)
