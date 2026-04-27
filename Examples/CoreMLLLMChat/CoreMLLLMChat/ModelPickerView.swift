@@ -1,3 +1,4 @@
+import CoreML
 import SwiftUI
 import CoreMLLLM
 
@@ -112,6 +113,19 @@ struct ModelPickerView: View {
                     Text("Download Options")
                 }
 
+                Section("MLState Probe (research)") {
+                    Button {
+                        runMLStateProbe()
+                    } label: {
+                        Label("Probe MLState T=288 prefill compile",
+                              systemImage: "stethoscope")
+                    }
+                    Text(downloader.status)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(nil)
+                }
+
                 Section("Troubleshooting") {
                     Button(role: .destructive) {
                         do {
@@ -138,6 +152,52 @@ struct ModelPickerView: View {
                 // User cancelled
             } catch {
                 downloader.status = "Error: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Stage 8 MLState multimodal feasibility probe.
+    /// Loads `Documents/mlstate_probe/chunk_1.mlmodelc` (a T=288 single-
+    /// function stateful prefill chunk built by
+    /// `conversion/probe_stateful_singlefunc_prefill.py` and pushed via
+    /// devicectl) with `.cpuAndNeuralEngine`. The Stage 3 finding was
+    /// that **multifunction** T>1 stateful is rejected by iPhone ANE 18
+    /// (`ANECCompile FAILED 11`); single-function T>1 stateful was never
+    /// tried. This probe answers that question in one button press.
+    private func runMLStateProbe() {
+        downloader.status = "Probe: loading T=288 stateful prefill chunk..."
+        Task {
+            do {
+                let docs = FileManager.default.urls(
+                    for: .documentDirectory, in: .userDomainMask).first!
+                let url = docs
+                    .appendingPathComponent("mlstate_probe")
+                    .appendingPathComponent("chunk_1.mlmodelc")
+                guard FileManager.default.fileExists(atPath: url.path) else {
+                    await MainActor.run {
+                        downloader.status = "Probe: file missing — push via " +
+                            "`xcrun devicectl device copy to ... " +
+                            "Documents/mlstate_probe/chunk_1.mlmodelc`"
+                    }
+                    return
+                }
+                let cfg = MLModelConfiguration()
+                cfg.computeUnits = .cpuAndNeuralEngine
+                let t0 = CFAbsoluteTimeGetCurrent()
+                _ = try MLModel(contentsOf: url, configuration: cfg)
+                let dt = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                await MainActor.run {
+                    downloader.status = String(format:
+                        "Probe: PASS — T=288 single-function stateful " +
+                        "prefill compiled on this device in %.0f ms. " +
+                        "Stateful multimodal is feasible.", dt)
+                }
+            } catch {
+                await MainActor.run {
+                    downloader.status = "Probe: FAIL — \(error.localizedDescription). " +
+                        "Stateful multimodal blocked at single-function " +
+                        "T>1 (same wall as multifunction)."
+                }
             }
         }
     }
