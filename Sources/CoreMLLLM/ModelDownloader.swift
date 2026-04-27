@@ -15,6 +15,14 @@ public final class ModelDownloader: NSObject {
     public var isPaused = false
     public var progress: Double = 0
     public var status = ""
+    /// UserDefaults key for the multimodal opt-in toggle. Default true
+    /// (multimodal encoders + sidecars included). Toggling this only
+    /// affects models that ship vision/audio encoders (currently
+    /// gemma4-e2b and gemma4-e2b-3way). Engine load() detects encoder
+    /// absence at runtime and disables vision/audio features cleanly,
+    /// so a text-only install just looks like a regular text decoder.
+    public static let includeMultimodalKey = "gemma4DownloadMultimodal"
+
     public var availableModels: [ModelInfo] = ModelInfo.defaults
     public var refreshTrigger = 0
     public var downloadingModelId: String?
@@ -1018,7 +1026,8 @@ public final class ModelDownloader: NSObject {
                 + prefillMeta("chunk3", "prefill_chunk3")
                 + prefillMeta("chunk4", "prefill_chunk4")
         }
-        let extraFiles: [DownloadFile] = [
+        // Core (text-decoder) sidecars. Always required.
+        let coreFiles: [DownloadFile] = [
             .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 500),
             .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
             .init(remotePath: "hf_model/tokenizer_config.json", localPath: "hf_model/tokenizer_config.json", estimatedSize: 5_000),
@@ -1033,6 +1042,13 @@ public final class ModelDownloader: NSObject {
             .init(remotePath: "swa/sin_sliding.npy", localPath: "sin_sliding.npy", estimatedSize: 4_194_432),
             .init(remotePath: "swa/cos_full.npy", localPath: "cos_full.npy", estimatedSize: 8_388_736),
             .init(remotePath: "swa/sin_full.npy", localPath: "sin_full.npy", estimatedSize: 8_388_736),
+        ]
+
+        // Multimodal encoders + sidecars (~990 MB). Toggleable from the
+        // model picker via UserDefaults `gemma4DownloadMultimodal`. Engine
+        // load() detects encoder absence and disables vision/audio cleanly,
+        // so a text-only install behaves like a normal text decoder.
+        let multimodalFiles: [DownloadFile] = [
             .init(remotePath: "vision.mlmodelc/weights/weight.bin", localPath: "vision.mlmodelc/weights/weight.bin", estimatedSize: 320_000_000),
             .init(remotePath: "vision.mlmodelc/coremldata.bin", localPath: "vision.mlmodelc/coremldata.bin", estimatedSize: 200_000),
             .init(remotePath: "vision.mlmodelc/model.mil", localPath: "vision.mlmodelc/model.mil", estimatedSize: 50_000),
@@ -1059,6 +1075,16 @@ public final class ModelDownloader: NSObject {
             .init(remotePath: "output_proj_bias.npy", localPath: "output_proj_bias.npy", estimatedSize: 3_200),
             .init(remotePath: "embed_proj_weight.npy", localPath: "embed_proj_weight.npy", estimatedSize: 4_718_720),
         ]
+
+        // Default: include multimodal (full bundle). User opts out via
+        // ModelPickerView's "Include multimodal" toggle (UserDefaults).
+        // Stored value = false means text-only install; default unset = true.
+        let includeMM = UserDefaults.standard
+            .object(forKey: ModelDownloader.includeMultimodalKey) as? Bool ?? true
+        let extraFiles = coreFiles + (includeMM ? multimodalFiles : [])
+        if !includeMM {
+            print("[Download] gemma4-e2b: multimodal opt-out — encoders skipped (saves ~990 MB)")
+        }
 
         let threshold: Int64 = 10_000_000  // 10 MB
         for file in chunkFiles + prefillFiles + extraFiles {

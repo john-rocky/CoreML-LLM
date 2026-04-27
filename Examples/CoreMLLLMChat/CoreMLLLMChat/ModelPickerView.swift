@@ -92,6 +92,26 @@ struct ModelPickerView: View {
                     }
                 }
 
+                Section {
+                    Toggle(isOn: Binding(
+                        get: { UserDefaults.standard.object(
+                            forKey: ModelDownloader.includeMultimodalKey) as? Bool ?? true },
+                        set: { UserDefaults.standard.set(
+                            $0, forKey: ModelDownloader.includeMultimodalKey) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Include multimodal (vision / audio / video)")
+                            Text("Default ON. Saves ~990 MB when off — text-only install. " +
+                                 "Applies to Gemma 4 E2B variants. Re-download if changed " +
+                                 "after install.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("Download Options")
+                }
+
                 Section("Troubleshooting") {
                     Button(role: .destructive) {
                         do {
