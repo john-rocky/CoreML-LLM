@@ -70,7 +70,7 @@ public final class ModelDownloader: NSObject {
         /// (`vision_video.mlmodelc`, 64 tokens/frame) so the Swift 2×2 pool
         /// no longer sits in the video path.
         public static let gemma4e2b = ModelInfo(
-            id: "gemma4-e2b", name: "Gemma 4 E2B", size: "3.1 GB",
+            id: "gemma4-e2b", name: "Gemma 4 E2B (4-chunk legacy)", size: "3.1 GB",
             // n1024 branch ships the N=1024 batched prefill that pairs with
             // the Swift SWA write fix (a878c44). Old clones still point at
             // `main` and keep downloading N=512, which is safe with the
@@ -230,7 +230,7 @@ public final class ModelDownloader: NSObject {
         /// (vision/audio stay on the legacy gemma4e2b multimodal bundle).
         public static let gemma4e2bStatefulLinear = ModelInfo(
             id: "gemma4-e2b-stateful-linear",
-            name: "Gemma 4 E2B (stateful, Linear)", size: "3.7 GB",
+            name: "Gemma 4 E2B (stateful research, text-only)", size: "3.7 GB",
             downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-stateful-coreml/resolve/main",
             folderName: "gemma4-e2b-stateful-linear")
 
