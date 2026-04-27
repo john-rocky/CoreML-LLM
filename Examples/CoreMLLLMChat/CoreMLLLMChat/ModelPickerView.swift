@@ -117,8 +117,12 @@ struct ModelPickerView: View {
                     Button {
                         runMLStateProbe()
                     } label: {
-                        Label("Probe MLState T=288 prefill compile",
-                              systemImage: "stethoscope")
+                        Label("(1) T=288 prefill compile", systemImage: "stethoscope")
+                    }
+                    Button {
+                        runStateBridgeProbe()
+                    } label: {
+                        Label("(2) State buffer bridge", systemImage: "arrow.left.arrow.right")
                     }
                     Text(downloader.status)
                         .font(.caption2)
@@ -197,6 +201,86 @@ struct ModelPickerView: View {
                     downloader.status = "Probe: FAIL — \(error.localizedDescription). " +
                         "Stateful multimodal blocked at single-function " +
                         "T>1 (same wall as multifunction)."
+                }
+            }
+        }
+    }
+
+    /// Stage 8 follow-up probe: state-buffer bridging via memcpy.
+    /// Verifies the API + memory model that the multimodal architecture
+    /// needs for the prefill-model → decode-model hand-off:
+    ///   1. .withMultiArray(for:) gives a CPU-readable/writable view
+    ///   2. dataPointer is stable within the closure
+    ///   3. memcpy between two MLState buffers (nested closures) works
+    /// Tests against TWO STATES OF THE SAME MODEL (same shape by
+    /// construction). Cross-model bridging is the identical operation
+    /// when the two models declare matching StateType shape.
+    private func runStateBridgeProbe() {
+        downloader.status = "Probe 2: state-buffer bridging..."
+        Task {
+            do {
+                let docs = FileManager.default.urls(
+                    for: .documentDirectory, in: .userDomainMask).first!
+                let probeURL = docs
+                    .appendingPathComponent("mlstate_probe")
+                    .appendingPathComponent("chunk_1.mlmodelc")
+                guard FileManager.default.fileExists(atPath: probeURL.path) else {
+                    await MainActor.run {
+                        downloader.status = "Probe 2: probe mlmodelc missing"
+                    }
+                    return
+                }
+                let cfg = MLModelConfiguration()
+                cfg.computeUnits = .cpuAndNeuralEngine
+                let model = try MLModel(contentsOf: probeURL, configuration: cfg)
+                // Two states of the same model — same StateType shape,
+                // tests the .withMultiArray closure + memcpy mechanism.
+                let prefillState = model.makeState()
+                let decodeState = model.makeState()
+
+                // CoreML 9: state.withMultiArray(for:) { closure } gives a
+                // mutable view into the buffer; pointer is only valid
+                // inside the closure. Write a known pattern through the
+                // prefill state buffer, memcpy to the decode state buffer
+                // inside nested closures, read back, verify match.
+                let stateName = "kv_cache_sliding"
+                var summary = ""
+                prefillState.withMultiArray(for: stateName) { src in
+                    let srcCount = src.count
+                    summary += "  prefill[\(stateName)]: shape=\(src.shape.map { $0.intValue }), count=\(srcCount)\n"
+                    let srcPtr = src.dataPointer.bindMemory(
+                        to: UInt16.self, capacity: srcCount)
+                    // Write a counter pattern so we can distinguish from a
+                    // zero-init decode state.
+                    for i in 0..<srcCount {
+                        srcPtr[i] = UInt16(i & 0xFFFF)
+                    }
+                    let firstSrc = srcPtr[0]
+                    let lastSrc = srcPtr[srcCount - 1]
+                    summary += "  pattern wrote: first=0x\(String(format: "%04X", firstSrc)), last=0x\(String(format: "%04X", lastSrc))\n"
+                    decodeState.withMultiArray(for: stateName) { dst in
+                        let dstCount = dst.count
+                        summary += "  decode[\(stateName)]: shape=\(dst.shape.map { $0.intValue }), count=\(dstCount)\n"
+                        guard dstCount == srcCount else {
+                            summary += "  SHAPE MISMATCH — bridging not directly viable\n"
+                            return
+                        }
+                        let dstPtr = dst.dataPointer.bindMemory(
+                            to: UInt16.self, capacity: dstCount)
+                        memcpy(dstPtr, srcPtr,
+                               srcCount * MemoryLayout<UInt16>.stride)
+                        let firstDst = dstPtr[0]
+                        let lastDst = dstPtr[srcCount - 1]
+                        let ok = firstDst == firstSrc && lastDst == lastSrc
+                        summary += "  bridged readback: first=0x\(String(format: "%04X", firstDst)), last=0x\(String(format: "%04X", lastDst))  \(ok ? "MATCH ✓" : "MISMATCH ✗")\n"
+                    }
+                }
+                await MainActor.run {
+                    downloader.status = "Probe 2 result:\n\(summary)"
+                }
+            } catch {
+                await MainActor.run {
+                    downloader.status = "Probe 2: FAIL — \(error.localizedDescription)"
                 }
             }
         }
