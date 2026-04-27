@@ -354,8 +354,10 @@ public final class ModelDownloader: NSObject {
         // Qwen3.5 has its own mlpackage names (no `model.mlpackage`).
         // Check shipping variants in order. Any one of these marks the
         // folder as a Qwen3.5 model folder.
-        //   1. 0.8B chunked  (qwen3_5_0_8b_decode_chunks/ — v1.x ANE recipe)
-        //   2. 2B  chunked   (qwen3_5_2b_decode_chunks/  — v1.1.0+ANE recipe)
+        //   1. 0.8B MLKV    (qwen3_5_0_8b_decode_chunks_mlkv/ — KV-MLState)
+        //   2. 2B  MLKV     (qwen3_5_2b_decode_chunks_mlkv/)
+        //   3. 0.8B chunked (qwen3_5_0_8b_decode_chunks/ — stateless legacy)
+        //   4. 2B  chunked  (qwen3_5_2b_decode_chunks/)
         // mseq128 monolithic artifacts (0.8B argmax/int8/fp16, 2B int8) were
         // retired with the 2K + ANE-recipe ship. They are no longer detected.
         let requiredChunks = ["chunk_a", "chunk_b", "chunk_c", "chunk_d"]
@@ -377,6 +379,9 @@ public final class ModelDownloader: NSObject {
             return allChunksPresent ? chunksDir : nil
         }
 
+        // MLKV first (faster), stateless fallback.
+        if let r = chunkBundlePresent("qwen3_5_0_8b_decode_chunks_mlkv") { return r }
+        if let r = chunkBundlePresent("qwen3_5_2b_decode_chunks_mlkv")   { return r }
         if let r = chunkBundlePresent("qwen3_5_0_8b_decode_chunks") { return r }
         if let r = chunkBundlePresent("qwen3_5_2b_decode_chunks")  { return r }
 

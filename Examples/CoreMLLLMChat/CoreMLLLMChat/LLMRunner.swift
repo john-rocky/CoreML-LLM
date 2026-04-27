@@ -39,6 +39,10 @@ final class LLMRunner {
     // different architecture (hybrid Gated-DeltaNet SSM + attention).
     private var qwen35Generator: Qwen35Generator?
     private var qwen35Tokenizer: (any Tokenizer)?
+    /// MLKV path: KV cache via MLState + slice_update, SSM state via I/O.
+    /// Selected when `qwen3_5_(0_8b|2b)_decode_chunks_mlkv/` is present.
+    /// Mac M4 measured 51 tok/s 0.8B, 32 tok/s 2B (vs 33 / 25 stateless).
+    private var qwen35MLKVGenerator: Qwen35MLKVGenerator?
 
     // Qwen3-VL 2B stateful path (Phase 1 ship): MLState + slice_update,
     // selected when `qwen3_vl_2b_stateful_chunks/` is present in the
@@ -83,12 +87,14 @@ final class LLMRunner {
         // Release previous engines BEFORE allocating a new one — peak footprint
         // on model switch would otherwise hold both in memory simultaneously,
         // OOMing on 8 GB devices.
-        if llm != nil || qwen35Generator != nil || qwen3vl2bGenerator != nil
+        if llm != nil || qwen35Generator != nil || qwen35MLKVGenerator != nil
+            || qwen3vl2bGenerator != nil
             || qwen3vl2bStatefulGenerator != nil
             || gemma4StatefulEngine != nil
         {
             llm = nil
             qwen35Generator = nil
+            qwen35MLKVGenerator = nil
             qwen35Tokenizer = nil
             qwen3vl2bGenerator = nil
             qwen3vl2bStatefulGenerator = nil
@@ -113,14 +119,27 @@ final class LLMRunner {
         modelFolderURL = folder
         loadingStatus = "Loading..."
 
-        // Qwen3.5 detection: the downloaded folder contains a 4-chunk +
-        // embed.bin layout under `qwen3_5_(0_8b|2b)_decode_chunks/`. Both
-        // model sizes share the same Generator code path; loader detects
-        // hidden size from chunk_a's `hidden_in` shape. Chunked detection
-        // honors BOTH `.mlpackage` (HF download) and `.mlmodelc` (devicectl
-        // sideload). mseq128 monolithic artifacts were retired with the
-        // 2K + ANE-recipe ship.
+        // Qwen3.5 detection — two paths, MLKV preferred:
+        //   1. MLKV (KV via MLState, +54% on 0.8B):
+        //        qwen3_5_(0_8b|2b)_decode_chunks_mlkv/{chunk_a..d, embed_weight.bin}
+        //   2. Stateless legacy (full state via I/O):
+        //        qwen3_5_(0_8b|2b)_decode_chunks/{chunk_a..d, embed_weight.bin}
+        // Both share the 4-chunk + embed sidecar layout. mseq128 monolithic
+        // artifacts were retired with the 2K + ANE-recipe ship.
         let fm = FileManager.default
+        for subdir in ["qwen3_5_0_8b_decode_chunks_mlkv", "qwen3_5_2b_decode_chunks_mlkv"] {
+            let chunksDir = folder.appendingPathComponent(subdir)
+            let embedPresent = fm.fileExists(atPath:
+                chunksDir.appendingPathComponent("embed_weight.bin").path)
+            let chunksOK = ["chunk_a", "chunk_b", "chunk_c", "chunk_d"].allSatisfy { base in
+                fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlpackage").path)
+                    || fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlmodelc").path)
+            }
+            if embedPresent && chunksOK {
+                try await loadQwen35MLKV(folder: folder)
+                return
+            }
+        }
         for subdir in ["qwen3_5_0_8b_decode_chunks", "qwen3_5_2b_decode_chunks"] {
             let chunksDir = folder.appendingPathComponent(subdir)
             func chunkPresent(_ base: String) -> Bool {
@@ -268,6 +287,9 @@ final class LLMRunner {
 
     func generate(messages: [ChatMessage], image: CGImage? = nil,
                   audio: [Float]? = nil) async throws -> AsyncStream<String> {
+        if qwen35MLKVGenerator != nil {
+            return try await generateQwen35MLKV(messages: messages)
+        }
         if qwen35Generator != nil {
             return try await generateQwen35(messages: messages)
         }
@@ -489,6 +511,111 @@ final class LLMRunner {
                     _ = try await gen.generate(
                         inputIds: inputIdsInt32, maxNewTokens: maxNew,
                         temperature: 0.0, topK: 40, repetitionPenalty: 1.0,
+                        eosTokenIds: eosSet,
+                        onToken: { [weak self] tokenId in
+                            tokenCount += 1
+                            if eosSet.contains(tokenId) { return }
+                            accumIds.append(Int(tokenId))
+                            let current = tok.decode(tokens: accumIds)
+                            if current.count > emittedText.count,
+                               current.hasPrefix(emittedText) {
+                                let delta = String(current.dropFirst(emittedText.count))
+                                continuation.yield(delta)
+                                emittedText = current
+                            }
+                            let elapsed = Date().timeIntervalSince(genStart)
+                            if elapsed > 0 {
+                                Task { @MainActor in
+                                    self?.tokensPerSecond = Double(tokenCount) / elapsed
+                                }
+                            }
+                        })
+                } catch {
+                    continuation.yield("[Error: \(error.localizedDescription)]")
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    // MARK: - Qwen3.5 MLKV dispatch
+
+    private func loadQwen35MLKV(folder: URL) async throws {
+        let fm = FileManager.default
+        let is0_8B = fm.fileExists(atPath: folder
+            .appendingPathComponent("qwen3_5_0_8b_decode_chunks_mlkv")
+            .appendingPathComponent("embed_weight.bin").path)
+        let cfg: Qwen35MLKVGenerator.Config =
+            is0_8B ? .default0_8B : .default2B
+
+        loadingStatus = "Loading Qwen tokenizer..."
+        let tokId = is0_8B ? "Qwen/Qwen3.5-0.8B" : "Qwen/Qwen3.5-2B"
+        let tok = try await AutoTokenizer.from(pretrained: tokId)
+        loadingStatus = "Compiling Qwen3.5 MLKV chunks (first run, can take a few min on ANE)..."
+        let gen = Qwen35MLKVGenerator(cfg: cfg)
+        gen.setModelFolder(folder)
+        do {
+            try gen.load()
+        } catch {
+            throw NSError(domain: "LLMRunner", code: 23,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Qwen3.5 MLKV load failed: \(error.localizedDescription)"])
+        }
+        qwen35MLKVGenerator = gen
+        qwen35Tokenizer = tok
+        modelName = is0_8B
+            ? "Qwen3.5 0.8B (MLKV — KV in MLState + slice_update)"
+            : "Qwen3.5 2B (MLKV — KV in MLState + slice_update)"
+        hasVision = false
+        hasAudio = false
+        isLoaded = true
+        loadingStatus = "Ready"
+        print("[LLMRunner] loaded Qwen3.5 MLKV (\(modelName)) from \(folder.lastPathComponent)")
+    }
+
+    private func generateQwen35MLKV(messages: [ChatMessage]) async throws -> AsyncStream<String> {
+        guard let gen = qwen35MLKVGenerator, let tok = qwen35Tokenizer else {
+            throw NSError(domain: "LLMRunner", code: 24,
+                userInfo: [NSLocalizedDescriptionKey: "Qwen3.5 MLKV not loaded"])
+        }
+        isGenerating = true
+        tokensPerSecond = 0
+
+        // Same chat-template + SYSTEM-stripping the legacy generateQwen35 uses.
+        let chatMessages: [[String: Any]] = messages.compactMap { m in
+            let role: String
+            switch m.role {
+            case .user: role = "user"
+            case .assistant: role = "assistant"
+            case .system: return nil
+            }
+            return ["role": role, "content": m.content]
+        }
+        let inputIds: [Int] = (try? tok.applyChatTemplate(messages: chatMessages))
+            ?? tok.encode(text: messages.last?.content ?? "")
+        let inputIdsInt32 = inputIds.map { Int32($0) }
+
+        let maxSeq = 2048
+        let remaining = maxSeq - inputIds.count - 1
+        if remaining < 1 {
+            throw NSError(domain: "LLMRunner", code: 25,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Qwen3.5 prompt (\(inputIds.count) tokens) exceeds max_seq=\(maxSeq)."])
+        }
+        let maxNew = min(remaining, 1024)
+        var eosSet: Set<Int32> = [248044, 248045, 248046]
+        if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
+
+        let genStart = Date()
+        return AsyncStream { continuation in
+            Task { [weak self] in
+                defer { Task { @MainActor in self?.isGenerating = false } }
+                var accumIds: [Int] = []
+                var emittedText = ""
+                var tokenCount = 0
+                do {
+                    _ = try await gen.generate(
+                        inputIds: inputIdsInt32, maxNewTokens: maxNew,
                         eosTokenIds: eosSet,
                         onToken: { [weak self] tokenId in
                             tokenCount += 1

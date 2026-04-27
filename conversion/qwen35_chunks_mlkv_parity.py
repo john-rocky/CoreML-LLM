@@ -52,25 +52,36 @@ def run_decode(
     input_ids_list, max_new,
     eos_tokens=(248044, 248045, 248046),
 ):
+    # Precompute RoPE tables once. Avoid the torch graph eval per step
+    # (~1-2 ms/step Python overhead).
     rot = Qwen3_5TextRotaryEmbedding(cfg).eval()
-    # Per-layer SSM state dict — keyed by absolute layer idx, fp16 numpy.
+    pos_ids_full = torch.arange(max_seq, dtype=torch.long).unsqueeze(0)  # (1, max_seq)
+    dummy = torch.zeros(1, 1, cfg.hidden_size)
+    with torch.no_grad():
+        cos_full, sin_full = rot(dummy, pos_ids_full)  # (1, max_seq, rd)
+    cos_table = cos_full.numpy().astype(np.float16)[0]  # (max_seq, rd)
+    sin_table = sin_full.numpy().astype(np.float16)[0]
+
+    # Precompute the causal-mask row template — index p gives a (max_seq,)
+    # row where positions > p are -1e4 and others 0. Build once.
+    idx = np.arange(max_seq, dtype=np.float32)
+    pos_arange = np.arange(max_seq, dtype=np.float32)[:, None]  # (max_seq, 1)
+    causal_table = np.where(idx[None, :] <= pos_arange, 0.0, -1e4).astype(np.float16)
+    # (max_seq, max_seq)
+
     states = make_zero_states(cfg, max_seq)
     ssm_state = {}
     for i in range(cfg.num_hidden_layers):
-        if i % 4 != 3:  # linear_attention layers
+        if i % 4 != 3:
             ssm_state[f"conv_state_{i}"] = states[2 * i].numpy().astype(np.float16)
             ssm_state[f"rec_state_{i}"]  = states[2 * i + 1].numpy().astype(np.float16)
 
     def _step(tok_id: int, pos: int):
         """Returns next_token (int) — chunk_d emits it via in-graph TopK."""
         hidden = embed_weight[tok_id:tok_id + 1, :].reshape(1, 1, -1).astype(np.float16)
-        pos_ids = torch.tensor([[pos]], dtype=torch.long)
-        dummy = torch.zeros(1, 1, cfg.hidden_size)
-        with torch.no_grad():
-            c_t, s_t = rot(dummy, pos_ids)
-        cos_np = c_t.numpy().astype(np.float16)
-        sin_np = s_t.numpy().astype(np.float16)
-        causal = make_causal_mask(pos, max_seq)
+        cos_np = cos_table[pos:pos + 1].reshape(1, 1, -1)
+        sin_np = sin_table[pos:pos + 1].reshape(1, 1, -1)
+        causal = causal_table[pos].reshape(1, 1, 1, max_seq)
         cur = np.array([pos], dtype=np.int32)
 
         last_out = None
