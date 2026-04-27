@@ -975,10 +975,24 @@ public final class ModelDownloader: NSObject {
             chunkFiles += mlc("swa", "chunk3", "chunk3", weightSize: 325_282_880)
             chunkFiles += mlc("swa", "chunk4", "chunk4", weightSize: 526_874_880)
         }
-        let prefillFiles = prefillMeta("chunk1", "prefill_chunk1")
-             + prefillMeta("chunk2", "prefill_chunk2")
-             + prefillMeta("chunk3", "prefill_chunk3")
-             + prefillMeta("chunk4", "prefill_chunk4")
+        // Prefill chunk weights: legacy variant shares them from decode
+        // chunks (`finishDownload` copies chunk{i}.weight → prefill_chunk{i}.weight).
+        // The 3way variant skips chunk{2,3,4} download, so the share has
+        // nothing to copy from for prefill_chunk{2,3,4}. Pull those weights
+        // directly from `prefill/chunk{i}.mlmodelc/weights/weight.bin` on
+        // HF (same content as decode chunks; the repo hosts both copies).
+        let prefillFiles: [DownloadFile]
+        if is3Way {
+            prefillFiles = prefillMeta("chunk1", "prefill_chunk1")
+                + mlc("prefill", "chunk2", "prefill_chunk2", weightSize: 133_963_968)
+                + mlc("prefill", "chunk3", "prefill_chunk3", weightSize: 325_282_880)
+                + mlc("prefill", "chunk4", "prefill_chunk4", weightSize: 526_874_880)
+        } else {
+            prefillFiles = prefillMeta("chunk1", "prefill_chunk1")
+                + prefillMeta("chunk2", "prefill_chunk2")
+                + prefillMeta("chunk3", "prefill_chunk3")
+                + prefillMeta("chunk4", "prefill_chunk4")
+        }
         let extraFiles: [DownloadFile] = [
             .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 500),
             .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
