@@ -208,56 +208,79 @@ Bundle sizes:
 - 2B: 4× INT8 chunks (347 + 340 + 347 + 849 MB) + 1017 MB embed
   = 2.90 GB total.
 
-## Best-of-Mac per model
+## Best-of-Mac per model — MLKV (KV-only MLState) wins both
 
-| Model | Best build | Compute | tok/s | Output |
-|-------|------------|---------|-------|--------|
-| 0.8B  | MLState    | GPU     | **40.1** | ✓ |
-| 2B    | stateless  | ANE     | **24.6** | ✓ |
+The multi-StateType MLState ANE error 11 turned out to be the multi-state
+issue. Switching to **MLKV** (kv_cache via single ct.StateType, SSM
+state via classic input/output) — same single-state pattern as VL
+Phase 1's verified iPhone-ANE-runnable layout — fixed ANE *and*
+delivered the headline speedup.
 
-The two models prefer different paths on Mac M4:
-- **0.8B is GPU-friendly** because it's small enough that GPU
-  parallelism beats ANE's per-chunk dispatch overhead. Adding MLState
-  removes the per-step state I/O bottleneck → +21% over stateless ANE.
-- **2B is ANE-friendly** because the bigger compute (hidden=2048)
-  amortizes ANE dispatch and the stateless I/O isn't the bottleneck.
-  MLState GPU on 2B is actually 12% SLOWER than stateless ANE.
+| Model | Best build | Compute | tok/s | Speedup vs stateless ANE |
+|-------|------------|---------|-------|--------------------------|
+| 0.8B  | **MLKV**   | ANE     | **51.0** | +54% |
+| 2B    | **MLKV**   | ANE     | **32.1** | +30% |
 
-ANE remains blocked for MLState on both sizes — iOS 18 multi-StateType
-+ slice_update fails at predict time with `ANEProgramProcessRequestDirect
-Error=(11)`. 4D conv_state didn't help. Likely root cause is having 3
-separate ct.StateType per chunk; VL Phase 1 ships with only 1
-(unified kv_cache). Possible fixes (not attempted in this session):
-1. Pack all SSM + KV state into one big buffer with offset arithmetic.
-2. Convert SSM state to ALL fp16 (drop the float casts) so ANE can run.
-3. Drop SSM state from MLState entirely — keep KV in MLState, SSM
-   stateless via input/output.
+Full bench matrix (Mac M4, INT8, 4-chunk + embed sidecar, max_new=40):
+
+| Model | Build | ANE | GPU | CPU | Notes |
+|-------|-------|-----|-----|-----|-------|
+| 0.8B | stateless        | 33.1 | 27.7 | 34.7 | output ✓ |
+| 0.8B | MLState (multi)  | err 11 | 40.1 | 57 (broken) | multi-state ANE incompat |
+| 0.8B | **MLKV (KV only)** | **51.0** | 33.1 | n/m | output ✓ |
+| 2B   | stateless        | 24.6 | n/m | n/m | output ✓ |
+| 2B   | MLState (multi)  | err 11 | 21.5 | n/m | output ✓ on GPU |
+| 2B   | **MLKV (KV only)** | **32.1** | 19.9 | n/m | output ✓ |
+
+Why MLKV wins where multi-state failed:
+- iOS 18 ANE compiler accepts a single ct.StateType + slice_update
+  (proven in VL Phase 1). With three StateTypes (kv_cache + conv_state
+  + rec_state), the runtime hits ANEProgramProcessRequestDirect
+  Error=(11) at predict time even though compile passed.
+- KV cache is the BIG state (12 MB on 0.8B per step) — putting just
+  it in MLState captures most of the marshaling savings. SSM state
+  flows through normal input/output — same as stateless.
 
 ## iPhone projection
 
-Mac M4 / iPhone A18 GPU ratio is more stable than ANE (~1.3-1.4×).
-Naively scaled iPhone 17 Pro estimates:
-- 0.8B MLState GPU @ 2K: ~28-32 tok/s vs v1.0.3 GPU 27.7 @ 128 → flat-to-modest.
-- 0.8B stateless ANE @ 2K: ~22 tok/s flat vs v1.0.3 ANE 22.
-- 2B  stateless ANE @ 2K: ~17 tok/s flat vs v1.1.0 ANE 17.
+Mac M4 / iPhone A18 ANE ratio in past data: ~1.5×. Naively scaled
+estimates for the MLKV ANE shipping path:
 
-**Honest read**: this PR didn't deliver "world-fastest" on Mac. The
-recipe-level wins (Conv2dLinear, ANERMSNorm, ane_softmax) are baked
-in but the dispatch and state-I/O costs eat much of the gain. The big
-follow-up moves (each potentially 1.5-2.5×) are:
-1. **Pack all states into 1 ct.StateType** — likely unblocks ANE
-   MLState (the big one).
-2. **In-graph TopK head** — saves 248K * 4 byte transfer per step.
-3. **IOSurface inputs** — VL Phase 1 stretch; small but real.
-4. **Speculative decoding** — separate work, biggest potential.
+| Model | Mac M4 ANE | iPhone projection | Prior ship | Expected uplift |
+|-------|------------|-------------------|------------|-----------------|
+| 0.8B  | 51.0       | ~34 tok/s         | v1.0.3 ANE 22 | **+55%** |
+| 2B    | 32.1       | ~21 tok/s         | v1.1.0 ANE 17 | **+24%** |
 
-Each of these needs deeper investigation than today's session allowed.
+The MLKV path leans on VL Phase 1's already-on-iPhone-ANE pattern
+(single ct.StateType + slice_update), so the iPhone projection has
+real grounding rather than just Mac-extrapolation hope. Confirm with
+the existing QWEN35_IPHONE_BENCH protocol once Swift loader is wired.
 
-Win conditions to validate on iPhone 17 Pro:
-- 0.8B MLState GPU: ≥ 30 tok/s (1.4× over v1.0.3 ANE).
-- 2B  stateless ANE: ≥ 18 tok/s (sanity vs v1.1.0).
-- 0.8B MLState ANE: if it works on iPhone A18 (Mac M4 ANE doesn't),
-  projection is ~30+ tok/s — would be the headline number.
+## Remaining stretch (next PR)
+
+Already in the bag (this PR):
+- Gemma 4 ANE recipe (Conv2dLinear, ANERMSNorm, ane_softmax,
+  repeat_kv_ane).
+- 4-chunk + mmap embed sidecar.
+- MLKV (KV in MLState, SSM stateless I/O) — **the big unlock**.
+
+Still on the table:
+1. **In-graph TopK head** — saves the 248K * 4 byte ANE→Swift transfer
+   per step. Conservative estimate: +1-3 tok/s.
+2. **IOSurface-backed inputs** — VL Phase 1 stretch; +1-3 tok/s.
+3. **Speculative decoding** — separate work, biggest potential.
+4. **Try 2B 2-chunk** — bigger per-chunk weights but half the dispatch
+   count; may move 2B above 35 on iPhone.
+
+## Swift loader update needed
+
+The current Swift `Qwen35Generator.swift` chunked path expects
+state_X_a / new_state_X_a inputs/outputs across ALL state. For MLKV:
+- `kv_cache` per chunk now lives in `MLState`. Use `MLModel.makeState()`
+  per chunk, persist across calls. No state input/output for KV.
+- `conv_state_X` / `rec_state_X` for SSM layers stay as named
+  inputs/outputs (one pair per linear_attention layer in chunk).
+- Bundle name to detect: `qwen3_5_(0_8b|2b)_decode_chunks_mlkv`.
 
 ## Files touched
 
