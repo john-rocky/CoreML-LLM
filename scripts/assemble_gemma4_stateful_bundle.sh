@@ -98,6 +98,36 @@ for item in "${SIDE_ITEMS[@]}"; do
     fi
 done
 
+# 3. Stage 6: optional multimodal encoders (vision / video / audio).
+#    MM_SRC defaults to a snapshot of `mlboydaisuke/gemma-4-E2B-coreml`
+#    on disk (matches what `convert_gemma4_multimodal.py` produces). Set
+#    MM_SRC=skip to opt out (text-only bundle, e.g. for Stage 3 bench).
+MM_SRC="${MM_SRC:-/tmp/gemma4_mm_encoders}"
+MM_ITEMS=(
+    "vision.mlmodelc"
+    "vision_video.mlmodelc"
+    "audio.mlmodelc"
+    "mel_filterbank.bin"
+    "audio_config.json"
+    "output_proj_weight.npy"
+    "output_proj_bias.npy"
+    "embed_proj_weight.npy"
+)
+if [[ "$MM_SRC" == "skip" ]]; then
+    echo "[skip] multimodal encoders (MM_SRC=skip)"
+elif [[ -d "$MM_SRC" ]]; then
+    for item in "${MM_ITEMS[@]}"; do
+        if [[ -e "$MM_SRC/$item" ]]; then
+            echo "[mm-copy] $item"
+            cp -R "$MM_SRC/$item" "$OUT/"
+        else
+            echo "  [warn] mm source missing $item"
+        fi
+    done
+else
+    echo "  [warn] MM_SRC=$MM_SRC not present — bundle stays text-only"
+fi
+
 echo ""
 echo "=== assembled ==="
 du -sh "$OUT_PARENT"

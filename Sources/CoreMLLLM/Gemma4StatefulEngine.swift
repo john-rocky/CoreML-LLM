@@ -247,12 +247,23 @@ public final class Gemma4StatefulEngine {
             }
             throw CoreMLLLMError.modelNotFound("\(name).mlmodelc/.mlpackage not found in \(modelDirectory.path)")
         }
-        // 1-chunk mode probe: model.{mlmodelc,mlpackage} present?
+        // 1-chunk mode probe: model.{mlmodelc,mlpackage} present AND no
+        // chunked bundle alongside? Stage 6: prefer the chunked bundle
+        // when both are present — sideload upgrades from a prior
+        // 1-chunk push leave model.mlmodelc behind in the same dir, and
+        // the production ship variant is the 3-chunk merged bundle.
+        // Without this guard, devicectl push of a chunked bundle on
+        // top of a stale 1-chunk install silently shadow-loads the
+        // wrong graph.
         let model1ChunkMlc = modelDirectory.appendingPathComponent("model.mlmodelc")
         let model1ChunkPkg = modelDirectory.appendingPathComponent("model.mlpackage")
         let has1ChunkModel = FileManager.default.fileExists(atPath: model1ChunkMlc.path)
             || FileManager.default.fileExists(atPath: model1ChunkPkg.path)
-        if has1ChunkModel {
+        let chunk1Mlc = modelDirectory.appendingPathComponent("chunk_1.mlmodelc")
+        let chunk1Pkg = modelDirectory.appendingPathComponent("chunk_1.mlpackage")
+        let hasChunkedBundle = FileManager.default.fileExists(atPath: chunk1Mlc.path)
+            || FileManager.default.fileExists(atPath: chunk1Pkg.path)
+        if has1ChunkModel && !hasChunkedBundle {
             is1Chunk = true
             // Prefer .mlpackage over a possibly-stale .mlmodelc — the
             // 35-layer single graph hits Mac↔iPhone ANE incompatibility
