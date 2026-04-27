@@ -26,32 +26,27 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).parent))
 from ane_ops import (
     MODEL_DTYPE,
-    ANERMSNorm,
-    Conv2dLinear,
     ane_softmax,
+    ane_norm_from_hf,
+    conv_from_linear,
     repeat_kv_ane,
 )
 
 
-def _conv_from_linear(lin: nn.Linear) -> Conv2dLinear:
-    c = Conv2dLinear(lin.in_features, lin.out_features,
-                     bias=lin.bias is not None, dtype=MODEL_DTYPE)
-    c.conv.weight.data = lin.weight.data.detach().to(MODEL_DTYPE).unsqueeze(-1).unsqueeze(-1)
-    if lin.bias is not None:
-        c.conv.bias.data = lin.bias.data.detach().to(MODEL_DTYPE)
-    return c
+# Local convenience aliases — Qwen3.5's RMSNorm uses the (1+w) gain
+# convention, so plus_one_gain=True. Per-head norms (q_norm, k_norm)
+# normalize over head_dim instead of hidden_size; the only difference
+# is the `hidden` argument value passed in.
+def _conv_from_linear(lin: nn.Linear):
+    return conv_from_linear(lin, dtype=MODEL_DTYPE)
 
 
-def _norm_from_hf(weight: torch.Tensor, eps: float, hidden: int) -> ANERMSNorm:
-    n = ANERMSNorm(hidden, eps=eps)
-    n.weight.data = (1.0 + weight.detach().float()).to(MODEL_DTYPE).clone()
-    return n
+def _norm_from_hf(weight: torch.Tensor, eps: float, hidden: int):
+    return ane_norm_from_hf(weight, eps, hidden, plus_one_gain=True)
 
 
-def _norm_from_hf_head(weight: torch.Tensor, eps: float, head_dim: int) -> ANERMSNorm:
-    n = ANERMSNorm(head_dim, eps=eps)
-    n.weight.data = (1.0 + weight.detach().float()).to(MODEL_DTYPE).clone()
-    return n
+def _norm_from_hf_head(weight: torch.Tensor, eps: float, head_dim: int):
+    return ane_norm_from_hf(weight, eps, head_dim, plus_one_gain=True)
 
 
 # ---- SSM step (stateless I/O) ---------------------------------------------
