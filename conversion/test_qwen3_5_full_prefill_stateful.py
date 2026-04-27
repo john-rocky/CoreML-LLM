@@ -6,7 +6,7 @@ states, letting Swift chain prefill -> decode without zero-init warmup.
 State outputs per linear_attention layer (18 layers):
   conv_state (1, 6144, K=4)        last K positions of pre-silu conv input
   rec_state  (1, 16, Dk=128, Dv=128)  final last_state from chunked rule
-State outputs per full_attention layer (6 layers), padded to max_seq=128:
+State outputs per full_attention layer (6 layers), padded to max_seq=2048:
   k_cache (1, num_kv=2, max_seq, head_dim=256)
   v_cache (1, num_kv=2, max_seq, head_dim=256)
 
@@ -38,7 +38,7 @@ from test_qwen3_5_prefill_trace import CHUNK_SIZE
 
 MODEL_ID = "Qwen/Qwen3.5-0.8B"
 ORACLE = Path(__file__).parent / "qwen3_5_reference_logits.pt"
-MAX_SEQ = 128
+MAX_SEQ = 2048
 
 
 class StatefulRMSNorm(nn.Module):

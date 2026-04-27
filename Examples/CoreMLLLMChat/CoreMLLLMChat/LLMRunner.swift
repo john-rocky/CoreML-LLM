@@ -113,30 +113,23 @@ final class LLMRunner {
         modelFolderURL = folder
         loadingStatus = "Loading..."
 
-        // Qwen3.5 detection: the downloaded folder contains the decode
-        // mlpackage directly — no `model_config.json` / `hf_model/` layout
-        // that Gemma uses. Accept any of the shipping variants, including
-        // the 4-chunk + embed.bin 2B layout under `qwen3_5_2b_decode_chunks/`.
-        // Chunked detection honors BOTH `.mlpackage` (from the HF download
-        // path) and `.mlmodelc` (from `devicectl copy to` sideload) so we
-        // can iterate on device without re-uploading to HF between runs.
-        let chunksDir = folder.appendingPathComponent("qwen3_5_2b_decode_chunks")
+        // Qwen3.5 detection: the downloaded folder contains a 4-chunk +
+        // embed.bin layout under `qwen3_5_(0_8b|2b)_decode_chunks/`. Both
+        // model sizes share the same Generator code path; loader detects
+        // hidden size from chunk_a's `hidden_in` shape. Chunked detection
+        // honors BOTH `.mlpackage` (HF download) and `.mlmodelc` (devicectl
+        // sideload). mseq128 monolithic artifacts were retired with the
+        // 2K + ANE-recipe ship.
         let fm = FileManager.default
-        func chunkPresent(_ base: String) -> Bool {
-            fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlpackage").path)
-                || fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlmodelc").path)
-        }
-        let embedPresent = fm.fileExists(atPath:
-            chunksDir.appendingPathComponent("embed_weight.bin").path)
-        if embedPresent && ["chunk_a", "chunk_b", "chunk_c", "chunk_d"].allSatisfy(chunkPresent) {
-            try await loadQwen35(folder: folder)
-            return
-        }
-        for mlpkgName in ["qwen3_5_0_8b_decode_int8_mseq128.mlpackage",
-                          "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage",
-                          "qwen3_5_2b_decode_int8_mseq128.mlpackage"] {
-            let path = folder.appendingPathComponent(mlpkgName)
-            if FileManager.default.fileExists(atPath: path.path) {
+        for subdir in ["qwen3_5_0_8b_decode_chunks", "qwen3_5_2b_decode_chunks"] {
+            let chunksDir = folder.appendingPathComponent(subdir)
+            func chunkPresent(_ base: String) -> Bool {
+                fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlpackage").path)
+                    || fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlmodelc").path)
+            }
+            let embedPresent = fm.fileExists(atPath:
+                chunksDir.appendingPathComponent("embed_weight.bin").path)
+            if embedPresent && ["chunk_a", "chunk_b", "chunk_c", "chunk_d"].allSatisfy(chunkPresent) {
                 try await loadQwen35(folder: folder)
                 return
             }
@@ -399,17 +392,20 @@ final class LLMRunner {
         // (devicectl sideload) for the chunked layout. Check chunk_a as
         // a representative marker — full presence is validated in the
         // router block above.
-        let chunksDir = folder.appendingPathComponent("qwen3_5_2b_decode_chunks")
-        let chunkAPkg = chunksDir.appendingPathComponent("chunk_a.mlpackage")
-        let chunkAMlc = chunksDir.appendingPathComponent("chunk_a.mlmodelc")
-        let mono2B = folder.appendingPathComponent("qwen3_5_2b_decode_int8_mseq128.mlpackage")
-        if FileManager.default.fileExists(atPath: chunkAPkg.path)
-            || FileManager.default.fileExists(atPath: chunkAMlc.path) {
-            modelName = "Qwen3.5 2B (mmap embed + 4-chunk)"
-        } else if FileManager.default.fileExists(atPath: mono2B.path) {
-            modelName = "Qwen3.5 2B"
+        // Detect 0.8B vs 2B from which chunked subdir is present.
+        // mseq128 monolithic builds were retired with the 2K + ANE recipe ship.
+        let fm = FileManager.default
+        func chunkAExistsIn(_ subdir: String) -> Bool {
+            let dir = folder.appendingPathComponent(subdir)
+            return fm.fileExists(atPath: dir.appendingPathComponent("chunk_a.mlpackage").path)
+                || fm.fileExists(atPath: dir.appendingPathComponent("chunk_a.mlmodelc").path)
+        }
+        if chunkAExistsIn("qwen3_5_0_8b_decode_chunks") {
+            modelName = "Qwen3.5 0.8B (mmap embed + 4-chunk ANE)"
+        } else if chunkAExistsIn("qwen3_5_2b_decode_chunks") {
+            modelName = "Qwen3.5 2B (mmap embed + 4-chunk ANE)"
         } else {
-            modelName = "Qwen3.5 0.8B"
+            modelName = "Qwen3.5"
         }
         hasVision = false
         hasAudio = false

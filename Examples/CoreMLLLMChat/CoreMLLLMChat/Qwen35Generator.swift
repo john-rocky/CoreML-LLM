@@ -404,6 +404,10 @@ final class Qwen35Generator {
     /// that the embed lookup writes into. Fed to the first body chunk
     /// as `hidden_in` via `Qwen35EmbedHiddenProvider`.
     @ObservationIgnored private var reusableHidden: MLMultiArray!
+    /// Detected from chunk_a's `hidden_in` input shape on chunked load.
+    /// 0.8B: 1024, 2B: 2048. Drives `embedLookup` row size and the
+    /// re-allocation of `reusableHidden` after a load.
+    @ObservationIgnored private var hiddenSize: Int = 2048
     @ObservationIgnored private var fvHidden: MLFeatureValue!
     /// Provider wrapping `fvHidden` — satisfies
     /// `Qwen35ChunkBFeatures.aOut.featureValue(for: "hidden")` so the
@@ -411,23 +415,31 @@ final class Qwen35Generator {
     /// as middle/tail chunks.
     @ObservationIgnored private var embedHiddenProvider: Qwen35EmbedHiddenProvider!
 
-    /// Locate the chunked 2B decode bundle. Returns (chunk URLs in
+    /// Candidate subdirectory names for chunked decode bundles. Tried in
+    /// order; first hit wins. Both 0.8B and 2B ship 4-chunk + embed
+    /// sidecar from `conversion/build_qwen35_decode_chunks_ane.py`; only
+    /// the per-chunk weight size and `hidden_in` shape differ.
+    @ObservationIgnored private let chunkBundleCandidates: [String] = [
+        "qwen3_5_0_8b_decode_chunks",  // 0.8B v1.x ANE recipe ship
+        "qwen3_5_2b_decode_chunks",    // 2B v1.1.0+ANE recipe ship
+    ]
+
+    /// Locate a chunked decode bundle. Returns (chunk URLs in
     /// `chunkNames` order, embed_weight.bin URL) ready for loading.
     /// Layout on disk (under the first folder that contains it):
-    ///   qwen3_5_2b_decode_chunks/chunk_a.mlpackage
-    ///   qwen3_5_2b_decode_chunks/chunk_b.mlpackage
-    ///   qwen3_5_2b_decode_chunks/chunk_c.mlpackage
-    ///   qwen3_5_2b_decode_chunks/chunk_d.mlpackage
-    ///   qwen3_5_2b_decode_chunks/embed_weight.bin
+    ///   <subdir>/chunk_a.mlpackage
+    ///   <subdir>/chunk_b.mlpackage
+    ///   <subdir>/chunk_c.mlpackage
+    ///   <subdir>/chunk_d.mlpackage
+    ///   <subdir>/embed_weight.bin
     /// Both `.mlpackage` and `.mlmodelc` are accepted per chunk. ALL
     /// chunks PLUS the embed bin must be present for this to return
     /// non-nil.
     private func resolveChunkedDecodeURLs() -> (chunks: [URL], embed: URL)? {
-        let subdir = "qwen3_5_2b_decode_chunks"
         let embedBinName = "embed_weight.bin"
         let fm = FileManager.default
 
-        func resolve(_ base: URL) -> (chunks: [URL], embed: URL)? {
+        func resolveOne(base: URL, subdir: String) -> (chunks: [URL], embed: URL)? {
             let dir = base.appendingPathComponent(subdir)
             let embedURL = dir.appendingPathComponent(embedBinName)
             guard fm.fileExists(atPath: embedURL.path) else { return nil }
@@ -450,10 +462,17 @@ final class Qwen35Generator {
             return (urls, embedURL)
         }
 
-        if let folder = modelFolderOverride, let r = resolve(folder) { return r }
+        func resolveAt(_ base: URL) -> (chunks: [URL], embed: URL)? {
+            for subdir in chunkBundleCandidates {
+                if let r = resolveOne(base: base, subdir: subdir) { return r }
+            }
+            return nil
+        }
+
+        if let folder = modelFolderOverride, let r = resolveAt(folder) { return r }
         if let docs = try? fm.url(for: .documentDirectory, in: .userDomainMask,
                                   appropriateFor: nil, create: false),
-           let r = resolve(docs) { return r }
+           let r = resolveAt(docs) { return r }
         return nil
     }
 
@@ -516,7 +535,6 @@ final class Qwen35Generator {
         guard let ptr = embedMmapPtr else {
             return  // no embed loaded; callers must validate before stepPredict
         }
-        let hiddenSize = 2048
         let src = ptr + Int(token) * hiddenSize
         let dst = reusableHidden.dataPointer.assumingMemoryBound(to: UInt16.self)
         memcpy(dst, src, hiddenSize * 2)
@@ -835,28 +853,38 @@ final class Qwen35Generator {
             decodeIsChunked = true
             decodeHasInGraphArgmax = false
             loadedURLs = resolved.chunks
-            variant = "2B-chunked-int8"
-        } else if let url = try? resolveModelURL("qwen3_5_2b_decode_int8_mseq128") {
-            decode = try MLModel(contentsOf: url, configuration: dCfg)
-            decodeHasInGraphArgmax = false
-            loadedURLs = [url]
-            variant = "2B-int8-monolithic"
-        } else if let url = try? resolveModelURL("qwen3_5_0_8b_decode_argmax_fp16_mseq128") {
-            decode = try MLModel(contentsOf: url, configuration: dCfg)
-            decodeHasInGraphArgmax = true
-            loadedURLs = [url]
-            variant = "0.8B-argmax-fp16"
-        } else if let url = try? resolveModelURL("qwen3_5_0_8b_decode_int8_mseq128") {
-            decode = try MLModel(contentsOf: url, configuration: dCfg)
-            decodeHasInGraphArgmax = false
-            loadedURLs = [url]
-            variant = "0.8B-int8"
+            // Detect hidden size from chunk_a's `hidden_in` input shape.
+            // 0.8B = 1024, 2B = 2048. Re-alloc reusableHidden to match —
+            // initial alloc in init() defaulted to 2048 (2B), which is
+            // wrong if the loaded bundle is 0.8B.
+            if let chunkA = decodeChunks.first,
+               let hi = chunkA.modelDescription.inputDescriptionsByName["hidden_in"],
+               let shape = hi.multiArrayConstraint?.shape,
+               let last = shape.last?.intValue, last > 0 {
+                hiddenSize = last
+                if reusableHidden == nil
+                    || reusableHidden.shape.last?.intValue != hiddenSize {
+                    reusableHidden = try MLMultiArray(
+                        shape: [1, 1, NSNumber(value: hiddenSize)],
+                        dataType: .float16)
+                    fvHidden = MLFeatureValue(multiArray: reusableHidden)
+                    embedHiddenProvider = Qwen35EmbedHiddenProvider(fvHidden: fvHidden)
+                }
+            }
+            // Detect 0.8B vs 2B from the resolved subdir name (parent of embed bin).
+            let parent = resolved.embed.deletingLastPathComponent().lastPathComponent
+            let model = parent.contains("0_8b") ? "0.8B" : "2B"
+            variant = "\(model)-chunked-ane-int8"
         } else {
-            let dURL = try resolveModelURL("qwen3_5_0_8b_decode_fp16_mseq128")
-            decode = try MLModel(contentsOf: dURL, configuration: dCfg)
-            decodeHasInGraphArgmax = false
-            loadedURLs = [dURL]
-            variant = "0.8B-fp16"
+            // mseq128 monolithic artifacts (0.8B argmax/int8/fp16, 2B int8)
+            // were retired with the 2K + ANE-recipe ship. Chunked path is the
+            // only supported layout — fail loudly so the operator notices a
+            // missing/old bundle instead of silently falling to a stale model.
+            throw NSError(domain: "Qwen35Generator", code: 11,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "no chunked decode bundle found in modelFolderOverride or " +
+                    "Documents/. Expected \(chunkBundleCandidates.joined(separator: " or ")) " +
+                    "with chunk_a..chunk_d + embed_weight.bin."])
         }
         // Different shipping artifacts were converted with different MAX_SEQ:
         // 0.8B int8/fp16 = 128, 2B chunked = 2048. The state shape

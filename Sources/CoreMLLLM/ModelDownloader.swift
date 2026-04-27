@@ -354,47 +354,31 @@ public final class ModelDownloader: NSObject {
         // Qwen3.5 has its own mlpackage names (no `model.mlpackage`).
         // Check shipping variants in order. Any one of these marks the
         // folder as a Qwen3.5 model folder.
-        //   1. 2B chunked (chunk_a + chunk_b must both exist)
-        //   2. 0.8B INT8 (default shipping)
-        //   3. 0.8B fp16 (ground-truth)
-        //   4. 2B monolithic INT8 (Mac fallback; fails ANE budget on iPhone)
-        let chunksDir = dir.appendingPathComponent("qwen3_5_2b_decode_chunks")
-        func chunkExists(_ base: String) -> Bool {
-            // HF-downloaded layout: chunk_X.mlpackage/Data/.../weight.bin
-            let pkgWeights = chunksDir
-                .appendingPathComponent("\(base).mlpackage")
-                .appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")
-            if fileManager.fileExists(atPath: pkgWeights.path) { return true }
-            // Sideload layout: chunk_X.mlmodelc/weights/weight.bin
-            let mlcWeights = chunksDir
-                .appendingPathComponent("\(base).mlmodelc")
-                .appendingPathComponent("weights/weight.bin")
-            return fileManager.fileExists(atPath: mlcWeights.path)
-        }
-        // 4-chunk + embed-bin layout: all must be present to count as
-        // downloaded. Missing any piece → fall through to monolithic /
-        // 0.8B layouts below. Embed is a raw .bin, not an mlpackage.
-        let embedBinURL = chunksDir.appendingPathComponent("embed_weight.bin")
-        let embedPresent = fileManager.fileExists(atPath: embedBinURL.path)
+        //   1. 0.8B chunked  (qwen3_5_0_8b_decode_chunks/ — v1.x ANE recipe)
+        //   2. 2B  chunked   (qwen3_5_2b_decode_chunks/  — v1.1.0+ANE recipe)
+        // mseq128 monolithic artifacts (0.8B argmax/int8/fp16, 2B int8) were
+        // retired with the 2K + ANE-recipe ship. They are no longer detected.
         let requiredChunks = ["chunk_a", "chunk_b", "chunk_c", "chunk_d"]
-        if embedPresent && requiredChunks.allSatisfy(chunkExists) {
-            // Return chunksDir itself (a directory under the model folder)
-            // so callers that do `url.deletingLastPathComponent()` land on
-            // the model folder root — same convention 0.8B follows when
-            // its mlpackage is returned directly. Qwen35Generator resolves
-            // the actual chunk_*.{mlpackage,mlmodelc} + embed_weight.bin
-            // from the folder.
-            return chunksDir
-        }
-        for name in ["qwen3_5_0_8b_decode_int8_mseq128.mlpackage",
-                     "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage",
-                     "qwen3_5_2b_decode_int8_mseq128.mlpackage"] {
-            let pkg = dir.appendingPathComponent(name)
-            if fileManager.fileExists(atPath: pkg.appendingPathComponent(
-                "Data/com.apple.CoreML/weights/weight.bin").path) {
-                return pkg
+
+        func chunkBundlePresent(_ subdir: String) -> URL? {
+            let chunksDir = dir.appendingPathComponent(subdir)
+            let embedBinURL = chunksDir.appendingPathComponent("embed_weight.bin")
+            guard fileManager.fileExists(atPath: embedBinURL.path) else { return nil }
+            let allChunksPresent = requiredChunks.allSatisfy { base in
+                let pkgWeights = chunksDir
+                    .appendingPathComponent("\(base).mlpackage")
+                    .appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")
+                if fileManager.fileExists(atPath: pkgWeights.path) { return true }
+                let mlcWeights = chunksDir
+                    .appendingPathComponent("\(base).mlmodelc")
+                    .appendingPathComponent("weights/weight.bin")
+                return fileManager.fileExists(atPath: mlcWeights.path)
             }
+            return allChunksPresent ? chunksDir : nil
         }
+
+        if let r = chunkBundlePresent("qwen3_5_0_8b_decode_chunks") { return r }
+        if let r = chunkBundlePresent("qwen3_5_2b_decode_chunks")  { return r }
 
         // Qwen3-VL 2B stateful (Phase 1): chunk_0..N + chunk_head +
         // embed_weight.bin under qwen3_vl_2b_stateful_chunks/. N ≥ 2
@@ -1113,29 +1097,50 @@ public final class ModelDownloader: NSObject {
     /// Tokenizer is fetched by swift-transformers at runtime from
     /// `Qwen/Qwen3.5-0.8B` on HF.
     ///
-    /// mlpackage structure:
-    ///   qwen3_5_0_8b_decode_int8_mseq128.mlpackage/
-    ///   ├── Manifest.json
-    ///   └── Data/com.apple.CoreML/
-    ///       ├── model.mlmodel
-    ///       └── weights/weight.bin  (753 MB)
+    /// Qwen3.5-0.8B CoreML layout (v1.x ANE recipe). Same 4-chunk +
+    /// embed-bin shape as 2B, scaled down: hidden=1024, vocab=248K. Drives
+    /// the iPhone shipping path; the mseq128 monolithic INT4/INT8/fp16
+    /// builds were retired.
     ///
-    /// Local layout after download (under `Models/qwen3.5-0.8b/`):
-    ///   qwen3_5_0_8b_decode_int8_mseq128.mlpackage/...  (same structure)
+    /// Layout under `qwen3_5_0_8b_decode_chunks/`:
+    ///   chunk_a..c:       6 layers each (pure transformer body)
+    ///   chunk_d:          6 layers + final_norm + lm_head
+    ///   embed_weight.bin: raw fp16 embed_tokens, Swift mmaps directly
+    /// (Same Generator.swift code path as 2B; the loader detects hidden
+    /// size from chunk_a's `hidden_in` input spec.)
     private func buildQwen35FileList() {
-        let pkg = "qwen3_5_0_8b_decode_int8_mseq128.mlpackage"
-        pendingFiles = [
-            .init(remotePath: "\(pkg)/Manifest.json",
-                  localPath: "\(pkg)/Manifest.json",
-                  estimatedSize: 700),
-            .init(remotePath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
-                  localPath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
-                  estimatedSize: 645_000),
-            .init(remotePath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
-                  localPath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
-                  estimatedSize: 753_000_000),
+        let root = "qwen3_5_0_8b_decode_chunks"
+        // Per-chunk weight.bin sizes — INT8 palettized 0.8B is roughly
+        // 1/4 of 2B because hidden=1024 (vs 2048). chunk_d carries the
+        // 500 MB lm_head (248K × 1024 × 2 bytes).
+        let sizes: [(String, Int64)] = [
+            ("chunk_a.mlpackage", 90_000_000),   // 6 layers, ~88 MB INT8
+            ("chunk_b.mlpackage", 90_000_000),
+            ("chunk_c.mlpackage", 90_000_000),
+            ("chunk_d.mlpackage", 590_000_000),  // 6 layers + lm_head
         ]
-        // Sort biggest-first so large weight download starts immediately.
+        var files: [DownloadFile] = []
+        for (chunk, weightSize) in sizes {
+            let pkg = "\(root)/\(chunk)"
+            files.append(.init(
+                remotePath: "\(pkg)/Manifest.json",
+                localPath: "\(pkg)/Manifest.json",
+                estimatedSize: 700))
+            files.append(.init(
+                remotePath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
+                localPath: "\(pkg)/Data/com.apple.CoreML/model.mlmodel",
+                estimatedSize: 900_000))
+            files.append(.init(
+                remotePath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
+                localPath: "\(pkg)/Data/com.apple.CoreML/weights/weight.bin",
+                estimatedSize: weightSize))
+        }
+        // Raw fp16 embed sidecar: 248320 × 1024 × 2 bytes ≈ 508 MB.
+        files.append(.init(
+            remotePath: "\(root)/embed_weight.bin",
+            localPath: "\(root)/embed_weight.bin",
+            estimatedSize: 508_000_000))
+        pendingFiles = files
         pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
         completedBytes = 0
