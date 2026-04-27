@@ -144,7 +144,12 @@ private final class Qwen35ChunkBFeatures: NSObject, MLFeatureProvider {
 final class Qwen35Generator {
     struct Config {
         let seqLen: Int           // prefill fixed seq length (64)
-        let maxSeq: Int           // decode + prefill max length (128)
+        // Default reflects the 2B chunked artifact (mseq=2048). Older
+        // 0.8B int8/fp16 packages were converted at MAX_SEQ=128;
+        // `reconcileMaxSeqWithLoadedModel()` overrides this from the
+        // loaded model's `state_*_b` shape so each variant works without
+        // re-uploading the mlpackage.
+        let maxSeq: Int
         let vocab: Int            // 248320
         let numLayers: Int        // 24
         let rotaryDim: Int        // head_dim * 0.25 = 64
@@ -853,6 +858,14 @@ final class Qwen35Generator {
             loadedURLs = [dURL]
             variant = "0.8B-fp16"
         }
+        // Different shipping artifacts were converted with different MAX_SEQ:
+        // 0.8B int8/fp16 = 128, 2B chunked = 2048. The state shape
+        // `[1, 2, mseq, 256]` is baked into the mlpackage at conversion
+        // time. Read it back from the loaded model and reset cfg.maxSeq +
+        // RoPE tables to match — otherwise predict() rejects the state
+        // input with "shape (1 x 2 x 2048 x 256) does not match the shape
+        // (1 x 2 x 128 x 256) specified in the model description".
+        reconcileMaxSeqWithLoadedModel()
         status = "Loaded decode (\(variant)) on \(unitsName(cfg.decodeUnits))"
         // Diagnostic: print ANE op-placement percentage per model so we can
         // verify the chosen compute units are actually being honored. Prior
@@ -861,6 +874,30 @@ final class Qwen35Generator {
         for (idx, url) in loadedURLs.enumerated() {
             let label = loadedURLs.count > 1 ? "\(variant)#\(idx)" : variant
             auditComputePlan(url: url, requestedUnits: cfg.decodeUnits, variant: label)
+        }
+    }
+
+    private func reconcileMaxSeqWithLoadedModel() {
+        let candidates: [MLModel] = decode.map { [$0] } ?? decodeChunks
+        for model in candidates {
+            for (_, desc) in model.modelDescription.inputDescriptionsByName {
+                guard desc.type == .multiArray,
+                      let constraint = desc.multiArrayConstraint else { continue }
+                let shape = constraint.shape
+                guard shape.count == 4,
+                      shape[0].intValue == 1,
+                      shape[1].intValue == 2,
+                      shape[3].intValue == 256 else { continue }
+                let modelMseq = shape[2].intValue
+                guard modelMseq > 0, modelMseq != cfg.maxSeq else { return }
+                print("[Qwen35] mseq mismatch — model=\(modelMseq), cfg=\(cfg.maxSeq); adopting model's value")
+                cfg = Config(seqLen: cfg.seqLen, maxSeq: modelMseq, vocab: cfg.vocab,
+                             numLayers: cfg.numLayers, rotaryDim: cfg.rotaryDim,
+                             prefillUnits: cfg.prefillUnits, decodeUnits: cfg.decodeUnits)
+                self.cosTable = buildRope(isCos: true)
+                self.sinTable = buildRope(isCos: false)
+                return
+            }
         }
     }
 
