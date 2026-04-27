@@ -165,19 +165,62 @@ xcrun devicectl device process launch ...  # use existing dev workflow
 #   - Measure decode tok/s, prefill TTFT, phys_footprint
 ```
 
-## Realistic targets at 2K context, iPhone 17 Pro
+## Mac M4 measurement (2026-04-28, this session)
 
-Baselines pre-PR:
-- 0.8B INT4 mseq128 ANE: 22 tok/s decode (v1.0.3, can't run 2K)
-- 2B  INT8 chunked v1.1.0: 17 tok/s decode @ 2K, 200 MB phys
+Greedy decode, 3 prompts × 40 new tokens. End-to-end via
+`conversion/qwen35_chunks_ane_parity.py` — embed mmap + 4-chunk Python
+chained predict() loop, mirrors the Swift stepPredict path.
 
-Post-PR estimates (rough, before iPhone confirmation):
-- 0.8B chunked + ANE recipe @ 2K: 30-45 tok/s decode, ≤350 MB phys
-- 2B  chunked + ANE recipe @ 2K: 25-35 tok/s decode, ~250 MB phys
+| Model | Compute | Prefill (tok/s) | Decode (tok/s) | ANE placement |
+|-------|---------|----------------|----------------|---------------|
+| 0.8B  | ANE     | 29.4 / 32.9 / 33.0 | **33.1**       | fp16 100% / INT8 91% |
+| 0.8B  | GPU     | 26.2 / 27.7 (warmup 4.5) | 27-28      | n/a |
+| 2B    | ANE     | 22.1 / 24.6 / 24.5 | **24.6**       | fp16 100% / INT8 91% |
 
-The Gemma 4 `_ane` precedent (11→31 = 2.8× on VL 4B) suggests upper-bound
-1.8-2.5× on Qwen3.5; the lower bound assumes only Conv2d helps (no other
-ANE wins). Confirm on iPhone 17 Pro.
+ANE placement per chunk (INT8 palettized, post-compile audit):
+- chunk_a: 524/576 ANE (91.0%)  — body layers 0-5
+- chunk_b: 529/579 ANE (91.4%)  — body layers 6-11
+- chunk_c: 524/576 ANE (91.0%)  — body layers 12-17
+- chunk_d: 537/589 ANE (91.2%)  — layers 18-23 + final_norm + lm_head
+
+The non-ANE 8-9% are the const palettize ops + the fp32 logits cast at
+chunk_d's tail. All compute ops land on ANE.
+
+Quality (greedy, no sampling):
+- English fact prompt: "Paris" / "Berlin" / "Rome" — correct.
+- Japanese recipe (餃子): coherent recipe text, both 0.8B (Japanese)
+  and 2B (English `<think>` block then Japanese).
+- Japanese short greeting (こんにちは): repetition loop (known v1.0.3
+  greedy issue, sampling required for coherent output).
+
+Bundle sizes:
+- 0.8B: 4× INT8 chunks (126 + 123 + 126 + 377 MB) + 509 MB embed
+  = 1.26 GB total.
+- 2B: 4× INT8 chunks (347 + 340 + 347 + 849 MB) + 1017 MB embed
+  = 2.90 GB total.
+
+## iPhone projection
+
+Mac M4 / iPhone A18 ANE ratio in past data: ~1.45-1.5× (M4 faster).
+Naively scaled iPhone estimates:
+- 0.8B: 33.1 / 1.5 ≈ 22 tok/s — **flat vs v1.0.3 baseline**.
+- 2B:   24.6 / 1.45 ≈ 17 tok/s — flat vs v1.1.0 baseline.
+
+The Mac numbers do not yet prove the recipe wins on iPhone. A18 may
+amortize chunk-dispatch overhead differently (each token = 4 dispatches
+vs v1.0.3's 1 dispatch on monolithic), so the recipe-vs-overhead
+tradeoff has to be confirmed on device.
+
+Win conditions to validate on iPhone 17 Pro:
+- 0.8B: ≥ 27 tok/s (1.2× over v1.0.3) — must clear chunk dispatch tax.
+- 2B:   ≥ 22 tok/s (1.3× over v1.1.0) — Conv2d recipe gain.
+Stretch:
+- 0.8B: ≥ 35 tok/s (1.6×) — recipe + amortized dispatch.
+- 2B:   ≥ 30 tok/s (1.75×).
+
+If iPhone numbers come in flat/regressing, the next move is in-graph
+TopK + IOSurface (separately worth ~1-3 tok/s each per VL Phase 1
+stretch memo).
 
 ## Files touched
 
