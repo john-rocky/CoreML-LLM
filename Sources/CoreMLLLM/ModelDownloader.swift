@@ -196,6 +196,28 @@ public final class ModelDownloader: NSObject {
             downloadURL: "",
             folderName: "gemma4-e2b-stateful")
 
+        /// Gemma 4 E2B (3-chunk decode) — Stage 7 ship default.
+        ///
+        /// Same multimodal bundle as legacy `gemma4e2b` but the decode path
+        /// is the 3-chunk variant: `chunk1` (L0-7, identical binary) +
+        /// `chunk2_3way` (L8-24 merged, 17 layers, owns + KV-shared) +
+        /// `chunk3_3way` (L25-34 + lm_head). Saves one ANE dispatch per
+        /// decode step (~+10% tok/s vs legacy 4-chunk on iPhone). Prefill
+        /// stays on the legacy 4-chunk graphs (T=1024 with vision-aware
+        /// bidirectional mask) so multimodal works unchanged.
+        ///
+        /// Bundle sharing: `folderName` matches legacy `gemma4e2b` so users
+        /// switching between the two reuse on-disk chunk1 / prefill /
+        /// sidecars / encoders. Only chunk2_3way + chunk3_3way are
+        /// 3way-specific. The 4-chunk decode files (chunk2/3/4) are NOT
+        /// downloaded by this entry — pick legacy `gemma4e2b` if the
+        /// 4-chunk fallback is needed.
+        public static let gemma4e2b3way = ModelInfo(
+            id: "gemma4-e2b-3way",
+            name: "Gemma 4 E2B", size: "5.0 GB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
+            folderName: "gemma4-e2b")
+
         /// Gemma 4 E2B stateful (3-chunk merged + Linear) — Stage 3 ship.
         /// MLState + slice_update KV, 3-chunk layout (chunk_1 L0-7 +
         /// chunk_2 merged L8-24 + chunk_3 L25-34+lm_head). Linear
@@ -221,15 +243,22 @@ public final class ModelDownloader: NSObject {
             let experimental =
                 ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
                 || UserDefaults.standard.bool(forKey: "showExperimentalModels")
-            // gemma4e2b (multimodal 4-chunk legacy) is the default for
-            // image+audio+video. gemma4e2bStatefulLinear (Stage 3 ship,
-            // text-only) is listed second as the high-speed chat option:
-            // 3-chunk merged + MLState + cross-turn KV reuse + Mac
-            // multifunction prefill. Multimodal stateful is a follow-up
-            // stage — until it lands, vision/audio users stay on the
-            // legacy bundle.
+            // Stage 7 picker order:
+            //   1. gemma4e2b3way   — 3-chunk decode + 4-chunk prefill,
+            //                         multimodal default (image+audio+video,
+            //                         +10% decode tok/s vs legacy 4-chunk).
+            //   2. gemma4e2b       — legacy 4-chunk decode, kept for back-
+            //                         compat with users who downloaded the
+            //                         pre-Stage-7 bundle. Same multimodal
+            //                         capability, slightly slower decode.
+            //   3. gemma4e2bStatefulLinear — text-only research entry
+            //                         (MLState + multifunction prefill_b8).
+            //                         Multimodal not supported; the prefill
+            //                         graph can't span the full image span
+            //                         in one batch (see
+            //                         docs/SESSION_2026_04_27_STAGE6_MULTIMODAL.md).
             var list: [ModelInfo] = [
-                gemma4e2b, gemma4e2bStatefulLinear,
+                gemma4e2b3way, gemma4e2b, gemma4e2bStatefulLinear,
                 gemma4e4b, gemma4e2bFashion,
                 qwen25_05b, qwen35_08b, qwen35_2b,
                 qwen3vl_2b, qwen3vl_2b_stateful,
@@ -929,16 +958,23 @@ public final class ModelDownloader: NSObject {
         var largeFiles: [DownloadFile] = []
         var smallFiles: [DownloadFile] = []
 
-        let chunkFiles = mlc("swa", "chunk1", "chunk1", weightSize: 155_436_864)
-             + mlc("swa", "chunk2", "chunk2", weightSize: 133_963_968)
-             + mlc("swa", "chunk3", "chunk3", weightSize: 325_282_880)
-             + mlc("swa", "chunk4", "chunk4", weightSize: 526_874_880)
-             // NOTE: legacy 3-chunk recurrent extras (chunk2_3way +
-             // chunk3_3way, ~987 MB) used to be downloaded by default but
-             // were never used by typical installs (LLM_3CHUNK=1 opt-in
-             // only). The new MLState 3-chunk merged path replaces this
-             // experiment entirely — see docs/SESSION_2026_04_26_STAGE3_PREFILL_BN.md
-             // for the wins. Removed from default to save users 987 MB.
+        // Stage 7: 3-chunk decode is the new default. The 3way ModelInfo
+        // entry skips chunk2/3/4 (replaced by chunk2_3way + chunk3_3way)
+        // for a -45 MB bundle delta. The legacy gemma4e2b entry still
+        // pulls chunk2/3/4 for backward-compat with apps that haven't
+        // upgraded to the 3-chunk loader path.
+        let is3Way = (model.id == "gemma4-e2b-3way")
+        var chunkFiles = mlc("swa", "chunk1", "chunk1", weightSize: 155_436_864)
+        if is3Way {
+            chunkFiles += mlc("swa", "chunk2_3way", "chunk2_3way",
+                              weightSize: 459_900_000)  // ~438.6 MB observed
+            chunkFiles += mlc("swa", "chunk3_3way", "chunk3_3way",
+                              weightSize: 527_000_000)  // ~502.8 MB observed
+        } else {
+            chunkFiles += mlc("swa", "chunk2", "chunk2", weightSize: 133_963_968)
+            chunkFiles += mlc("swa", "chunk3", "chunk3", weightSize: 325_282_880)
+            chunkFiles += mlc("swa", "chunk4", "chunk4", weightSize: 526_874_880)
+        }
         let prefillFiles = prefillMeta("chunk1", "prefill_chunk1")
              + prefillMeta("chunk2", "prefill_chunk2")
              + prefillMeta("chunk3", "prefill_chunk3")

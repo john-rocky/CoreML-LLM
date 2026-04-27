@@ -25,3 +25,4 @@ Format: one line per active claim.
 
 (empty — no active claims)
 stage3-prefill-bn | 8A5C2B35 | 2026-04-25T19:27:16Z | multifunction prefill_bN — ready for merge (Mac + iPhone tested; 3-chunk merged dual-state Linear is the ship variant)
+gemma4-3chunk-multimodal-default | 439ABBDE | 2026-04-27T03:53:47Z | non-MLState 3-chunk decode default + 4-chunk prefill (multimodal)
