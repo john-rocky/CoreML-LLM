@@ -182,7 +182,9 @@ Greedy decode, 3 prompts × 40 new tokens. Two builds tested:
 | 0.8B | MLState   | ANE | — | — | — | error 11 ANEProgramProcessRequestDirect (multi-StateType incompat suspected; 4D conv_state didn't help) |
 | 0.8B | MLState   | CPU | — | 57-59 | ✗ broken | CoreML CPU runtime miscompiles slice_update on multi-state model |
 | 0.8B | stateless | 2-chunk ANE | — | 33.1 | ✓ | dispatch overhead is negligible — chunk consolidation no-op |
-| 2B    | stateless | ANE | 22.1 / 24.6 / 24.5 | 24.6 | ✓ | fp16 100% / INT8 91% ANE |
+| 2B    | stateless | ANE | 22.1 / 24.6 / 24.5 | **24.6** | ✓ | fp16 100% / INT8 91% ANE |
+| 2B    | MLState   | GPU | 11.2 / 21.2 / 21.3 | 21.5 | ✓ | LOSES vs stateless ANE on 2B |
+| 2B    | MLState   | ANE | — | — | — | error 11 (same as 0.8B) |
 
 ANE placement per chunk (INT8 palettized, post-compile audit):
 - chunk_a: 524/576 ANE (91.0%)  — body layers 0-5
@@ -206,35 +208,56 @@ Bundle sizes:
 - 2B: 4× INT8 chunks (347 + 340 + 347 + 849 MB) + 1017 MB embed
   = 2.90 GB total.
 
+## Best-of-Mac per model
+
+| Model | Best build | Compute | tok/s | Output |
+|-------|------------|---------|-------|--------|
+| 0.8B  | MLState    | GPU     | **40.1** | ✓ |
+| 2B    | stateless  | ANE     | **24.6** | ✓ |
+
+The two models prefer different paths on Mac M4:
+- **0.8B is GPU-friendly** because it's small enough that GPU
+  parallelism beats ANE's per-chunk dispatch overhead. Adding MLState
+  removes the per-step state I/O bottleneck → +21% over stateless ANE.
+- **2B is ANE-friendly** because the bigger compute (hidden=2048)
+  amortizes ANE dispatch and the stateless I/O isn't the bottleneck.
+  MLState GPU on 2B is actually 12% SLOWER than stateless ANE.
+
+ANE remains blocked for MLState on both sizes — iOS 18 multi-StateType
++ slice_update fails at predict time with `ANEProgramProcessRequestDirect
+Error=(11)`. 4D conv_state didn't help. Likely root cause is having 3
+separate ct.StateType per chunk; VL Phase 1 ships with only 1
+(unified kv_cache). Possible fixes (not attempted in this session):
+1. Pack all SSM + KV state into one big buffer with offset arithmetic.
+2. Convert SSM state to ALL fp16 (drop the float casts) so ANE can run.
+3. Drop SSM state from MLState entirely — keep KV in MLState, SSM
+   stateless via input/output.
+
 ## iPhone projection
 
-The MLState path moves the headline number from 33.1 (stateless ANE) to
-**40.1 tok/s (MLState GPU)** on Mac M4. ANE remains blocked behind a
-multi-StateType iOS 18 issue (3 separate state types — kv_cache,
-conv_state, rec_state — interact with the slice_update lowering in a
-way that CPU/ANE runtime can't execute; GPU runtime is fine).
+Mac M4 / iPhone A18 GPU ratio is more stable than ANE (~1.3-1.4×).
+Naively scaled iPhone 17 Pro estimates:
+- 0.8B MLState GPU @ 2K: ~28-32 tok/s vs v1.0.3 GPU 27.7 @ 128 → flat-to-modest.
+- 0.8B stateless ANE @ 2K: ~22 tok/s flat vs v1.0.3 ANE 22.
+- 2B  stateless ANE @ 2K: ~17 tok/s flat vs v1.1.0 ANE 17.
 
-Mac M4 / iPhone GPU ratio is more stable than ANE (~1.3-1.4× per the
-Gemma 4 vision A19 retest memo). Naively scaled iPhone projections:
-- **0.8B MLState GPU @ 2K: ~30-35 tok/s on iPhone 17 Pro**, vs
-  v1.0.3 monolithic GPU 27.7 tok/s @ 128 — beats current ship.
-- 0.8B stateless ANE @ 2K: ~22 tok/s flat vs v1.0.3 ANE.
-- 2B  MLState GPU @ 2K: pending bench.
-- 2B  stateless ANE @ 2K: ~17 tok/s flat vs v1.1.0.
+**Honest read**: this PR didn't deliver "world-fastest" on Mac. The
+recipe-level wins (Conv2dLinear, ANERMSNorm, ane_softmax) are baked
+in but the dispatch and state-I/O costs eat much of the gain. The big
+follow-up moves (each potentially 1.5-2.5×) are:
+1. **Pack all states into 1 ct.StateType** — likely unblocks ANE
+   MLState (the big one).
+2. **In-graph TopK head** — saves 248K * 4 byte transfer per step.
+3. **IOSurface inputs** — VL Phase 1 stretch; small but real.
+4. **Speculative decoding** — separate work, biggest potential.
+
+Each of these needs deeper investigation than today's session allowed.
 
 Win conditions to validate on iPhone 17 Pro:
-- 0.8B MLState GPU: ≥ 30 tok/s (1.4× over v1.0.3 ANE 22) — should be
-  the easiest win; just deploy and measure.
-- 2B  MLState GPU: ≥ 22 tok/s (1.3× over v1.1.0 ANE 17).
-
-If MLState ANE on iPhone also fails with error 11, GPU is the ship
-default. If it works (iPhone A18 ANE may handle multi-state where M4
-ANE doesn't), even better — projected iPhone MLState ANE ≈ 27 tok/s
-via the same Mac/iPhone ratio applied to the 40 tok/s GPU number.
-
-The Mac numbers do not yet prove the recipe wins on iPhone for ANE,
-but **MLState GPU is a real speedup** that ports cleanly via the Swift
-loader update.
+- 0.8B MLState GPU: ≥ 30 tok/s (1.4× over v1.0.3 ANE).
+- 2B  stateless ANE: ≥ 18 tok/s (sanity vs v1.1.0).
+- 0.8B MLState ANE: if it works on iPhone A18 (Mac M4 ANE doesn't),
+  projection is ~30+ tok/s — would be the headline number.
 
 ## Files touched
 
