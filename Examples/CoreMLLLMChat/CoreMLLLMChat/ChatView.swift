@@ -782,11 +782,18 @@ struct MessageBubble: View {
                     }
                     .frame(maxWidth: 280)
                 }
-                Text(message.content)
-                    .padding(.horizontal, 14).padding(.vertical, 10)
-                    .background(backgroundColor)
-                    .foregroundStyle(message.role == .user ? .white : .primary)
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                Group {
+                    if message.role == .assistant {
+                        MarkdownText(text: message.content)
+                    } else {
+                        Text(message.content)
+                    }
+                }
+                .padding(.horizontal, 14).padding(.vertical, 10)
+                .background(backgroundColor)
+                .foregroundStyle(message.role == .user ? .white : .primary)
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+                .textSelection(.enabled)
             }
             if message.role != .user { Spacer(minLength: 60) }
         }
@@ -807,3 +814,246 @@ struct MessageBubble: View {
 }
 
 #Preview { ChatView() }
+
+// MARK: - Markdown rendering
+//
+// Lightweight block-level markdown renderer for assistant bubbles. Avoids a
+// third-party dependency: blocks are parsed by hand, inline formatting
+// (bold/italic/inline-code/links) is delegated to AttributedString's
+// built-in markdown parser. Streaming text is re-parsed per token; that's
+// O(n) per token, which is fine for chat-sized responses.
+
+private enum MDBlock: Hashable {
+    case heading(Int, String)
+    case paragraph(String)
+    case codeBlock(String, String?)
+    case bulletList([String])
+    case numberedList([String])
+    case blockquote(String)
+    case rule
+}
+
+private func parseMarkdownBlocks(_ text: String) -> [MDBlock] {
+    let lines = text.components(separatedBy: "\n")
+    var blocks: [MDBlock] = []
+    var paragraph: [String] = []
+    var i = 0
+
+    func flushParagraph() {
+        if !paragraph.isEmpty {
+            blocks.append(.paragraph(paragraph.joined(separator: "\n")))
+            paragraph.removeAll()
+        }
+    }
+
+    while i < lines.count {
+        let raw = lines[i]
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+
+        if trimmed.isEmpty {
+            flushParagraph()
+            i += 1
+            continue
+        }
+
+        // Fenced code block
+        if trimmed.hasPrefix("```") {
+            flushParagraph()
+            let lang = String(trimmed.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+            i += 1
+            var code: [String] = []
+            while i < lines.count {
+                let l = lines[i]
+                if l.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                    i += 1
+                    break
+                }
+                code.append(l)
+                i += 1
+            }
+            blocks.append(.codeBlock(code.joined(separator: "\n"),
+                                     lang.isEmpty ? nil : lang))
+            continue
+        }
+
+        // ATX heading
+        if trimmed.first == "#" {
+            var hashCount = 0
+            for ch in trimmed {
+                if ch == "#" { hashCount += 1 } else { break }
+            }
+            if hashCount >= 1 && hashCount <= 6 {
+                let after = trimmed.dropFirst(hashCount)
+                if after.first == " " || after.isEmpty {
+                    flushParagraph()
+                    blocks.append(.heading(
+                        hashCount,
+                        String(after).trimmingCharacters(in: .whitespaces)))
+                    i += 1
+                    continue
+                }
+            }
+        }
+
+        // Horizontal rule
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            flushParagraph()
+            blocks.append(.rule)
+            i += 1
+            continue
+        }
+
+        // Blockquote
+        if trimmed.hasPrefix(">") {
+            flushParagraph()
+            var quote: [String] = []
+            while i < lines.count {
+                let l = lines[i].trimmingCharacters(in: .whitespaces)
+                if l.hasPrefix(">") {
+                    let body = l.dropFirst()
+                    quote.append(String(body).trimmingCharacters(in: .whitespaces))
+                    i += 1
+                } else { break }
+            }
+            blocks.append(.blockquote(quote.joined(separator: "\n")))
+            continue
+        }
+
+        // Bullet list
+        if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("+ ") {
+            flushParagraph()
+            var items: [String] = []
+            while i < lines.count {
+                let l = lines[i].trimmingCharacters(in: .whitespaces)
+                if l.hasPrefix("- ") || l.hasPrefix("* ") || l.hasPrefix("+ ") {
+                    items.append(String(l.dropFirst(2)))
+                    i += 1
+                } else { break }
+            }
+            blocks.append(.bulletList(items))
+            continue
+        }
+
+        // Numbered list — "1. " or "1) "
+        if trimmed.range(of: #"^\d+[\.\)]\s+"#, options: .regularExpression) != nil {
+            flushParagraph()
+            var items: [String] = []
+            while i < lines.count {
+                let l = lines[i].trimmingCharacters(in: .whitespaces)
+                if let rr = l.range(of: #"^\d+[\.\)]\s+"#, options: .regularExpression) {
+                    items.append(String(l[rr.upperBound...]))
+                    i += 1
+                } else { break }
+            }
+            blocks.append(.numberedList(items))
+            continue
+        }
+
+        paragraph.append(raw)
+        i += 1
+    }
+
+    flushParagraph()
+    return blocks
+}
+
+private func inlineMarkdown(_ s: String) -> AttributedString {
+    var opts = AttributedString.MarkdownParsingOptions()
+    opts.interpretedSyntax = .inlineOnlyPreservingWhitespace
+    return (try? AttributedString(markdown: s, options: opts)) ?? AttributedString(s)
+}
+
+private struct MarkdownText: View {
+    let text: String
+
+    var body: some View {
+        let blocks = parseMarkdownBlocks(text)
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                blockView(block)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: MDBlock) -> some View {
+        switch block {
+        case .heading(let level, let content):
+            Text(inlineMarkdown(content))
+                .font(headingFont(level))
+                .fontWeight(level <= 2 ? .bold : .semibold)
+        case .paragraph(let content):
+            Text(inlineMarkdown(content))
+                .fixedSize(horizontal: false, vertical: true)
+        case .codeBlock(let code, let lang):
+            CodeBlock(code: code, language: lang)
+        case .bulletList(let items):
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text("•").bold()
+                        Text(inlineMarkdown(item))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        case .numberedList(let items):
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(Array(items.enumerated()), id: \.offset) { idx, item in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text("\(idx + 1).")
+                            .monospacedDigit()
+                        Text(inlineMarkdown(item))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        case .blockquote(let content):
+            HStack(alignment: .top, spacing: 8) {
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(Color.secondary.opacity(0.5))
+                    .frame(width: 3)
+                Text(inlineMarkdown(content))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        case .rule:
+            Divider()
+        }
+    }
+
+    private func headingFont(_ level: Int) -> Font {
+        switch level {
+        case 1: return .title2
+        case 2: return .title3
+        case 3: return .headline
+        default: return .subheadline
+        }
+    }
+}
+
+private struct CodeBlock: View {
+    let code: String
+    let language: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let language, !language.isEmpty {
+                Text(language)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10).padding(.top, 6)
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(code)
+                    .font(.callout.monospaced())
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 10).padding(.vertical, 8)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.black.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
