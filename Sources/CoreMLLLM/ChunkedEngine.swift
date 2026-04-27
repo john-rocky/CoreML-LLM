@@ -428,33 +428,33 @@ final class ChunkedEngine {
         //   Isolates whether ANE prefers 15-layer first chunk over the shipped
         //   17-layer middle chunk — dispatch count is identical so any delta is
         //   per-chunk ANE efficiency at different layer counts.
-        let threeChunkEnv = ProcessInfo.processInfo.environment["LLM_3CHUNK"] == "1"
-        let topoEnv = ProcessInfo.processInfo.environment["LLM_3CHUNK_TOPO"] ?? "II"
-        let topoIRequested = threeChunkEnv && topoEnv.uppercased() == "I"
+        // Stage 7: Topology II is now default-on when chunk2_3way + chunk3_3way
+        // are present. Old `LLM_3CHUNK=1` env gate dropped — bundle composition
+        // alone decides. Topology I (15-layer first chunk variant) stays
+        // opt-in via LLM_3CHUNK_TOPO=I for benchmarking.
+        let topoEnv = ProcessInfo.processInfo.environment["LLM_3CHUNK_TOPO"]?.uppercased()
         let topoIFilesPresent =
             findModel("chunk1_topoI") != nil
             && findModel("chunk2_topoI") != nil
             && findModel("chunk3_topoI") != nil
-        let topoIIRequested = threeChunkEnv && topoEnv.uppercased() != "I"
         let topoIIFilesPresent =
             findModel("chunk2_3way") != nil
             && findModel("chunk3_3way") != nil
+        let topoIRequested = topoEnv == "I"
 
         let is3ChunkTopoI = topoIRequested && topoIFilesPresent
-        let is3Chunk = is3ChunkTopoI || (topoIIRequested && topoIIFilesPresent)
+        let is3Chunk = is3ChunkTopoI || topoIIFilesPresent
 
         if topoIRequested && !topoIFilesPresent {
             print("[Load] LLM_3CHUNK_TOPO=I requested but chunk{1,2,3}_topoI not found — " +
                   "falling back to Topology II / 4-chunk")
         }
-        if topoIIRequested && !topoIIFilesPresent && !topoIRequested {
-            print("[Load] LLM_3CHUNK=1 set but chunk2_3way/chunk3_3way not found — " +
-                  "falling back to 4-chunk decode")
-        }
         if is3ChunkTopoI {
             print("[Load] Topology I — 3-chunk (chunk1_topoI[L0-14] + chunk2_topoI[L15-24] + chunk3_topoI[L25-34+head])")
         } else if is3Chunk {
-            print("[Load] Topology II — 3-chunk (chunk1 + chunk2_3way[L8-24 merged] + chunk3_3way[L25-34+head])")
+            print("[Load] Topology II — 3-chunk default (chunk1 + chunk2_3way[L8-24 merged] + chunk3_3way[L25-34+head])")
+        } else {
+            print("[Load] 4-chunk decode (legacy bundle, no chunk2_3way/chunk3_3way present)")
         }
 
         var c1: MLModel!, c2: MLModel!, c3: MLModel?, c4: MLModel!

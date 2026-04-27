@@ -10,7 +10,7 @@ Where [MLX Swift](https://github.com/ml-explore/mlx-swift) is the right call whe
 
 | Model | Size | Task | iPhone 17 Pro decode | HuggingFace |
 |---|---:|---|---:|---|
-| **Gemma 4 E2B** | 3.1 GB | Text + image + video + audio | **34.2 tok/s** (3-chunk) / 31.6 (4-chunk) | [mlboydaisuke/gemma-4-E2B-coreml](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
+| **Gemma 4 E2B** | 5.4 GB (4.4 GB text-only) | Text + image + video + audio | **34.2 tok/s** (3-chunk default, v1.7+) | [mlboydaisuke/gemma-4-E2B-coreml](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
 | **Gemma 4 E4B** | 5.5 GB | Text | ~14 tok/s | [mlboydaisuke/gemma-4-E4B-coreml](https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml) |
 | **Qwen3.5 2B** | 2.4 GB | Text | ~17 tok/s (~200 MB RSS) | [mlboydaisuke/qwen3.5-2B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML) |
 | **Qwen3.5 0.8B** | 1.4 GB | Text | ~20 tok/s | [mlboydaisuke/qwen3.5-0.8B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML) |
@@ -164,7 +164,7 @@ Standalone sample at `Examples/Gemma3Demo/` imports `CoreMLLLM` and exercises bo
     └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
 ```
 
-As of v1.4.0, the default shipping Gemma 4 E2B decode collapses `ch2+ch3` into a single 17-layer chunk when `LLM_3CHUNK=1` is set — 3 ANE dispatches per token instead of 4, +8.2 % on iPhone A19 Pro. See [docs/THREE_CHUNK_MAC_BENCH.md](docs/THREE_CHUNK_MAC_BENCH.md).
+As of v1.7.0 the Gemma 4 E2B picker default is the **3-chunk decode** variant (`gemma4e2b3way`) — `chunk1` + `chunk2_3way` (L8-24 merged) + `chunk3_3way` (L25-34 + lm_head). 3 ANE dispatches per decode step instead of 4, **+8.2 %** on iPhone A19 Pro. The 4-chunk legacy entry stays in the picker as `Gemma 4 E2B (4-chunk legacy)` for back-compat with users who already downloaded the older bundle. Prefill graphs stay 4-chunk (T=1024) so multimodal vision-aware bidirectional mask is preserved unchanged. The picker also has a **Download Options** toggle: turning off "Include multimodal" drops the vision/video/audio encoders + sidecars (~1 GB) for a text-only install. See [docs/THREE_CHUNK_MAC_BENCH.md](docs/THREE_CHUNK_MAC_BENCH.md).
 
 ### ANE optimizations
 
@@ -206,7 +206,7 @@ python convert.py --model qwen2.5-0.5b --output ./output/qwen2.5-0.5b
 python build_gemma4_bundle.py --model gemma4-e2b --ctx 2048
 python build_gemma4_bundle.py --model gemma4-e4b --ctx 2048
 
-# Gemma 4 E2B 3-chunk decode (optional, +8.2 % tok/s on iPhone A19 Pro)
+# Gemma 4 E2B 3-chunk decode (default since v1.7, +8.2 % tok/s on iPhone A19 Pro)
 python build_gemma4_3way.py --model gemma4-e2b --ctx 2048
 python install_3way_bundle.py
 
@@ -237,8 +237,9 @@ Step-by-step: [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md). Full reference (qu
 
 ## What's new
 
-Current release: **v1.6.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases)).
+Current release: **v1.7.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases)).
 
+- **v1.7.0** — Gemma 4 E2B 3-chunk decode is the picker default + multimodal opt-out toggle. The new `gemma4e2b3way` ModelInfo ships `chunk2_3way` (L8-24 merged) + `chunk3_3way` (L25-34 + lm_head) and re-uses legacy `chunk1` + 4-chunk prefill graphs (vision-aware bidirectional mask preserved). Decode `c1+c2+c4` (chunk3 nil) — 3 ANE dispatches/step, **34.2 tok/s** on iPhone 17 Pro A19 Pro. The 4-chunk legacy entry stays as `Gemma 4 E2B (4-chunk legacy)`. ModelPickerView's "Download Options → Include multimodal" toggle drops vision/video/audio encoders + sidecars when off (~1 GB savings, text-only install). finishDownload now hardlinks shared decode↔prefill weights instead of copying (`chunk1↔prefill_chunk1` and `chunk3_3way↔prefill_chunk4`, **−682 MB on disk**).
 - **v1.6.0** — Qwen3-VL 2B stateful Phase 2: cross-turn KV reuse + ANE prewarm. Same-prompt 2nd TTFT **4 s → 125 ms** (~32×), vision-chat 2nd-turn TTFT 125 ms (target was <500 ms). LCP-matched MLState resume + image-pinned-to-first-user-turn prompt builder + per-chunk dummy predict at load (231 ms total).
 - **v1.5.0** — Qwen3-VL 2B stateful Phase 1: MLState + slice_update KV cache + multifunction prefill_b8. **24 tok/s decode at 256 MB phys_footprint** on iPhone 17 Pro (vs 7.5 tok/s / 1.7 GB on the v1.3 recurrent build — 3.2× decode, 6.4× memory drop). 4-chunk INT8 + fp16 embed sidecar.
 - **v1.4.0** — Gemma 4 E2B 3-chunk decode (opt-in, `LLM_3CHUNK=1`): 31.6 → **34.2 tok/s** on iPhone 17 Pro A19 Pro (+8.2 %). Bit-equivalent to 4-chunk by construction. Closes the ANE-ceiling sweep for E2B; five additional lossless probes (SDPA fusion, K=V alias, Topology I boundary search, blockwise palettization, native softmax) all landed as negative results — see [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md).

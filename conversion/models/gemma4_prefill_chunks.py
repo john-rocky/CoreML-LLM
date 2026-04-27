@@ -432,6 +432,89 @@ class PrefillChunk3(nn.Module):
         return hidden_states
 
 
+class MergedPrefillChunk23(nn.Module):
+    """Merged middle prefill chunk: L8-24 (= PrefillChunk2 + PrefillChunk3).
+
+    Combines own-KV layers (L8-14) with KV-shared layers (L15-24) so the
+    sliding/full producer aliases (kv13/kv14) stay internal between L13/L14
+    production and L15-24 consumption — saves one ANE dispatch + the
+    associated I/O serialization that legacy 4-chunk prefill incurred.
+
+    Output contract is identical to PrefillChunk2's:
+      hidden + (K, V) per non-producer own-KV layer + kv13_*/kv14_*.
+    The shared L15-24 layers consume kv13/kv14 internally and emit nothing
+    extra. Downstream (PrefillChunk4) reads the same I/O shape it always did.
+
+    E2B: L8-24 (5 sliding own + 2 full own [L13/L14 producers] + 10 shared).
+    E4B: L12-32 (similar layout, kv producers at L22/L23).
+    """
+    START_C2, END_C2 = 8, 15
+    START_C3, END_C3 = 15, 25
+
+    def __init__(self, model: Gemma4Model):
+        super().__init__()
+        self.config = model.config
+        self.layers_c2 = nn.ModuleList(
+            [model.layers[i] for i in range(self.START_C2, self.END_C2)])
+        self.layers_c3 = nn.ModuleList(
+            [model.layers[i] for i in range(self.START_C3, self.END_C3)])
+        # KV layout is the L8-14 portion only — L15-24 are shared.
+        self.non_prod, self.sliding_prod, self.full_prod = chunk_kv_layout(
+            self.START_C2, self.END_C2, model.config)
+
+    def forward(self, hidden_states, causal_mask, per_layer_combined,
+                cos_s, sin_s, cos_f, sin_f):
+        config = self.config
+        kv13_k = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+        kv13_v = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+        kv14_k = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+        kv14_v = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+
+        non_prod_K: dict[int, torch.Tensor] = {}
+        non_prod_V: dict[int, torch.Tensor] = {}
+
+        # L8-14: own-KV portion. kv13/kv14 producers captured here.
+        for local_idx in range(self.END_C2 - self.START_C2):
+            layer_idx = self.START_C2 + local_idx
+            (hidden_states, K_new, V_new,
+             kv13_k, kv13_v, kv14_k, kv14_v) = _run_layer_prefill(
+                self.layers_c2[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f, causal_mask,
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+            )
+            if config.is_kv_shared(layer_idx):
+                continue
+            if layer_idx == config.kv_sliding_producer:
+                continue  # captured via kv13_* below
+            if layer_idx == config.kv_full_producer:
+                continue  # captured via kv14_* below
+            non_prod_K[layer_idx] = K_new
+            non_prod_V[layer_idx] = V_new
+
+        # L15-24: shared-KV portion. kv13/kv14 stay internal — only
+        # hidden_states is mutated.
+        for local_idx in range(self.END_C3 - self.START_C3):
+            layer_idx = self.START_C3 + local_idx
+            (hidden_states, _K, _V,
+             kv13_k, kv13_v, kv14_k, kv14_v) = _run_layer_prefill(
+                self.layers_c3[local_idx], layer_idx, hidden_states,
+                cos_s, sin_s, cos_f, sin_f, causal_mask,
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+            )
+
+        outputs: list[torch.Tensor] = [hidden_states]
+        for abs_idx in self.non_prod:
+            outputs.append(non_prod_K[abs_idx])
+            outputs.append(non_prod_V[abs_idx])
+        if self.sliding_prod is not None:
+            outputs.extend([kv13_k, kv13_v])
+        if self.full_prod is not None:
+            outputs.extend([kv14_k, kv14_v])
+        return tuple(outputs)
+
+
 class PrefillChunk4(nn.Module):
     """Final prefill chunk + norm + lm_head. Outputs LAST token's id.
 
