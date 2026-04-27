@@ -135,7 +135,15 @@ class MLKVBodyChunk(nn.Module):
 
 
 class MLKVTailChunk(MLKVBodyChunk):
-    """Body + final_norm + Conv2d lm_head + fp32 logits."""
+    """Body + final_norm + Conv2d lm_head + in-graph TopK.
+
+    Emits next_token (1, 1) int32 instead of fp32 logits (1, 1, 248320),
+    saving the per-step ANE→Swift transfer (248K * 4 byte ≈ 1 MB → 4 byte).
+
+    Per chunk4_argmax_topk_parity memory: derive next_token from
+    topk[k=1] (not torch.argmax) to dodge ANE-vs-CPU vocab-partition
+    divergence on palettized lm_heads.
+    """
     def __init__(self, cfg, hf_model, start: int, max_seq: int):
         super().__init__(cfg, hf_model, start, cfg.num_hidden_layers, max_seq)
         self.final_norm = _norm_from_hf(
@@ -155,8 +163,10 @@ class MLKVTailChunk(MLKVBodyChunk):
         h = out[0]
         ssm_outs = out[1:]
         h = self.final_norm(h)
-        logits = self.lm_head(h).float()
-        return (logits, *ssm_outs)
+        logits = self.lm_head(h)                    # (1, 1, V) fp16
+        _vals, idx = torch.topk(logits, k=1, dim=-1)
+        next_token = idx.squeeze(-1).to(torch.int32)  # (1, 1) int32
+        return (next_token, *ssm_outs)
 
 
 def _audit_ane(out_path: Path) -> float:
@@ -216,7 +226,7 @@ def convert_chunk(chunk, cfg, max_seq, out_path: Path, *, kind: str):
         ct.TensorType(name="current_pos", shape=(1,), dtype=np.int32),
     ]
     if kind == "tail":
-        ct_outputs = [ct.TensorType(name="logits", dtype=np.float32)]
+        ct_outputs = [ct.TensorType(name="next_token", dtype=np.int32)]
     else:
         ct_outputs = [ct.TensorType(name="hidden", dtype=np.float16)]
 

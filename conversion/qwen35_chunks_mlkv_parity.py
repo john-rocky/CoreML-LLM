@@ -62,6 +62,7 @@ def run_decode(
             ssm_state[f"rec_state_{i}"]  = states[2 * i + 1].numpy().astype(np.float16)
 
     def _step(tok_id: int, pos: int):
+        """Returns next_token (int) — chunk_d emits it via in-graph TopK."""
         hidden = embed_weight[tok_id:tok_id + 1, :].reshape(1, 1, -1).astype(np.float16)
         pos_ids = torch.tensor([[pos]], dtype=torch.long)
         dummy = torch.zeros(1, 1, cfg.hidden_size)
@@ -92,16 +93,15 @@ def run_decode(
                 ssm_state[f"rec_state_{i}"]  = out[f"new_rec_state_{i}"]
             if "hidden" in out:
                 hidden = out["hidden"].astype(np.float16)
-        return last_out["logits"][0, 0]
+        return int(last_out["next_token"][0, 0])
 
-    last_logits = None
     t_pre = time.time()
+    next_token = -1
     for t, tok_id in enumerate(input_ids_list):
-        last_logits = _step(tok_id, t)
+        next_token = _step(tok_id, t)
     pre_dt = time.time() - t_pre
 
     generated = []
-    next_token = int(np.argmax(last_logits))
     S_prompt = len(input_ids_list)
     t_dec = time.time()
     decode_steps = 0
@@ -113,8 +113,7 @@ def run_decode(
         decode_steps += 1
         if next_token in eos_tokens:
             break
-        logits = _step(next_token, pos)
-        next_token = int(np.argmax(logits))
+        next_token = _step(next_token, pos)
     dec_dt = time.time() - t_dec
     return generated, pre_dt, dec_dt, decode_steps
 
