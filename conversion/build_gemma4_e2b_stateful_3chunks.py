@@ -434,6 +434,11 @@ def main():
     ap.add_argument("--prefill-batches", default="",
                     help="Comma-separated batch sizes (e.g. '8' or '8,16').")
     ap.add_argument("--linear-projections", action="store_true")
+    ap.add_argument("--prune-n-m", default=None,
+                    help="N:M structured sparsity, e.g. '2:4'. Applied to "
+                         "weight tensors before palettize. Joint sparse + "
+                         "palettized produces "
+                         "constexpr_lut_to_sparse + constexpr_sparse_to_dense.")
     ap.add_argument("--single-buffer", action="store_true",
                     help="Probe variant: collapse kv_cache_sliding + "
                          "kv_cache_full into a single MLState (one buffer "
@@ -476,6 +481,16 @@ def main():
     do = (lambda n: args.only_chunk is None or args.only_chunk == n)
     use_linear = args.linear_projections
 
+    prune_n_m = None
+    if args.prune_n_m:
+        try:
+            n_str, m_str = args.prune_n_m.split(":")
+            prune_n_m = (int(n_str), int(m_str))
+            print(f"Prune: N:M sparsity = {prune_n_m[0]}:{prune_n_m[1]}")
+        except ValueError:
+            raise SystemExit(
+                f"--prune-n-m must be 'N:M' (got '{args.prune_n_m}')")
+
     prefill_Ts = [int(x) for x in args.prefill_batches.split(",") if x.strip()]
     if prefill_Ts:
         print(f"Multifunction prefill batches: {prefill_Ts}")
@@ -515,7 +530,8 @@ def main():
         else:
             _build_one(
                 lambda p: convert_chunk1(base, *chunk1_range, args.ctx, p,
-                                           args.nbits, use_linear=use_linear),
+                                           args.nbits, use_linear=use_linear,
+                                           prune_n_m=prune_n_m),
                 lambda T, p: convert_chunk1_prefill(
                     base, *chunk1_range, args.ctx, T, p, args.nbits,
                     use_linear=use_linear),

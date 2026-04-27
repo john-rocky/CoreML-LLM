@@ -54,6 +54,7 @@ from coremltools.optimize.coreml import (
     OpPalettizerConfig, OptimizationConfig, palettize_weights,
     linear_quantize_activations, linear_quantize_weights,
     OpLinearQuantizerConfig,
+    prune_weights, OpMagnitudePrunerConfig,
 )
 from coremltools.optimize.coreml.experimental import (
     OpActivationLinearQuantizerConfig,
@@ -344,6 +345,7 @@ def _trace_and_convert_stateful(
     activation_scope: str = "linear",
     activation_mode: str = "linear_symmetric",
     joint_int8_lut: bool = False,
+    prune_n_m: tuple[int, int] | None = None,
 ):
     """Trace + ct.convert with StateType, save, optionally palettize, audit."""
     t = time.time()
@@ -367,6 +369,20 @@ def _trace_and_convert_stateful(
         convert_kwargs["states"] = state_specs
     mlmodel = ct.convert(traced, **convert_kwargs)
     print(f"    converted in {time.time()-t:.1f}s")
+
+    # ROUND8 #3 lever: N:M structured pruning before palettize. coremltools
+    # composes these into `constexpr_lut_to_sparse + constexpr_sparse_to_dense`
+    # automatically when prune is followed by palettize. Probe gate:
+    # post-build ANE audit; non-ANE > 5% → fall back to W4 LUT only.
+    if prune_n_m is not None:
+        n, m = prune_n_m
+        t = time.time()
+        prune_cfg = OpMagnitudePrunerConfig(
+            n_m_ratio=(n, m), dim=1, weight_threshold=2048,
+        )
+        mlmodel = prune_weights(
+            mlmodel, OptimizationConfig(global_config=prune_cfg))
+        print(f"    pruned {n}:{m} sparse in {time.time()-t:.1f}s")
 
     if quantize_nbits > 0:
         t = time.time()
@@ -448,7 +464,8 @@ def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits, *,
                    calib_data_path=None, activation_scope="linear",
                    activation_mode="linear_symmetric",
                    awq_calib_data_path=None, awq_alpha=0.5,
-                   joint_int8_lut=False):
+                   joint_int8_lut=False,
+                   prune_n_m=None):
     print("\n" + "=" * 60)
     print(f"CHUNK 1 (L{c_start}-{c_end-1}) — own KV state, computes PLE")
     print("=" * 60)
@@ -516,7 +533,8 @@ def convert_chunk1(base, c_start, c_end, ctx, out_path, nbits, *,
         calib_data_path=calib_data_path,
         activation_scope=activation_scope,
         activation_mode=activation_mode,
-        joint_int8_lut=joint_int8_lut)
+        joint_int8_lut=joint_int8_lut,
+        prune_n_m=prune_n_m)
 
 
 def convert_chunk2(base, c_start, c_end, ctx, out_path, nbits, *,

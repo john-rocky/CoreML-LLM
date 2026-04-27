@@ -34,6 +34,7 @@ new upstream result or API change, (b) link the reproduction harness, and
 | EAGLE-3 HASS (live) | 2026-04 | Phase 3 bench 11–17 tok/s with fallback to T=1; live speedup ≈0.96–1.11× (net even after oracle-live accept-rate gap). Demoted below ship bar. | `EAGLE3_INTEGRATION_STATE.md`, `ROUND7_FINDINGS.md` §Math verification |
 | LayerSkip at L14 | 2026-04-08, 2026-04-16 | 0/60 match twice; L14 hidden useless without refinement | `HANDOFF.md:56` (`LAYERSKIP_PROBE=1`) |
 | Path A post-11c drafter | 2026-04 | 0% Mac CPU across 29 rounds | memory `project_drafter_structurally_dead.md` |
+| **HF Gemma 4 E2B base K-future signal** | **2026-04-27** | **H1 probe: linear K=2 = 11.7 %, K=3 = 6.9 %; MLP probe (non-linear capacity, ±2 pt). All drafter retrain variants (Section 9 init, larger drafter, ANE-collected labels) information-theoretically bounded. Base lacks MTP-aware imprint.** | `docs/SESSION_2026_04_27_H1_PROBE.md` |
 | verify_qK fp16 write-before-accept (item 11c) | 2026-04 | Structural blocker: verify writes drafter proposals into KV at P+1..P+K-1 *before* acceptance is decided, corrupting all spec-decode paths. Confirmed by MTP Path C, EAGLE-3 Blocker 1, PHASE_B. | `MTP_PATH_C_FINDINGS.md:149`, `SESSION_STATE.md:179` |
 | PLD-only standalone mode | — | Standalone PLD is not a speedup route; PLD *inside* the union orchestrator is still default-ON (the `pld-only` flag in `union-bitexact` exists as an isolation harness, not a product mode). | `Sources/union-bitexact/Verifier.swift`, `HANDOFF.md:34` |
 
@@ -108,6 +109,7 @@ targets / nonexistent "CoreML-friendly" claims). See memory
 | Cross-Layer Attention (CLA), Tensor Product Attention (TPA) | Both require fine-tuning ~1B+ tokens; bundle with W2-QAT campaign rather than separate workstreams | `ROUND8_FINDINGS.md` |
 | `reshapeFrequency = .infrequent` standalone hint | Tried, deleted. `LLM_PREFIX_CACHE=1` combo reproducibly triggers `MILCompilerForANE: failed to compile ANEF` on iPhone 17 Pro / iOS 26 | `Sources/CoreMLLLM/ChunkedEngine.swift:300-305` |
 | **Joint compression: INT8 LUT entries** (Apple `linear_quantize_weights(joint_compression=True)`) | **Mac probe 2026-04-26**: cml9 accepts the API, but 73 INT8-dequant ops fall off ANE (92.9 → 86.7 %), Mac latency +3.4 %, cos sim 0.83 vs gate ≥0.95, bundle size unchanged (W4 indices dominate). Failure matches predicted top failure mode in ROUND8_FINDINGS §1. The `--joint-int8-lut` converter flag is kept in tree (default OFF) for future cml/iOS retry. | `docs/SESSION_2026_04_26_ROUND8_INT8_LUT_PROBE.md` |
+| **Joint sparse + palettized** (N:M 2:4 prune + W4 LUT) | **Mac probe 2026-04-27**: cml9 `prune_weights(OpMagnitudePrunerConfig(n_m_ratio=(2,4)))` + `palettize_weights` ran clean. Bundle 155.8 → 349.6 MB (+124 % worse, sparse encoding non-efficient on cml9), step latency 5.12 → 5.69 ms (+11 %), ANE placement unchanged (92.9 % vs baseline same), cos sim hidden_states_out = 0.449 (quality destroyed by calibration-free magnitude prune). All four axes regressed. The `--prune-n-m` converter flag is kept in tree (default OFF) for cml10 retry. | `docs/SESSION_2026_04_27_ROUND8_JOINT_SPARSE_PROBE.md` |
 
 ---
 
