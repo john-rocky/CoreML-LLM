@@ -796,18 +796,39 @@ public final class ModelDownloader: NSObject {
         // ship prefill (e.g. gemma4-e4b) would otherwise get half-populated
         // prefill_chunk{i}.mlmodelc directories — just weights, no
         // coremldata.bin — which CoreML rejects at load time.
-        for i in 1...4 {
-            let src = dest.appendingPathComponent("chunk\(i).mlmodelc/weights/weight.bin")
-            let prefillDir = dest.appendingPathComponent("prefill_chunk\(i).mlmodelc")
-            let coreML = prefillDir.appendingPathComponent("coremldata.bin")
-            let dst = prefillDir.appendingPathComponent("weights/weight.bin")
+        //
+        // Stage 7: hardlink instead of copy. Decode and prefill weights are
+        // bit-identical (md5-verified) for chunk1↔prefill_chunk1 and
+        // chunk3_3way↔prefill_chunk4 — a hardlink shares the inode so the
+        // 155 + 527 = 682 MB doesn't get duplicated on disk.
+        func shareWeight(src: URL, dst: URL, coreML: URL) {
             guard fileManager.fileExists(atPath: coreML.path),
                   fileManager.fileExists(atPath: src.path),
-                  !fileManager.fileExists(atPath: dst.path) else { continue }
+                  !fileManager.fileExists(atPath: dst.path) else { return }
             try? fileManager.createDirectory(at: dst.deletingLastPathComponent(),
                                               withIntermediateDirectories: true)
-            try? fileManager.copyItem(at: src, to: dst)
+            // linkItem creates a hardlink; falls back to copy if the FS
+            // doesn't support links (uncommon on iOS APFS, but defensive).
+            do {
+                try fileManager.linkItem(at: src, to: dst)
+            } catch {
+                try? fileManager.copyItem(at: src, to: dst)
+            }
         }
+        for i in 1...4 {
+            shareWeight(
+                src: dest.appendingPathComponent("chunk\(i).mlmodelc/weights/weight.bin"),
+                dst: dest.appendingPathComponent("prefill_chunk\(i).mlmodelc/weights/weight.bin"),
+                coreML: dest.appendingPathComponent("prefill_chunk\(i).mlmodelc/coremldata.bin"))
+        }
+        // 3way variant: chunk3_3way (L25-34 + lm_head) shares weights with
+        // prefill_chunk4 (same SWAChunk4 graph, T=N prefill flavor). The
+        // 1...4 loop above missed it because the source filename is
+        // chunk3_3way, not chunk4.
+        shareWeight(
+            src: dest.appendingPathComponent("chunk3_3way.mlmodelc/weights/weight.bin"),
+            dst: dest.appendingPathComponent("prefill_chunk4.mlmodelc/weights/weight.bin"),
+            coreML: dest.appendingPathComponent("prefill_chunk4.mlmodelc/coremldata.bin"))
 
         // Clean up any stray prefill directories that lack the required
         // metadata. These happen when an older build of the app pulled prefill
@@ -977,16 +998,20 @@ public final class ModelDownloader: NSObject {
         }
         // Prefill chunk weights: legacy variant shares them from decode
         // chunks (`finishDownload` copies chunk{i}.weight → prefill_chunk{i}.weight).
-        // The 3way variant skips chunk{2,3,4} download, so the share has
-        // nothing to copy from for prefill_chunk{2,3,4}. Pull those weights
-        // directly from `prefill/chunk{i}.mlmodelc/weights/weight.bin` on
-        // HF (same content as decode chunks; the repo hosts both copies).
+        //
+        // 3way variant share map (md5-verified bit-identical):
+        //   - prefill_chunk1 weight = chunk1 weight       — hardlink
+        //   - prefill_chunk2 weight = unique (L8-14 own)  — direct download
+        //   - prefill_chunk3 weight = unique (L15-24)     — direct download
+        //   - prefill_chunk4 weight = chunk3_3way weight  — hardlink (Stage 7
+        //     extra: same SWAChunk4 weights as the decode head, saves 527 MB
+        //     on download AND on disk vs duplicate-copy storage).
         let prefillFiles: [DownloadFile]
         if is3Way {
             prefillFiles = prefillMeta("chunk1", "prefill_chunk1")
                 + mlc("prefill", "chunk2", "prefill_chunk2", weightSize: 133_963_968)
                 + mlc("prefill", "chunk3", "prefill_chunk3", weightSize: 325_282_880)
-                + mlc("prefill", "chunk4", "prefill_chunk4", weightSize: 526_874_880)
+                + prefillMeta("chunk4", "prefill_chunk4")
         } else {
             prefillFiles = prefillMeta("chunk1", "prefill_chunk1")
                 + prefillMeta("chunk2", "prefill_chunk2")
