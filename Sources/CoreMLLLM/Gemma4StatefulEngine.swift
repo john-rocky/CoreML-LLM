@@ -588,12 +588,20 @@ public final class Gemma4StatefulEngine {
     /// call (background prewarm usually has it loaded already).
     public func processImage(_ image: CGImage) throws -> MLMultiArray {
         if visionModel == nil, let url = visionModelURL, let cfg = visionConfig {
-            visionModel = try MLModel(contentsOf: url, configuration: cfg)
+            do {
+                visionModel = try MLModel(contentsOf: url, configuration: cfg)
+                print("[Gemma4Stateful/Vision] model loaded (\(url.lastPathComponent))")
+            } catch {
+                print("[Gemma4Stateful/Vision] load failed at \(url.path): \(error)")
+                throw error
+            }
         }
         guard let vm = visionModel else { throw CoreMLLLMError.visionNotAvailable }
-        return visionUsesANEBuild
+        let arr = visionUsesANEBuild
             ? try ImageProcessor.processANE(image, with: vm)
             : try ImageProcessor.process(image, with: vm)
+        print("[Gemma4Stateful/Vision] encoded shape=\(arr.shape.map { $0.intValue })")
+        return arr
     }
 
     /// Encode a single video frame at 64 tokens via vision_video.mlmodelc
@@ -601,7 +609,13 @@ public final class Gemma4StatefulEngine {
     /// expected to fall back to 2×2 pooling of `processImage`'s output.
     public func processVideoFrame(_ image: CGImage) throws -> MLMultiArray {
         if videoVisionModel == nil, let url = videoVisionModelURL, let cfg = videoVisionConfig {
-            videoVisionModel = try MLModel(contentsOf: url, configuration: cfg)
+            do {
+                videoVisionModel = try MLModel(contentsOf: url, configuration: cfg)
+                print("[Gemma4Stateful/VideoVision] model loaded (\(url.lastPathComponent))")
+            } catch {
+                print("[Gemma4Stateful/VideoVision] load failed at \(url.path): \(error)")
+                throw error
+            }
         }
         guard let vm = videoVisionModel else { throw CoreMLLLMError.visionNotAvailable }
         return try ImageProcessor.processVideoFrame(image, with: vm)
@@ -612,10 +626,19 @@ public final class Gemma4StatefulEngine {
     /// real audio length, matching HF Gemma4AudioFeatureExtractor.
     public func processAudio(_ samples: [Float]) throws -> (MLMultiArray, Int) {
         if audioModel == nil, let url = audioModelURL, let cfg = audioConfig {
-            audioModel = try MLModel(contentsOf: url, configuration: cfg)
+            do {
+                audioModel = try MLModel(contentsOf: url, configuration: cfg)
+                print("[Gemma4Stateful/Audio] model loaded (\(url.lastPathComponent))")
+            } catch {
+                print("[Gemma4Stateful/Audio] load failed at \(url.path): \(error)")
+                throw error
+            }
         }
         guard let am = audioModel else { throw CoreMLLLMError.audioNotAvailable }
-        guard let mel = melFilterbank else { throw CoreMLLLMError.audioNotAvailable }
+        guard let mel = melFilterbank else {
+            print("[Gemma4Stateful/Audio] melFilterbank=nil (mel_filterbank.bin missing)")
+            throw CoreMLLLMError.audioNotAvailable
+        }
 
         // pad-left + unfold → mel frames; 2× Conv2d stride 2 → tokens.
         let padLeft = 160
@@ -692,40 +715,19 @@ public final class Gemma4StatefulEngine {
         return nil
     }
 
-    /// Vision-aware T=1 full causal mask. Each pair (p, i) is unmasked
-    /// when either i ≤ p (causal) or both share a vision group.
-    private func fillFullCausalMaskVisionAware(position p: Int, groupIds: [Int]) {
-        let ctx = modelConfig!.contextLength
-        let neg = Float16(-65504).bitPattern
-        let mp = maskFull.dataPointer.bindMemory(to: UInt16.self, capacity: ctx)
-        let pGroup = (p < groupIds.count) ? groupIds[p] : -1
-        let pClamped = min(max(p, 0), ctx - 1)
-        for i in 0..<ctx {
-            let causal = i <= pClamped
-            let sameGroup = pGroup >= 0 && i < groupIds.count && groupIds[i] == pGroup
-            mp[i] = (causal || sameGroup) ? 0 : neg
-        }
+    /// Vision-aware T=1 full causal mask. With T=1 only the current
+    /// position has fresh K/V in state — future same-group positions
+    /// haven't been computed yet, so unmasking them would let stale
+    /// state slots leak into softmax. The vision-aware path therefore
+    /// reduces to strict causal at T=1 (kept as a separate function
+    /// for symmetry with the T=N path and so multifunction-disabled
+    /// fallback turns still take the same code path).
+    private func fillFullCausalMaskVisionAware(position p: Int, groupIds _: [Int]) {
+        fillFullCausalMask(position: p)
     }
 
-    /// Vision-aware T=1 sliding mask. For p < W slot i maps to absolute
-    /// position i; for p ≥ W the ring is fully populated and we keep
-    /// strict-all-valid (vision-group unmask is moot because groups
-    /// fit comfortably inside W=512 — image=256, video=64×frame).
-    private func fillSlidingCausalMaskVisionAware(position p: Int, groupIds: [Int]) {
-        let W = modelConfig!.slidingWindow
-        let neg = Float16(-65504).bitPattern
-        let mp = maskSliding.dataPointer.bindMemory(to: UInt16.self, capacity: W)
-        if p >= W {
-            for i in 0..<W { mp[i] = 0 }
-            return
-        }
-        let pGroup = (p < groupIds.count) ? groupIds[p] : -1
-        let valid = min(p + 1, W)
-        for i in 0..<W {
-            let causal = i < valid
-            let sameGroup = pGroup >= 0 && i < groupIds.count && groupIds[i] == pGroup
-            mp[i] = (causal || sameGroup) ? 0 : neg
-        }
+    private func fillSlidingCausalMaskVisionAware(position p: Int, groupIds _: [Int]) {
+        fillSlidingCausalMask(position: p)
     }
 
     /// Vision-aware T-row prefill masks. Same shape as fillBatchMasks
@@ -733,6 +735,15 @@ public final class Gemma4StatefulEngine {
     /// attend bidirectionally. Optimization E: keeps the multifunction
     /// prefill_b8 win on vision turns (else we'd fall back to T=1, ≈8×
     /// slower for the 256-token image span).
+    ///
+    /// IMPORTANT: bidirectional unmask is bounded to within-batch
+    /// positions [startPos, startPos+T-1]. K/V at positions beyond the
+    /// current batch is STALE (zeros after a state reset, or worse: an
+    /// older prompt's K/V) — unmasking them lets stale slots leak into
+    /// softmax with non-trivial weights and corrupts attention. The
+    /// legacy 4-chunk prefill (prefillN=1024) didn't hit this because
+    /// the whole image group fit in one batch; stateful T=8 splits
+    /// each image group across ~32 batches.
     private func fillBatchMasksVisionAware(startPos: Int, T: Int, groupIds: [Int]) {
         let ctx = modelConfig!.contextLength
         let W = modelConfig!.slidingWindow
@@ -741,6 +752,7 @@ public final class Gemma4StatefulEngine {
             to: UInt16.self, capacity: T * ctx)
         let ms = batchMaskSliding!.dataPointer.bindMemory(
             to: UInt16.self, capacity: T * W)
+        let batchEnd = startPos + T - 1
         for t in 0..<T {
             let p = startPos + t
             let pGroup = (p < groupIds.count) ? groupIds[p] : -1
@@ -748,18 +760,30 @@ public final class Gemma4StatefulEngine {
             // Full mask
             for i in 0..<ctx {
                 let causal = i <= pClamped
-                let sameGroup = pGroup >= 0 && i < groupIds.count && groupIds[i] == pGroup
+                let sameGroup = pGroup >= 0
+                    && i >= startPos && i <= batchEnd
+                    && i < groupIds.count
+                    && groupIds[i] == pGroup
                 mf[t * ctx + i] = (causal || sameGroup) ? 0 : neg
             }
-            // Sliding mask
+            // Sliding mask. For p < W slot i corresponds to position i;
+            // for p >= W ring rotation makes the mapping non-trivial,
+            // but the vision groups (≤256 tok) always fit inside W=512
+            // and the within-batch bidirectional bound applies the
+            // same way regardless.
             if p < W {
                 let valid = min(p + 1, W)
                 for i in 0..<W {
                     let causal = i < valid
-                    let sameGroup = pGroup >= 0 && i < groupIds.count && groupIds[i] == pGroup
+                    let sameGroup = pGroup >= 0
+                        && i >= startPos && i <= batchEnd
+                        && i < groupIds.count
+                        && groupIds[i] == pGroup
                     ms[t * W + i] = (causal || sameGroup) ? 0 : neg
                 }
             } else {
+                // All W slots already valid for strict-causal; same-
+                // group within-batch positions are subset.
                 for i in 0..<W { ms[t * W + i] = 0 }
             }
         }
@@ -1342,7 +1366,27 @@ public final class Gemma4StatefulEngine {
         mmAudioIdx = 0
         let hasMultimodal = imageFeatures != nil || audioFeatures != nil
         mmVisionGroupIds = hasMultimodal ? computeVisionGroupIds(inputIds: inputIds) : nil
+        if hasMultimodal {
+            let imgShape = imageFeatures?.shape.map { $0.intValue } ?? []
+            let audShape = audioFeatures?.shape.map { $0.intValue } ?? []
+            let imgPadCount = inputIds.lazy.filter {
+                $0 == Self.IMAGE_TOKEN_ID || $0 == Self.VIDEO_TOKEN_ID
+            }.count
+            let audPadCount = inputIds.lazy.filter { $0 == Self.AUDIO_TOKEN_ID }.count
+            let groupCount = (mmVisionGroupIds ?? []).reduce(into: -1) { acc, g in
+                if g > acc { acc = g }
+            } + 1
+            print("[Gemma4Stateful/MM] entry: " +
+                  "img feats=\(imgShape) numTok=\(imageNumTokens) padInPrompt=\(imgPadCount) | " +
+                  "aud feats=\(audShape) numTok=\(audioNumTokens) padInPrompt=\(audPadCount) | " +
+                  "vision groups=\(groupCount)")
+        }
         defer {
+            if hasMultimodal {
+                print("[Gemma4Stateful/MM] exit: " +
+                      "imageIdx=\(mmImageIdx)/\(mmImageNumTokens) " +
+                      "audioIdx=\(mmAudioIdx)/\(mmAudioNumTokens)")
+            }
             mmImageFeatures = nil
             mmAudioFeatures = nil
             mmImageNumTokens = 0

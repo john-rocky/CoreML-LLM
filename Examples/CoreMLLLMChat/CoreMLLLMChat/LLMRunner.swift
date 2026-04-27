@@ -324,6 +324,14 @@ final class LLMRunner {
     /// optional audio from the same clip if `includeAudio` is set.
     func generate(messages: [ChatMessage], videoURL: URL,
                   videoOptions: VideoProcessor.Options) async throws -> AsyncStream<String> {
+        // Stage 6: route video through Gemma 4 stateful when it's the
+        // active engine. Frames + optional audio are extracted in the
+        // runner and handed to the engine as pre-encoded features.
+        if gemma4StatefulEngine != nil {
+            return try await generateGemma4StatefulVideo(
+                messages: messages, videoURL: videoURL,
+                videoOptions: videoOptions)
+        }
         guard let llm else {
             throw NSError(domain: "LLMRunner", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "Model not loaded"])
@@ -414,6 +422,178 @@ final class LLMRunner {
             h = h &* 0x9E3779B1 &+ bits
         }
         return h
+    }
+
+    // MARK: - Gemma 4 stateful: video
+
+    /// Stage 6 video path for the stateful engine. Sample frames, encode
+    /// each via vision_video.mlmodelc (or fall back to processImage when
+    /// the video tower isn't shipped), concat into a single feature
+    /// buffer, optionally extract audio, then call the engine's generic
+    /// multimodal generate with VIDEO_TOKEN_ID placeholders.
+    private func generateGemma4StatefulVideo(
+        messages: [ChatMessage], videoURL: URL,
+        videoOptions: VideoProcessor.Options
+    ) async throws -> AsyncStream<String> {
+        guard let engine = gemma4StatefulEngine,
+              let tok = gemma4StatefulTokenizer
+        else {
+            throw NSError(domain: "LLMRunner", code: 41,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Gemma 4 stateful not loaded"])
+        }
+        guard engine.hasVision || engine.hasVideoVision else {
+            throw NSError(domain: "LLMRunner", code: 42,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Gemma 4 stateful: video requires vision encoder bundle"])
+        }
+        isGenerating = true
+        tokensPerSecond = 0
+
+        // 1) Sample frames + optional audio.
+        let frames = try await VideoProcessor.extractFrames(
+            from: videoURL, options: videoOptions)
+        guard !frames.isEmpty else {
+            throw NSError(domain: "LLMRunner", code: 43,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Gemma 4 stateful: video has no frames"])
+        }
+        let pcm: [Float]? = videoOptions.includeAudio
+            ? try await VideoProcessor.extractAudioPCM16k(from: videoURL)
+            : nil
+
+        // 2) Per-frame encode → concat. Prefer the dedicated video
+        //    tower (64 real tokens / frame). Without it, fall back to
+        //    the still-image encoder (280 / 256 tokens) — this still
+        //    produces valid output but uses ≈4× the prompt budget per
+        //    frame, so the chat prefill is longer.
+        let useVideoTower = engine.hasVideoVision
+        let tokensPerFrame = useVideoTower ? 64 : 256
+        let H = engine.modelConfig?.hiddenSize ?? 1536
+        let total = frames.count * tokensPerFrame
+        let combined = try MLMultiArray(
+            shape: [1, NSNumber(value: total), NSNumber(value: H)],
+            dataType: .float16)
+        let dst = combined.dataPointer.bindMemory(
+            to: UInt16.self, capacity: total * H)
+        for (i, f) in frames.enumerated() {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let perFrame = useVideoTower
+                ? try engine.processVideoFrame(f.image)
+                : try engine.processImage(f.image)
+            let dt = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            let src = perFrame.dataPointer.bindMemory(
+                to: UInt16.self, capacity: perFrame.count)
+            // Take the first `tokensPerFrame` rows. The still-image
+            // encoder pads to 280; the video tower already emits 64.
+            memcpy(dst.advanced(by: i * tokensPerFrame * H), src,
+                   tokensPerFrame * H * MemoryLayout<UInt16>.stride)
+            print("[Gemma4Stateful/Video] frame \(i+1)/\(frames.count) " +
+                  "encode \(String(format: "%.1f", dt)) ms " +
+                  "(\(useVideoTower ? "video tower" : "still-image"))")
+        }
+
+        // 3) Audio (optional). Same cache pattern as image+audio path.
+        var audioFeatures: MLMultiArray? = nil
+        var audioNumTokens = 0
+        if let pcm, !pcm.isEmpty, engine.hasAudio {
+            let sig = audioSignature(pcm)
+            if sig == cachedGemma4AudioSig, let f = cachedGemma4AudioFeatures {
+                audioFeatures = f
+                audioNumTokens = cachedGemma4AudioTokens
+            } else {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                let (f, n) = try engine.processAudio(pcm)
+                let dt = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                print("[Gemma4Stateful/Audio] video audio encode \(String(format: "%.1f", dt)) ms tokens=\(n)")
+                audioFeatures = f
+                audioNumTokens = n
+                cachedGemma4AudioSig = sig
+                cachedGemma4AudioFeatures = f
+                cachedGemma4AudioTokens = n
+                engine.resetPersistedState()
+            }
+        }
+
+        // 4) Build the video chat prompt. Mirrors CoreMLLLM.swift
+        //    `buildVideoBlock` + `buildGemmaMediaPrompt`: each frame
+        //    block is `MM:SS <|image><|video|>×K<image|>` joined by
+        //    spaces. Video frames go on the LAST user turn.
+        let videoBlock = frames
+            .map { f -> String in
+                let label = VideoProcessor.timestampLabel(f.timestampSeconds)
+                let placeholder = String(repeating: "<|video|>", count: tokensPerFrame)
+                return "\(label) <|image>\(placeholder)<image|>"
+            }
+            .joined(separator: " ")
+        let audioBlock = audioNumTokens > 0
+            ? "<|audio>" + String(repeating: "<|audio|>", count: audioNumTokens) + "<audio|>"
+            : ""
+        let lastUserIdx = messages.lastIndex { $0.role == .user }
+        var prompt = "<bos>"
+        for (i, m) in messages.enumerated() {
+            switch m.role {
+            case .user:
+                let isLast = i == lastUserIdx
+                var mediaPrefix = ""
+                if isLast { mediaPrefix += videoBlock + "\n" }
+                if isLast && !audioBlock.isEmpty { mediaPrefix += audioBlock + "\n" }
+                prompt += "<|turn>user\n\(mediaPrefix)\(m.content)<turn|>\n"
+            case .assistant:
+                prompt += "<|turn>model\n\(m.content)<turn|>\n"
+            case .system:
+                continue
+            }
+        }
+        prompt += "<|turn>model\n"
+        let inputIds = tok.encode(text: prompt)
+        let inputIdsInt32 = inputIds.map { Int32($0) }
+
+        var eosSet: Set<Int32> = [1, 106]
+        if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
+        let skipSet: Set<Int32> = [1, 105, 106]
+
+        let genStart = Date()
+        return AsyncStream { continuation in
+            Task { [weak self] in
+                defer { Task { @MainActor in self?.isGenerating = false } }
+                var accum: [Int] = []
+                var emittedString = ""
+                var totalEmitted = 0
+                do {
+                    _ = try await engine.generate(
+                        inputIds: inputIdsInt32,
+                        imageFeatures: combined,
+                        imageNumTokens: total,
+                        audioFeatures: audioFeatures,
+                        audioNumTokens: audioNumTokens,
+                        maxNewTokens: 256,
+                        eosTokenIds: eosSet,
+                        onToken: { tokenId in
+                            if skipSet.contains(tokenId) { return }
+                            accum.append(Int(tokenId))
+                            let current = tok.decode(tokens: accum)
+                            if current.count > emittedString.count {
+                                let delta = String(
+                                    current.suffix(current.count - emittedString.count))
+                                continuation.yield(delta)
+                                emittedString = current
+                            }
+                            totalEmitted += 1
+                        })
+                    let dt = Date().timeIntervalSince(genStart)
+                    if dt > 0 {
+                        let tps = Double(totalEmitted) / dt
+                        Task { @MainActor in
+                            self?.tokensPerSecond = tps
+                        }
+                    }
+                } catch {
+                    continuation.yield("[Error: \(error.localizedDescription)]")
+                }
+                continuation.finish()
+            }
+        }
     }
 
     // MARK: - Qwen3.5 dispatch
