@@ -642,6 +642,14 @@ final class LLMRunner {
                 do {
                     _ = try await gen.generate(
                         inputIds: inputIdsInt32, maxNewTokens: maxNew,
+                        // 0.7 / 0.95 / 1.1 = HF Qwen3.5 chat defaults.
+                        // Greedy (temperature=0) loops on emoji-heavy
+                        // outputs (e.g. "...🌟🌟🌟🌟" wall) — sampling
+                        // breaks the loop without measurable speed cost.
+                        temperature: 0.7,
+                        topK: 40,
+                        topP: 0.95,
+                        repetitionPenalty: 1.1,
                         eosTokenIds: eosSet,
                         onToken: { [weak self] tokenId in
                             if decodeStart == nil { decodeStart = Date() }

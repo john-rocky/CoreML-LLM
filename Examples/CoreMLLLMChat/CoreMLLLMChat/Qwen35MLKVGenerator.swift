@@ -96,6 +96,16 @@ final class Qwen35MLKVGenerator {
     @ObservationIgnored private var cosTable: [Float] = []
     @ObservationIgnored private var sinTable: [Float] = []
 
+    // Sampling parameters set by generate(); used in stepPredict's
+    // sampleFromTopK call. Defaults break greedy emoji-loops.
+    @ObservationIgnored private var samplingTemperature: Float = 0.7
+    @ObservationIgnored private var samplingTopP: Float = 0.95
+    @ObservationIgnored private var samplingRepPenalty: Float = 1.1
+    /// Sliding window of recently generated tokens — used by the
+    /// repetition penalty branch. 64-token window matches HF default.
+    @ObservationIgnored private var recentTokens: [Int32] = []
+    private let recentWindow = 64
+
     // mmap'd embed sidecar.
     @ObservationIgnored private var embedMmapPtr: UnsafePointer<UInt16>?
     @ObservationIgnored private var embedMmapBase: UnsafeMutableRawPointer?
@@ -153,19 +163,28 @@ final class Qwen35MLKVGenerator {
         status = "Loaded MLKV bundle (\(unitsName(cfg.computeUnits)))"
     }
 
-    /// Greedy decode (in-graph topk[k=1] in chunk_d).
-    /// `temperature`/`topK`/`repetitionPenalty` are accepted for API
-    /// parity with `Qwen35Generator.generate` but ignored — sampling
-    /// would require reverting to fp32-logits output. Adding it later
-    /// is a small builder change.
+    /// Decode with sampling.
+    /// chunk_d emits top-K (default 40) indices + values; this function
+    /// applies temperature → repetition penalty → top-p → multinomial
+    /// sample over the candidate set.
+    /// - temperature 0: greedy (just take top-1 of the K candidates).
+    /// - topK: ignored — fixed by the chunk_d build (K=40 in shipping).
+    /// - repetitionPenalty: > 1 reduces logits of tokens in the recent
+    ///   window (default last 64 tokens).
+    /// - topP: nucleus filter (0.0..1.0). Default 0.95.
     @discardableResult
     func generate(inputIds: [Int32], maxNewTokens: Int = 64,
-                  temperature: Float = 0.0,
+                  temperature: Float = 0.7,
                   topK: Int = 40,
-                  repetitionPenalty: Float = 1.0,
+                  topP: Float = 0.95,
+                  repetitionPenalty: Float = 1.1,
                   eosTokenIds: Set<Int32> = [248044, 248045, 248046],
                   onToken: ((Int32) -> Void)? = nil) async throws -> [Int32]
     {
+        self.samplingTemperature = temperature
+        self.samplingTopP = topP
+        self.samplingRepPenalty = repetitionPenalty
+        self.recentTokens = []
         if bodyChunks.isEmpty { try load() }
         running = true
         defer { running = false }
@@ -239,17 +258,101 @@ final class Qwen35MLKVGenerator {
                 }
             }
             if isLast {
-                guard let nt = out.featureValue(for: "next_token")?.multiArrayValue else {
+                // chunk_d emits top_indices (1, 1, K) int32 + top_values
+                // (1, 1, K) fp16 — Swift samples over the candidate set.
+                guard let idxArr = out.featureValue(for: "top_indices")?.multiArrayValue,
+                      let valArr = out.featureValue(for: "top_values")?.multiArrayValue else {
                     throw NSError(domain: "Qwen35MLKV", code: 50,
-                        userInfo: [NSLocalizedDescriptionKey: "chunk_d missing next_token output"])
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "chunk_d missing top_indices/top_values output"])
                 }
-                let ptr = nt.dataPointer.assumingMemoryBound(to: Int32.self)
-                return ptr[0]
+                return sampleFromTopK(topIndices: idxArr, topValues: valArr)
             } else if let h = out.featureValue(for: "hidden") {
                 hiddenFV = h
             }
         }
         return -1  // unreachable
+    }
+
+    /// Sample one token from chunk_d's top-K candidates.
+    /// Pipeline: read top_indices/top_values into Swift arrays → apply
+    /// repetition penalty (lower logits of tokens in `recentTokens`) →
+    /// scale by `1/temperature` → softmax → top-p (nucleus) filter →
+    /// multinomial sample. Updates `recentTokens` sliding window.
+    private func sampleFromTopK(topIndices: MLMultiArray,
+                                  topValues: MLMultiArray) -> Int32 {
+        let K = topIndices.count
+        let idxPtr = topIndices.dataPointer.assumingMemoryBound(to: Int32.self)
+        let valPtr = topValues.dataPointer.assumingMemoryBound(to: UInt16.self)
+
+        var indices = [Int32](repeating: 0, count: K)
+        var logits  = [Float](repeating: 0, count: K)
+        for i in 0..<K {
+            indices[i] = idxPtr[i]
+            let bits = valPtr[i]
+            let h = withUnsafeBytes(of: bits) { $0.load(as: Float16.self) }
+            logits[i] = Float(h)
+        }
+
+        // 1. Repetition penalty.
+        if samplingRepPenalty > 1.0 && !recentTokens.isEmpty {
+            let recent = Set(recentTokens)
+            for i in 0..<K {
+                if recent.contains(indices[i]) {
+                    if logits[i] > 0 { logits[i] /= samplingRepPenalty }
+                    else             { logits[i] *= samplingRepPenalty }
+                }
+            }
+        }
+
+        // 2. Temperature 0 = greedy over the (possibly rep-penalized) top-K.
+        if samplingTemperature < 0.001 {
+            var bestI = 0
+            for i in 1..<K where logits[i] > logits[bestI] { bestI = i }
+            updateRecent(indices[bestI])
+            return indices[bestI]
+        }
+
+        // 3. Temperature scaling + softmax.
+        let invT = 1.0 / samplingTemperature
+        let maxLogit = logits.max() ?? 0
+        var probs = logits.map { Float(exp(Double(($0 - maxLogit) * invT))) }
+        let sumP = probs.reduce(0, +)
+        if sumP > 0 { for i in 0..<K { probs[i] /= sumP } }
+
+        // 4. Top-p (nucleus): sort by prob desc, keep until cumulative ≥ topP.
+        let order = (0..<K).sorted { probs[$0] > probs[$1] }
+        var cum: Float = 0
+        var keep = Set<Int>()
+        for idx in order {
+            keep.insert(idx)
+            cum += probs[idx]
+            if cum >= samplingTopP { break }
+        }
+        var filtered = [Float](repeating: 0, count: K)
+        for i in keep { filtered[i] = probs[i] }
+        let fSum = filtered.reduce(0, +)
+        if fSum > 0 { for i in 0..<K { filtered[i] /= fSum } }
+
+        // 5. Multinomial sample.
+        let r = Float.random(in: 0..<1)
+        var cumP: Float = 0
+        for i in 0..<K {
+            cumP += filtered[i]
+            if r < cumP {
+                updateRecent(indices[i])
+                return indices[i]
+            }
+        }
+        updateRecent(indices[order[0]])
+        return indices[order[0]]
+    }
+
+    private func updateRecent(_ tok: Int32) {
+        recentTokens.append(tok)
+        if recentTokens.count > recentWindow {
+            recentTokens.removeFirst(recentTokens.count - recentWindow)
+        }
     }
 
     private func buildFeatureProvider(hiddenFV: MLFeatureValue,

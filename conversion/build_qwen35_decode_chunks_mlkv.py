@@ -134,15 +134,21 @@ class MLKVBodyChunk(nn.Module):
         return (h, *new_ssm_outs)
 
 
+TOPK_OUT = 40   # top-K candidates emitted to Swift for sampling.
+
+
 class MLKVTailChunk(MLKVBodyChunk):
-    """Body + final_norm + Conv2d lm_head + in-graph TopK.
+    """Body + final_norm + Conv2d lm_head + in-graph TopK[k=40].
 
-    Emits next_token (1, 1) int32 instead of fp32 logits (1, 1, 248320),
-    saving the per-step ANE→Swift transfer (248K * 4 byte ≈ 1 MB → 4 byte).
+    Emits both top-K indices (int32) AND top-K values (fp16) so Swift
+    can apply temperature / top-p / repetition penalty over the
+    candidate set. Returning K=40 entries (320 byte total) instead of
+    full fp32 logits (V * 4 = 1 MB) keeps the per-step ANE→Swift
+    transfer ≈ 99.97% smaller, while leaving room for proper sampling.
 
-    Per chunk4_argmax_topk_parity memory: derive next_token from
-    topk[k=1] (not torch.argmax) to dodge ANE-vs-CPU vocab-partition
-    divergence on palettized lm_heads.
+    Per chunk4_argmax_topk_parity memory: derive ranks from torch.topk
+    (not torch.argmax) — argmax has ANE-vs-CPU divergence on palettized
+    lm_heads.
     """
     def __init__(self, cfg, hf_model, start: int, max_seq: int):
         super().__init__(cfg, hf_model, start, cfg.num_hidden_layers, max_seq)
@@ -164,9 +170,9 @@ class MLKVTailChunk(MLKVBodyChunk):
         ssm_outs = out[1:]
         h = self.final_norm(h)
         logits = self.lm_head(h)                    # (1, 1, V) fp16
-        _vals, idx = torch.topk(logits, k=1, dim=-1)
-        next_token = idx.squeeze(-1).to(torch.int32)  # (1, 1) int32
-        return (next_token, *ssm_outs)
+        vals, idx = torch.topk(logits, k=TOPK_OUT, dim=-1)
+        # vals: (1, 1, K) fp16, idx: (1, 1, K) int64 → cast to int32
+        return (idx.to(torch.int32), vals, *ssm_outs)
 
 
 def _audit_ane(out_path: Path) -> float:
@@ -226,7 +232,10 @@ def convert_chunk(chunk, cfg, max_seq, out_path: Path, *, kind: str):
         ct.TensorType(name="current_pos", shape=(1,), dtype=np.int32),
     ]
     if kind == "tail":
-        ct_outputs = [ct.TensorType(name="next_token", dtype=np.int32)]
+        ct_outputs = [
+            ct.TensorType(name="top_indices", dtype=np.int32),
+            ct.TensorType(name="top_values",  dtype=np.float16),
+        ]
     else:
         ct_outputs = [ct.TensorType(name="hidden", dtype=np.float16)]
 

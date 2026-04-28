@@ -104,7 +104,10 @@ def run_decode(
                 ssm_state[f"rec_state_{i}"]  = out[f"new_rec_state_{i}"]
             if "hidden" in out:
                 hidden = out["hidden"].astype(np.float16)
-        return int(last_out["next_token"][0, 0])
+        # Greedy top-1 over the topk[k=40] result for parity (Swift adds
+        # temperature + top-p + rep-penalty at runtime).
+        top_idx = last_out["top_indices"][0, 0]
+        return int(top_idx[0])
 
     t_pre = time.time()
     next_token = -1
