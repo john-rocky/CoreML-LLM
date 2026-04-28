@@ -734,6 +734,42 @@ public final class CoreMLLLM: @unchecked Sendable {
                                onProgress: onProgress)
     }
 
+    /// One-call entry point — accepts either a registered model id
+    /// (e.g. ``"lfm2.5-350m"``) or the full HuggingFace repo path
+    /// (e.g. ``"mlboydaisuke/lfm2.5-350m-coreml"``).  Looks the matching
+    /// ``ModelDownloader.ModelInfo`` up in ``ModelInfo.defaults``,
+    /// downloads it on first call, and returns a loaded ``CoreMLLLM``.
+    ///
+    /// ```swift
+    /// // tweet-friendly five-liner
+    /// let llm = try await CoreMLLLM.load(repo: "mlboydaisuke/lfm2.5-350m-coreml")
+    /// let stream = try await llm.generate(messages, maxTokens: 256)
+    /// for await chunk in stream { print(chunk, terminator: "") }
+    /// ```
+    public static func load(
+        repo: String,
+        computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
+        onProgress: ((String) -> Void)? = nil
+    ) async throws -> CoreMLLLM {
+        let needle = repo.lowercased()
+        let hit = ModelDownloader.ModelInfo.defaults.first { info in
+            info.id.lowercased() == needle ||
+                info.downloadURL.lowercased().contains(needle)
+        }
+        guard let info = hit else {
+            let known = ModelDownloader.ModelInfo.defaults
+                .map(\.id).joined(separator: ", ")
+            throw CoreMLLLMError.unknownRepo(
+                "no registered model matches \"\(repo)\". "
+                + "Known ids: \(known). "
+                + "Or build a ModelInfo manually and call load(model:)."
+            )
+        }
+        return try await load(model: info,
+                              computeUnits: computeUnits,
+                              onProgress: onProgress)
+    }
+
     /// Whether EAGLE-3 speculative decoding is loaded and active for this model.
     public var supportsSpeculative: Bool { speculativeLoop != nil }
 
@@ -1779,6 +1815,7 @@ public enum CoreMLLLMError: LocalizedError {
     /// Returned by `benchVerifyTopK` / `verifyCandidatesWithLogits` until the
     /// Track B re-export (`feat/c0-verify-requant`) lands on `main`.
     case verifyLogitsNotExposed
+    case unknownRepo(String)
 
     public var errorDescription: String? {
         switch self {
@@ -1791,6 +1828,8 @@ public enum CoreMLLLMError: LocalizedError {
         case .videoDecodeFailed: return "Could not decode any frames from video"
         case .verifyLogitsNotExposed:
             return "verify chunk 4 does not expose `logits_fp16` (Track B re-export pending)"
+        case .unknownRepo(let msg):
+            return msg
         }
     }
 }
