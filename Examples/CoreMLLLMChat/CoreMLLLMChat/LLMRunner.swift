@@ -642,16 +642,19 @@ final class LLMRunner {
                 do {
                     _ = try await gen.generate(
                         inputIds: inputIdsInt32, maxNewTokens: maxNew,
-                        // Greedy on iPhone 17 Pro ANE confirmed clean
-                        // (matches HF fp32 reference: "Hello! How can I
-                        // assist you today? 😊<EOS>", 50.3 tok/s decode).
-                        // Sampling defaults are kept opt-in via env if a
-                        // user wants more diversity; greedy is the
-                        // deterministic ship default.
+                        // Greedy + rep_penalty=1.1 (HF Qwen3.5 chat
+                        // default).  Pure greedy on this 0.8B model loops
+                        // on short Japanese prompts ("こんにちは" →
+                        // "おはる！おはる！...") even with chat template
+                        // applied — documented in QWEN35_LESSONS §5.
+                        // rep_penalty knocks down logits of tokens seen
+                        // in the last 64 steps, so the second occurrence
+                        // of the looped token gets demoted and the model
+                        // moves on.  Stays deterministic (no random).
                         temperature: 0.0,
                         topK: 40,
                         topP: 1.0,
-                        repetitionPenalty: 1.0,
+                        repetitionPenalty: 1.1,
                         eosTokenIds: eosSet,
                         onToken: { [weak self] tokenId in
                             if decodeStart == nil { decodeStart = Date() }
