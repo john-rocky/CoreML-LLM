@@ -2060,7 +2060,15 @@ final class ChunkedEngine {
         var embF16 = [Float16](repeating: 0, count: hidden)
         var embF32 = [Float](repeating: 0, count: hidden)
         for i in 0..<hidden { embF16[i] = Float16(bitPattern: embPtr[i]) }
+        #if targetEnvironment(simulator) && arch(x86_64)
+        // Accelerate does not expose the Float16 -> Float vDSP overload for
+        // the x86_64 iOS Simulator SDK slice. Keep the slower fallback scoped
+        // to Intel simulator builds so device and arm64 simulator paths retain
+        // the vectorized conversion.
+        for i in 0..<hidden { embF32[i] = Float(embF16[i]) }
+        #else
         vDSP.convertElements(of: embF16, to: &embF32)
+        #endif
 
         var proj = [Float](repeating: 0, count: totalDim)
         cblas_sgemv(CblasRowMajor, CblasNoTrans,
