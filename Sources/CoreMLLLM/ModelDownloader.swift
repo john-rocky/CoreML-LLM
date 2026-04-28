@@ -963,6 +963,10 @@ public final class ModelDownloader: NSObject {
             buildQwen3VL2BFileList()
             return
         }
+        if model.id == "lfm2.5-350m" {
+            buildLfm2FileList()
+            return
+        }
         // 2K-context shipping model lives at the repo root on HF:
         //   - Decode chunks:  swa/chunk{1-4}.mlmodelc/
         //   - Prefill chunks: prefill/chunk{1-4}.mlmodelc/  (remote name is
@@ -1138,6 +1142,56 @@ public final class ModelDownloader: NSObject {
     ///
     /// Local layout after download (under `Models/qwen3.5-0.8b/`):
     ///   qwen3_5_0_8b_decode_int8_mseq128.mlpackage/...  (same structure)
+    /// LFM2.5 350M CoreML layout on `mlboydaisuke/lfm2.5-350m-coreml`.
+    /// Flat tree:
+    ///   model.mlmodelc/                pre-compiled (no .mlpackage)
+    ///     ├── weights/weight.bin       805 MB
+    ///     ├── coremldata.bin           tiny
+    ///     ├── model.mil                ~1 MB
+    ///     ├── metadata.json            ~few KB
+    ///     └── analytics/coremldata.bin
+    ///   model_config.json              ~500 B
+    ///   hf_model/{tokenizer.json, tokenizer_config.json, config.json,
+    ///             generation_config.json}
+    private func buildLfm2FileList() {
+        pendingFiles = [
+            .init(remotePath: "model.mlmodelc/weights/weight.bin",
+                  localPath: "model.mlmodelc/weights/weight.bin",
+                  estimatedSize: 844_243_968),
+            .init(remotePath: "model.mlmodelc/coremldata.bin",
+                  localPath: "model.mlmodelc/coremldata.bin",
+                  estimatedSize: 600),
+            .init(remotePath: "model.mlmodelc/model.mil",
+                  localPath: "model.mlmodelc/model.mil",
+                  estimatedSize: 1_500_000),
+            .init(remotePath: "model.mlmodelc/metadata.json",
+                  localPath: "model.mlmodelc/metadata.json",
+                  estimatedSize: 5_000),
+            .init(remotePath: "model.mlmodelc/analytics/coremldata.bin",
+                  localPath: "model.mlmodelc/analytics/coremldata.bin",
+                  estimatedSize: 250),
+            .init(remotePath: "model_config.json",
+                  localPath: "model_config.json",
+                  estimatedSize: 500),
+            .init(remotePath: "hf_model/tokenizer.json",
+                  localPath: "hf_model/tokenizer.json",
+                  estimatedSize: 5_000_000),
+            .init(remotePath: "hf_model/tokenizer_config.json",
+                  localPath: "hf_model/tokenizer_config.json",
+                  estimatedSize: 1_000),
+            .init(remotePath: "hf_model/config.json",
+                  localPath: "hf_model/config.json",
+                  estimatedSize: 1_500),
+            .init(remotePath: "hf_model/generation_config.json",
+                  localPath: "hf_model/generation_config.json",
+                  estimatedSize: 200),
+        ]
+        pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
+        totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
+        completedBytes = 0
+        nextFileIndex = 0
+    }
+
     private func buildQwen35FileList() {
         let pkg = "qwen3_5_0_8b_decode_int8_mseq128.mlpackage"
         pendingFiles = [
