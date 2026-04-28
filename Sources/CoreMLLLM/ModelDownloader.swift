@@ -703,13 +703,17 @@ public final class ModelDownloader: NSObject {
         try forceRemove(at: url)
     }
 
-    /// Recursive removeItem with a best-effort `chmod` walk first, so root-
-    /// owned sideloaded folders (UID 0, 0755) become deletable by the app.
+    /// Recursive removeItem with a best-effort `chmod` walk first.
+    ///
+    /// The chmod walk usually no-ops on iOS — apps can't change perms on
+    /// files they don't own, and `xcrun devicectl device copy to` lands
+    /// sideloaded trees with `UID 0`/`0755` which the user-mode app can
+    /// neither chmod nor unlink (parent dir's `w` bit belongs to root,
+    /// not the app).  When `removeItem` then fails with EPERM, we surface
+    /// a friendlier message that points at the only working escape
+    /// hatches — re-sideload with `--remove-existing-content true`, or
+    /// reinstall the app to wipe the container.
     private func forceRemove(at url: URL) throws {
-        // First pass: open up perms on the directory tree.  POSIX `chmod`
-        // is enough — we don't need to change ownership; iOS lets the app
-        // unlink anything in its container as long as the entry is writable
-        // (and APFS doesn't enforce sticky-bit restrictions on Documents).
         if let enumerator = fileManager.enumerator(at: url,
                                                     includingPropertiesForKeys: nil,
                                                     options: []) {
@@ -725,9 +729,28 @@ public final class ModelDownloader: NSObject {
 
         do {
             try fileManager.removeItem(at: url)
-        } catch let removalError {
-            // Surface the underlying error verbatim so the user sees the
-            // real reason instead of a generic "doesn't exist" wrapper.
+        } catch let removalError as NSError {
+            let folder = url.lastPathComponent
+            // EPERM (1), EACCES (13), and Cocoa NSFileWriteNoPermissionError
+            // (513) all map to "this was sideloaded as root, you can't
+            // delete it from inside the sandbox".
+            let permErrorCodes: Set<Int> = [1, 13, 513]
+            let isPermError =
+                permErrorCodes.contains(removalError.code) ||
+                permErrorCodes.contains(
+                    (removalError.userInfo[NSUnderlyingErrorKey] as? NSError)?.code ?? -1)
+            if isPermError {
+                throw NSError(
+                    domain: "CoreMLLLM.ModelDownloader",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: """
+                        Couldn’t delete “\(folder)”: it was sideloaded with \
+                        root-owned files, which iOS won’t let the app remove. \
+                        From your Mac, run:
+                          scripts/uninstall_sideloaded_model.sh \(folder)
+                        Or uninstall the app to wipe every sideloaded model.
+                        """])
+            }
             throw removalError
         }
     }
