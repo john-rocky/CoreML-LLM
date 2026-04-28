@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Build Gemma 4 E2B stateful prefill chunks as **single-function**
-mlpackages (no multifunction merge).
+"""Build Gemma 4 stateful prefill chunks as **single-function**
+mlpackages (no multifunction merge). Supports E2B and E4B; chunk
+boundaries come from `compute_chunk_boundaries(config)`.
 
 Stage 8 / Stage 6.5 opt-in builder. Companion to
 `docs/HANDOFF_STAGE8_MLSTATE_MULTIMODAL.md` and the probe results in
@@ -26,11 +27,14 @@ from the decode chunk and bridge KV state via `state.withMultiArray(for:)`
 
 Layout produced (3-chunk merged variant, T=288 default):
 
-    chunk_1_prefill_T288.mlpackage      (L0-7, own KV)
-    chunk_2_3way_prefill_T288.mlpackage (L8-24 merged, own + shared)
-    chunk_3_prefill_T288.mlpackage      (L25-34 + lm_head + argmax,
-                                         structurally same as 4-chunk
-                                         chunk_4_prefill)
+    E2B (35 layers):
+      chunk_1_prefill_T288.mlpackage       (L0-7, own KV)
+      chunk_2_3way_prefill_T288.mlpackage  (L8-24 merged, own + shared)
+      chunk_3_prefill_T288.mlpackage       (L25-34 + lm_head + argmax)
+    E4B (42 layers):
+      chunk_1_prefill_T288.mlpackage       (L0-11, own KV)
+      chunk_2_3way_prefill_T288.mlpackage  (L12-32 merged, own + shared)
+      chunk_3_prefill_T288.mlpackage       (L33-41 + lm_head + argmax)
 
 Usage:
     python conversion/build_gemma4_stateful_singlefunc_prefill.py \\
@@ -125,12 +129,16 @@ def main():
     base = Gemma4Model.from_pretrained(hf_dir, context_length=args.ctx)
     base.eval()
 
-    # E2B layer split: chunk_1 = L0-7 (own KV), chunk_2_3way = L8-24
-    # (merged), chunk_3 = L25-34 (+head). E4B has different boundaries
-    # but we don't ship E4B stateful yet.
+    # Chunk layout (config-derived via compute_chunk_boundaries):
+    #   E2B: c1=L0-7,   own=L8-14,  shared=L15-24, c4=L25-34
+    #   E4B: c1=L0-11,  own=L12-23, shared=L24-32, c4=L33-41
+    # The merged prefill needs own_range + shared_range so it picks
+    # the right layer-index window for the kv13/kv14 producer aliases.
     boundaries = compute_chunk_boundaries(base.config)
-    c1_start, c1_end = boundaries[0]   # E2B (0, 8)
-    c4_start, c4_end = boundaries[3]   # E2B (25, 35)
+    c1_start, c1_end = boundaries[0]
+    own_range = boundaries[1]
+    shared_range = boundaries[2]
+    c4_start, c4_end = boundaries[3]
 
     paths = {
         "chunk1": os.path.join(args.output, f"chunk_1_prefill_T{args.t}.mlpackage"),
@@ -154,6 +162,8 @@ def main():
             out_path=paths["chunk2_3way"],
             nbits=args.nbits,
             use_linear=args.linear_projections,
+            own_range=own_range,
+            shared_range=shared_range,
         )
     if args.only in (None, "chunk3"):
         convert_chunk_shared_prefill(
