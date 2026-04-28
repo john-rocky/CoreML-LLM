@@ -568,6 +568,27 @@ public final class ModelDownloader: NSObject {
 
                     let dest = self.modelsDirectory.appendingPathComponent(model.folderName)
                     self.destDir = dest
+
+                    // Wipe any leftover from a previous sideload before
+                    // creating the new dir.  `xcrun devicectl device copy
+                    // to ... --remove-existing-content true` lands a root-
+                    // owned `.placeholder` file (or worse, the whole prior
+                    // bundle) that the app can't write into — left in
+                    // place, downloads silently truncate because every
+                    // file write hits EPERM.  forceRemove handles both
+                    // app-owned residue and surfaces a clear pointer at
+                    // the uninstall script if the leftover is sideloaded.
+                    if self.fileManager.fileExists(atPath: dest.path) {
+                        do {
+                            try self.forceRemove(at: dest)
+                        } catch {
+                            self.isDownloading = false
+                            self.downloadingModelId = nil
+                            self.currentModel = nil
+                            continuation.resume(throwing: error)
+                            return
+                        }
+                    }
                     try? self.fileManager.createDirectory(at: dest, withIntermediateDirectories: true)
 
                     if model.downloadURL.contains("huggingface.co") {
