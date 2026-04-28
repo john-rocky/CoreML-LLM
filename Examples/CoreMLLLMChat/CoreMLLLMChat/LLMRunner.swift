@@ -508,11 +508,13 @@ final class LLMRunner {
                     // compensated for an EOS miss, not a real loop. Keep
                     // the path available by upping this arg when
                     // investigating.
+                    var decodeStart: Date?
                     _ = try await gen.generate(
                         inputIds: inputIdsInt32, maxNewTokens: maxNew,
                         temperature: 0.0, topK: 40, repetitionPenalty: 1.0,
                         eosTokenIds: eosSet,
                         onToken: { [weak self] tokenId in
+                            if decodeStart == nil { decodeStart = Date() }
                             tokenCount += 1
                             if eosSet.contains(tokenId) { return }
                             accumIds.append(Int(tokenId))
@@ -532,18 +534,22 @@ final class LLMRunner {
                             // Throttle tps update (per 8 tokens) — at high
                             // tok/s, per-token MainActor tasks queue up
                             // and lock the input field after generation.
-                            let elapsed = Date().timeIntervalSince(genStart)
-                            if elapsed > 0 && tokenCount % 8 == 0 {
-                                let tps = Double(tokenCount) / elapsed
-                                Task { @MainActor in
-                                    self?.tokensPerSecond = tps
+                            if let start = decodeStart {
+                                let elapsed = Date().timeIntervalSince(start)
+                                if elapsed > 0 && tokenCount % 8 == 0 {
+                                    let tps = Double(tokenCount) / elapsed
+                                    Task { @MainActor in
+                                        self?.tokensPerSecond = tps
+                                    }
                                 }
                             }
                         })
-                    let totalElapsed = Date().timeIntervalSince(genStart)
-                    if totalElapsed > 0 && tokenCount > 0 {
-                        let finalTPS = Double(tokenCount) / totalElapsed
-                        Task { @MainActor in self?.tokensPerSecond = finalTPS }
+                    if let start = decodeStart {
+                        let totalElapsed = Date().timeIntervalSince(start)
+                        if totalElapsed > 0 && tokenCount > 0 {
+                            let finalTPS = Double(tokenCount) / totalElapsed
+                            Task { @MainActor in self?.tokensPerSecond = finalTPS }
+                        }
                     }
                 } catch {
                     continuation.yield("[Error: \(error.localizedDescription)]")
@@ -628,20 +634,26 @@ final class LLMRunner {
                 var accumIds: [Int] = []
                 var emittedText = ""
                 var tokenCount = 0
+                // tps clock starts on FIRST token, not at function entry.
+                // First-call ANE compile + model load can take 60+ sec on
+                // device; including that in elapsed shrinks the displayed
+                // tok/s by 10× even when the actual decode rate is 40+.
+                var decodeStart: Date?
                 do {
                     _ = try await gen.generate(
                         inputIds: inputIdsInt32, maxNewTokens: maxNew,
                         eosTokenIds: eosSet,
                         onToken: { [weak self] tokenId in
+                            if decodeStart == nil { decodeStart = Date() }
                             tokenCount += 1
                             if eosSet.contains(tokenId) { return }
                             accumIds.append(Int(tokenId))
                             // Strip trailing U+FFFD: BPE tokens split
                             // multi-byte UTF-8 (emoji, CJK glyphs); the
-                            // intermediate decode shows the partial bytes
-                            // as the replacement char. Without this the
+                            // intermediate decode shows partial bytes as
+                            // the replacement char. Without this the
                             // emittedText baseline locks at "...\u{FFFD}"
-                            // and never matches the next-step "...emoji"
+                            // and never matches the next step's "...emoji"
                             // prefix → emit stalls, UI shows mojibake.
                             var current = tok.decode(tokens: accumIds)
                             while current.hasSuffix("\u{FFFD}") {
@@ -654,24 +666,27 @@ final class LLMRunner {
                                 emittedText = current
                             }
                             // Throttle per-token tps update — every 8 tokens.
-                            // At 40+ tok/s, every-token MainActor dispatches
-                            // pile up and tokensPerSecond keeps "ticking" for
-                            // ~1 s after generation completes (also delays
-                            // isGenerating=false → input stays locked).
-                            let elapsed = Date().timeIntervalSince(genStart)
-                            if elapsed > 0 && tokenCount % 8 == 0 {
-                                let tps = Double(tokenCount) / elapsed
-                                Task { @MainActor in
-                                    self?.tokensPerSecond = tps
+                            // At 40+ tok/s, every-token MainActor dispatch
+                            // piles up tasks and delays isGenerating=false
+                            // (input stays locked after generation ends).
+                            if let start = decodeStart {
+                                let elapsed = Date().timeIntervalSince(start)
+                                if elapsed > 0 && tokenCount % 8 == 0 {
+                                    let tps = Double(tokenCount) / elapsed
+                                    Task { @MainActor in
+                                        self?.tokensPerSecond = tps
+                                    }
                                 }
                             }
                         })
                     // Final tps snapshot — captures the last < 8-token
                     // window the throttle skipped.
-                    let totalElapsed = Date().timeIntervalSince(genStart)
-                    if totalElapsed > 0 && tokenCount > 0 {
-                        let finalTPS = Double(tokenCount) / totalElapsed
-                        Task { @MainActor in self?.tokensPerSecond = finalTPS }
+                    if let start = decodeStart {
+                        let totalElapsed = Date().timeIntervalSince(start)
+                        if totalElapsed > 0 && tokenCount > 0 {
+                            let finalTPS = Double(tokenCount) / totalElapsed
+                            Task { @MainActor in self?.tokensPerSecond = finalTPS }
+                        }
                     }
                 } catch {
                     continuation.yield("[Error: \(error.localizedDescription)]")
