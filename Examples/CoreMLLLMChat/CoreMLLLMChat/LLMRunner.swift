@@ -658,18 +658,21 @@ final class LLMRunner {
                             tokenCount += 1
                             if eosSet.contains(tokenId) { return }
                             accumIds.append(Int(tokenId))
-                            // Strip trailing U+FFFD before prefix check.
-                            // Confirmed safe by 2026-04-28 diagnostic:
-                            // strip OFF → trailing "�" where emoji should
-                            // be (e.g. "Hello! ... today? �" instead of
-                            // "Hello! ... today? 😊"). The strip waits one
-                            // BPE token until the multi-byte UTF-8 sequence
-                            // completes; accumIds is untouched so model
-                            // output is identical with/without the strip.
-                            var current = tok.decode(tokens: accumIds)
-                            while current.hasSuffix("\u{FFFD}") {
-                                current = String(current.dropLast())
-                            }
+                            // U+FFFD strip removed.  2026-04-28 iPhone 17
+                            // Pro test: strip ON → consistent emoji-wall
+                            // loop on greedy "Hello." (every run).
+                            // strip OFF → clean stop matching HF reference,
+                            // 50.3 tok/s.  Mechanism unknown — strip
+                            // touches only the display string, not
+                            // accumIds, so it should not affect the model.
+                            // Suspect ANE timing / Swift actor interaction.
+                            // Trade-off: incomplete multi-byte UTF-8 (emoji,
+                            // CJK) renders as "�" until the next BPE token
+                            // completes the sequence.  Acceptable until
+                            // root cause is found.  Investigate via a
+                            // token-level streaming refactor or
+                            // bytes-aware decode (swift-transformers).
+                            let current = tok.decode(tokens: accumIds)
                             if current.count > emittedText.count,
                                current.hasPrefix(emittedText) {
                                 let delta = String(current.dropFirst(emittedText.count))
