@@ -15,7 +15,7 @@ Where [MLX Swift](https://github.com/ml-explore/mlx-swift) is the right call whe
 | **Qwen3.5 2B** | 2.4 GB | Text | ~17 tok/s (~200 MB RSS) | [mlboydaisuke/qwen3.5-2B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML) |
 | **Qwen3.5 0.8B** | 1.4 GB | Text | ~20 tok/s | [mlboydaisuke/qwen3.5-0.8B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML) |
 | **Qwen3-VL 2B (stateful)** | 2.3 GB | Text + image (DeepStack) | **~24 tok/s** (256 MB RSS, TTFT 125 ms on resumed turn) | [mlboydaisuke/qwen3-vl-2b-stateful-coreml](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-stateful-coreml) |
-| **LFM2.5 350M** | 810 MB | Text (hybrid attn + short-conv) | **52 tok/s** (97.8 % ANE-resident) | [mlboydaisuke/lfm2.5-350m-coreml](https://huggingface.co/mlboydaisuke/lfm2.5-350m-coreml) |
+| **LFM2.5 350M** [†](#lfm2-license) | 810 MB | Text (hybrid attn + short-conv) | **52 tok/s** (97.8 % ANE-resident) | [mlboydaisuke/lfm2.5-350m-coreml](https://huggingface.co/mlboydaisuke/lfm2.5-350m-coreml) |
 | **FunctionGemma-270M** | 850 MB | Function calling | (specialist) | [mlboydaisuke/functiongemma-270m-coreml](https://huggingface.co/mlboydaisuke/functiongemma-270m-coreml) |
 | **EmbeddingGemma-300M** | 295 MB | Sentence embeddings (768/512/256/128) | (specialist) | [mlboydaisuke/embeddinggemma-300m-coreml](https://huggingface.co/mlboydaisuke/embeddinggemma-300m-coreml) |
 | Qwen3-VL 2B (legacy, recurrent) | 2.9 GB | Text + image (DeepStack) | ~7.5 tok/s | [mlboydaisuke/qwen3-vl-2b-coreml](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-coreml) |
@@ -29,7 +29,7 @@ All numbers are iPhone 17 Pro A19 Pro, 2048-token context, ANE-only (no GPU fall
 - Text-only, maximum quality under ≤3 GB → **Qwen3.5 2B**
 - Text-only, maximum quality → **Gemma 4 E4B**
 - Text-only, fastest + smallest → **Qwen3.5 0.8B**
-- Text-only, smallest at high tok/s on iPhone → **LFM2.5 350M** (52 tok/s, 810 MB)
+- Text-only, smallest at high tok/s on iPhone → **LFM2.5 350M** (52 tok/s, 810 MB) [†](#lfm2-license)
 - Tool / function calling → **FunctionGemma-270M**
 - Sentence embeddings / RAG → **EmbeddingGemma-300M**
 
@@ -293,3 +293,6 @@ docs/                       Design docs, benchmarks, decision log
 ## License
 
 MIT for the CoreML-LLM code. Model weights inherit the original licenses (Gemma weights: [Gemma Terms of Use](https://ai.google.dev/gemma/terms); Qwen weights: Apache 2.0; Qwen3-VL vision weights: Apache 2.0).
+
+<a id="lfm2-license"></a>
+**† LFM2.5 350M** weights are under [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-350M/blob/main/LICENSE) (Liquid AI). Free for non-commercial use, research, and commercial use **up to a US $10M annual revenue threshold**. Above that threshold, see [Liquid AI](https://www.liquid.ai/) for a separate commercial license.

@@ -6,6 +6,11 @@ correct generation.  fp16 build, conv state passed as input/output tensor.
 **Model:** `LiquidAI/LFM2.5-350M` (16 layers, 6 attention + 10 short-conv,
 `hidden=1024`, `num_kv_heads=8`, `head_dim=64`, `vocab=65536`,
 `conv_L_cache=3`, `tie_embedding=True`).
+**License:** [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-350M/blob/main/LICENSE)
+— commercial use is free up to a **US $10M annual revenue threshold**.
+Above that you need a separate commercial license from
+[Liquid AI](https://www.liquid.ai/).  Our conversion pipeline + Swift
+runtime stays Apache 2.0; the constraint is on the model weights.
 
 ## Pipeline
 
