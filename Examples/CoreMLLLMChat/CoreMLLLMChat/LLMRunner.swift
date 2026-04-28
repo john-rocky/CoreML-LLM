@@ -642,27 +642,30 @@ final class LLMRunner {
                 do {
                     _ = try await gen.generate(
                         inputIds: inputIdsInt32, maxNewTokens: maxNew,
-                        // 0.7 / 0.95 / 1.1 = HF Qwen3.5 chat defaults.
-                        // Greedy (temperature=0) loops on emoji-heavy
-                        // outputs (e.g. "...🌟🌟🌟🌟" wall) — sampling
-                        // breaks the loop without measurable speed cost.
-                        temperature: 0.7,
+                        // Greedy on iPhone 17 Pro ANE confirmed clean
+                        // (matches HF fp32 reference: "Hello! How can I
+                        // assist you today? 😊<EOS>", 50.3 tok/s decode).
+                        // Sampling defaults are kept opt-in via env if a
+                        // user wants more diversity; greedy is the
+                        // deterministic ship default.
+                        temperature: 0.0,
                         topK: 40,
-                        topP: 0.95,
-                        repetitionPenalty: 1.1,
+                        topP: 1.0,
+                        repetitionPenalty: 1.0,
                         eosTokenIds: eosSet,
                         onToken: { [weak self] tokenId in
                             if decodeStart == nil { decodeStart = Date() }
                             tokenCount += 1
                             if eosSet.contains(tokenId) { return }
                             accumIds.append(Int(tokenId))
-                            // Strip trailing U+FFFD: BPE tokens split
-                            // multi-byte UTF-8 (emoji, CJK glyphs); the
-                            // intermediate decode shows partial bytes as
-                            // the replacement char. Without this the
-                            // emittedText baseline locks at "...\u{FFFD}"
-                            // and never matches the next step's "...emoji"
-                            // prefix → emit stalls, UI shows mojibake.
+                            // Strip trailing U+FFFD before prefix check.
+                            // Confirmed safe by 2026-04-28 diagnostic:
+                            // strip OFF → trailing "�" where emoji should
+                            // be (e.g. "Hello! ... today? �" instead of
+                            // "Hello! ... today? 😊"). The strip waits one
+                            // BPE token until the multi-byte UTF-8 sequence
+                            // completes; accumIds is untouched so model
+                            // output is identical with/without the strip.
                             var current = tok.decode(tokens: accumIds)
                             while current.hasSuffix("\u{FFFD}") {
                                 current = String(current.dropLast())
