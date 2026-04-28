@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
-"""Build Gemma 4 E2B stateful 3-chunk variant (merged middle).
+"""Build Gemma 4 stateful 3-chunk variant (merged middle).
 
 Same as `build_gemma4_e2b_stateful_chunks.py` but emits 3 mlpackages
-instead of 4 — the middle chunk merges the 4-chunk's chunk_2 (own KV
-L8-14) and chunk_3 (KV-shared L15-24), keeping kv13/kv14 producer
-aliases internal. Final chunk_3 = old chunk_4 (KV-shared L25-34 +
-lm_head + argmax).
+instead of 4 — the middle chunk merges the 4-chunk's chunk_2 (own KV)
+and chunk_3 (KV-shared), keeping kv13/kv14 producer aliases internal.
+Final chunk_3 = old chunk_4 (KV-shared tail + lm_head + argmax).
 
-Layout:
-  chunk_1.mlpackage  (L0-7,  own KV, computes PLE)        — same as 4-chunk
-  chunk_2.mlpackage  (L8-24, merged: own + shared inside) — NEW
-  chunk_3.mlpackage  (L25-34 + lm_head + argmax)          — = old chunk_4
+Layout (E2B / E4B, derived from `compute_chunk_boundaries(config)`):
+  E2B (35 layers):
+    chunk_1  L0-7   own KV, computes PLE        — same as 4-chunk
+    chunk_2  L8-24  merged: own L8-14 + shared L15-24
+    chunk_3  L25-34 + lm_head + argmax          — = old chunk_4
+  E4B (42 layers):
+    chunk_1  L0-11  own KV, computes PLE
+    chunk_2  L12-32 merged: own L12-23 + shared L24-32
+    chunk_3  L33-41 + lm_head + argmax
 
 Multifunction `--prefill-batches "8"` adds a `prefill_b8` function to
 each chunk (sharing weights via coremltools save_multifunction).
 
 Usage:
     python conversion/build_gemma4_e2b_stateful_3chunks.py \
+        --model gemma4-e2b \
         --output /tmp/g4_3chunk/multi \
         --hf-dir /path/to/gemma4-e2b/hf_model \
+        --ctx 2048 --linear-projections --prefill-batches "8"
+
+    python conversion/build_gemma4_e2b_stateful_3chunks.py \
+        --model gemma4-e4b \
+        --output /tmp/g4_3chunk_e4b \
         --ctx 2048 --linear-projections --prefill-batches "8"
 """
 from __future__ import annotations
@@ -63,9 +73,13 @@ from models.gemma4_swa_chunks import compute_chunk_boundaries
 fp16 = np.float16
 
 
-def convert_chunk2_merged(base, ctx, out_path, nbits, *, use_linear=False):
+def convert_chunk2_merged(base, ctx, out_path, nbits, *, use_linear=False,
+                          own_range=None, shared_range=None):
+    own = own_range or (8, 15)
+    shared = shared_range or (15, 25)
     print("\n" + "=" * 60)
-    print(f"CHUNK 2 MERGED (L8-24) — own KV L8-14 + KV-shared L15-24")
+    print(f"CHUNK 2 MERGED (L{own[0]}-{shared[1]-1}) — "
+          f"own KV L{own[0]}-{own[1]-1} + KV-shared L{shared[0]}-{shared[1]-1}")
     print("=" * 60)
     cfg = base.config
     hidden = cfg.hidden_size
@@ -77,7 +91,10 @@ def convert_chunk2_merged(base, ctx, out_path, nbits, *, use_linear=False):
     HKV = cfg.num_key_value_heads
 
     chunk = SWAStatefulMergedChunk23(base, ctx,
-                                       use_linear=use_linear).eval().to(MODEL_DTYPE)
+                                       use_linear=use_linear,
+                                       own_range=own_range,
+                                       shared_range=shared_range
+                                       ).eval().to(MODEL_DTYPE)
     ns, nf = max(chunk.num_sliding, 1), max(chunk.num_full, 1)
 
     sample = (
@@ -128,9 +145,12 @@ def convert_chunk2_merged(base, ctx, out_path, nbits, *, use_linear=False):
 
 
 def convert_chunk2_merged_prefill(base, ctx, T, out_path, nbits, *,
-                                    use_linear=False):
+                                    use_linear=False,
+                                    own_range=None, shared_range=None):
+    own = own_range or (8, 15)
+    shared = shared_range or (15, 25)
     print("\n" + "-" * 60)
-    print(f"CHUNK 2 MERGED PREFILL T={T} (L8-24)")
+    print(f"CHUNK 2 MERGED PREFILL T={T} (L{own[0]}-{shared[1]-1})")
     print("-" * 60)
     cfg = base.config
     hidden = cfg.hidden_size
@@ -142,7 +162,8 @@ def convert_chunk2_merged_prefill(base, ctx, T, out_path, nbits, *,
     HKV = cfg.num_key_value_heads
 
     chunk = SWAStatefulMergedChunk23Prefill(
-        base, ctx, use_linear=use_linear, T=T).eval().to(MODEL_DTYPE)
+        base, ctx, use_linear=use_linear, T=T,
+        own_range=own_range, shared_range=shared_range).eval().to(MODEL_DTYPE)
     ns, nf = max(chunk.num_sliding, 1), max(chunk.num_full, 1)
 
     sample = (
@@ -305,7 +326,8 @@ def convert_chunk1_prefill_single(base, c_start, c_end, ctx, T, out_path, nbits,
         chunk, sample, inputs, outputs, states, out_path, nbits)
 
 
-def convert_chunk2_merged_single(base, ctx, out_path, nbits, *, use_linear=False):
+def convert_chunk2_merged_single(base, ctx, out_path, nbits, *, use_linear=False,
+                                 own_range=None, shared_range=None):
     print("\n" + "=" * 60)
     print(f"CHUNK 2 MERGED SINGLE-BUFFER (L8-24)")
     print("=" * 60)
@@ -319,7 +341,10 @@ def convert_chunk2_merged_single(base, ctx, out_path, nbits, *, use_linear=False
     HKV = cfg.num_key_value_heads
 
     chunk = SWAStatefulMergedChunk23Single(base, ctx,
-                                             use_linear=use_linear).eval().to(MODEL_DTYPE)
+                                             use_linear=use_linear,
+                                             own_range=own_range,
+                                             shared_range=shared_range
+                                             ).eval().to(MODEL_DTYPE)
     no = max(chunk.num_own, 1)
     sample = (
         torch.zeros(1, 1, hidden, dtype=torch.float16),
@@ -364,7 +389,8 @@ def convert_chunk2_merged_single(base, ctx, out_path, nbits, *, use_linear=False
 
 
 def convert_chunk2_merged_prefill_single(base, ctx, T, out_path, nbits, *,
-                                            use_linear=False):
+                                            use_linear=False,
+                                            own_range=None, shared_range=None):
     print("\n" + "-" * 60)
     print(f"CHUNK 2 MERGED SINGLE-BUFFER PREFILL T={T} (L8-24)")
     print("-" * 60)
@@ -378,7 +404,8 @@ def convert_chunk2_merged_prefill_single(base, ctx, T, out_path, nbits, *,
     HKV = cfg.num_key_value_heads
 
     chunk = SWAStatefulMergedChunk23PrefillSingle(
-        base, ctx, use_linear=use_linear, T=T).eval().to(MODEL_DTYPE)
+        base, ctx, use_linear=use_linear, T=T,
+        own_range=own_range, shared_range=shared_range).eval().to(MODEL_DTYPE)
     no = max(chunk.num_own, 1)
     sample = (
         torch.zeros(1, T, hidden, dtype=torch.float16),
@@ -425,7 +452,11 @@ def convert_chunk2_merged_prefill_single(base, ctx, T, out_path, nbits, *,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="gemma4-e2b",
-                    help="Model name (gemma4-e2b only for now)")
+                    help="Model name (gemma4-e2b or gemma4-e4b). Chunk "
+                         "boundaries are derived from the HF config via "
+                         "compute_chunk_boundaries(config); kv13/kv14 names "
+                         "are legacy aliases (sliding/full producer slots) "
+                         "shared across both models.")
     ap.add_argument("--output", required=True)
     ap.add_argument("--hf-dir", default=None)
     ap.add_argument("--ctx", type=int, default=None)
@@ -465,15 +496,22 @@ def main():
 
     cfg = base.config
     boundaries = compute_chunk_boundaries(cfg)
-    # 3-chunk: re-use boundaries[0] (chunk_1 L0-7) and boundaries[3]
-    # (= old chunk_4 L25-34, which becomes new chunk_3). The merged
-    # middle (= boundaries[1] start, boundaries[2] end = L8-25) is
-    # baked into SWAStatefulMergedChunk23.
+    # 3-chunk: re-use boundaries[0] (chunk_1) and boundaries[3] (= old
+    # chunk_4, which becomes new chunk_3). The merged middle spans
+    # boundaries[1] (own KV) → boundaries[2] (KV-shared), passed into
+    # SWAStatefulMergedChunk23 via own_range/shared_range so the same
+    # builder works for E2B (own=L8-14, shared=L15-24) and E4B
+    # (own=L12-23, shared=L24-32).
     chunk1_range = boundaries[0]
+    own_range = boundaries[1]
+    shared_range = boundaries[2]
     chunk3_range = boundaries[3]   # final chunk = old chunk_4
     print(f"\nctx={args.ctx}  W={cfg.sliding_window}  hidden={cfg.hidden_size}")
     print(f"3-chunk layout: c1=L{chunk1_range[0]}-{chunk1_range[1]-1}, "
-          f"c2_merged=L8-24, c3=L{chunk3_range[0]}-{chunk3_range[1]-1}")
+          f"c2_merged=L{own_range[0]}-{shared_range[1]-1} "
+          f"(own L{own_range[0]}-{own_range[1]-1} + "
+          f"shared L{shared_range[0]}-{shared_range[1]-1}), "
+          f"c3=L{chunk3_range[0]}-{chunk3_range[1]-1}")
     print(f"Quantize: int{args.nbits}" if args.nbits else "Quantize: fp16")
     if args.linear_projections:
         print(f"Projections: nn.Linear")
@@ -542,20 +580,26 @@ def main():
             _build_one(
                 lambda p: convert_chunk2_merged_single(base, args.ctx, p,
                                                          args.nbits,
-                                                         use_linear=use_linear),
+                                                         use_linear=use_linear,
+                                                         own_range=own_range,
+                                                         shared_range=shared_range),
                 lambda T, p: convert_chunk2_merged_prefill_single(
                     base, args.ctx, T, p, args.nbits,
-                    use_linear=use_linear),
+                    use_linear=use_linear,
+                    own_range=own_range, shared_range=shared_range),
                 "chunk_2",
             )
         else:
             _build_one(
                 lambda p: convert_chunk2_merged(base, args.ctx, p,
                                                   args.nbits,
-                                                  use_linear=use_linear),
+                                                  use_linear=use_linear,
+                                                  own_range=own_range,
+                                                  shared_range=shared_range),
                 lambda T, p: convert_chunk2_merged_prefill(
                     base, args.ctx, T, p, args.nbits,
-                    use_linear=use_linear),
+                    use_linear=use_linear,
+                    own_range=own_range, shared_range=shared_range),
                 "chunk_2",
             )
     if do(3):

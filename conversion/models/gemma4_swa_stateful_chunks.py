@@ -838,17 +838,27 @@ class SWAStatefulChunk4Prefill(SWAStatefulChunk4):
 
 
 class SWAStatefulMergedChunk23(_StatefulChunkBase):
-    """Merged stateful chunk for L8-24. Owns KV state for L8-14, runs
-    L15-24 KV-shared internally. Eliminates the 4-chunk's chunk_2 →
-    chunk_3 hidden-state round-trip (~+5-10% Mac decode).
+    """Merged stateful chunk that owns the lower-half KV span and runs
+    the upper-half KV-shared internally. Eliminates the 4-chunk's
+    chunk_2 → chunk_3 hidden-state round-trip (~+5-10% Mac decode).
+
+    Boundaries default to E2B (own=L8-14, shared=L15-24). For E4B pass
+    own_range / shared_range derived from compute_chunk_boundaries(cfg)
+    (E4B: own=L12-23, shared=L24-32).
     """
-    START_OWN, END_OWN = 8, 15      # own-KV layers (= old chunk_2)
-    START_SHARED, END_SHARED = 15, 25  # KV-shared layers (= old chunk_3)
+    DEFAULT_OWN = (8, 15)       # E2B own-KV layers (= old chunk_2)
+    DEFAULT_SHARED = (15, 25)   # E2B KV-shared layers (= old chunk_3)
 
     def __init__(self, model: Gemma4Model, ctx: int = 2048,
-                 use_linear: bool = False):
+                 use_linear: bool = False,
+                 own_range: tuple[int, int] | None = None,
+                 shared_range: tuple[int, int] | None = None):
+        own = own_range if own_range is not None else self.DEFAULT_OWN
+        shared = shared_range if shared_range is not None else self.DEFAULT_SHARED
+        self.START_OWN, self.END_OWN = own
+        self.START_SHARED, self.END_SHARED = shared
         # Init base with the OWN-KV span so the kv_cache_* buffers size
-        # to L8-14 only. KV-shared layers don't need state slots.
+        # to chunk_2 only. KV-shared layers don't need state slots.
         super().__init__(model, self.START_OWN, self.END_OWN, ctx)
         self.layers_shared = nn.ModuleList([
             model.layers[i] for i in range(self.START_SHARED, self.END_SHARED)
@@ -905,8 +915,11 @@ class SWAStatefulMergedChunk23(_StatefulChunkBase):
 class SWAStatefulMergedChunk23Prefill(SWAStatefulMergedChunk23):
     """T=N prefill variant of the merged middle chunk."""
 
-    def __init__(self, model, ctx=2048, use_linear=False, T: int = 8):
-        super().__init__(model, ctx, use_linear=use_linear)
+    def __init__(self, model, ctx=2048, use_linear=False, T: int = 8,
+                 own_range: tuple[int, int] | None = None,
+                 shared_range: tuple[int, int] | None = None):
+        super().__init__(model, ctx, use_linear=use_linear,
+                         own_range=own_range, shared_range=shared_range)
         self.T = T
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
@@ -1351,13 +1364,23 @@ class SWAStatefulChunk1PrefillSingle(SWAStatefulChunk1Single):
 
 
 class SWAStatefulMergedChunk23Single(_StatefulSingleChunkBase):
-    """3-chunk merged middle (L8-24) with unified state buffer.
-    Owns L8-14 KV; runs L15-24 KV-shared internally. Emits kv13/kv14
-    aliases for the final chunk_3."""
-    START_OWN, END_OWN = 8, 15
-    START_SHARED, END_SHARED = 15, 25
+    """3-chunk merged middle with unified state buffer.
+    Owns chunk_2 KV; runs chunk_3 KV-shared internally. Emits kv13/kv14
+    aliases for the final chunk_3.
 
-    def __init__(self, model, ctx=2048, use_linear=False):
+    Boundaries default to E2B (own=L8-14, shared=L15-24). For E4B pass
+    own_range / shared_range from compute_chunk_boundaries(cfg)
+    (E4B: own=L12-23, shared=L24-32)."""
+    DEFAULT_OWN = (8, 15)
+    DEFAULT_SHARED = (15, 25)
+
+    def __init__(self, model, ctx=2048, use_linear=False,
+                 own_range: tuple[int, int] | None = None,
+                 shared_range: tuple[int, int] | None = None):
+        own = own_range if own_range is not None else self.DEFAULT_OWN
+        shared = shared_range if shared_range is not None else self.DEFAULT_SHARED
+        self.START_OWN, self.END_OWN = own
+        self.START_SHARED, self.END_SHARED = shared
         super().__init__(model, self.START_OWN, self.END_OWN, ctx)
         self.layers_shared = nn.ModuleList([
             model.layers[i] for i in range(self.START_SHARED, self.END_SHARED)
@@ -1406,8 +1429,11 @@ class SWAStatefulMergedChunk23Single(_StatefulSingleChunkBase):
 class SWAStatefulMergedChunk23PrefillSingle(SWAStatefulMergedChunk23Single):
     """T=N prefill variant of merged middle with unified state."""
 
-    def __init__(self, model, ctx=2048, use_linear=False, T: int = 8):
-        super().__init__(model, ctx, use_linear=use_linear)
+    def __init__(self, model, ctx=2048, use_linear=False, T: int = 8,
+                 own_range: tuple[int, int] | None = None,
+                 shared_range: tuple[int, int] | None = None):
+        super().__init__(model, ctx, use_linear=use_linear,
+                         own_range=own_range, shared_range=shared_range)
         self.T = T
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,

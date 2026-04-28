@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mac sanity check for /tmp/gemma4-e2b-stateful/ chunk_{1..4}.mlpackage.
+"""Mac sanity check for Gemma 4 stateful chunk_{1..4}.mlpackage bundles.
 
 Verifies:
   1. Each chunk loads on Mac CPU_AND_NE without error.
@@ -15,9 +15,15 @@ Verifies:
 This is NOT a numerical correctness test — inputs are zeros / synthetic
 RoPE — only a wiring sanity check. Real perf/correctness will be on
 iPhone after the Swift Generator is wired up.
+
+Usage:
+    python conversion/sanity_stateful_chunks.py             # E2B default
+    python conversion/sanity_stateful_chunks.py --model gemma4-e4b
+    python conversion/sanity_stateful_chunks.py --artifacts /tmp/foo
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
@@ -26,19 +32,26 @@ from pathlib import Path
 import numpy as np
 import coremltools as ct
 
-CTX = 512
-W = 512
-HIDDEN = 1536
-PLD = 256
-NLAYERS = 35
-HKV = 1
-HD_S = 256
-HD_F = 512
-VOCAB = 262_144
-ARTIFACTS = Path("/tmp/gemma4-e2b-stateful")
+# --- Per-model presets (must match build_gemma4_e2b_stateful_chunks.py) ---
+PRESETS = {
+    "gemma4-e2b": dict(
+        ctx=512, w=512, hidden=1536, pld=256, nlayers=35, hkv=1,
+        hd_s=256, hd_f=512, vocab=262_144,
+        artifacts="/tmp/gemma4-e2b-stateful",
+        boundaries=[(0, 8), (8, 15), (15, 25), (25, 35)],
+    ),
+    "gemma4-e4b": dict(
+        ctx=2048, w=512, hidden=2560, pld=256, nlayers=42, hkv=2,
+        hd_s=256, hd_f=512, vocab=262_144,
+        artifacts="/tmp/gemma4-e4b-stateful",
+        boundaries=[(0, 12), (12, 24), (24, 33), (33, 42)],
+    ),
+}
 
-# --- E2B chunk topology (must match build_gemma4_e2b_stateful_chunks.py) ---
-CHUNK_BOUNDARIES = [(0, 8), (8, 15), (15, 25), (25, 35)]
+# Defaults overwritten in main() once we read --model / --artifacts.
+CTX = W = HIDDEN = PLD = NLAYERS = HKV = HD_S = HD_F = VOCAB = 0
+ARTIFACTS: Path = Path("/tmp/gemma4-e2b-stateful")
+CHUNK_BOUNDARIES: list = []
 
 
 def _make_mask_full(pos: int) -> np.ndarray:
@@ -134,7 +147,32 @@ def shared_chunk_inputs(seed: int, hidden_in: np.ndarray, per_layer_combined: np
     }
 
 
+def _apply_preset(name: str, artifacts_override: str | None) -> None:
+    """Populate the module-level constants other functions read."""
+    if name not in PRESETS:
+        sys.exit(f"unknown preset {name!r}; choose from {list(PRESETS)}")
+    p = PRESETS[name]
+    g = globals()
+    g["CTX"], g["W"] = p["ctx"], p["w"]
+    g["HIDDEN"], g["PLD"] = p["hidden"], p["pld"]
+    g["NLAYERS"], g["HKV"] = p["nlayers"], p["hkv"]
+    g["HD_S"], g["HD_F"], g["VOCAB"] = p["hd_s"], p["hd_f"], p["vocab"]
+    g["ARTIFACTS"] = Path(artifacts_override or p["artifacts"])
+    g["CHUNK_BOUNDARIES"] = p["boundaries"]
+    print(f"[preset] {name}  artifacts={ARTIFACTS}")
+    print(f"  ctx={CTX} W={W} hidden={HIDDEN} layers={NLAYERS} HKV={HKV}")
+
+
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="gemma4-e2b",
+                    choices=list(PRESETS),
+                    help="Which Gemma 4 stateful preset to sanity-test")
+    ap.add_argument("--artifacts", default=None,
+                    help="Override artifacts dir (defaults to preset's path)")
+    args = ap.parse_args()
+    _apply_preset(args.model, args.artifacts)
+
     if not ARTIFACTS.is_dir():
         sys.exit(f"missing: {ARTIFACTS}")
 

@@ -263,6 +263,31 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-stateful-coreml/resolve/main",
             folderName: "gemma4-e2b-stateful-linear")
 
+        /// Gemma 4 E4B stateful — Stage 2 port of the E2B Phase 1 + 2a
+        /// stateful path to the larger 4 B sibling. Built by
+        /// `conversion/build_gemma4_e2b_stateful_chunks.py --model gemma4-e4b`
+        /// (same script; chunk boundaries / hidden / HKV come from the HF
+        /// config). Shares the inner subdir name `gemma4_e2b_stateful_chunks`
+        /// with the E2B variants — Gemma4StatefulEngine reads
+        /// hidden_size / num_layers / per_layer_dim from `model_config.json`,
+        /// so E4B runs without engine code changes. Sideload-only to
+        /// `Documents/Models/gemma4-e4b-stateful/gemma4_e2b_stateful_chunks/`.
+        public static let gemma4e4bStateful = ModelInfo(
+            id: "gemma4-e4b-stateful",
+            name: "Gemma 4 E4B (stateful, MLState)", size: "5.6 GB",
+            downloadURL: "",
+            folderName: "gemma4-e4b-stateful")
+
+        /// Gemma 4 E4B stateful — Linear projections variant (cml9 PR #2577
+        /// `nn.Linear` form, ANE-equivalent placement). Same layout as
+        /// `gemma4e4bStateful`. Production HF download URL is filled in
+        /// once the iPhone 17 Pro A/B clears (Stage 2 closure step A6).
+        public static let gemma4e4bStatefulLinear = ModelInfo(
+            id: "gemma4-e4b-stateful-linear",
+            name: "Gemma 4 E4B (stateful, Linear projections)", size: "5.6 GB",
+            downloadURL: "",
+            folderName: "gemma4-e4b-stateful-linear")
+
         /// Visible in the UI picker. EAGLE-3 / LookAhead probe variants are
         /// hidden unless `LLM_SHOW_EXPERIMENTAL=1` is set (or the
         /// UserDefaults key `showExperimentalModels` is true). Keeps the
@@ -297,6 +322,8 @@ public final class ModelDownloader: NSObject {
                 list.insert(gemma4e2bEagle3, at: 3)
                 list.insert(gemma4e2bLookaheadProbe, at: 4)
                 list.insert(gemma4e2bStateful, at: 5)        // Conv2d variant
+                list.insert(gemma4e4bStateful, at: 6)        // E4B Stage 2 Conv2d
+                list.insert(gemma4e4bStatefulLinear, at: 7)  // E4B Stage 2 Linear
             }
             return list
         }
