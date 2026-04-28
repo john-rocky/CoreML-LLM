@@ -680,12 +680,56 @@ public final class ModelDownloader: NSObject {
     ///
     /// The visible model folder disappears immediately. Remaining graveyard
     /// bytes are swept up by `cleanGraveyard` at the next init.
+    ///
+    /// Fallback path: if the rename fails (graveyard parent unwritable, or
+    /// the model was sideloaded with root-owned files), we attempt a chmod
+    /// + recursive removeItem.  Sideloaded models pushed via
+    /// `xcrun devicectl device copy to` arrive with `UID 0` perms `0755`,
+    /// which silently breaks the rename pattern; the chmod walk restores
+    /// app ownership before the unlink loop.
     private func evictToGraveyard(_ url: URL) throws {
         let graveRoot = modelsDirectory.appendingPathComponent(".graveyard", isDirectory: true)
-        try? fileManager.createDirectory(at: graveRoot, withIntermediateDirectories: true)
-        let grave = graveRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try fileManager.moveItem(at: url, to: grave)
-        try? fileManager.removeItem(at: grave)  // best-effort; leftovers cleaned next launch
+        do {
+            try fileManager.createDirectory(at: graveRoot, withIntermediateDirectories: true)
+            let grave = graveRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try fileManager.moveItem(at: url, to: grave)
+            try? fileManager.removeItem(at: grave)
+            return
+        } catch {
+            // graveyard rename failed — try the direct removal fallback.
+            print("[ModelDownloader] graveyard rename failed (\(error.localizedDescription)); "
+                  + "falling back to in-place delete")
+        }
+        try forceRemove(at: url)
+    }
+
+    /// Recursive removeItem with a best-effort `chmod` walk first, so root-
+    /// owned sideloaded folders (UID 0, 0755) become deletable by the app.
+    private func forceRemove(at url: URL) throws {
+        // First pass: open up perms on the directory tree.  POSIX `chmod`
+        // is enough — we don't need to change ownership; iOS lets the app
+        // unlink anything in its container as long as the entry is writable
+        // (and APFS doesn't enforce sticky-bit restrictions on Documents).
+        if let enumerator = fileManager.enumerator(at: url,
+                                                    includingPropertiesForKeys: nil,
+                                                    options: []) {
+            for case let child as URL in enumerator {
+                _ = try? fileManager.setAttributes(
+                    [.posixPermissions: NSNumber(value: Int16(0o755))],
+                    ofItemAtPath: child.path)
+            }
+        }
+        _ = try? fileManager.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o755))],
+            ofItemAtPath: url.path)
+
+        do {
+            try fileManager.removeItem(at: url)
+        } catch let removalError {
+            // Surface the underlying error verbatim so the user sees the
+            // real reason instead of a generic "doesn't exist" wrapper.
+            throw removalError
+        }
     }
 
     /// Best-effort removal of any graveyard residue from prior sessions.
