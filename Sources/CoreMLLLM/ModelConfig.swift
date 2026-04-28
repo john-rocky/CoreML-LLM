@@ -27,19 +27,39 @@ public struct ModelConfig: Sendable {
     /// rather than compute their own). E2B: 20, E4B: 18.
     public let numKvSharedLayers: Int
 
+    /// LFM2-specific: number of conv layers and their cache window so the
+    /// runtime can size the `conv_state_in` / `conv_state_out` buffer
+    /// without having to peek at the mlpackage spec.  Zero for non-LFM2
+    /// architectures.
+    public let lfm2NumConvLayers: Int
+    public let lfm2ConvLPad: Int
+
     public static func load(from directory: URL) throws -> ModelConfig {
         let url = directory.appendingPathComponent("model_config.json")
         guard let data = try? Data(contentsOf: url),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw CoreMLLLMError.configNotFound
         }
-        let numLayers = json["num_layers"] as? Int ?? 35
-        let defaultLayerTypes = (0..<numLayers).map { i -> String in
-            (i + 1) % 5 == 0 ? "full_attention" : "sliding_attention"
-        }
+        // Both `num_layers` (gemma4-era key) and `num_hidden_layers` (HF
+        // canonical, what the LFM2 / qwen converters emit) are accepted.
+        let numLayers = (json["num_layers"] as? Int)
+            ?? (json["num_hidden_layers"] as? Int) ?? 35
+        let arch = json["architecture"] as? String ?? "gemma4"
+        let layerTypes = (json["layer_types"] as? [String])
+            ?? (0..<numLayers).map { i -> String in
+                (i + 1) % 5 == 0 ? "full_attention" : "sliding_attention"
+            }
+        // LFM2: count conv layers + read the padded conv-state width from
+        // the config (defaults to 16 — same as the converter default).
+        let nConv = (arch == "lfm2")
+            ? layerTypes.filter { $0 == "conv" }.count
+            : 0
+        let lPad = (arch == "lfm2")
+            ? (json["lfm2_conv_l_pad"] as? Int ?? 16)
+            : 0
         return ModelConfig(
             modelName: json["model_name"] as? String ?? "Model",
-            architecture: json["architecture"] as? String ?? "gemma4",
+            architecture: arch,
             hiddenSize: json["hidden_size"] as? Int ?? 1536,
             contextLength: json["context_length"] as? Int ?? 2048,
             vocabSize: json["vocab_size"] as? Int ?? 262144,
@@ -52,8 +72,10 @@ public struct ModelConfig: Sendable {
             perLayerProjScale: Float(json["per_layer_model_projection_scale"] as? Double ?? 0.0255),
             perLayerInputScale: Float(json["per_layer_input_scale"] as? Double ?? 0.707),
             perLayerEmbedScale: Float(json["per_layer_embed_scale"] as? Double ?? 16.0),
-            layerTypes: (json["layer_types"] as? [String]) ?? defaultLayerTypes,
-            numKvSharedLayers: json["num_kv_shared_layers"] as? Int ?? 20
+            layerTypes: layerTypes,
+            numKvSharedLayers: json["num_kv_shared_layers"] as? Int ?? 20,
+            lfm2NumConvLayers: nConv,
+            lfm2ConvLPad: lPad
         )
     }
 

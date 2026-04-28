@@ -176,6 +176,8 @@ def _detect_architecture(repo_id: str) -> str:
         return "gemma3-embedding"
     if "functiongemma" in repo_lower or "gemma-3" in repo_lower or "gemma3" in repo_lower:
         return "gemma3"
+    if "lfm2" in repo_lower or "liquidai/lfm" in repo_lower:
+        return "lfm2"
     if "llama" in repo_lower or "smollm" in repo_lower:
         return "llama"
     raise ValueError(
@@ -204,6 +206,8 @@ def _detect_architecture_from_path(path: str) -> str:
         return "qwen3"
     if "llama" in arch:
         return "llama"
+    if "lfm2" in arch:
+        return "lfm2"
 
     raise ValueError(f"Unsupported architecture: {arch_list[0]}")
 
@@ -219,6 +223,9 @@ def _get_model_class(architecture: str):
     if architecture == "gemma3":
         from models.gemma3 import Gemma3Model
         return Gemma3Model
+    if architecture == "lfm2":
+        from models.lfm2 import Lfm2Model
+        return Lfm2Model
     if architecture == "gemma3-embedding":
         raise ValueError(
             "gemma3-embedding (EmbeddingGemma) uses a dedicated export path. "

@@ -92,6 +92,21 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
             folderName: "qwen2.5-0.5b")
 
+        /// LFM2.5 350M — Liquid AI hybrid attention + short-conv decoder.
+        /// 16 layers (6 attn + 10 conv), `hidden=1024`, `vocab=65536`. The
+        /// conv block keeps a `(hidden, L_pad=3)` rolling window per
+        /// layer, passed as a regular tensor input/output (NOT MLState —
+        /// dual-state ANE planner regression on M-series, see
+        /// docs/LFM2_CONVERSION_FINDINGS.md). 97.8 % ANE-resident; the
+        /// 10 depthwise short-conv ops bounce to CPU each step but at
+        /// 350M scale ANE matmul wins overall (52 tok/s on iPhone 17 Pro
+        /// CPU+ANE vs ~30-40 CPU-only). Sideload only — `python
+        /// conversion/build_lfm2_bundle.py --l-pad 3` produces the bundle.
+        public static let lfm2_5_350m = ModelInfo(
+            id: "lfm2.5-350m", name: "LFM2.5 350M (ANE)", size: "810 MB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/lfm2.5-350m-coreml/resolve/main",
+            folderName: "lfm2.5-350m")
+
         /// Qwen3.5 0.8B — hybrid Gated-DeltaNet SSM + attention, text-only.
         /// Ships the INT8 palettized decode mlpackage (754 MB) — same
         /// semantic precision as fp16 (top-3 = 100% parity vs fp32 oracle),
@@ -270,6 +285,7 @@ public final class ModelDownloader: NSObject {
                 gemma4e4b, gemma4e2bFashion,
                 qwen25_05b, qwen35_08b, qwen35_2b,
                 qwen3vl_2b, qwen3vl_2b_stateful,
+                lfm2_5_350m,
             ]
             if experimental {
                 list.insert(gemma4e2bEagle3, at: 3)
