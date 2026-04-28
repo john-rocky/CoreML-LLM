@@ -102,6 +102,11 @@ public final class ModelDownloader: NSObject {
         /// 350M scale ANE matmul wins overall (52 tok/s on iPhone 17 Pro
         /// CPU+ANE vs ~30-40 CPU-only). Sideload only — `python
         /// conversion/build_lfm2_bundle.py --l-pad 3` produces the bundle.
+        ///
+        /// License: weights are under
+        /// [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-350M/blob/main/LICENSE)
+        /// — free for commercial use up to US $10M annual revenue;
+        /// above that, see https://www.liquid.ai/ for a commercial license.
         public static let lfm2_5_350m = ModelInfo(
             id: "lfm2.5-350m", name: "LFM2.5 350M (ANE)", size: "810 MB",
             downloadURL: "https://huggingface.co/mlboydaisuke/lfm2.5-350m-coreml/resolve/main",

@@ -17,20 +17,38 @@ struct Smoke {
     static func main() async {
         let args = CommandLine.arguments
         guard args.count >= 2 else {
-            fputs("usage: \(args[0]) <model-dir> [prompt] [maxTokens]\n", stderr)
+            fputs("usage: \(args[0]) <model-dir-or-repo> [prompt] [maxTokens]\n", stderr)
+            fputs("       repo form: org/name  (e.g. mlboydaisuke/lfm2.5-350m-coreml)\n", stderr)
+            fputs("       or model id           (e.g. lfm2.5-350m)\n", stderr)
             exit(2)
         }
-        let modelDir = URL(fileURLWithPath: args[1])
+        let target = args[1]
         let prompt = args.count >= 3
             ? args[2]
             : "Write three short sentences about the ocean."
         let maxTokens = args.count >= 4 ? (Int(args[3]) ?? 64) : 64
 
+        // "repo or id" vs "path": an HF repo path / registered model id
+        // doesn't begin with `/`, `./`, `../`, and isn't an existing entry
+        // on disk.
+        let looksLikeRepo =
+            !target.hasPrefix("/") && !target.hasPrefix("./") && !target.hasPrefix("../")
+            && !FileManager.default.fileExists(atPath: target)
+
         do {
-            print("[smoke] loading model from: \(modelDir.path)")
             let t0 = CFAbsoluteTimeGetCurrent()
-            let llm = try await CoreMLLLM.load(from: modelDir) { msg in
-                print("[load] \(msg)")
+            let llm: CoreMLLLM
+            if looksLikeRepo {
+                print("[smoke] loading via repo: \(target)")
+                llm = try await CoreMLLLM.load(repo: target) { msg in
+                    print("[load] \(msg)")
+                }
+            } else {
+                let modelDir = URL(fileURLWithPath: target)
+                print("[smoke] loading model from: \(modelDir.path)")
+                llm = try await CoreMLLLM.load(from: modelDir) { msg in
+                    print("[load] \(msg)")
+                }
             }
             let dt = CFAbsoluteTimeGetCurrent() - t0
             print("[smoke] loaded in \(String(format: "%.1f", dt))s — model=\(llm.modelName)")
