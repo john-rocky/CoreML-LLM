@@ -516,20 +516,35 @@ final class LLMRunner {
                             tokenCount += 1
                             if eosSet.contains(tokenId) { return }
                             accumIds.append(Int(tokenId))
-                            let current = tok.decode(tokens: accumIds)
+                            // Strip trailing U+FFFD before prefix check
+                            // (multi-byte UTF-8 split across BPE tokens —
+                            // emoji / CJK).
+                            var current = tok.decode(tokens: accumIds)
+                            while current.hasSuffix("\u{FFFD}") {
+                                current = String(current.dropLast())
+                            }
                             if current.count > emittedText.count,
                                current.hasPrefix(emittedText) {
                                 let delta = String(current.dropFirst(emittedText.count))
                                 continuation.yield(delta)
                                 emittedText = current
                             }
+                            // Throttle tps update (per 8 tokens) — at high
+                            // tok/s, per-token MainActor tasks queue up
+                            // and lock the input field after generation.
                             let elapsed = Date().timeIntervalSince(genStart)
-                            if elapsed > 0 {
+                            if elapsed > 0 && tokenCount % 8 == 0 {
+                                let tps = Double(tokenCount) / elapsed
                                 Task { @MainActor in
-                                    self?.tokensPerSecond = Double(tokenCount) / elapsed
+                                    self?.tokensPerSecond = tps
                                 }
                             }
                         })
+                    let totalElapsed = Date().timeIntervalSince(genStart)
+                    if totalElapsed > 0 && tokenCount > 0 {
+                        let finalTPS = Double(tokenCount) / totalElapsed
+                        Task { @MainActor in self?.tokensPerSecond = finalTPS }
+                    }
                 } catch {
                     continuation.yield("[Error: \(error.localizedDescription)]")
                 }
@@ -621,20 +636,43 @@ final class LLMRunner {
                             tokenCount += 1
                             if eosSet.contains(tokenId) { return }
                             accumIds.append(Int(tokenId))
-                            let current = tok.decode(tokens: accumIds)
+                            // Strip trailing U+FFFD: BPE tokens split
+                            // multi-byte UTF-8 (emoji, CJK glyphs); the
+                            // intermediate decode shows the partial bytes
+                            // as the replacement char. Without this the
+                            // emittedText baseline locks at "...\u{FFFD}"
+                            // and never matches the next-step "...emoji"
+                            // prefix → emit stalls, UI shows mojibake.
+                            var current = tok.decode(tokens: accumIds)
+                            while current.hasSuffix("\u{FFFD}") {
+                                current = String(current.dropLast())
+                            }
                             if current.count > emittedText.count,
                                current.hasPrefix(emittedText) {
                                 let delta = String(current.dropFirst(emittedText.count))
                                 continuation.yield(delta)
                                 emittedText = current
                             }
+                            // Throttle per-token tps update — every 8 tokens.
+                            // At 40+ tok/s, every-token MainActor dispatches
+                            // pile up and tokensPerSecond keeps "ticking" for
+                            // ~1 s after generation completes (also delays
+                            // isGenerating=false → input stays locked).
                             let elapsed = Date().timeIntervalSince(genStart)
-                            if elapsed > 0 {
+                            if elapsed > 0 && tokenCount % 8 == 0 {
+                                let tps = Double(tokenCount) / elapsed
                                 Task { @MainActor in
-                                    self?.tokensPerSecond = Double(tokenCount) / elapsed
+                                    self?.tokensPerSecond = tps
                                 }
                             }
                         })
+                    // Final tps snapshot — captures the last < 8-token
+                    // window the throttle skipped.
+                    let totalElapsed = Date().timeIntervalSince(genStart)
+                    if totalElapsed > 0 && tokenCount > 0 {
+                        let finalTPS = Double(tokenCount) / totalElapsed
+                        Task { @MainActor in self?.tokensPerSecond = finalTPS }
+                    }
                 } catch {
                     continuation.yield("[Error: \(error.localizedDescription)]")
                 }

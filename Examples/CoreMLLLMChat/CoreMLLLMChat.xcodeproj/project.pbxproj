@@ -10,6 +10,7 @@
 		32404BC1AC91219654BB4034 /* Qwen35GeneratorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */; };
 		370C4C3589D85D9148AED4C9 /* Qwen35BenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8714748BF0A5E81B6E3499A /* Qwen35BenchmarkView.swift */; };
 		3D7B40A686C6B3EA9089FC5A /* Qwen35Generator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */; };
+		D1E20000000000000000BE09 /* Qwen35MLKVGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE0A /* Qwen35MLKVGenerator.swift */; };
 		C1A1B2C3D4E5F6A7B8C9D000 /* Qwen3VL2BGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2A1B2C3D4E5F6A7B8C9D001 /* Qwen3VL2BGenerator.swift */; };
 		C1A1B2C3D4E5F6A7B8C9D002 /* Qwen3VL2BVisionEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2A1B2C3D4E5F6A7B8C9D003 /* Qwen3VL2BVisionEncoder.swift */; };
 		72EA4F4B993C82EAA1F18FF1 /* qwen3_5_oracle_ios.json in Resources */ = {isa = PBXBuildFile; fileRef = 96644CCA8CDD9D651ACBD01D /* qwen3_5_oracle_ios.json */; };
@@ -34,6 +35,7 @@
 
 /* Begin PBXFileReference section */
 		4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35Generator.swift; path = CoreMLLLMChat/Qwen35Generator.swift; sourceTree = SOURCE_ROOT; };
+		D1E20000000000000000BE0A /* Qwen35MLKVGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35MLKVGenerator.swift; path = CoreMLLLMChat/Qwen35MLKVGenerator.swift; sourceTree = SOURCE_ROOT; };
 		C2A1B2C3D4E5F6A7B8C9D001 /* Qwen3VL2BGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen3VL2BGenerator.swift; path = CoreMLLLMChat/Qwen3VL2BGenerator.swift; sourceTree = SOURCE_ROOT; };
 		C2A1B2C3D4E5F6A7B8C9D003 /* Qwen3VL2BVisionEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen3VL2BVisionEncoder.swift; path = CoreMLLLMChat/Qwen3VL2BVisionEncoder.swift; sourceTree = SOURCE_ROOT; };
 		96644CCA8CDD9D651ACBD01D /* qwen3_5_oracle_ios.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; name = qwen3_5_oracle_ios.json; path = CoreMLLLMChat/qwen3_5_oracle_ios.json; sourceTree = SOURCE_ROOT; };
@@ -82,6 +84,7 @@
 				CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */,
 				A83A47DE9322C639B9EFD102 /* Qwen35DecodeBenchmarkView.swift */,
 				4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */,
+				D1E20000000000000000BE0A /* Qwen35MLKVGenerator.swift */,
 				C2A1B2C3D4E5F6A7B8C9D001 /* Qwen3VL2BGenerator.swift */,
 				C2A1B2C3D4E5F6A7B8C9D003 /* Qwen3VL2BVisionEncoder.swift */,
 				AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */,
@@ -200,6 +203,7 @@
 				B60E4AB380E7B9E215F1B15E /* Qwen35DecodeBenchmark.swift in Sources */,
 				79D8443C9596EB593A5FE1EC /* Qwen35DecodeBenchmarkView.swift in Sources */,
 				3D7B40A686C6B3EA9089FC5A /* Qwen35Generator.swift in Sources */,
+				D1E20000000000000000BE09 /* Qwen35MLKVGenerator.swift in Sources */,
 				C1A1B2C3D4E5F6A7B8C9D000 /* Qwen3VL2BGenerator.swift in Sources */,
 				C1A1B2C3D4E5F6A7B8C9D002 /* Qwen3VL2BVisionEncoder.swift in Sources */,
 				32404BC1AC91219654BB4034 /* Qwen35GeneratorView.swift in Sources */,
