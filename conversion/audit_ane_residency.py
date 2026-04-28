@@ -36,7 +36,13 @@ def _iter_block(block, func_name):
 def _device_label(usage) -> str:
     if usage is None:
         return "unknown"
-    preferred = getattr(usage, "preferred", None)
+    # coremltools 9.0 renamed the attribute to `preferred_compute_device`;
+    # earlier versions exposed it as `preferred`.  Try both so this works
+    # against either coremltools.
+    preferred = (
+        getattr(usage, "preferred_compute_device", None)
+        or getattr(usage, "preferred", None)
+    )
     if preferred is None:
         return "unknown"
     name = type(preferred).__name__
@@ -64,9 +70,13 @@ def audit(path: str) -> None:
     total = 0
 
     for func_name, op in _iter_mlprogram_ops(ms):
+        # `const` ops aren't dispatched to a compute device — skip so the
+        # ANE/CPU/GPU percentages reflect actual compute work, not weights.
+        if op.operator_name == "const":
+            continue
         try:
             usage = plan.get_compute_device_usage_for_mlprogram_operation(op)
-        except Exception as e:
+        except Exception:
             usage = None
         dev = _device_label(usage)
         by_device[dev] += 1
