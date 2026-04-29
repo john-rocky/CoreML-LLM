@@ -55,18 +55,12 @@ All numbers are iPhone 17 Pro A19 Pro, 2048-token context, ANE-only (no GPU fall
 
 <table>
   <tr>
-    <td align="center" width="50%"><b>Text (E2B)</b><br><img src="https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a" width="100%"></td>
-    <td align="center" width="50%"><b>Text (E4B)</b><br><img src="https://github.com/user-attachments/assets/5d514739-8538-4048-bfce-78605de64e83" width="100%"></td>
+    <td align="center" width="50%"><b>Text</b><br><img src="https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a" width="100%"></td>
+    <td align="center" width="50%"><b>Image</b><br><img src="https://github.com/user-attachments/assets/2a869bf5-8315-422d-8b06-a4a7edecd173" width="100%"></td>
   </tr>
   <tr>
-    <td align="center"><b>Image</b><br><img src="https://github.com/user-attachments/assets/2a869bf5-8315-422d-8b06-a4a7edecd173" width="100%"></td>
     <td align="center"><b>Video</b><br><img src="https://github.com/user-attachments/assets/1d2a9ff3-2912-40e9-895d-fbaa3c73ee3a" width="100%"></td>
-  </tr>
-  <tr>
-    <td align="center" colspan="2"><b>Audio</b><br><video src="https://github.com/user-attachments/assets/e8deb6d0-d8b0-4210-885c-5d7a7ddc7ad3" controls></video></td>
-  </tr>
-  <tr>
-    <td align="center" colspan="2"><b>Image (Qwen3-VL 2B)</b><br><video src="https://github.com/user-attachments/assets/f9a257cf-cf10-4968-8964-b979b0a352d1" controls></video></td>
+    <td align="center"><b>Audio</b><br><video src="https://github.com/user-attachments/assets/e8deb6d0-d8b0-4210-885c-5d7a7ddc7ad3" controls></video></td>
   </tr>
 </table>
 
