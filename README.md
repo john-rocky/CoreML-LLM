@@ -1,6 +1,6 @@
 # CoreML-LLM
 
-**On-device LLMs on the Apple Neural Engine.** Run Gemma 4, Qwen3.5, Qwen3-VL, FunctionGemma, and EmbeddingGemma on iPhone with CoreML — ANE-first, battery-friendly, no server.
+**On-device LLMs on the Apple Neural Engine.** Run Gemma 4, Qwen3.5, Qwen3-VL, FunctionGemma, EmbeddingGemma, and Liquid AI's LFM2.5 on iPhone with CoreML — ANE-first, battery-friendly, no server.
 
 Where [MLX Swift](https://github.com/ml-explore/mlx-swift) is the right call when you want maximum GPU throughput, CoreML-LLM is what you use when the LLM should live on the **ANE** so the GPU stays free for the rest of the app.
 
@@ -15,6 +15,7 @@ Where [MLX Swift](https://github.com/ml-explore/mlx-swift) is the right call whe
 | **Qwen3.5 2B** | 2.4 GB | Text | ~17 tok/s (~200 MB RSS) | [mlboydaisuke/qwen3.5-2B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML) |
 | **Qwen3.5 0.8B** | 1.4 GB | Text | ~20 tok/s | [mlboydaisuke/qwen3.5-0.8B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML) |
 | **Qwen3-VL 2B (stateful)** | 2.3 GB | Text + image (DeepStack) | **~24 tok/s** (256 MB RSS, TTFT 125 ms on resumed turn) | [mlboydaisuke/qwen3-vl-2b-stateful-coreml](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-stateful-coreml) |
+| **LFM2.5 350M** [†](#lfm2-license) | 810 MB | Text (hybrid attn + short-conv) | **52 tok/s** (97.8 % ANE-resident) | [mlboydaisuke/lfm2.5-350m-coreml](https://huggingface.co/mlboydaisuke/lfm2.5-350m-coreml) |
 | **FunctionGemma-270M** | 850 MB | Function calling | (specialist) | [mlboydaisuke/functiongemma-270m-coreml](https://huggingface.co/mlboydaisuke/functiongemma-270m-coreml) |
 | **EmbeddingGemma-300M** | 295 MB | Sentence embeddings (768/512/256/128) | (specialist) | [mlboydaisuke/embeddinggemma-300m-coreml](https://huggingface.co/mlboydaisuke/embeddinggemma-300m-coreml) |
 | Qwen3-VL 2B (legacy, recurrent) | 2.9 GB | Text + image (DeepStack) | ~7.5 tok/s | [mlboydaisuke/qwen3-vl-2b-coreml](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-coreml) |
@@ -28,6 +29,7 @@ All numbers are iPhone 17 Pro A19 Pro, 2048-token context, ANE-only (no GPU fall
 - Text-only, maximum quality under ≤3 GB → **Qwen3.5 2B**
 - Text-only, maximum quality → **Gemma 4 E4B**
 - Text-only, fastest + smallest → **Qwen3.5 0.8B**
+- Text-only, smallest at high tok/s on iPhone → **LFM2.5 350M** (52 tok/s, 810 MB) [†](#lfm2-license)
 - Tool / function calling → **FunctionGemma-270M**
 - Sentence embeddings / RAG → **EmbeddingGemma-300M**
 
@@ -213,9 +215,12 @@ python install_3way_bundle.py
 # Specialists
 python build_functiongemma_bundle.py --ctx 2048 --quantize int8 --prefill-t 32
 python build_embeddinggemma_bundle.py --max-seq-len 128 --quantize int8
+
+# LFM2.5 350M (Liquid AI hybrid attn + short-conv) — sideload-ready bundle
+python build_lfm2_bundle.py --model lfm2.5-350m --l-pad 3
 ```
 
-Step-by-step: [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md). Full reference (quant, `.mlpackage` → `.mlmodelc`, iPhone deployment): [docs/CONVERSION.md](docs/CONVERSION.md).
+Step-by-step: [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md). Full reference (quant, `.mlpackage` → `.mlmodelc`, iPhone deployment): [docs/CONVERSION.md](docs/CONVERSION.md). LFM2-specific deep-dive (ChatML template, dual-state ANE blocker, fp16 short-conv drift): [docs/LFM2_CONVERSION_FINDINGS.md](docs/LFM2_CONVERSION_FINDINGS.md).
 
 ## Documentation
 
@@ -232,6 +237,7 @@ Step-by-step: [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md). Full reference (qu
 | 8K context roadmap, ANE-compat matrix | [docs/SPEED_8K.md](docs/SPEED_8K.md) |
 | FunctionGemma I/O contract | [docs/FUNCTIONGEMMA.md](docs/FUNCTIONGEMMA.md) |
 | EmbeddingGemma I/O contract, Matryoshka recipe | [docs/EMBEDDINGGEMMA.md](docs/EMBEDDINGGEMMA.md) |
+| LFM2.5 conversion (ChatML, ANE dual-state workaround, fp16 padding drift) | [docs/LFM2_CONVERSION_FINDINGS.md](docs/LFM2_CONVERSION_FINDINGS.md) |
 | Research background, competitive landscape | [docs/RESEARCH.md](docs/RESEARCH.md) |
 | Decision log (WFA, Flash, W8A8, Medusa, EAGLE-3, SDPA fusion, KV alias, Topology I) | [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) |
 
@@ -287,3 +293,6 @@ docs/                       Design docs, benchmarks, decision log
 ## License
 
 MIT for the CoreML-LLM code. Model weights inherit the original licenses (Gemma weights: [Gemma Terms of Use](https://ai.google.dev/gemma/terms); Qwen weights: Apache 2.0; Qwen3-VL vision weights: Apache 2.0).
+
+<a id="lfm2-license"></a>
+**† LFM2.5 350M** weights are under [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-350M/blob/main/LICENSE) (Liquid AI). Free for non-commercial use, research, and commercial use **up to a US $10M annual revenue threshold**. Above that threshold, see [Liquid AI](https://www.liquid.ai/) for a separate commercial license.

@@ -211,6 +211,9 @@ class CoreMLExporter:
         elif 'Gemma3' in cls_name:
             from models.gemma3_wrapper import Gemma3MonolithicWrapper
             wrapper = Gemma3MonolithicWrapper(self.model)
+        elif 'Lfm2' in cls_name:
+            from models.lfm2_wrapper import Lfm2MonolithicWrapper
+            wrapper = Lfm2MonolithicWrapper(self.model)
         else:
             wrapper = MonolithicWrapper(self.model)
         wrapper.eval()
@@ -225,24 +228,58 @@ class CoreMLExporter:
         sample_update_mask = torch.zeros((1, 1, ctx, 1), dtype=torch.float16)
         sample_update_mask[0, 0, 0, 0] = 1.0
 
+        # LFM2 wrapper takes an extra conv_state_in tensor (not MLState — see
+        # lfm2_wrapper.py for the dual-state-on-ANE blocker).
+        is_lfm2 = "Lfm2" in self.model.__class__.__name__
+        sample_conv_state_in = None
+        if is_lfm2 and getattr(wrapper, "uses_conv_io", False):
+            n_conv = len(wrapper.conv_layer_indices)
+            l_pad = wrapper.conv_l_padded
+            sample_conv_state_in = torch.zeros(
+                (n_conv, self.config.hidden_size, l_pad), dtype=torch.float16,
+            )
+            print(f"  conv_state_in: {tuple(sample_conv_state_in.shape)}")
+
         print(f"  input_ids: {sample_input_ids.shape}")
         print(f"  position_ids: {sample_position_ids.shape}")
         print(f"  causal_mask: {sample_causal_mask.shape}")
         print(f"  update_mask: {sample_update_mask.shape}")
 
-        # Reset KV cache before tracing
+        # Reset state buffers before tracing.
         with torch.no_grad():
             wrapper.kv_cache_0.zero_()
 
         print("Tracing model...")
         with torch.no_grad():
-            traced = torch.jit.trace(
-                wrapper,
-                (sample_input_ids, sample_position_ids, sample_causal_mask, sample_update_mask),
-            )
+            trace_args = (sample_input_ids, sample_position_ids,
+                          sample_causal_mask, sample_update_mask)
+            if sample_conv_state_in is not None:
+                trace_args = trace_args + (sample_conv_state_in,)
+            traced = torch.jit.trace(wrapper, trace_args)
 
         # KV cache state shape - use the wrapper's actual buffer shape
         cache_shape = tuple(wrapper.kv_cache_0.shape)
+        states = [
+            ct.StateType(
+                wrapped_type=ct.TensorType(shape=cache_shape, dtype=np.float16),
+                name="kv_cache_0",
+            ),
+        ]
+
+        # LFM2 takes the conv state as an extra input/output tensor pair.
+        extra_inputs = []
+        extra_outputs = []
+        if sample_conv_state_in is not None:
+            extra_inputs.append(
+                ct.TensorType(
+                    name="conv_state_in",
+                    shape=tuple(sample_conv_state_in.shape),
+                    dtype=np.float16,
+                )
+            )
+            extra_outputs.append(
+                ct.TensorType(name="conv_state_out", dtype=np.float16)
+            )
 
         print("Converting to CoreML...")
         convert_kwargs = dict(
@@ -251,23 +288,29 @@ class CoreMLExporter:
                 ct.TensorType(name="position_ids", shape=(1,), dtype=np.int32),
                 ct.TensorType(name="causal_mask", shape=(1, 1, 1, ctx), dtype=np.float16),
                 ct.TensorType(name="update_mask", shape=(1, 1, ctx, 1), dtype=np.float16),
+                *extra_inputs,
             ],
             outputs=[
                 ct.TensorType(name="token_id", dtype=np.int32),
                 ct.TensorType(name="token_logit", dtype=np.float16),
+                *extra_outputs,
             ],
-            states=[
-                ct.StateType(
-                    wrapped_type=ct.TensorType(shape=cache_shape, dtype=np.float16),
-                    name="kv_cache_0",
-                ),
-            ],
+            states=states,
             compute_units=ct.ComputeUnit.ALL,
         )
         if compute_precision == "fp32":
             convert_kwargs["compute_precision"] = ct.precision.FLOAT32
-        # Bump to iOS 26 target — its fp16 lowering path differs from iOS 18
-        # and is what we validated EmbeddingGemma against.
+        # LFM2: prior runs forced fp32 to dodge the short-conv drift, but
+        # ANE only accepts fp16 ops so that pinned the model to CPU.  Try
+        # fp16 + ANE — the ANE matmul order differs from CPU's and may not
+        # exhibit the same drift.  Override with LFM2_FORCE_FP32=1 if
+        # the model still degenerates.
+        if ("Lfm2" in self.model.__class__.__name__
+                and compute_precision is None
+                and os.environ.get("LFM2_FORCE_FP32") == "1"):
+            convert_kwargs["compute_precision"] = ct.precision.FLOAT32
+            print("  LFM2: LFM2_FORCE_FP32=1 → compute_precision=FLOAT32")
+        # iOS 26 by default — its fp16 lowering path differs from iOS 18.
         convert_kwargs["minimum_deployment_target"] = ct.target.iOS26
         mlmodel = ct.convert(traced, **convert_kwargs)
 

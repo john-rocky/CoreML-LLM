@@ -37,6 +37,14 @@ public final class CoreMLLLM: @unchecked Sendable {
     private var monolithicModel: MLModel?
     private var monolithicState: MLState?
 
+    // LFM2: rolling conv-state passed as input/output (NOT MLState — see
+    // docs/LFM2_CONVERSION_FINDINGS.md, "ANE blocker: dual-state CoreML
+    // programs").  Allocated once at load() if the model declares
+    // `conv_state_in`; zeroed on reset() and copied from `conv_state_out`
+    // after every prediction.
+    private var monolithicConvState: MLMultiArray?
+    private var monolithicConvStateShape: [NSNumber]?
+
     // EAGLE-3 speculative decoding (optional — nil if the fusion/draft/verify
     // assets aren't in the model directory).
     private var speculativeLoop: SpeculativeLoop?
@@ -312,7 +320,17 @@ public final class CoreMLLLM: @unchecked Sendable {
             }
         } else {
             let mlConfig = MLModelConfiguration()
-            mlConfig.computeUnits = computeUnits
+            // LFM2: forcibly route to CPU when LLM_LFM2_USE_CPU=1.  Default
+            // is to honour the caller (typically .cpuAndNeuralEngine) so we
+            // can try ANE for speed.  fp32-built models pin themselves to
+            // CPU because ANE doesn't accept fp32 ops; fp16 builds will
+            // actually use the requested compute units.
+            let lfm2UseCPU =
+                ProcessInfo.processInfo.environment["LLM_LFM2_USE_CPU"] == "1"
+            mlConfig.computeUnits =
+                (config.architecture == "lfm2" && lfm2UseCPU)
+                    ? .cpuOnly
+                    : computeUnits
             let modelURL = directory.appendingPathComponent("model.mlmodelc")
             if FileManager.default.fileExists(atPath: modelURL.path) {
                 onProgress?("Loading model...")
@@ -324,6 +342,23 @@ public final class CoreMLLLM: @unchecked Sendable {
                 llm.monolithicModel = try MLModel(contentsOf: compiled, configuration: mlConfig)
             }
             llm.monolithicState = llm.monolithicModel?.makeState()
+
+            // LFM2: pre-allocate the conv-state I/O buffer if the model
+            // exposes the `conv_state_in` input.  Shape is read from the
+            // model description so this works regardless of how the
+            // converter padded L_cache.
+            if let inputs = llm.monolithicModel?.modelDescription
+                .inputDescriptionsByName,
+               let convIn = inputs["conv_state_in"],
+               let constraint = convIn.multiArrayConstraint {
+                let shape = constraint.shape  // [NSNumber]
+                let arr = try MLMultiArray(shape: shape, dataType: .float16)
+                memset(arr.dataPointer, 0,
+                       arr.count * MemoryLayout<UInt16>.stride)
+                llm.monolithicConvState = arr
+                llm.monolithicConvStateShape = shape
+                print("[Load] LFM2 conv_state_in shape: \(shape)")
+            }
         }
 
         // MTP drafter (optional — enables speculative decoding)
@@ -699,6 +734,42 @@ public final class CoreMLLLM: @unchecked Sendable {
                                onProgress: onProgress)
     }
 
+    /// One-call entry point — accepts either a registered model id
+    /// (e.g. ``"lfm2.5-350m"``) or the full HuggingFace repo path
+    /// (e.g. ``"mlboydaisuke/lfm2.5-350m-coreml"``).  Looks the matching
+    /// ``ModelDownloader.ModelInfo`` up in ``ModelInfo.defaults``,
+    /// downloads it on first call, and returns a loaded ``CoreMLLLM``.
+    ///
+    /// ```swift
+    /// // tweet-friendly five-liner
+    /// let llm = try await CoreMLLLM.load(repo: "mlboydaisuke/lfm2.5-350m-coreml")
+    /// let stream = try await llm.generate(messages, maxTokens: 256)
+    /// for await chunk in stream { print(chunk, terminator: "") }
+    /// ```
+    public static func load(
+        repo: String,
+        computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
+        onProgress: ((String) -> Void)? = nil
+    ) async throws -> CoreMLLLM {
+        let needle = repo.lowercased()
+        let hit = ModelDownloader.ModelInfo.defaults.first { info in
+            info.id.lowercased() == needle ||
+                info.downloadURL.lowercased().contains(needle)
+        }
+        guard let info = hit else {
+            let known = ModelDownloader.ModelInfo.defaults
+                .map(\.id).joined(separator: ", ")
+            throw CoreMLLLMError.unknownRepo(
+                "no registered model matches \"\(repo)\". "
+                + "Known ids: \(known). "
+                + "Or build a ModelInfo manually and call load(model:)."
+            )
+        }
+        return try await load(model: info,
+                              computeUnits: computeUnits,
+                              onProgress: onProgress)
+    }
+
     /// Whether EAGLE-3 speculative decoding is loaded and active for this model.
     public var supportsSpeculative: Bool { speculativeLoop != nil }
 
@@ -1031,8 +1102,15 @@ public final class CoreMLLLM: @unchecked Sendable {
                             }
                         }
 
-                        // Decode loop with tok/s tracking
-                        let eosIDs: Set<Int> = [1, 106, 151645]
+                        // Decode loop with tok/s tracking. Per-architecture
+                        // EOS ids: 1/106 = gemma4 <eos>/<end_of_turn>,
+                        // 151645 = qwen <|im_end|>.  LFM2 adds 7 (its
+                        // <|im_end|>) and 2 (<|endoftext|>) — supplied via
+                        // config.eosTokenId so future architectures don't
+                        // need a code change.
+                        var eosIDs: Set<Int> = [1, 106, 151645]
+                        eosIDs.insert(config.eosTokenId)
+                        if config.architecture == "lfm2" { eosIDs.insert(2) }
                         let startTime = CFAbsoluteTimeGetCurrent()
                         var tokenCount = 0
                         let maxDecode = min(ctxLimit - engine.currentPosition, maxTokens)
@@ -1243,7 +1321,9 @@ public final class CoreMLLLM: @unchecked Sendable {
                                 }
                             }
                         }
-                        let eosIDs: Set<Int> = [1, 106, 151645]
+                        var eosIDs: Set<Int> = [1, 106, 151645]
+                        eosIDs.insert(mutableSelf.config.eosTokenId)
+                        if mutableSelf.config.architecture == "lfm2" { eosIDs.insert(2) }
                         let startTime = CFAbsoluteTimeGetCurrent()
                         var pos = tokens.count
                         var tokenCount = 0
@@ -1277,6 +1357,11 @@ public final class CoreMLLLM: @unchecked Sendable {
             engine.reset()
         } else {
             monolithicState = monolithicModel?.makeState()
+            // LFM2: also wipe the rolling conv state.
+            if let conv = monolithicConvState {
+                memset(conv.dataPointer, 0,
+                       conv.count * MemoryLayout<UInt16>.stride)
+            }
         }
         mtpEngine?.reset()
         crossVocabEngine?.reset()
@@ -1429,8 +1514,25 @@ public final class CoreMLLLM: @unchecked Sendable {
             dict["image_embedding"] = MLFeatureValue(multiArray: imgEmb)
         }
 
+        // LFM2: feed the rolling conv state.  Buffer was zeroed at load /
+        // reset and is updated in place from `conv_state_out` after each
+        // call.  See docs/LFM2_CONVERSION_FINDINGS.md.
+        if inputNames["conv_state_in"] != nil,
+           let convState = monolithicConvState {
+            dict["conv_state_in"] = MLFeatureValue(multiArray: convState)
+        }
+
         let output = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: dict),
                                            using: state)
+
+        if let outConv = output.featureValue(for: "conv_state_out")?
+                .multiArrayValue,
+           let dst = monolithicConvState {
+            // Same shape & dtype (fp16); just byte-copy.
+            let bytes = dst.count * MemoryLayout<UInt16>.stride
+            memcpy(dst.dataPointer, outConv.dataPointer, bytes)
+        }
+
         return output.featureValue(for: "token_id")!.multiArrayValue![0].intValue
     }
 
@@ -1493,8 +1595,35 @@ public final class CoreMLLLM: @unchecked Sendable {
         if config.architecture.hasPrefix("qwen") {
             return buildQwenPrompt(messages)
         }
+        if config.architecture == "lfm2" {
+            return buildLfm2Prompt(messages)
+        }
         return buildGemmaPrompt(messages, hasImage: hasImage, hasAudio: hasAudio,
                                 audioTokenCount: audioTokenCount)
+    }
+
+    /// LFM2 / LFM2.5 chat template — ChatML-style (matches the upstream
+    /// ``chat_template.jinja``):
+    ///
+    ///   <|startoftext|>
+    ///   [<|im_start|>system\n<system content><|im_end|>\n]
+    ///   <|im_start|>user\n<user content><|im_end|>\n
+    ///   <|im_start|>assistant\n<assistant content><|im_end|>\n
+    ///   ...
+    ///   <|im_start|>assistant\n
+    private func buildLfm2Prompt(_ messages: [Message]) -> String {
+        var p = "<|startoftext|>"
+        for m in messages {
+            let role: String
+            switch m.role {
+            case .user:      role = "user"
+            case .assistant: role = "assistant"
+            case .system:    role = "system"
+            }
+            p += "<|im_start|>\(role)\n\(m.content)<|im_end|>\n"
+        }
+        p += "<|im_start|>assistant\n"
+        return p
     }
 
     private func buildGemmaPrompt(_ messages: [Message], hasImage: Bool, hasAudio: Bool,
@@ -1686,6 +1815,7 @@ public enum CoreMLLLMError: LocalizedError {
     /// Returned by `benchVerifyTopK` / `verifyCandidatesWithLogits` until the
     /// Track B re-export (`feat/c0-verify-requant`) lands on `main`.
     case verifyLogitsNotExposed
+    case unknownRepo(String)
 
     public var errorDescription: String? {
         switch self {
@@ -1698,6 +1828,8 @@ public enum CoreMLLLMError: LocalizedError {
         case .videoDecodeFailed: return "Could not decode any frames from video"
         case .verifyLogitsNotExposed:
             return "verify chunk 4 does not expose `logits_fp16` (Track B re-export pending)"
+        case .unknownRepo(let msg):
+            return msg
         }
     }
 }

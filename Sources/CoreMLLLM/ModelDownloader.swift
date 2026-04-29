@@ -92,6 +92,26 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
             folderName: "qwen2.5-0.5b")
 
+        /// LFM2.5 350M — Liquid AI hybrid attention + short-conv decoder.
+        /// 16 layers (6 attn + 10 conv), `hidden=1024`, `vocab=65536`. The
+        /// conv block keeps a `(hidden, L_pad=3)` rolling window per
+        /// layer, passed as a regular tensor input/output (NOT MLState —
+        /// dual-state ANE planner regression on M-series, see
+        /// docs/LFM2_CONVERSION_FINDINGS.md). 97.8 % ANE-resident; the
+        /// 10 depthwise short-conv ops bounce to CPU each step but at
+        /// 350M scale ANE matmul wins overall (52 tok/s on iPhone 17 Pro
+        /// CPU+ANE vs ~30-40 CPU-only). Sideload only — `python
+        /// conversion/build_lfm2_bundle.py --l-pad 3` produces the bundle.
+        ///
+        /// License: weights are under
+        /// [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-350M/blob/main/LICENSE)
+        /// — free for commercial use up to US $10M annual revenue;
+        /// above that, see https://www.liquid.ai/ for a commercial license.
+        public static let lfm2_5_350m = ModelInfo(
+            id: "lfm2.5-350m", name: "LFM2.5 350M (ANE)", size: "810 MB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/lfm2.5-350m-coreml/resolve/main",
+            folderName: "lfm2.5-350m")
+
         /// Qwen3.5 0.8B — hybrid Gated-DeltaNet SSM + attention, text-only.
         /// v1.8.0 — full-vocab rep_penalty workaround for iPhone A18 ANE
         /// fp16 reduction bias. chunk_d emits FULL fp16 logits (248K)
@@ -271,6 +291,7 @@ public final class ModelDownloader: NSObject {
                 gemma4e4b, gemma4e2bFashion,
                 qwen25_05b, qwen35_08b, qwen35_2b,
                 qwen3vl_2b, qwen3vl_2b_stateful,
+                lfm2_5_350m,
             ]
             if experimental {
                 list.insert(gemma4e2bEagle3, at: 3)
@@ -542,6 +563,27 @@ public final class ModelDownloader: NSObject {
 
                     let dest = self.modelsDirectory.appendingPathComponent(model.folderName)
                     self.destDir = dest
+
+                    // Wipe any leftover from a previous sideload before
+                    // creating the new dir.  `xcrun devicectl device copy
+                    // to ... --remove-existing-content true` lands a root-
+                    // owned `.placeholder` file (or worse, the whole prior
+                    // bundle) that the app can't write into — left in
+                    // place, downloads silently truncate because every
+                    // file write hits EPERM.  forceRemove handles both
+                    // app-owned residue and surfaces a clear pointer at
+                    // the uninstall script if the leftover is sideloaded.
+                    if self.fileManager.fileExists(atPath: dest.path) {
+                        do {
+                            try self.forceRemove(at: dest)
+                        } catch {
+                            self.isDownloading = false
+                            self.downloadingModelId = nil
+                            self.currentModel = nil
+                            continuation.resume(throwing: error)
+                            return
+                        }
+                    }
                     try? self.fileManager.createDirectory(at: dest, withIntermediateDirectories: true)
 
                     if model.downloadURL.contains("huggingface.co") {
@@ -654,12 +696,79 @@ public final class ModelDownloader: NSObject {
     ///
     /// The visible model folder disappears immediately. Remaining graveyard
     /// bytes are swept up by `cleanGraveyard` at the next init.
+    ///
+    /// Fallback path: if the rename fails (graveyard parent unwritable, or
+    /// the model was sideloaded with root-owned files), we attempt a chmod
+    /// + recursive removeItem.  Sideloaded models pushed via
+    /// `xcrun devicectl device copy to` arrive with `UID 0` perms `0755`,
+    /// which silently breaks the rename pattern; the chmod walk restores
+    /// app ownership before the unlink loop.
     private func evictToGraveyard(_ url: URL) throws {
         let graveRoot = modelsDirectory.appendingPathComponent(".graveyard", isDirectory: true)
-        try? fileManager.createDirectory(at: graveRoot, withIntermediateDirectories: true)
-        let grave = graveRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try fileManager.moveItem(at: url, to: grave)
-        try? fileManager.removeItem(at: grave)  // best-effort; leftovers cleaned next launch
+        do {
+            try fileManager.createDirectory(at: graveRoot, withIntermediateDirectories: true)
+            let grave = graveRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try fileManager.moveItem(at: url, to: grave)
+            try? fileManager.removeItem(at: grave)
+            return
+        } catch {
+            // graveyard rename failed — try the direct removal fallback.
+            print("[ModelDownloader] graveyard rename failed (\(error.localizedDescription)); "
+                  + "falling back to in-place delete")
+        }
+        try forceRemove(at: url)
+    }
+
+    /// Recursive removeItem with a best-effort `chmod` walk first.
+    ///
+    /// The chmod walk usually no-ops on iOS — apps can't change perms on
+    /// files they don't own, and `xcrun devicectl device copy to` lands
+    /// sideloaded trees with `UID 0`/`0755` which the user-mode app can
+    /// neither chmod nor unlink (parent dir's `w` bit belongs to root,
+    /// not the app).  When `removeItem` then fails with EPERM, we surface
+    /// a friendlier message that points at the only working escape
+    /// hatches — re-sideload with `--remove-existing-content true`, or
+    /// reinstall the app to wipe the container.
+    private func forceRemove(at url: URL) throws {
+        if let enumerator = fileManager.enumerator(at: url,
+                                                    includingPropertiesForKeys: nil,
+                                                    options: []) {
+            for case let child as URL in enumerator {
+                _ = try? fileManager.setAttributes(
+                    [.posixPermissions: NSNumber(value: Int16(0o755))],
+                    ofItemAtPath: child.path)
+            }
+        }
+        _ = try? fileManager.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o755))],
+            ofItemAtPath: url.path)
+
+        do {
+            try fileManager.removeItem(at: url)
+        } catch let removalError as NSError {
+            let folder = url.lastPathComponent
+            // EPERM (1), EACCES (13), and Cocoa NSFileWriteNoPermissionError
+            // (513) all map to "this was sideloaded as root, you can't
+            // delete it from inside the sandbox".
+            let permErrorCodes: Set<Int> = [1, 13, 513]
+            let isPermError =
+                permErrorCodes.contains(removalError.code) ||
+                permErrorCodes.contains(
+                    (removalError.userInfo[NSUnderlyingErrorKey] as? NSError)?.code ?? -1)
+            if isPermError {
+                throw NSError(
+                    domain: "CoreMLLLM.ModelDownloader",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: """
+                        Couldn’t delete “\(folder)”: it was sideloaded with \
+                        root-owned files, which iOS won’t let the app remove. \
+                        From your Mac, run:
+                          scripts/uninstall_sideloaded_model.sh \(folder)
+                        Or uninstall the app to wipe every sideloaded model.
+                        """])
+            }
+            throw removalError
+        }
     }
 
     /// Best-effort removal of any graveyard residue from prior sessions.
@@ -937,6 +1046,10 @@ public final class ModelDownloader: NSObject {
             buildQwen3VL2BFileList()
             return
         }
+        if model.id == "lfm2.5-350m" {
+            buildLfm2FileList()
+            return
+        }
         // 2K-context shipping model lives at the repo root on HF:
         //   - Decode chunks:  swa/chunk{1-4}.mlmodelc/
         //   - Prefill chunks: prefill/chunk{1-4}.mlmodelc/  (remote name is
@@ -1149,6 +1262,56 @@ public final class ModelDownloader: NSObject {
             localPath: "\(root)/embed_weight.bin",
             estimatedSize: 508_000_000))
         pendingFiles = files
+        pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
+        totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
+        completedBytes = 0
+        nextFileIndex = 0
+    }
+
+    /// LFM2.5 350M CoreML layout on `mlboydaisuke/lfm2.5-350m-coreml`.
+    /// Flat tree:
+    ///   model.mlmodelc/                pre-compiled (no .mlpackage)
+    ///     ├── weights/weight.bin       805 MB
+    ///     ├── coremldata.bin           tiny
+    ///     ├── model.mil                ~1 MB
+    ///     ├── metadata.json            ~few KB
+    ///     └── analytics/coremldata.bin
+    ///   model_config.json              ~500 B
+    ///   hf_model/{tokenizer.json, tokenizer_config.json, config.json,
+    ///             generation_config.json}
+    private func buildLfm2FileList() {
+        pendingFiles = [
+            .init(remotePath: "model.mlmodelc/weights/weight.bin",
+                  localPath: "model.mlmodelc/weights/weight.bin",
+                  estimatedSize: 844_243_968),
+            .init(remotePath: "model.mlmodelc/coremldata.bin",
+                  localPath: "model.mlmodelc/coremldata.bin",
+                  estimatedSize: 600),
+            .init(remotePath: "model.mlmodelc/model.mil",
+                  localPath: "model.mlmodelc/model.mil",
+                  estimatedSize: 1_500_000),
+            .init(remotePath: "model.mlmodelc/metadata.json",
+                  localPath: "model.mlmodelc/metadata.json",
+                  estimatedSize: 5_000),
+            .init(remotePath: "model.mlmodelc/analytics/coremldata.bin",
+                  localPath: "model.mlmodelc/analytics/coremldata.bin",
+                  estimatedSize: 250),
+            .init(remotePath: "model_config.json",
+                  localPath: "model_config.json",
+                  estimatedSize: 500),
+            .init(remotePath: "hf_model/tokenizer.json",
+                  localPath: "hf_model/tokenizer.json",
+                  estimatedSize: 5_000_000),
+            .init(remotePath: "hf_model/tokenizer_config.json",
+                  localPath: "hf_model/tokenizer_config.json",
+                  estimatedSize: 1_000),
+            .init(remotePath: "hf_model/config.json",
+                  localPath: "hf_model/config.json",
+                  estimatedSize: 1_500),
+            .init(remotePath: "hf_model/generation_config.json",
+                  localPath: "hf_model/generation_config.json",
+                  estimatedSize: 200),
+        ]
         pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
         completedBytes = 0

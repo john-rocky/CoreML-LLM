@@ -5,7 +5,7 @@ sessions (and agents) stop re-exploring them. This file is an **index**
 only — point at the authoritative doc, commit, or memory entry. Do not
 duplicate numbers here.
 
-**Last refreshed:** 2026-04-24. When adding a rejection, land it in the
+**Last refreshed:** 2026-04-28. When adding a rejection, land it in the
 source doc first, then link from here.
 
 Categories:
@@ -74,6 +74,7 @@ item per `CPU_BOTTLENECK_INVESTIGATION.md`.
 | Chunk consolidation 4→2 | — | +1 tok/s; dispatch-overhead theory refuted | `CHUNK_CONSOLIDATION_BENCH.md`, memory `project_chunk_consolidation_dead.md` |
 | Topology I (c1 absorbs c2) | 2026-04 | iPhone A19 rejected | commits `d3703ee`, `72785c4` |
 | Global-layer K=V alias (Gemma 4 E2B) | 2026-04-24 | K≠V at weight level — architecturally impossible for E2B | memory `project_gemma4_k_eq_v_false.md` |
+| ANEMLL 16-way LM head split (Gemma 4 E2B) | 2026-04-28 | iPhone 17 Pro: −4.6 % E2E tok/s, +9.3 % chunk3 latency. Single `Conv2d(2304→262144)` already ANE-optimal at vocab=262k. ANEMLL claim does not transfer above their vocab=128k. | `SESSION_2026_04_28_LMSPLIT_FINALISE.md` |
 
 ## Prefill / KV layout
 

@@ -68,6 +68,20 @@ MODEL_REGISTRY: dict[str, ConversionConfig] = {
         max_context_length=2048,
         description="EmbeddingGemma 300M - Gemma 3 bidirectional encoder, 768-d sentence embedding (Matryoshka)",
     ),
+    "lfm2.5-350m": ConversionConfig(
+        hf_repo="LiquidAI/LFM2.5-350M",
+        architecture="lfm2",
+        default_context_length=2048,
+        max_context_length=128_000,
+        description="Liquid AI LFM2.5 350M - hybrid attention/short-conv decoder (16 layers, 6 attn / 10 conv)",
+    ),
+    "lfm2-350m": ConversionConfig(
+        hf_repo="LiquidAI/LFM2-350M",
+        architecture="lfm2",
+        default_context_length=2048,
+        max_context_length=32_768,
+        description="Liquid AI LFM2 350M - first-gen LFM2 350M (architecturally identical to 2.5)",
+    ),
 }
 
 
