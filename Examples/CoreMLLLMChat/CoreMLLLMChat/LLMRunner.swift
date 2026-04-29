@@ -671,21 +671,17 @@ final class LLMRunner {
                             tokenCount += 1
                             if eosSet.contains(tokenId) { return }
                             accumIds.append(Int(tokenId))
-                            // U+FFFD strip removed.  2026-04-28 iPhone 17
-                            // Pro test: strip ON → consistent emoji-wall
-                            // loop on greedy "Hello." (every run).
-                            // strip OFF → clean stop matching HF reference,
-                            // 50.3 tok/s.  Mechanism unknown — strip
-                            // touches only the display string, not
-                            // accumIds, so it should not affect the model.
-                            // Suspect ANE timing / Swift actor interaction.
-                            // Trade-off: incomplete multi-byte UTF-8 (emoji,
-                            // CJK) renders as "�" until the next BPE token
-                            // completes the sequence.  Acceptable until
-                            // root cause is found.  Investigate via a
-                            // token-level streaming refactor or
-                            // bytes-aware decode (swift-transformers).
-                            let current = tok.decode(tokens: accumIds)
+                            // Strip trailing U+FFFD before prefix check
+                            // (multi-byte UTF-8 split across BPE tokens —
+                            // emoji / CJK). The previously suspected
+                            // strip-induced emoji-wall loop was actually
+                            // iPhone A18 fp16 ANE bias on the 248K-vocab
+                            // lm_head; full-vocab rep_penalty (v1.8.0)
+                            // masks that, so the strip is safe again.
+                            var current = tok.decode(tokens: accumIds)
+                            while current.hasSuffix("\u{FFFD}") {
+                                current = String(current.dropLast())
+                            }
                             if current.count > emittedText.count,
                                current.hasPrefix(emittedText) {
                                 let delta = String(current.dropFirst(emittedText.count))
