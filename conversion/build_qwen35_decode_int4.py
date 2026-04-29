@@ -25,13 +25,12 @@ from coremltools.optimize.coreml import (
     palettize_weights,
 )
 
-from test_qwen3_5_full_decode_trace import make_zero_states, cos_sim
+from test_qwen3_5_full_decode_trace import make_zero_states, cos_sim, MAX_SEQ
 from transformers import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedding
 
 MODEL_ID = "Qwen/Qwen3.5-0.8B"
 ORACLE = Path(__file__).parent / "qwen3_5_reference_logits.pt"
-MAX_SEQ = 128
 
 
 def palettize(input_pkg: Path, output_pkg: Path, nbits: int):

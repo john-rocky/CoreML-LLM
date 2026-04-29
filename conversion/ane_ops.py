@@ -7,7 +7,19 @@ optimized for Apple Neural Engine execution via CoreML:
 - Conv2dLinear: nn.Linear replacement using nn.Conv2d(kernel_size=1)
 - InModelArgmax: Embeds argmax in the CoreML graph
 
-Reference: ANEMLL project (github.com/Anemll/Anemll)
+Plus stateless factory helpers for the common builder boilerplate:
+- conv_from_linear(lin, dtype=MODEL_DTYPE)
+- ane_norm_from_hf(weight, eps, hidden, plus_one_gain=False)
+
+Reference: ANEMLL project (github.com/Anemll/Anemll). Recipe lessons
+distilled in `docs/MLSTATE_PATTERN.md` (single ct.StateType per chunk;
+slice_update on int32 current_pos; KV-only MLState for hybrid models).
+
+RMSNorm gain convention varies by model:
+- Qwen3.5 / Llama-style: y = x * rsqrt(var+eps) * (1 + w)
+  → call ane_norm_from_hf(weight, eps, hidden, plus_one_gain=True)
+- Qwen3-VL / Gemma 4-style: y = x * rsqrt(var+eps) * w
+  → call ane_norm_from_hf(weight, eps, hidden, plus_one_gain=False)
 """
 
 from __future__ import annotations
@@ -88,19 +100,28 @@ class Conv2dLinear(nn.Module):
         self.out_features = out_features
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear) -> Conv2dLinear:
-        """Convert an existing nn.Linear to Conv2dLinear."""
+    def from_linear(cls, linear: nn.Linear,
+                     dtype: torch.dtype | None = None) -> Conv2dLinear:
+        """Convert an existing nn.Linear to Conv2dLinear.
+
+        `dtype` defaults to the source linear's weight dtype. For ANE
+        builders, pass `dtype=MODEL_DTYPE` (fp16) so the resulting
+        Conv2d weight is fp16 regardless of the HF source precision.
+        """
+        target_dtype = dtype if dtype is not None else linear.weight.dtype
         has_bias = linear.bias is not None
         conv_linear = cls(
             linear.in_features,
             linear.out_features,
             bias=has_bias,
-            dtype=linear.weight.dtype,
+            dtype=target_dtype,
         )
         # Reshape: (out, in) -> (out, in, 1, 1)
-        conv_linear.conv.weight.data = linear.weight.data.unsqueeze(-1).unsqueeze(-1)
+        conv_linear.conv.weight.data = (
+            linear.weight.detach().to(target_dtype).unsqueeze(-1).unsqueeze(-1)
+        )
         if has_bias:
-            conv_linear.conv.bias.data = linear.bias.data
+            conv_linear.conv.bias.data = linear.bias.detach().to(target_dtype)
         return conv_linear
 
     def forward_conv(self, x: torch.Tensor) -> torch.Tensor:
@@ -141,6 +162,49 @@ class InModelArgmax(nn.Module):
         token_id = torch.argmax(logits, dim=-1)
         token_logit = logits.gather(-1, token_id.unsqueeze(-1)).squeeze(-1)
         return token_id, token_logit
+
+
+# ---- factory helpers used by every chunked ANE builder ------------------
+
+
+def conv_from_linear(lin: nn.Linear,
+                      dtype: torch.dtype = MODEL_DTYPE) -> Conv2dLinear:
+    """Wrap an HF nn.Linear as a Conv2dLinear at the given dtype (fp16
+    by default for ANE).
+
+    Equivalent to Conv2dLinear.from_linear with an explicit dtype.
+    Provided as a free function so model builders can write a single
+    `from ane_ops import conv_from_linear` instead of duplicating the
+    boilerplate.
+    """
+    return Conv2dLinear.from_linear(lin, dtype=dtype)
+
+
+def ane_norm_from_hf(weight: torch.Tensor, eps: float, hidden: int, *,
+                      plus_one_gain: bool = False) -> ANERMSNorm:
+    """Build an ANERMSNorm whose output matches an HF RMSNorm exactly.
+
+    HF RMSNorm has two conventions in the wild:
+      Qwen3.5 / Llama style:
+        y = x * rsqrt(mean(x^2)+eps) * (1 + w)
+        → set plus_one_gain=True so the wrapped ANERMSNorm.weight is
+          stored as (1 + w).
+      Qwen3-VL / Gemma 4 style:
+        y = x * rsqrt(mean(x^2)+eps) * w
+        → leave plus_one_gain=False (default).
+
+    `hidden` is the size of the LAST dim that the norm operates on —
+    i.e., the model's `hidden_size` for layer-level norms, or
+    `head_dim` for per-head q_norm / k_norm.
+    """
+    n = ANERMSNorm(hidden, eps=eps)
+    w = weight.detach().float()
+    gain = (1.0 + w) if plus_one_gain else w
+    n.weight.data = gain.to(MODEL_DTYPE).clone()
+    return n
+
+
+# ---- math primitives ----------------------------------------------------
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:

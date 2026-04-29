@@ -235,19 +235,82 @@ Use `lama-cml` env (coremltools 8.3, Python 3.10). coremltools 9.0's BlobWriter 
 
 ---
 
-## 9 · Open research directions (not shipping today)
+## 9 · MLKV (KV-only MLState) — the +54% / +30% unlock (added 2026-04-28)
+
+After v1.0.3 / v1.1.0 shipped on stateless I/O, Mac M4 measured an
+extra 1.5×-1.7× by moving KV cache into Core ML's `MLState` and writing
+via `ios18.slice_update`. Final Mac M4 numbers:
+
+| Model | stateless ANE | MLKV ANE | uplift |
+|-------|---------------|----------|--------|
+| 0.8B  | 33.1 tok/s    | **51.0** | **+54%** |
+| 2B    | 24.6 tok/s    | **32.2** | **+30%** |
+
+Output ✓ on English fact (Paris/Berlin/Rome) + Japanese recipe.
+
+### 9.1 The "single ct.StateType per chunk" rule
+
+`ct.StateType` works on iOS 18 ANE if **at most a small fixed number
+of StateTypes per chunk**. VL Phase 1 ships 1 (unified `kv_cache_0`);
+Gemma 4 ships 2 (`kv_cache_sliding` + `kv_cache_full`); both ANE-stable.
+
+The first attempt for Qwen3.5 hybrid
+(`build_qwen35_decode_chunks_mlstate.py`) used 3 StateTypes per chunk
+(`kv_cache` + `conv_state` + `rec_state`). Mac compiles fine, audit
+reports 100% ANE; predict-time runtime fails with
+`ANEProgramProcessRequestDirect Error=(11)` and the CPU runtime
+miscompiles slice_update on multi-state and emits garbage tokens.
+GPU is the only working path on the multi-state model.
+
+**Fix**: keep KV in MLState (the biggest state — 12 MB/step on 0.8B),
+move SSM `conv_state` + `rec_state` back to conventional input/output
+tensors. Single StateType per chunk → ANE happy.
+
+The pattern lives in `conversion/qwen3_5_decode_layer_mlkv.py` /
+`build_qwen35_decode_chunks_mlkv.py` / Swift
+`Qwen35MLKVGenerator.swift`. Reusable for any hybrid model where
+multiple state types coexist — pick the biggest and put it in MLState,
+push the rest through input/output. See `docs/MLSTATE_PATTERN.md` for
+the generic recipe.
+
+### 9.2 In-graph TopK head
+
+chunk_d's tail emits `next_token` (1, 1) int32 via `topk[k=1]` instead
+of fp32 logits (1, 1, 248320). Per-step ANE→Swift transfer drops from
+~1 MB to 4 byte. On Mac the Python predict() path is local memory so
+no measurable change; on iPhone the transfer crosses the runtime
+boundary, so this is a real win there.
+
+Per `chunk4_argmax_topk_parity` memory, `topk[0]` (not `argmax`) is
+the right primitive — argmax has ANE-vs-CPU divergence on palettized
+heads.
+
+### 9.3 What didn't help on Mac M4 ANE
+
+- **2-chunk vs 4-chunk MLKV**: same 51 tok/s. Per-chunk dispatch
+  overhead is sub-ms; consolidating doesn't move the needle.
+- **3-chunk MLKV**: 49 tok/s (-3%). Per-chunk graph grows faster than
+  dispatch reduction.
+- **Native softmax (`USE_NATIVE_SOFTMAX=1`)**: 50.4 vs 51 — slightly
+  slower. Decomposed `ane_softmax` (max/sub/exp/sum/div) wins.
+- **Precomputed RoPE table**: same 50.4. The torch eval per step was
+  not the bottleneck.
+
+---
+
+## 10 · Open research directions
 
 - **2-chunk INT8 for 2B**: see `QWEN35_2B_CHUNKED_HANDOFF.md`. Enables 2B on iPhone without jetsam.
-- **MLState API**: Apple's iOS 18+ zero-copy state handoff. Attempted twice (Gemma + Qwen3.5), both GPU-180-tok/s-achievable but parity broken — state buffers trace as const zeros. Probably a coremltools 8.3 bug.
+- **(Resolved 2026-04-28) MLState API**: ship via the MLKV path (§9.1).
 - **Gemma spec decoding (EAGLE-3)**: already implemented in stack, disabled by default, would give Gemma 4 E2B +30-50% if acceptance rate ≥ 40%. Pending: PR #111's EAGLE-3 retrain recovery.
 - **In-graph argmax output**: tested on 0.8B (`build_qwen35_decode_argmax.py`), measured 2 ms/step SLOWER on Mac. Argmax forces CPU placement, so the 500 KB logit transfer happens anyway. Not viable.
 - **Larger Qwen3.5 variants (4B/9B)**: VL checkpoints; text backbone extraction works via AutoModelForCausalLM (§1.2). Same 24-layer pattern. Bigger than 2B will definitely need chunking. Acceptance criteria from §8 apply.
 
 ---
 
-## 10 · Memory / commit trail
+## 11 · Memory / commit trail
 
-All session-specific discoveries were saved to auto-memory under `~/.claude/projects/.../memory/qwen35_*.md` during the 2026-04-20 → 2026-04-22 work. This doc consolidates them into a single reference; memory files remain the source for timeline-ordered details.
+All session-specific discoveries were saved to auto-memory under `~/.claude/projects/.../memory/qwen35_*.md` during the 2026-04-20 → 2026-04-22 + 2026-04-28 work. This doc consolidates them into a single reference; memory files remain the source for timeline-ordered details.
 
 Key commits on main (chronological):
 - #112 ship to main ChatView
@@ -256,5 +319,60 @@ Key commits on main (chronological):
 - #118 UTF-8 streaming fix
 - #120 INT8 palettized default + EOS fix + rep_penalty + marshal
 - v1.0.3 release
+- v1.x (this branch) MLKV path: `fix/qwen35-mseq-reconcile`
 
-Feature branch (open): `feat/qwen35-2b` — 2B monolithic converter + Swift entry + handoff doc. Not merged; superseded by the chunked work described in `QWEN35_2B_CHUNKED_HANDOFF.md`.
+Feature branch (open): `fix/qwen35-mseq-reconcile` — MAX_SEQ=2048 + Gemma 4 ANE recipe + MLKV (KV in MLState, SSM stateless), 0.8B 51 tok/s / 2B 32 tok/s on Mac M4 ANE. See `docs/SESSION_2026_04_28_QWEN35_2K_ANE.md`.
+
+---
+
+## 12 · v1.8.0 — full-vocab rep_penalty unlocks iPhone ANE 49 tok/s clean (2026-04-29)
+
+iPhone A18 ANE has hardware-level fp16 reduction non-determinism on
+large-vocab matmul: where Mac M4 picks the fp32-correct top-1 from a
+tied logit pair, A18 picks the other. Symptoms:
+- `こんにちは` greedy → `おはる、おはる、…` tight loop on iPhone, clean
+  on Mac with the same INT8 mlpackage.
+- `Hello.` → ⭐️ wall on some iPhone runs.
+- Confirmed via Apple coremltools issues
+  [#2359](https://github.com/apple/coremltools/issues/2359) and
+  [#2625](https://github.com/apple/coremltools/issues/2625) — fp16
+  ANE precision is a known class of bugs without official fix.
+
+**Workaround that ships at 45-50 tok/s clean (beats prior 33 tok/s
+ceiling we thought was structural):**
+
+1. Build `chunk_d` with body + final_norm + lm_head, emit FULL fp16
+   logits (1, 1, 248320). Drop the in-graph topk[k=N] entirely.
+2. In Swift: cast fp16 → fp32 in batch via
+   `vImageConvert_Planar16FtoPlanarF` (~1 ms for 248K).
+3. **Apply rep_penalty over the FULL VOCAB**, not just top-K. This is
+   the key — top-K-only rep_penalty (v1.0 default) only reaches the
+   candidates ANE put in top-40, which on biased prompts are all
+   "おはる-flavored". Full-vocab demotion lets fresh tokens that ANE
+   ranked outside top-40 win after 2-3 self-correcting steps.
+4. `vDSP_maxvi` argmax for greedy (or full-vocab softmax for T>0).
+
+The fp16 ANE bias isn't fixed — it's MASKED. The first 1-2 generated
+tokens may still be "off" from Mac output, but the model self-corrects
+within 2-3 tokens because rep_penalty pushes all biased candidates
+below fresh ones.
+
+Body chunks unchanged. Only `chunk_d` schema changes (`logits` output
+instead of `top_indices`/`top_values`). KV-MLState and SSM state I/O
+unchanged. Output transfer ~485 KB/step (~2 ms iPhone bus), tiny next
+to the body's compute.
+
+**TTFT improvements (same patch):**
+- `gen.load()` now `async`, runs a single dummy `stepPredictPrefillOnly`
+  to JIT-compile ANE kernels. Eliminates the 200-500 ms first-prompt
+  stall.
+- Recurrent prefill skips Swift fp16→fp32 / rep_penalty / argmax for
+  prefill[0..N-2] — only the last prompt token needs sampling.
+
+**Final iPhone 17 Pro speeds (clean output, Japanese + English):**
+- 0.8B: 48→43 tok/s (10% throttle from continuous SSM-state I/O on ANE)
+- 2B: 27→25 tok/s
+
+Beats the previous v1.x split-head ceiling (0.8B 33 tok/s) by +45%.
+See `docs/QWEN35_FULL_VOCAB_REP_PENALTY.md` for the full discovery
+trail and `docs/QWEN35_FUTURE_IMPROVEMENTS.md` for what's left to try.

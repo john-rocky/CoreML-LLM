@@ -39,6 +39,10 @@ final class LLMRunner {
     // different architecture (hybrid Gated-DeltaNet SSM + attention).
     private var qwen35Generator: Qwen35Generator?
     private var qwen35Tokenizer: (any Tokenizer)?
+    /// MLKV path: KV cache via MLState + slice_update, SSM state via I/O.
+    /// Selected when `qwen3_5_(0_8b|2b)_decode_chunks_mlkv/` is present.
+    /// Mac M4 measured 51 tok/s 0.8B, 32 tok/s 2B (vs 33 / 25 stateless).
+    private var qwen35MLKVGenerator: Qwen35MLKVGenerator?
 
     // Qwen3-VL 2B stateful path (Phase 1 ship): MLState + slice_update,
     // selected when `qwen3_vl_2b_stateful_chunks/` is present in the
@@ -83,12 +87,14 @@ final class LLMRunner {
         // Release previous engines BEFORE allocating a new one — peak footprint
         // on model switch would otherwise hold both in memory simultaneously,
         // OOMing on 8 GB devices.
-        if llm != nil || qwen35Generator != nil || qwen3vl2bGenerator != nil
+        if llm != nil || qwen35Generator != nil || qwen35MLKVGenerator != nil
+            || qwen3vl2bGenerator != nil
             || qwen3vl2bStatefulGenerator != nil
             || gemma4StatefulEngine != nil
         {
             llm = nil
             qwen35Generator = nil
+            qwen35MLKVGenerator = nil
             qwen35Tokenizer = nil
             qwen3vl2bGenerator = nil
             qwen3vl2bStatefulGenerator = nil
@@ -113,30 +119,36 @@ final class LLMRunner {
         modelFolderURL = folder
         loadingStatus = "Loading..."
 
-        // Qwen3.5 detection: the downloaded folder contains the decode
-        // mlpackage directly — no `model_config.json` / `hf_model/` layout
-        // that Gemma uses. Accept any of the shipping variants, including
-        // the 4-chunk + embed.bin 2B layout under `qwen3_5_2b_decode_chunks/`.
-        // Chunked detection honors BOTH `.mlpackage` (from the HF download
-        // path) and `.mlmodelc` (from `devicectl copy to` sideload) so we
-        // can iterate on device without re-uploading to HF between runs.
-        let chunksDir = folder.appendingPathComponent("qwen3_5_2b_decode_chunks")
+        // Qwen3.5 detection — two paths, MLKV preferred:
+        //   1. MLKV (KV via MLState, +54% on 0.8B):
+        //        qwen3_5_(0_8b|2b)_decode_chunks_mlkv/{chunk_a..d, embed_weight.bin}
+        //   2. Stateless legacy (full state via I/O):
+        //        qwen3_5_(0_8b|2b)_decode_chunks/{chunk_a..d, embed_weight.bin}
+        // Both share the 4-chunk + embed sidecar layout. mseq128 monolithic
+        // artifacts were retired with the 2K + ANE-recipe ship.
         let fm = FileManager.default
-        func chunkPresent(_ base: String) -> Bool {
-            fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlpackage").path)
-                || fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlmodelc").path)
+        for subdir in ["qwen3_5_0_8b_decode_chunks_mlkv", "qwen3_5_2b_decode_chunks_mlkv"] {
+            let chunksDir = folder.appendingPathComponent(subdir)
+            let embedPresent = fm.fileExists(atPath:
+                chunksDir.appendingPathComponent("embed_weight.bin").path)
+            let chunksOK = ["chunk_a", "chunk_b", "chunk_c", "chunk_d"].allSatisfy { base in
+                fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlpackage").path)
+                    || fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlmodelc").path)
+            }
+            if embedPresent && chunksOK {
+                try await loadQwen35MLKV(folder: folder)
+                return
+            }
         }
-        let embedPresent = fm.fileExists(atPath:
-            chunksDir.appendingPathComponent("embed_weight.bin").path)
-        if embedPresent && ["chunk_a", "chunk_b", "chunk_c", "chunk_d"].allSatisfy(chunkPresent) {
-            try await loadQwen35(folder: folder)
-            return
-        }
-        for mlpkgName in ["qwen3_5_0_8b_decode_int8_mseq128.mlpackage",
-                          "qwen3_5_0_8b_decode_fp16_mseq128.mlpackage",
-                          "qwen3_5_2b_decode_int8_mseq128.mlpackage"] {
-            let path = folder.appendingPathComponent(mlpkgName)
-            if FileManager.default.fileExists(atPath: path.path) {
+        for subdir in ["qwen3_5_0_8b_decode_chunks", "qwen3_5_2b_decode_chunks"] {
+            let chunksDir = folder.appendingPathComponent(subdir)
+            func chunkPresent(_ base: String) -> Bool {
+                fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlpackage").path)
+                    || fm.fileExists(atPath: chunksDir.appendingPathComponent("\(base).mlmodelc").path)
+            }
+            let embedPresent = fm.fileExists(atPath:
+                chunksDir.appendingPathComponent("embed_weight.bin").path)
+            if embedPresent && ["chunk_a", "chunk_b", "chunk_c", "chunk_d"].allSatisfy(chunkPresent) {
                 try await loadQwen35(folder: folder)
                 return
             }
@@ -275,6 +287,9 @@ final class LLMRunner {
 
     func generate(messages: [ChatMessage], image: CGImage? = nil,
                   audio: [Float]? = nil) async throws -> AsyncStream<String> {
+        if qwen35MLKVGenerator != nil {
+            return try await generateQwen35MLKV(messages: messages)
+        }
         if qwen35Generator != nil {
             return try await generateQwen35(messages: messages)
         }
@@ -399,17 +414,20 @@ final class LLMRunner {
         // (devicectl sideload) for the chunked layout. Check chunk_a as
         // a representative marker — full presence is validated in the
         // router block above.
-        let chunksDir = folder.appendingPathComponent("qwen3_5_2b_decode_chunks")
-        let chunkAPkg = chunksDir.appendingPathComponent("chunk_a.mlpackage")
-        let chunkAMlc = chunksDir.appendingPathComponent("chunk_a.mlmodelc")
-        let mono2B = folder.appendingPathComponent("qwen3_5_2b_decode_int8_mseq128.mlpackage")
-        if FileManager.default.fileExists(atPath: chunkAPkg.path)
-            || FileManager.default.fileExists(atPath: chunkAMlc.path) {
-            modelName = "Qwen3.5 2B (mmap embed + 4-chunk)"
-        } else if FileManager.default.fileExists(atPath: mono2B.path) {
-            modelName = "Qwen3.5 2B"
+        // Detect 0.8B vs 2B from which chunked subdir is present.
+        // mseq128 monolithic builds were retired with the 2K + ANE recipe ship.
+        let fm = FileManager.default
+        func chunkAExistsIn(_ subdir: String) -> Bool {
+            let dir = folder.appendingPathComponent(subdir)
+            return fm.fileExists(atPath: dir.appendingPathComponent("chunk_a.mlpackage").path)
+                || fm.fileExists(atPath: dir.appendingPathComponent("chunk_a.mlmodelc").path)
+        }
+        if chunkAExistsIn("qwen3_5_0_8b_decode_chunks") {
+            modelName = "Qwen3.5 0.8B (mmap embed + 4-chunk ANE)"
+        } else if chunkAExistsIn("qwen3_5_2b_decode_chunks") {
+            modelName = "Qwen3.5 2B (mmap embed + 4-chunk ANE)"
         } else {
-            modelName = "Qwen3.5 0.8B"
+            modelName = "Qwen3.5"
         }
         hasVision = false
         hasAudio = false
@@ -490,14 +508,183 @@ final class LLMRunner {
                     // compensated for an EOS miss, not a real loop. Keep
                     // the path available by upping this arg when
                     // investigating.
+                    var decodeStart: Date?
                     _ = try await gen.generate(
                         inputIds: inputIdsInt32, maxNewTokens: maxNew,
                         temperature: 0.0, topK: 40, repetitionPenalty: 1.0,
                         eosTokenIds: eosSet,
                         onToken: { [weak self] tokenId in
+                            if decodeStart == nil { decodeStart = Date() }
                             tokenCount += 1
                             if eosSet.contains(tokenId) { return }
                             accumIds.append(Int(tokenId))
+                            // Strip trailing U+FFFD before prefix check
+                            // (multi-byte UTF-8 split across BPE tokens —
+                            // emoji / CJK).
+                            var current = tok.decode(tokens: accumIds)
+                            while current.hasSuffix("\u{FFFD}") {
+                                current = String(current.dropLast())
+                            }
+                            if current.count > emittedText.count,
+                               current.hasPrefix(emittedText) {
+                                let delta = String(current.dropFirst(emittedText.count))
+                                continuation.yield(delta)
+                                emittedText = current
+                            }
+                            // Throttle tps update (per 8 tokens) — at high
+                            // tok/s, per-token MainActor tasks queue up
+                            // and lock the input field after generation.
+                            if let start = decodeStart {
+                                let elapsed = Date().timeIntervalSince(start)
+                                if elapsed > 0 && tokenCount % 8 == 0 {
+                                    let tps = Double(tokenCount) / elapsed
+                                    Task { @MainActor in
+                                        self?.tokensPerSecond = tps
+                                    }
+                                }
+                            }
+                        })
+                    if let start = decodeStart {
+                        let totalElapsed = Date().timeIntervalSince(start)
+                        if totalElapsed > 0 && tokenCount > 0 {
+                            let finalTPS = Double(tokenCount) / totalElapsed
+                            Task { @MainActor in self?.tokensPerSecond = finalTPS }
+                        }
+                    }
+                } catch {
+                    continuation.yield("[Error: \(error.localizedDescription)]")
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    // MARK: - Qwen3.5 MLKV dispatch
+
+    private func loadQwen35MLKV(folder: URL) async throws {
+        let fm = FileManager.default
+        let is0_8B = fm.fileExists(atPath: folder
+            .appendingPathComponent("qwen3_5_0_8b_decode_chunks_mlkv")
+            .appendingPathComponent("embed_weight.bin").path)
+        let cfg: Qwen35MLKVGenerator.Config =
+            is0_8B ? .default0_8B : .default2B
+
+        loadingStatus = "Loading Qwen tokenizer..."
+        let tokId = is0_8B ? "Qwen/Qwen3.5-0.8B" : "Qwen/Qwen3.5-2B"
+        let tok = try await AutoTokenizer.from(pretrained: tokId)
+        loadingStatus = "Compiling Qwen3.5 MLKV chunks (first run, can take a few min on ANE)..."
+        let gen = Qwen35MLKVGenerator(cfg: cfg)
+        gen.setModelFolder(folder)
+        do {
+            try await gen.load()
+        } catch {
+            throw NSError(domain: "LLMRunner", code: 23,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Qwen3.5 MLKV load failed: \(error.localizedDescription)"])
+        }
+        qwen35MLKVGenerator = gen
+        qwen35Tokenizer = tok
+        modelName = is0_8B
+            ? "Qwen3.5 0.8B (MLKV — KV in MLState + slice_update)"
+            : "Qwen3.5 2B (MLKV — KV in MLState + slice_update)"
+        hasVision = false
+        hasAudio = false
+        isLoaded = true
+        loadingStatus = "Ready"
+        print("[LLMRunner] loaded Qwen3.5 MLKV (\(modelName)) from \(folder.lastPathComponent)")
+    }
+
+    private func generateQwen35MLKV(messages: [ChatMessage]) async throws -> AsyncStream<String> {
+        guard let gen = qwen35MLKVGenerator, let tok = qwen35Tokenizer else {
+            throw NSError(domain: "LLMRunner", code: 24,
+                userInfo: [NSLocalizedDescriptionKey: "Qwen3.5 MLKV not loaded"])
+        }
+        isGenerating = true
+        tokensPerSecond = 0
+
+        // Same chat-template + SYSTEM-stripping the legacy generateQwen35 uses.
+        let chatMessages: [[String: Any]] = messages.compactMap { m in
+            let role: String
+            switch m.role {
+            case .user: role = "user"
+            case .assistant: role = "assistant"
+            case .system: return nil
+            }
+            return ["role": role, "content": m.content]
+        }
+        // DIAGNOSTIC: log whether applyChatTemplate succeeds vs falls
+        // through to raw encode. If iPhone's swift-transformers can't
+        // handle Qwen3.5's macro/namespace Jinja template, applyChatTemplate
+        // returns nil → fallback to raw `tok.encode` → raw-prompt loop
+        // (QWEN35_LESSONS §5.2 documents "こんにちは → loop" without
+        // chat template). This print verifies the chat template path
+        // actually fired AND produced canonical IDs (e.g. "こんにちは"
+        // should yield 13 tokens including 85951).
+        let templated = try? tok.applyChatTemplate(messages: chatMessages)
+        let templateOK = templated != nil
+        let inputIds: [Int] = templated ?? tok.encode(text: messages.last?.content ?? "")
+        let inputIdsInt32 = inputIds.map { Int32($0) }
+        print("[Qwen35MLKV.diag] templateApplied=\(templateOK) inputIds.count=\(inputIds.count) ids=\(inputIds.prefix(20))")
+
+        let maxSeq = 2048
+        let remaining = maxSeq - inputIds.count - 1
+        if remaining < 1 {
+            throw NSError(domain: "LLMRunner", code: 25,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Qwen3.5 prompt (\(inputIds.count) tokens) exceeds max_seq=\(maxSeq)."])
+        }
+        let maxNew = min(remaining, 1024)
+        var eosSet: Set<Int32> = [248044, 248045, 248046]
+        if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
+
+        let genStart = Date()
+        return AsyncStream { continuation in
+            Task { [weak self] in
+                defer { Task { @MainActor in self?.isGenerating = false } }
+                var accumIds: [Int] = []
+                var emittedText = ""
+                var tokenCount = 0
+                // tps clock starts on FIRST token, not at function entry.
+                // First-call ANE compile + model load can take 60+ sec on
+                // device; including that in elapsed shrinks the displayed
+                // tok/s by 10× even when the actual decode rate is 40+.
+                var decodeStart: Date?
+                do {
+                    _ = try await gen.generate(
+                        inputIds: inputIdsInt32, maxNewTokens: maxNew,
+                        // Greedy + rep_penalty=1.1 (HF Qwen3.5 chat
+                        // default).  Pure greedy on this 0.8B model loops
+                        // on short Japanese prompts ("こんにちは" →
+                        // "おはる！おはる！...") even with chat template
+                        // applied — documented in QWEN35_LESSONS §5.
+                        // rep_penalty knocks down logits of tokens seen
+                        // in the last 64 steps, so the second occurrence
+                        // of the looped token gets demoted and the model
+                        // moves on.  Stays deterministic (no random).
+                        temperature: 0.0,
+                        topK: 40,
+                        topP: 1.0,
+                        repetitionPenalty: 1.1,
+                        eosTokenIds: eosSet,
+                        onToken: { [weak self] tokenId in
+                            if decodeStart == nil { decodeStart = Date() }
+                            tokenCount += 1
+                            if eosSet.contains(tokenId) { return }
+                            accumIds.append(Int(tokenId))
+                            // U+FFFD strip removed.  2026-04-28 iPhone 17
+                            // Pro test: strip ON → consistent emoji-wall
+                            // loop on greedy "Hello." (every run).
+                            // strip OFF → clean stop matching HF reference,
+                            // 50.3 tok/s.  Mechanism unknown — strip
+                            // touches only the display string, not
+                            // accumIds, so it should not affect the model.
+                            // Suspect ANE timing / Swift actor interaction.
+                            // Trade-off: incomplete multi-byte UTF-8 (emoji,
+                            // CJK) renders as "�" until the next BPE token
+                            // completes the sequence.  Acceptable until
+                            // root cause is found.  Investigate via a
+                            // token-level streaming refactor or
+                            // bytes-aware decode (swift-transformers).
                             let current = tok.decode(tokens: accumIds)
                             if current.count > emittedText.count,
                                current.hasPrefix(emittedText) {
@@ -505,13 +692,29 @@ final class LLMRunner {
                                 continuation.yield(delta)
                                 emittedText = current
                             }
-                            let elapsed = Date().timeIntervalSince(genStart)
-                            if elapsed > 0 {
-                                Task { @MainActor in
-                                    self?.tokensPerSecond = Double(tokenCount) / elapsed
+                            // Throttle per-token tps update — every 8 tokens.
+                            // At 40+ tok/s, every-token MainActor dispatch
+                            // piles up tasks and delays isGenerating=false
+                            // (input stays locked after generation ends).
+                            if let start = decodeStart {
+                                let elapsed = Date().timeIntervalSince(start)
+                                if elapsed > 0 && tokenCount % 8 == 0 {
+                                    let tps = Double(tokenCount) / elapsed
+                                    Task { @MainActor in
+                                        self?.tokensPerSecond = tps
+                                    }
                                 }
                             }
                         })
+                    // Final tps snapshot — captures the last < 8-token
+                    // window the throttle skipped.
+                    if let start = decodeStart {
+                        let totalElapsed = Date().timeIntervalSince(start)
+                        if totalElapsed > 0 && tokenCount > 0 {
+                            let finalTPS = Double(tokenCount) / totalElapsed
+                            Task { @MainActor in self?.tokensPerSecond = finalTPS }
+                        }
+                    }
                 } catch {
                     continuation.yield("[Error: \(error.localizedDescription)]")
                 }

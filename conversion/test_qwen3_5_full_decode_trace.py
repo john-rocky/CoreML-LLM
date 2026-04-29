@@ -10,7 +10,7 @@ Inputs:
   cos, sin     : (1, 1, rotary_dim)  precomputed RoPE for this position
   states       : 18 × (conv_state, rec_state) for linear_attention layers,
                   6 × (k_cache,     v_cache)   for full_attention layers.
-                  Shapes fixed to max_seq=128 (plenty of headroom).
+                  Shapes fixed to max_seq=2048.
 
 Outputs:
   logits       : (1, 1, V)
@@ -44,7 +44,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedd
 
 MODEL_ID = "Qwen/Qwen3.5-0.8B"
 ORACLE = Path(__file__).parent / "qwen3_5_reference_logits.pt"
-MAX_SEQ = 128  # max prefill+decode length for this converter
+MAX_SEQ = 2048  # max prefill+decode length for this converter
 
 
 # ---- layer submodules ------------------------------------------------------
