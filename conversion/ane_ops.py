@@ -12,7 +12,7 @@ Plus stateless factory helpers for the common builder boilerplate:
 - ane_norm_from_hf(weight, eps, hidden, plus_one_gain=False)
 
 Reference: ANEMLL project (github.com/Anemll/Anemll). Recipe lessons
-distilled in `docs/MLSTATE_PATTERN.md` (single ct.StateType per chunk;
+distilled in `docs/experiments/MLSTATE_PATTERN.md` (single ct.StateType per chunk;
 slice_update on int32 current_pos; KV-only MLState for hybrid models).
 
 RMSNorm gain convention varies by model:

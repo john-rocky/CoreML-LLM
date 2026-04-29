@@ -10,7 +10,7 @@
 //  `SpeculativeTarget`. ChunkedEngine should be made to conform to this
 //  protocol as part of the bench session's integration work.
 //
-//  See docs/EAGLE3_DEPLOY.md for the full contract.
+//  See docs/experiments/EAGLE3_DEPLOY.md for the full contract.
 //
 
 import CoreML

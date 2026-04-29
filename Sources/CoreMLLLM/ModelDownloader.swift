@@ -204,7 +204,7 @@ public final class ModelDownloader: NSObject {
         /// to `Documents/Models/gemma4-e2b-lookahead-probe/` — keeps the
         /// production `gemma4-e2b/` bundle untouched so users can flip
         /// between the two from the model picker. See
-        /// `docs/LOOKAHEAD_PROBE_RESULTS.md` for the workflow.
+        /// `docs/experiments/LOOKAHEAD_PROBE_RESULTS.md` for the workflow.
         public static let gemma4e2bLookaheadProbe = ModelInfo(
             id: "gemma4-e2b-lookahead-probe", name: "Gemma 4 E2B + LookAhead (K=8, probe)",
             size: "5.7 GB",

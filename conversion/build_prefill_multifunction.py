@@ -254,7 +254,7 @@ def export_chunk_multifunction(base: Gemma4Model, chunk_idx: int, sizes: list[in
 
     # Single-variant short-circuit: skip the multifunction wrapper. The
     # wrapper carries a ~3x cold-load penalty on iPhone ANE even when only
-    # one function is active (see docs/SESSION_2026_04_23.md §multifunction
+    # one function is active (see docs/experiments/SESSION_2026_04_23.md §multifunction
     # prefill variants), so a one-size build should produce a plain
     # single-function mlpackage instead.
     if len(per_variant_paths) == 1:

@@ -42,8 +42,8 @@ See `docs/SPEED_8K.md` for the overall speed roadmap and tier assignments.
 
 ### SWA 2-chunk / 1-chunk consolidation  —  Prototype (2026-04-15)
 
-- Files: `conversion/models/gemma4_swa_merged2.py` (2-chunk), `conversion/models/gemma4_swa_merged1.py` (1-chunk), `conversion/build_merged_chunks.py`, `conversion/test_merged_parity.py`, `Sources/CoreMLLLM/ChunkedEngine.swift` (auto-detect + dispatch), `docs/CHUNK_CONSOLIDATION_BENCH.md`
-- Motivation: `docs/BASELINE_SPEED_AUDIT.md` shows 4×2.3 ms dispatch overhead per step. Halving dispatches ≈ +14 tok/s on the 2K decode path.
+- Files: `conversion/models/gemma4_swa_merged2.py` (2-chunk), `conversion/models/gemma4_swa_merged1.py` (1-chunk), `conversion/build_merged_chunks.py`, `conversion/test_merged_parity.py`, `Sources/CoreMLLLM/ChunkedEngine.swift` (auto-detect + dispatch), `docs/experiments/CHUNK_CONSOLIDATION_BENCH.md`
+- Motivation: `docs/experiments/BASELINE_SPEED_AUDIT.md` shows 4×2.3 ms dispatch overhead per step. Halving dispatches ≈ +14 tok/s on the 2K decode path.
 - Idea:
   - **2-chunk**: `MergedChunk12` (L0-14 + PLE, owns KV) -> `MergedChunk34` (L15-34 + norm + LM head). Reuses `_run_layer_swa` from the shipping builder, so layer math is byte-identical — composition only.
   - **1-chunk**: `MergedChunk1` (all 35 layers, PLE, norm, LM head) in a single graph. kv13/kv14 stay internal so the Swift runtime never materialises them.

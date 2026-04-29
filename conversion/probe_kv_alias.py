@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Probe: does Gemma 4 global-attn K_proj == V_proj at the weight level?
 
-docs/ANE_ONLY_LEVERS.md §D asserts the global-attention design guarantees
+docs/experiments/ANE_ONLY_LEVERS.md §D asserts the global-attention design guarantees
 K ≡ V within each full-attn layer (producers L14/L19/L24/L29/L34 in E2B).
 If true at the weight level, the inference-side k_proj / v_proj can be
 aliased to one Conv2d + one output tensor, halving kv14 memory and
@@ -86,7 +86,7 @@ def main():
 
     if any_mismatch:
         print("\n❌ K ≠ V at the weight level — within-layer alias does NOT apply")
-        print("   (docs/ANE_ONLY_LEVERS.md §D claim would need re-examination)")
+        print("   (docs/experiments/ANE_ONLY_LEVERS.md §D claim would need re-examination)")
     else:
         print("\n✅ All full-attn layers have K ≡ V at the weight level — alias is safe")
         print("   Next step: modify converter to emit single kv14 output + consume once in chunks 3/4")

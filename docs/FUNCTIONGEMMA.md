@@ -8,7 +8,7 @@ the output.
 
 ## Architectural fit
 
-Strict subset of Gemma 4 E2B (see `docs/GEMMA4_ARCHITECTURE_VERIFIED.md`):
+Strict subset of Gemma 4 E2B (see `docs/experiments/GEMMA4_ARCHITECTURE_VERIFIED.md`):
 
 | Feature | Gemma 4 E2B | Gemma 3 270M (FunctionGemma) |
 |---|---|---|

@@ -5,6 +5,13 @@
 Where [MLX Swift](https://github.com/ml-explore/mlx-swift) is the right call when you want maximum GPU throughput, CoreML-LLM is what you use when the LLM should live on the **ANE** so the GPU stays free for the rest of the app.
 
 [![App Store](https://toolbox.marketingtools.apple.com/api/v2/badges/download-on-the-app-store/black/en-us?releaseDate=1735689600)](https://apps.apple.com/jp/app/models-zoo/id6762083207)
+[![Swift Package CI](https://github.com/john-rocky/CoreML-LLM/actions/workflows/swift.yml/badge.svg)](https://github.com/john-rocky/CoreML-LLM/actions/workflows/swift.yml)
+
+> **Use it** → pick a model below, install the Swift Package, ship it inside your iOS / macOS app. Production-ready models are listed in [Models](#models); see [Production readiness](#production-readiness) for the device / memory / thermal envelope.
+>
+> **Read the research** → ANE perf write-ups live under [docs/](docs/). The full experiment archive — probes, benchmarks, dead-end findings, decision logs — is split out under [docs/experiments/](docs/experiments/).
+>
+> **Hire the author** → CoreML / ANE / on-device LLM consulting and conversion work: [docs/HIRE.md](docs/HIRE.md).
 
 ## Models
 
@@ -32,6 +39,26 @@ All numbers are iPhone 17 Pro A19 Pro, 2048-token context, ANE-only (no GPU fall
 - Text-only, smallest at high tok/s on iPhone → **LFM2.5 350M** (52 tok/s, 810 MB) [†](#lfm2-license)
 - Tool / function calling → **FunctionGemma-270M**
 - Sentence embeddings / RAG → **EmbeddingGemma-300M**
+
+## Production readiness
+
+| Item | Status |
+|---|---|
+| Minimum OS | iOS 18 / macOS 15 |
+| Tested devices | iPhone 17 Pro (A19 Pro, 8 GB) — reference benchmark target. <!-- TODO_USER_FILL: list other phones / iPads / Macs you've validated on --> |
+| Minimum supported device | <!-- TODO_USER_FILL: e.g. iPhone 15 Pro / M1 Mac --> |
+| Compute units | `.cpuAndNeuralEngine` (ANE-resident; CPU only for tokenizer + I/O staging) |
+| Memory (peak `phys_footprint`, decode) | Qwen3-VL 2B stateful: **256 MB** · Qwen3.5 2B: **~200 MB** · Qwen3.5 0.8B: <!-- TODO_USER_FILL --> · Gemma 4 E2B (3-chunk): <!-- TODO_USER_FILL --> · LFM2.5 350M: <!-- TODO_USER_FILL --> |
+| Sustained thermal | <!-- TODO_USER_FILL: e.g. "10 min @ 30 tok/s on iPhone 17 Pro before nominal→fair throttle" --> |
+| Battery / power | <!-- TODO_USER_FILL: pointer to a power-bench summary number; full data in [docs/experiments/POWER_BENCH.md](docs/experiments/POWER_BENCH.md) --> |
+| Concurrency | ANE serialises predictions per process — keep one inference in flight; chunked decode is sequential by design |
+| Context window | 2048 tokens (default for all bundled models). 8K decode path tracked in [docs/SPEED_8K.md](docs/SPEED_8K.md) |
+| Background download | `URLSessionConfiguration.background` with pause / resume — see [Quick Start](#swift-package) |
+| Versioning | SemVer on the Swift Package; minor bumps document migration in [Releases](https://github.com/john-rocky/CoreML-LLM/releases) |
+| Model status | Stable: Gemma 4 E2B / E4B, Qwen3.5 0.8B / 2B, Qwen3-VL 2B (stateful), FunctionGemma-270M, EmbeddingGemma-300M, LFM2.5 350M (52 tok/s @ 97.8 % ANE-resident on iPhone 17 Pro; LFM Open License — see [†](#lfm2-license)). Legacy: Qwen3-VL 2B (recurrent), Qwen2.5 0.5B |
+| License | MIT for the library code. Model weights inherit upstream licences — see [License](#license) |
+
+Reproducing these numbers: [docs/BENCHMARKING.md](docs/BENCHMARKING.md). Conversion-time decisions and ANE constraints encountered along the way: [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) (decision log) + [docs/experiments/](docs/experiments/) (full archive).
 
 ## Demos
 
@@ -70,7 +97,7 @@ Set your development team → build to an iOS 18+ device → **Get Model** → d
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/john-rocky/CoreML-LLM", from: "1.4.0"),
+    .package(url: "https://github.com/john-rocky/CoreML-LLM", from: "1.8.0"),
 ]
 ```
 
@@ -238,20 +265,20 @@ Step-by-step: [docs/ADDING_MODELS.md](docs/ADDING_MODELS.md). Full reference (qu
 | FunctionGemma I/O contract | [docs/FUNCTIONGEMMA.md](docs/FUNCTIONGEMMA.md) |
 | EmbeddingGemma I/O contract, Matryoshka recipe | [docs/EMBEDDINGGEMMA.md](docs/EMBEDDINGGEMMA.md) |
 | LFM2.5 conversion (ChatML, ANE dual-state workaround, fp16 padding drift) | [docs/LFM2_CONVERSION_FINDINGS.md](docs/LFM2_CONVERSION_FINDINGS.md) |
-| Research background, competitive landscape | [docs/RESEARCH.md](docs/RESEARCH.md) |
 | Decision log (WFA, Flash, W8A8, Medusa, EAGLE-3, SDPA fusion, KV alias, Topology I) | [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) |
+| Experiment archive (probes, session logs, dead-end findings) | [docs/experiments/](docs/experiments/) |
 
 ## What's new
 
-Current release: **v1.7.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases)).
+Current release: **v1.8.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases)).
 
+- **v1.8.0** — Qwen3.5 0.8B / 2B full-vocab rep_penalty masks iPhone A18 fp16 ANE reduction bias. 0.8B: 48 tok/s, 2B: 27 tok/s on iPhone 17 Pro, all clean output across English + Japanese. +45 % over the prior v1.x ceiling. See [docs/QWEN35_FULL_VOCAB_REP_PENALTY.md](docs/QWEN35_FULL_VOCAB_REP_PENALTY.md).
 - **v1.7.0** — Gemma 4 E2B 3-chunk decode is the picker default + multimodal opt-out toggle. The new `gemma4e2b3way` ModelInfo ships `chunk2_3way` (L8-24 merged) + `chunk3_3way` (L25-34 + lm_head) and re-uses legacy `chunk1` + 4-chunk prefill graphs (vision-aware bidirectional mask preserved). Decode `c1+c2+c4` (chunk3 nil) — 3 ANE dispatches/step, **34.2 tok/s** on iPhone 17 Pro A19 Pro. The 4-chunk legacy entry stays as `Gemma 4 E2B (4-chunk legacy)`. ModelPickerView's "Download Options → Include multimodal" toggle drops vision/video/audio encoders + sidecars when off (~1 GB savings, text-only install). finishDownload now hardlinks shared decode↔prefill weights instead of copying (`chunk1↔prefill_chunk1` and `chunk3_3way↔prefill_chunk4`, **−682 MB on disk**).
 - **v1.6.0** — Qwen3-VL 2B stateful Phase 2: cross-turn KV reuse + ANE prewarm. Same-prompt 2nd TTFT **4 s → 125 ms** (~32×), vision-chat 2nd-turn TTFT 125 ms (target was <500 ms). LCP-matched MLState resume + image-pinned-to-first-user-turn prompt builder + per-chunk dummy predict at load (231 ms total).
 - **v1.5.0** — Qwen3-VL 2B stateful Phase 1: MLState + slice_update KV cache + multifunction prefill_b8. **24 tok/s decode at 256 MB phys_footprint** on iPhone 17 Pro (vs 7.5 tok/s / 1.7 GB on the v1.3 recurrent build — 3.2× decode, 6.4× memory drop). 4-chunk INT8 + fp16 embed sidecar.
 - **v1.4.0** — Gemma 4 E2B 3-chunk decode (opt-in, `LLM_3CHUNK=1`): 31.6 → **34.2 tok/s** on iPhone 17 Pro A19 Pro (+8.2 %). Bit-equivalent to 4-chunk by construction. Closes the ANE-ceiling sweep for E2B; five additional lossless probes (SDPA fusion, K=V alias, Topology I boundary search, blockwise palettization, native softmax) all landed as negative results — see [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md).
 - **v1.3.0** — Qwen3-VL 2B (text + vision on ANE, 196 image tokens, DeepStack injection at L0/1/2, interleaved mRoPE for image tokens). 28-layer GQA, 2.9 GB bundle, ~7.5 tok/s text decode. (Recurrent KV — superseded by v1.5.0 stateful build; kept for backward compatibility.)
 - **v1.2.0** — FunctionGemma-270M (function calling, batched prefill T=32) and EmbeddingGemma-300M (99.80 % ANE, Matryoshka 768/512/256/128). Standalone `Gemma3Demo` sample.
-- **v1.8.0** — Qwen3.5 0.8B / 2B full-vocab rep_penalty masks iPhone A18 fp16 ANE reduction bias. 0.8B: 48 tok/s, 2B: 27 tok/s on iPhone 17 Pro, all clean output across English + Japanese. +45 % over the prior v1.x ceiling. See [docs/QWEN35_FULL_VOCAB_REP_PENALTY.md](docs/QWEN35_FULL_VOCAB_REP_PENALTY.md).
 - **v1.1.0** — Qwen3.5 2B (4 INT8 chunks + mmap fp16 embed sidecar, ~200 MB phys_footprint for a 2B-param model).
 - **v1.0.0** — Qwen3.5 0.8B (first hybrid SSM+attention LLM on CoreML, 99.9 % ANE).
 - **v0.8.0** — Gemma 4 E4B (42-layer text decoder, 100 % ANE).

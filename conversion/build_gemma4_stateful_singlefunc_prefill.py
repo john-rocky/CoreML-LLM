@@ -3,8 +3,8 @@
 mlpackages (no multifunction merge).
 
 Stage 8 / Stage 6.5 opt-in builder. Companion to
-`docs/HANDOFF_STAGE8_MLSTATE_MULTIMODAL.md` and the probe results in
-`docs/MLSTATE_MULTIMODAL_PROBE.md`.
+`docs/experiments/HANDOFF_STAGE8_MLSTATE_MULTIMODAL.md` and the probe results in
+`docs/experiments/MLSTATE_MULTIMODAL_PROBE.md`.
 
 Why this is separate from `build_gemma4_e2b_stateful_chunks.py` /
 `build_gemma4_e2b_stateful_3chunks.py`:
@@ -185,7 +185,7 @@ def main():
     print("     to verify iPhone ANE compile + state-buffer bridging")
     print("     (probe 1 already validated chunk_1 — repeat for the")
     print("     other chunks and on non-Pro RAM devices).")
-    print("  4. See docs/HANDOFF_STAGE8_MLSTATE_MULTIMODAL.md for the")
+    print("  4. See docs/experiments/HANDOFF_STAGE8_MLSTATE_MULTIMODAL.md for the")
     print("     full Stage 8 implementation plan.")
 
 

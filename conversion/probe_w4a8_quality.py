@@ -200,7 +200,7 @@ def main():
               f"min={cs.min():.6f}")
         print(f"  rel L2 error:  mean={rl.mean():.4f}  "
               f"max={rl.max():.4f}")
-        # Stage 1 gate per docs/ROADMAP_2026_04_26.md §2.4: cos sim ≥ 0.95
+        # Stage 1 gate per docs/experiments/ROADMAP_2026_04_26.md §2.4: cos sim ≥ 0.95
         # is the GO threshold; 0.99+ ideal.
         if cs.mean() >= 0.99:
             verdict = "PASS (cos≥0.99)"

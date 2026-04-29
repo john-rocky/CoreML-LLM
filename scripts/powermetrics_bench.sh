@@ -2,7 +2,7 @@
 # Tethered iPhone power measurement via macOS powermetrics.
 #
 # Splits CPU / GPU / ANE power so we can attribute heat sources during
-# inference. Pair with the on-device PowerBench (see docs/POWER_BENCH.md)
+# inference. Pair with the on-device PowerBench (see docs/experiments/POWER_BENCH.md)
 # or just run during a normal generation in CoreMLLLMChat.
 #
 # Usage:

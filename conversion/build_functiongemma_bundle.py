@@ -2,7 +2,7 @@
 """Build a complete on-device bundle for FunctionGemma-270M (Gemma 3 decoder).
 
 Single-chunk monolithic export — 270M fp16 ≈ 540 MB, well under the per-mlprogram
-ANE budget (docs/QWEN35_2B_CHUNKED_HANDOFF.md). No chunk splits, no PLE sidecar,
+ANE budget (docs/experiments/QWEN35_2B_CHUNKED_HANDOFF.md). No chunk splits, no PLE sidecar,
 no per-layer projection — Gemma 3 is a strict subset of Gemma 4 on the
 architecture side.
 

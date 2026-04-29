@@ -106,11 +106,11 @@ public final class CoreMLLLM: @unchecked Sendable {
     // Phase B Task 1 — union of cross-vocab + prompt-lookup{n=2, n=3}
     private var drafterUnion: DrafterUnion?
     /// Opt-in for Phase B union. Default off until iPhone baseline check
-    /// confirms no regression (per merge discipline in docs/HANDOFF.md).
+    /// confirms no regression (per merge discipline in docs/experiments/HANDOFF.md).
     /// Takes precedence over crossVocabEnabled when both are true.
     public var drafterUnionEnabled: Bool = false
 
-    // Linear LookAhead / Jacobi (drafter-free, docs/LOOKAHEAD_PROBE_HANDOFF.md).
+    // Linear LookAhead / Jacobi (drafter-free, docs/experiments/LOOKAHEAD_PROBE_HANDOFF.md).
     // Drafts K-1 tokens per cycle via n-gram lookup + Jacobi warm-start,
     // verifies in one ANE dispatch. Opt-in; defaults off until iPhone
     // baseline check confirms no regression.
@@ -140,7 +140,7 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// Hard-disable the cross-vocab source inside the union. Used by the
     /// Mac-side bit-exact verifier to keep CV out of the picture when the
     /// staging Qwen has the wrong context length (gotcha #2 in
-    /// docs/SESSION_STATE.md). On iPhone leave this `false`.
+    /// docs/experiments/SESSION_STATE.md). On iPhone leave this `false`.
     public func setDrafterUnionCrossVocabDisabled(_ disabled: Bool) {
         drafterUnion?.crossVocabDisabled = disabled
     }
@@ -154,7 +154,7 @@ public final class CoreMLLLM: @unchecked Sendable {
 
     // Token-ID recording for offline accept-rate benches. These are populated
     // from the last `generate` / `stream` call and live until the next one.
-    // See `docs/MAC_FIRST_EXECUTION_PLAN.md` §A1 for usage.
+    // See `docs/experiments/MAC_FIRST_EXECUTION_PLAN.md` §A1 for usage.
     public private(set) var lastPromptTokenIDs: [Int32] = []
     public private(set) var lastEmittedTokenIDs: [Int32] = []
 

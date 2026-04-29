@@ -103,7 +103,7 @@ struct Verifier {
                 // very high rolling-accept threshold because the Mac
                 // staging Qwen is compiled at ctx=512 but CoreMLLLM.load
                 // hands it ctx=2048, which crashes at first prediction
-                // (gotcha #2 in docs/SESSION_STATE.md). The CV verify
+                // (gotcha #2 in docs/experiments/SESSION_STATE.md). The CV verify
                 // walk was already proven correct by PR #45's
                 // CrossVocabSpeculativeEngine; the new code under test
                 // here is the PLD path inside DrafterUnion. The iPhone

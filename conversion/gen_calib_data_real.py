@@ -2,7 +2,7 @@
 """Generate real-prompt calibration data for `linear_quantize_activations`.
 
 Stage 1 retry: synthetic N(0, 0.5) calibration produced cos sim 0.108
-on chunk_1 (see docs/SESSION_2026_04_26_W4A8_HOLD.md). Real Gemma 4
+on chunk_1 (see docs/experiments/SESSION_2026_04_26_W4A8_HOLD.md). Real Gemma 4
 embeddings have channel-wise outliers / heavy-tailed distributions that
 random Gaussian doesn't capture.
 

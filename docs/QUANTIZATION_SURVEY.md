@@ -148,7 +148,7 @@
 
 ## 4. Our quantization roadmap reconciled
 
-Per `docs/ROUND7_FINDINGS.md:238-261`:
+Per `docs/experiments/ROUND7_FINDINGS.md:238-261`:
 
 ### Proposed execution order
 

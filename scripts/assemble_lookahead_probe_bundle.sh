@@ -24,7 +24,7 @@ for c in chunk1 chunk2 chunk3 chunk4; do
     echo "Run: cd conversion && PYENV_VERSION=lama-cml python build_verify_chunks.py" \
          "--K 8 --model gemma4-e2b --ctx 2048" \
          "--output ../output/gemma4-e2b/chunks-k8 --keep-tmp" >&2
-    echo "Then compile each mlpackage to mlmodelc (see docs/LOOKAHEAD_PROBE_RESULTS.md)." >&2
+    echo "Then compile each mlpackage to mlmodelc (see docs/experiments/LOOKAHEAD_PROBE_RESULTS.md)." >&2
     exit 1
   fi
 done

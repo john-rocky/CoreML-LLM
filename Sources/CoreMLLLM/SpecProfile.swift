@@ -51,7 +51,7 @@ enum SpecProfile {
         return UserDefaults.standard.bool(forKey: "SPECULATIVE_PROFILE")
     }()
 
-    /// Chat-CV residual investigation (docs/PHASE_B_CHAT_CV_RESIDUAL.md).
+    /// Chat-CV residual investigation (docs/experiments/PHASE_B_CHAT_CV_RESIDUAL.md).
     /// Additive to `SPECULATIVE_PROFILE`; prints pre-propose / post-propose /
     /// post-commit CV state per burst so we can disentangle rolling-gate
     /// closure, bootstrap replay effects, and mid-burst state drift.

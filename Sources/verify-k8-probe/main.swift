@@ -2,7 +2,7 @@
 //
 // Goal: measure pure verify_qK=8 wall-clock on ANE so we can decide whether
 // LookAhead / Jacobi decoding is worth full implementation. See
-// docs/LOOKAHEAD_PROBE_HANDOFF.md for the go / no-go gate.
+// docs/experiments/LOOKAHEAD_PROBE_HANDOFF.md for the go / no-go gate.
 //
 // Usage:
 //   swift run -c release verify-k8-probe <model-dir> [iterations] [prompt]
@@ -108,7 +108,7 @@ struct Probe {
             print("[probe]   max    = \(String(format: "%6.2f", maxMs))")
             print("[probe]   std    = \(String(format: "%6.2f", stdMs))")
 
-            // Decision gate — matches docs/LOOKAHEAD_PROBE_HANDOFF.md §2.4.
+            // Decision gate — matches docs/experiments/LOOKAHEAD_PROBE_HANDOFF.md §2.4.
             let verdict: String
             if medianMs < 50 {
                 verdict = "GO — LookAhead implementation is worth committing to"

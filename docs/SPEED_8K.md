@@ -1,6 +1,6 @@
 # 8K Context Speed — Exhaustive Research & Roadmap (v3)
 
-**Status:** ctx=2048 ships at 31 tok/s · ctx=8192 = **14.9 tok/s on iPhone 17 Pro** (PR #7 per-chunk diag, 2026-04-13) · **chunk2 (7 full-attn layers) isolated as the 8K bottleneck at 20.7 ms / 2.96 ms-per-layer, 2× slower than sibling chunks (§0b)** · WFA rejected on quality · W8A8 rejected (ANE compile fails on iPhone) · **W2A16/W3A16 post-training rejected (gibberish; QAT required)** · EAGLE-3 benched on-device, not faster than baseline (distribution mismatch + commit re-runs decode; see `docs/EAGLE3_INTEGRATION_STATE.md`).
+**Status:** ctx=2048 ships at 31 tok/s · ctx=8192 = **14.9 tok/s on iPhone 17 Pro** (PR #7 per-chunk diag, 2026-04-13) · **chunk2 (7 full-attn layers) isolated as the 8K bottleneck at 20.7 ms / 2.96 ms-per-layer, 2× slower than sibling chunks (§0b)** · WFA rejected on quality · W8A8 rejected (ANE compile fails on iPhone) · **W2A16/W3A16 post-training rejected (gibberish; QAT required)** · EAGLE-3 benched on-device, not faster than baseline (distribution mismatch + commit re-runs decode; see `docs/experiments/EAGLE3_INTEGRATION_STATE.md`).
 **Goal:** 8K @ 50+ tok/s *without quality loss*, with a documented path to 80+.
 **Updated:** 2026-04-13. W2A16/W3A16 post-training palettization measured — complete quality collapse without QAT. See `docs/EXPERIMENTS.md`.
 
@@ -65,7 +65,7 @@ Even quartering chunk2 only gets ~19 tok/s. To reach the §2 target of 34 tok/s,
 
 **Next action when this session is resumed.** Target chunk2 with a full-attention-layer-specific bandwidth reduction. Three viable approaches, ordered by ROI × implementation cost:
 
-1. **DuoAttention on the 7 full-attn layers only** (Tier A, training-free after offline head classification). Gemma 4 E2B has `num_heads=8` per full-attn layer → classify which heads need full KV vs streaming-window. If ~50% fall to streaming, chunk2 KV halves → ~10 ms → ~18 tok/s. Code in `docs/SPEED_8K.md §1 A1` + Phase 3 of `docs/EAGLE3_INTEGRATION_STATE.md` has the pipeline sketch. Start at `conversion/identify_retrieval_heads.py` (already scaffolded) and `conversion/models/gemma4_swa_chunks.py` (per-head KV budget wiring).
+1. **DuoAttention on the 7 full-attn layers only** (Tier A, training-free after offline head classification). Gemma 4 E2B has `num_heads=8` per full-attn layer → classify which heads need full KV vs streaming-window. If ~50% fall to streaming, chunk2 KV halves → ~10 ms → ~18 tok/s. Code in `docs/SPEED_8K.md §1 A1` + Phase 3 of `docs/experiments/EAGLE3_INTEGRATION_STATE.md` has the pipeline sketch. Start at `conversion/identify_retrieval_heads.py` (already scaffolded) and `conversion/models/gemma4_swa_chunks.py` (per-head KV budget wiring).
 2. **Block-static TriForce / Quest retrieval on the 7 full-attn layers** (§1 A3/A4). Higher ceiling (~¼ KV read) but needs the block-static top-k redesign to stay ANE. Not started.
 3. **WFA (windowed full attention) on the 7 full-attn layers** (shelved in `docs/EXPERIMENTS.md` for quality regression) — the bandwidth win is proven (chunk2 collapses to SWA-class ~1.5 ms/layer ≈ 10 ms), but quality past the window is unrecoverable without DuoAttention-style per-head classification. Only viable combined with #1.
 
