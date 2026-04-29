@@ -12,8 +12,8 @@ Where [MLX Swift](https://github.com/ml-explore/mlx-swift) is the right call whe
 |---|---:|---|---:|---|
 | **Gemma 4 E2B** | 5.4 GB (4.4 GB text-only) | Text + image + video + audio | **34.2 tok/s** (3-chunk default, v1.7+) | [mlboydaisuke/gemma-4-E2B-coreml](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
 | **Gemma 4 E4B** | 5.5 GB | Text | ~14 tok/s | [mlboydaisuke/gemma-4-E4B-coreml](https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml) |
-| **Qwen3.5 2B** | 2.4 GB | Text | ~17 tok/s (~200 MB RSS) | [mlboydaisuke/qwen3.5-2B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML) |
-| **Qwen3.5 0.8B** | 1.4 GB | Text | ~20 tok/s | [mlboydaisuke/qwen3.5-0.8B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML) |
+| **Qwen3.5 2B** | 2.8 GB | Text (hybrid SSM + attn) | **~27 tok/s** (v1.8.0, full-vocab rep_penalty) | [mlboydaisuke/qwen3.5-2B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML) |
+| **Qwen3.5 0.8B** | 1.2 GB | Text (hybrid SSM + attn) | **~48 tok/s** (v1.8.0, full-vocab rep_penalty) | [mlboydaisuke/qwen3.5-0.8B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML) |
 | **Qwen3-VL 2B (stateful)** | 2.3 GB | Text + image (DeepStack) | **~24 tok/s** (256 MB RSS, TTFT 125 ms on resumed turn) | [mlboydaisuke/qwen3-vl-2b-stateful-coreml](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-stateful-coreml) |
 | **LFM2.5 350M** [†](#lfm2-license) | 810 MB | Text (hybrid attn + short-conv) | **52 tok/s** (97.8 % ANE-resident) | [mlboydaisuke/lfm2.5-350m-coreml](https://huggingface.co/mlboydaisuke/lfm2.5-350m-coreml) |
 | **FunctionGemma-270M** | 850 MB | Function calling | (specialist) | [mlboydaisuke/functiongemma-270m-coreml](https://huggingface.co/mlboydaisuke/functiongemma-270m-coreml) |
@@ -28,7 +28,7 @@ All numbers are iPhone 17 Pro A19 Pro, 2048-token context, ANE-only (no GPU fall
 - Image + text chat, lowest memory + fastest follow-up → **Qwen3-VL 2B (stateful)**
 - Text-only, maximum quality under ≤3 GB → **Qwen3.5 2B**
 - Text-only, maximum quality → **Gemma 4 E4B**
-- Text-only, fastest + smallest → **Qwen3.5 0.8B**
+- Text-only, fast + chat-strong → **Qwen3.5 0.8B** (48 tok/s, hybrid SSM + attention)
 - Text-only, smallest at high tok/s on iPhone → **LFM2.5 350M** (52 tok/s, 810 MB) [†](#lfm2-license)
 - Tool / function calling → **FunctionGemma-270M**
 - Sentence embeddings / RAG → **EmbeddingGemma-300M**
@@ -251,6 +251,7 @@ Current release: **v1.7.0** ([release notes](https://github.com/john-rocky/CoreM
 - **v1.4.0** — Gemma 4 E2B 3-chunk decode (opt-in, `LLM_3CHUNK=1`): 31.6 → **34.2 tok/s** on iPhone 17 Pro A19 Pro (+8.2 %). Bit-equivalent to 4-chunk by construction. Closes the ANE-ceiling sweep for E2B; five additional lossless probes (SDPA fusion, K=V alias, Topology I boundary search, blockwise palettization, native softmax) all landed as negative results — see [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md).
 - **v1.3.0** — Qwen3-VL 2B (text + vision on ANE, 196 image tokens, DeepStack injection at L0/1/2, interleaved mRoPE for image tokens). 28-layer GQA, 2.9 GB bundle, ~7.5 tok/s text decode. (Recurrent KV — superseded by v1.5.0 stateful build; kept for backward compatibility.)
 - **v1.2.0** — FunctionGemma-270M (function calling, batched prefill T=32) and EmbeddingGemma-300M (99.80 % ANE, Matryoshka 768/512/256/128). Standalone `Gemma3Demo` sample.
+- **v1.8.0** — Qwen3.5 0.8B / 2B full-vocab rep_penalty masks iPhone A18 fp16 ANE reduction bias. 0.8B: 48 tok/s, 2B: 27 tok/s on iPhone 17 Pro, all clean output across English + Japanese. +45 % over the prior v1.x ceiling. See [docs/QWEN35_FULL_VOCAB_REP_PENALTY.md](docs/QWEN35_FULL_VOCAB_REP_PENALTY.md).
 - **v1.1.0** — Qwen3.5 2B (4 INT8 chunks + mmap fp16 embed sidecar, ~200 MB phys_footprint for a 2B-param model).
 - **v1.0.0** — Qwen3.5 0.8B (first hybrid SSM+attention LLM on CoreML, 99.9 % ANE).
 - **v0.8.0** — Gemma 4 E4B (42-layer text decoder, 100 % ANE).
