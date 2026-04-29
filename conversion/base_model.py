@@ -48,6 +48,9 @@ class ModelConfig:
     tie_word_embeddings: bool = True
     attention_bias: bool = True
     hidden_act: str = "silu"
+    # Qwen3 / some newer Qwen variants apply per-head RMSNorm to Q and K
+    # before RoPE. Leave off by default to keep existing Qwen2 / Gemma conversions unchanged.
+    has_qk_norm: bool = False
     bos_token_id: int = 151643
     eos_token_id: int = 151645
 
@@ -80,6 +83,17 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.dim = config.head_dim
         base = config.rope_theta
+
+        if config.rope_scaling is not None:
+            original_max = config.rope_scaling.get("original_max_position_embeddings")
+            if original_max is not None and config.context_length > original_max:
+                import warnings
+                warnings.warn(
+                    f"rope_scaling={config.rope_scaling} ignored (YaRN not implemented). "
+                    f"context_length={config.context_length} exceeds original {original_max}; "
+                    f"RoPE will extrapolate and quality may degrade.",
+                    stacklevel=2,
+                )
 
         inv_freq = 1.0 / (
             base ** (torch.arange(0, self.dim, 2).float() / self.dim)
@@ -136,6 +150,11 @@ class ANEAttention(nn.Module):
         self.v_proj = nn.Conv2d(config.hidden_size, kv_dim, 1, bias=has_bias, dtype=MODEL_DTYPE)
         self.o_proj = nn.Conv2d(q_dim, config.hidden_size, 1, bias=False, dtype=MODEL_DTYPE)
 
+        self.has_qk_norm = config.has_qk_norm
+        if self.has_qk_norm:
+            self.q_norm = ANERMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = ANERMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
         self.rotary_emb = RotaryEmbedding(config)
 
     def _project_qkv(
@@ -155,6 +174,10 @@ class ANEAttention(nn.Module):
         q = self.q_proj(x).view(batch, self.num_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)
         k = self.k_proj(x).view(batch, self.num_kv_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)
         v = self.v_proj(x).view(batch, self.num_kv_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)
+
+        if self.has_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         return q.to(MODEL_DTYPE), k.to(MODEL_DTYPE), v.to(MODEL_DTYPE)
 

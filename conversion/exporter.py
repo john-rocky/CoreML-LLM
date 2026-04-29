@@ -99,6 +99,12 @@ class MonolithicWrapper(nn.Module):
             k = layer.self_attn.k_proj(x).view(1, num_kv_heads, head_dim, 1).permute(0, 1, 3, 2).to(MODEL_DTYPE)
             v = layer.self_attn.v_proj(x).view(1, num_kv_heads, head_dim, 1).permute(0, 1, 3, 2).to(MODEL_DTYPE)
 
+            # Qwen3-style per-head QK-norm before RoPE.
+            # Skipped for architectures without has_qk_norm set.
+            if getattr(layer.self_attn, "has_qk_norm", False):
+                q = layer.self_attn.q_norm(q)
+                k = layer.self_attn.k_norm(k)
+
             # Apply RoPE
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
