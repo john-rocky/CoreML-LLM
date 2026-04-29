@@ -72,7 +72,38 @@ We report **peak** in the README performance table because that matches how comp
   - Mid-decode: ~981 MB
   - Headroom (`os_proc_available`): ~5 GB
 
-## Energy (`J/tok`)
+## Energy (`mJ/tok`, `%/hour`, thermal trajectory)
+
+The sample app's **Bench** menu now exposes three presets aimed at
+power reporting:
+
+- **2 min (speed)** — quick peak tok/s check
+- **15 min (power)** — minimum duration for a defensible `mJ/tok`
+  number given the iOS battery gauge's 1 % resolution
+- **60 min** — long-haul thermal profile, useful for "will this
+  throttle in a real session" questions
+
+After each run the app writes a CSV to `Documents/bench-<unix_ts>.csv`
+with the per-30s thermal trajectory, battery log, and a `# summary`
+block. The CSV filename is printed in the in-app result and to the
+console. Retrieve via Files app (the target already has
+document-sharing entitlements).
+
+`BenchmarkResult` exposes:
+
+- `mJPerToken` — `drainedPercent × batteryCapacityWh × 36000 / totalTokens`.
+  iPhone 17 Pro nominal capacity is 14.03 Wh; override
+  `batteryCapacityWh` for other devices.
+- `drainedPerHour` — extrapolated from the run duration.
+- `timeToFair`, `timeToSerious` — first elapsed second at which
+  `ProcessInfo.thermalState` transitioned.
+- `thermalTrajectory` — array of `ThermalSample(t, state, batteryLevel)`
+  at 30-second intervals.
+
+For the methodology, metric tiers, and head-to-head protocol against
+other engines, see [POWER_BENCHMARK_PLAN.md](POWER_BENCHMARK_PLAN.md).
+
+## Energy (`J/tok`) — legacy derivation
 
 The ~0.07 J/tok figure in `docs/RESEARCH.md` is **derived**, not directly measured:
 
