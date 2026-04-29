@@ -6,6 +6,24 @@ Where [MLX Swift](https://github.com/ml-explore/mlx-swift) is the right call whe
 
 [![App Store](https://toolbox.marketingtools.apple.com/api/v2/badges/download-on-the-app-store/black/en-us?releaseDate=1735689600)](https://apps.apple.com/jp/app/models-zoo/id6762083207)
 
+## Use in your app
+
+Add the package, name a model, generate.
+
+```swift
+// Package.swift
+.package(url: "https://github.com/john-rocky/CoreML-LLM", from: "1.4.0")
+```
+
+```swift
+import CoreMLLLM
+
+let llm = try await CoreMLLLM.load(repo: "lfm2.5-350m")
+let answer = try await llm.generate("What is the capital of France?")
+```
+
+`repo:` accepts a registered model id (`"gemma4-e2b"`, `"qwen3.5-0.8b"`, `"lfm2.5-350m"`, …) or a full HuggingFace path — first call downloads, later calls reuse the on-device bundle. Streaming, multi-turn chat, image / video / audio, FunctionGemma, EmbeddingGemma → [package docs (Quick Start → Swift Package)](#swift-package).
+
 ## Models
 
 | Model | Size | Task | iPhone 17 Pro decode | HuggingFace |
