@@ -141,8 +141,8 @@ private final class Qwen35ChunkBFeatures: NSObject, MLFeatureProvider {
 }
 
 @Observable
-final class Qwen35Generator {
-    struct Config {
+public final class Qwen35Generator {
+    public struct Config {
         let seqLen: Int           // prefill fixed seq length (64)
         // Default reflects the 2B chunked artifact (mseq=2048). Older
         // 0.8B int8/fp16 packages were converted at MAX_SEQ=128;
@@ -166,35 +166,35 @@ final class Qwen35Generator {
         /// (status reflects "Compiling decode model..."); cached after that.
         /// Switch to `.cpuAndGPU` for bit-exact output (22 tok/s, ~3 GB
         /// Metal) or `.cpuOnly` for no accelerator usage.
-        static let `default` = Config(seqLen: 64, maxSeq: 2048, vocab: 248320,
+        public static let `default` = Config(seqLen: 64, maxSeq: 2048, vocab: 248320,
                                       numLayers: 24, rotaryDim: 64,
                                       prefillUnits: .cpuAndNeuralEngine,
                                       decodeUnits: .cpuAndNeuralEngine)
     }
 
-    var status = "Idle"
-    var running = false
-    var generatedIds: [Int32] = []
-    var prefillMs: Double = 0
-    var decodeMsAvg: Double = 0
-    var tokensPerSecond: Double = 0
+    public var status = "Idle"
+    public var running = false
+    public var generatedIds: [Int32] = []
+    public var prefillMs: Double = 0
+    public var decodeMsAvg: Double = 0
+    public var tokensPerSecond: Double = 0
     /// Debug: top-5 (id, logit) at the first decode position — useful to
     /// diagnose degenerate distributions.
-    var firstStepDebug: [(Int32, Float)] = []
+    public var firstStepDebug: [(Int32, Float)] = []
 
     /// Per-phase timing profile — decode-loop breakdown aggregated over
     /// all decode calls in the last generation. Each value is the mean
     /// milliseconds per decode step. Use this to identify which phase
     /// dominates the per-token latency.
-    struct PhaseProfile {
-        var inputsBuild: Double = 0   // makeDecodeInputs (allocs + dict)
-        var predict: Double = 0       // decode.prediction
-        var stateCopy: Double = 0     // featureValue reads + dict writes
-        var logitRead: Double = 0     // copyLogits / fastArgmax / sampling
-        var total: Double = 0         // wall-clock per step
-        var count: Int = 0            // number of samples
+    public struct PhaseProfile {
+        public var inputsBuild: Double = 0   // makeDecodeInputs (allocs + dict)
+        public var predict: Double = 0       // decode.prediction
+        public var stateCopy: Double = 0     // featureValue reads + dict writes
+        public var logitRead: Double = 0     // copyLogits / fastArgmax / sampling
+        public var total: Double = 0         // wall-clock per step
+        public var count: Int = 0            // number of samples
     }
-    var decodeProfile = PhaseProfile()
+    public var decodeProfile = PhaseProfile()
 
     private var decode: MLModel?
     /// N+1-chunk INT8 shipping path for 2B. Inspired by the Gemma 4 E4B
@@ -227,14 +227,14 @@ final class Qwen35Generator {
     /// Reset per-phase profile accumulators. Call between comparable
     /// measurement runs (e.g., before running the same prompt on a
     /// different compute backend to compare).
-    func resetProfile() {
+    public func resetProfile() {
         decodeProfile = PhaseProfile()
     }
 
     /// Swap compute units at runtime. Since this Generator uses the decode
     /// model for both prefill and decode, only `decode` units take effect;
     /// the `prefill` parameter is accepted for API compat and ignored.
-    func setComputeUnits(prefill: MLComputeUnits, decode: MLComputeUnits) {
+    public func setComputeUnits(prefill: MLComputeUnits, decode: MLComputeUnits) {
         cfg = Config(seqLen: cfg.seqLen, maxSeq: cfg.maxSeq, vocab: cfg.vocab,
                       numLayers: cfg.numLayers, rotaryDim: cfg.rotaryDim,
                       prefillUnits: prefill, decodeUnits: decode)
@@ -278,7 +278,7 @@ final class Qwen35Generator {
     @ObservationIgnored private var fvCos: MLFeatureValue!
     @ObservationIgnored private var fvSin: MLFeatureValue!
 
-    init(cfg: Config = .default) {
+    public init(cfg: Config = .default) {
         self.cfg = cfg
         self.cosTable = buildRope(isCos: true)
         self.sinTable = buildRope(isCos: false)
@@ -348,7 +348,7 @@ final class Qwen35Generator {
     /// Optional override folder (e.g., `Documents/Models/qwen3.5-0.8b/`)
     /// to look inside for the mlpackage. When set, this is tried before
     /// the Documents/ top-level or the app bundle.
-    var modelFolderOverride: URL?
+    public var modelFolderOverride: URL?
 
     /// Resolution order (first hit wins):
     ///   1. `modelFolderOverride/<base>.mlpackage`  (on-device compile)
@@ -546,7 +546,7 @@ final class Qwen35Generator {
 
     /// Deprecated — retained for API compat. `generate(...)` now calls
     /// `loadDecodeOnly()` directly. Kept so external callers don't break.
-    func load() throws {
+    public func load() throws {
         try loadDecodeOnly()
     }
 
@@ -649,7 +649,7 @@ final class Qwen35Generator {
     /// repetitive output. `topP` (nucleus) and `repetitionPenalty` further
     /// suppress loops.
     @discardableResult
-    func generate(inputIds: [Int32], maxNewTokens: Int = 32,
+    public func generate(inputIds: [Int32], maxNewTokens: Int = 32,
                    temperature: Float = 0.7, topK: Int = 40,
                    repetitionPenalty: Float = 1.1,
                    eosTokenIds: Set<Int32> = [],

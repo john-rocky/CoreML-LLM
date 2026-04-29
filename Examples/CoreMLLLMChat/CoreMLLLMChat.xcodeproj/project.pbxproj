@@ -9,10 +9,6 @@
 /* Begin PBXBuildFile section */
 		32404BC1AC91219654BB4034 /* Qwen35GeneratorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */; };
 		370C4C3589D85D9148AED4C9 /* Qwen35BenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8714748BF0A5E81B6E3499A /* Qwen35BenchmarkView.swift */; };
-		3D7B40A686C6B3EA9089FC5A /* Qwen35Generator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */; };
-		D1E20000000000000000BE09 /* Qwen35MLKVGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE0A /* Qwen35MLKVGenerator.swift */; };
-		C1A1B2C3D4E5F6A7B8C9D000 /* Qwen3VL2BGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2A1B2C3D4E5F6A7B8C9D001 /* Qwen3VL2BGenerator.swift */; };
-		C1A1B2C3D4E5F6A7B8C9D002 /* Qwen3VL2BVisionEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2A1B2C3D4E5F6A7B8C9D003 /* Qwen3VL2BVisionEncoder.swift */; };
 		72EA4F4B993C82EAA1F18FF1 /* qwen3_5_oracle_ios.json in Resources */ = {isa = PBXBuildFile; fileRef = 96644CCA8CDD9D651ACBD01D /* qwen3_5_oracle_ios.json */; };
 		79D8443C9596EB593A5FE1EC /* Qwen35DecodeBenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A83A47DE9322C639B9EFD102 /* Qwen35DecodeBenchmarkView.swift */; };
 		'B1000001' = {isa = PBXBuildFile; fileRef = B2000001; };
@@ -29,15 +25,10 @@
 		CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */; };
 		D1E20000000000000000BE01 /* GateZeroBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE02 /* GateZeroBenchmark.swift */; };
 		D1E20000000000000000BE03 /* GateZeroBenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */; };
-		D1E20000000000000000BE05 /* Qwen3VL2BStatefulGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE06 /* Qwen3VL2BStatefulGenerator.swift */; };
 		D1E20000000000000000BE07 /* Qwen3VL2BStatefulGeneratorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE08 /* Qwen3VL2BStatefulGeneratorView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35Generator.swift; path = CoreMLLLMChat/Qwen35Generator.swift; sourceTree = SOURCE_ROOT; };
-		D1E20000000000000000BE0A /* Qwen35MLKVGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35MLKVGenerator.swift; path = CoreMLLLMChat/Qwen35MLKVGenerator.swift; sourceTree = SOURCE_ROOT; };
-		C2A1B2C3D4E5F6A7B8C9D001 /* Qwen3VL2BGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen3VL2BGenerator.swift; path = CoreMLLLMChat/Qwen3VL2BGenerator.swift; sourceTree = SOURCE_ROOT; };
-		C2A1B2C3D4E5F6A7B8C9D003 /* Qwen3VL2BVisionEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen3VL2BVisionEncoder.swift; path = CoreMLLLMChat/Qwen3VL2BVisionEncoder.swift; sourceTree = SOURCE_ROOT; };
 		96644CCA8CDD9D651ACBD01D /* qwen3_5_oracle_ios.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; name = qwen3_5_oracle_ios.json; path = CoreMLLLMChat/qwen3_5_oracle_ios.json; sourceTree = SOURCE_ROOT; };
 		A640406284DC310A703609F0 /* Qwen35Benchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35Benchmark.swift; path = CoreMLLLMChat/Qwen35Benchmark.swift; sourceTree = SOURCE_ROOT; };
 		A83A47DE9322C639B9EFD102 /* Qwen35DecodeBenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35DecodeBenchmarkView.swift; path = CoreMLLLMChat/Qwen35DecodeBenchmarkView.swift; sourceTree = SOURCE_ROOT; };
@@ -56,7 +47,6 @@
 		DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35ChatView.swift; path = CoreMLLLMChat/Qwen35ChatView.swift; sourceTree = SOURCE_ROOT; };
 		D1E20000000000000000BE02 /* GateZeroBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GateZeroBenchmark.swift; path = CoreMLLLMChat/GateZeroBenchmark.swift; sourceTree = SOURCE_ROOT; };
 		D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GateZeroBenchmarkView.swift; path = CoreMLLLMChat/GateZeroBenchmarkView.swift; sourceTree = SOURCE_ROOT; };
-		D1E20000000000000000BE06 /* Qwen3VL2BStatefulGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen3VL2BStatefulGenerator.swift; path = CoreMLLLMChat/Qwen3VL2BStatefulGenerator.swift; sourceTree = SOURCE_ROOT; };
 		D1E20000000000000000BE08 /* Qwen3VL2BStatefulGeneratorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen3VL2BStatefulGeneratorView.swift; path = CoreMLLLMChat/Qwen3VL2BStatefulGeneratorView.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
@@ -83,15 +73,10 @@
 				F8714748BF0A5E81B6E3499A /* Qwen35BenchmarkView.swift */,
 				CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */,
 				A83A47DE9322C639B9EFD102 /* Qwen35DecodeBenchmarkView.swift */,
-				4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */,
-				D1E20000000000000000BE0A /* Qwen35MLKVGenerator.swift */,
-				C2A1B2C3D4E5F6A7B8C9D001 /* Qwen3VL2BGenerator.swift */,
-				C2A1B2C3D4E5F6A7B8C9D003 /* Qwen3VL2BVisionEncoder.swift */,
 				AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */,
 				DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */,
 				D1E20000000000000000BE02 /* GateZeroBenchmark.swift */,
 				D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */,
-				D1E20000000000000000BE06 /* Qwen3VL2BStatefulGenerator.swift */,
 				D1E20000000000000000BE08 /* Qwen3VL2BStatefulGeneratorView.swift */,
 			);
 			sourceTree = "<group>";
@@ -202,15 +187,10 @@
 				370C4C3589D85D9148AED4C9 /* Qwen35BenchmarkView.swift in Sources */,
 				B60E4AB380E7B9E215F1B15E /* Qwen35DecodeBenchmark.swift in Sources */,
 				79D8443C9596EB593A5FE1EC /* Qwen35DecodeBenchmarkView.swift in Sources */,
-				3D7B40A686C6B3EA9089FC5A /* Qwen35Generator.swift in Sources */,
-				D1E20000000000000000BE09 /* Qwen35MLKVGenerator.swift in Sources */,
-				C1A1B2C3D4E5F6A7B8C9D000 /* Qwen3VL2BGenerator.swift in Sources */,
-				C1A1B2C3D4E5F6A7B8C9D002 /* Qwen3VL2BVisionEncoder.swift in Sources */,
 				32404BC1AC91219654BB4034 /* Qwen35GeneratorView.swift in Sources */,
 				CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */,
 				D1E20000000000000000BE01 /* GateZeroBenchmark.swift in Sources */,
 				D1E20000000000000000BE03 /* GateZeroBenchmarkView.swift in Sources */,
-				D1E20000000000000000BE05 /* Qwen3VL2BStatefulGenerator.swift in Sources */,
 				D1E20000000000000000BE07 /* Qwen3VL2BStatefulGeneratorView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

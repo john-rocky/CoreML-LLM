@@ -5,8 +5,9 @@
 // Not wired into the main ChatView's multi-model infrastructure; this is
 // a focused screen that demonstrates the end-to-end ANE shipping path.
 
-import SwiftUI
 import CoreML
+import CoreMLLLM
+import SwiftUI
 import Tokenizers
 
 enum ComputeChoice: String, CaseIterable, Identifiable {

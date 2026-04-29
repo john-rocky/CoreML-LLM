@@ -20,26 +20,26 @@ import CoreGraphics
 import Foundation
 import Accelerate
 
-struct Qwen3VL2BVisionFeatures {
+public struct Qwen3VL2BVisionFeatures {
     /// Pooled vision tokens. Shape (196, 2048) fp16.
-    let hidden: MLMultiArray
+    public let hidden: MLMultiArray
     /// Three DeepStack tensors injected at text layers 0/1/2, each
     /// shape (196, 2048) fp16.
-    let deepstack: [MLMultiArray]
+    public let deepstack: [MLMultiArray]
     /// Number of image tokens (= merger output rows, 196 at 448×448).
-    var count: Int { hidden.shape[0].intValue }
+    public var count: Int { hidden.shape[0].intValue }
 }
 
 @Observable
-final class Qwen3VL2BVisionEncoder {
-    struct Config {
+public final class Qwen3VL2BVisionEncoder {
+    public struct Config {
         let imageSize: Int       // 448
         let computeUnits: MLComputeUnits
-        static let `default` = Config(imageSize: 448,
+        public static let `default` = Config(imageSize: 448,
                                       computeUnits: .cpuAndNeuralEngine)
     }
 
-    var status = "Idle"
+    public var status = "Idle"
     @ObservationIgnored private let cfg: Config
     @ObservationIgnored private var model: MLModel?
 
@@ -60,7 +60,7 @@ final class Qwen3VL2BVisionEncoder {
     private static let imageMean: [Float] = [0.5, 0.5, 0.5]
     private static let imageStd:  [Float] = [0.5, 0.5, 0.5]
 
-    init(cfg: Config = .default) {
+    public init(cfg: Config = .default) {
         self.cfg = cfg
         // Pre-patchified layout: (num_patches, patch_flat) = (784, 1536).
         // num_patches = (grid_h * grid_w) = 28 * 28 with grid_t = 1
@@ -79,7 +79,7 @@ final class Qwen3VL2BVisionEncoder {
         self.pixelFV = MLFeatureValue(multiArray: pixelBuffer)
     }
 
-    func load(modelURL: URL) throws {
+    public func load(modelURL: URL) throws {
         let mcfg = MLModelConfiguration()
         mcfg.computeUnits = cfg.computeUnits
         model = try MLModel(contentsOf: modelURL, configuration: mcfg)
@@ -88,7 +88,7 @@ final class Qwen3VL2BVisionEncoder {
 
     /// Resolve `vision.mlmodelc` or `vision.mlpackage` under
     /// `<folder>/qwen3_vl_2b_vision/` (compiling the package on demand).
-    static func resolveModel(folder: URL) -> URL? {
+    public static func resolveModel(folder: URL) -> URL? {
         let dir = folder.appendingPathComponent("qwen3_vl_2b_vision")
         let fm = FileManager.default
         let mlc = dir.appendingPathComponent("vision.mlmodelc")
@@ -102,7 +102,7 @@ final class Qwen3VL2BVisionEncoder {
 
     /// Preprocess + encode a single image. Returns the 196-token merger
     /// hidden + DeepStack slices.
-    func encode(_ cgImage: CGImage) async throws -> Qwen3VL2BVisionFeatures {
+    public func encode(_ cgImage: CGImage) async throws -> Qwen3VL2BVisionFeatures {
         guard let model else {
             throw NSError(domain: "Qwen3VL2BVisionEncoder", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "Vision encoder not loaded"])

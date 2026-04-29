@@ -40,8 +40,8 @@ import Foundation
 
 
 @Observable
-final class Qwen35MLKVGenerator {
-    struct Config {
+public final class Qwen35MLKVGenerator {
+    public struct Config {
         let maxSeq: Int
         let vocab: Int
         let hiddenSize: Int
@@ -52,7 +52,7 @@ final class Qwen35MLKVGenerator {
         let numChunks: Int
         let computeUnits: MLComputeUnits
 
-        static let default0_8B = Config(
+        public static let default0_8B = Config(
             maxSeq: 2048, vocab: 248320,
             hiddenSize: 1024, numLayers: 24,
             numKVHeads: 2, headDim: 256,
@@ -60,7 +60,7 @@ final class Qwen35MLKVGenerator {
             numChunks: 4,
             computeUnits: .cpuAndNeuralEngine)
 
-        static let default2B = Config(
+        public static let default2B = Config(
             maxSeq: 2048, vocab: 248320,
             hiddenSize: 2048, numLayers: 24,
             numKVHeads: 2, headDim: 256,
@@ -69,12 +69,12 @@ final class Qwen35MLKVGenerator {
             computeUnits: .cpuAndNeuralEngine)
     }
 
-    var status = "Idle"
-    var running = false
-    var generatedIds: [Int32] = []
-    var prefillMs: Double = 0
-    var decodeMsAvg: Double = 0
-    var tokensPerSecond: Double = 0
+    public var status = "Idle"
+    public var running = false
+    public var generatedIds: [Int32] = []
+    public var prefillMs: Double = 0
+    public var decodeMsAvg: Double = 0
+    public var tokensPerSecond: Double = 0
 
     @ObservationIgnored private var cfg: Config
     @ObservationIgnored private var bodyChunks: [MLModel] = []
@@ -129,7 +129,7 @@ final class Qwen35MLKVGenerator {
     @ObservationIgnored private var embedMmapLen: Int = 0
     @ObservationIgnored private var embedMmapFD: Int32 = -1
 
-    init(cfg: Config) {
+    public init(cfg: Config) {
         self.cfg = cfg
         self.cosTable = buildRope(isCos: true)
         self.sinTable = buildRope(isCos: false)
@@ -137,11 +137,11 @@ final class Qwen35MLKVGenerator {
 
     // MARK: Public API
 
-    func setModelFolder(_ url: URL) {
+    public func setModelFolder(_ url: URL) {
         modelFolderOverride = url
     }
 
-    func setComputeUnits(_ units: MLComputeUnits) {
+    public func setComputeUnits(_ units: MLComputeUnits) {
         cfg = Config(
             maxSeq: cfg.maxSeq, vocab: cfg.vocab,
             hiddenSize: cfg.hiddenSize, numLayers: cfg.numLayers,
@@ -155,7 +155,7 @@ final class Qwen35MLKVGenerator {
         status = "Idle (units changed, will reload)"
     }
 
-    func load() async throws {
+    public func load() async throws {
         guard let r = resolveURLs() else {
             throw NSError(domain: "Qwen35MLKV", code: 40,
                 userInfo: [NSLocalizedDescriptionKey:
@@ -229,7 +229,7 @@ final class Qwen35MLKVGenerator {
     ///   window (default last 64 tokens).
     /// - topP: nucleus filter (0.0..1.0). Default 0.95.
     @discardableResult
-    func generate(inputIds: [Int32], maxNewTokens: Int = 64,
+    public func generate(inputIds: [Int32], maxNewTokens: Int = 64,
                   temperature: Float = 0.7,
                   topK: Int = 40,
                   topP: Float = 0.95,
