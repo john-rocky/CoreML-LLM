@@ -134,21 +134,24 @@ class MLKVBodyChunk(nn.Module):
         return (h, *new_ssm_outs)
 
 
-TOPK_OUT = 40   # top-K candidates emitted to Swift for sampling.
+TOPK_OUT = 2048   # top-K candidates emitted to Swift for sampling.
+                  # K=40 was enough on Mac (correct top-1 in top-40)
+                  # but iPhone A18 ANE's fp16 reduction places the
+                  # right token outside top-40 sometimes (Japanese
+                  # short prompts loop because the correct head token
+                  # ranks ~50-1000). 2048 is well within ANE topk
+                  # capacity (~10 KB transfer/step) and gives Swift
+                  # enough candidates to fp32-rerank correctly.
 
 
 class MLKVTailChunk(MLKVBodyChunk):
-    """Body + final_norm + Conv2d lm_head + in-graph TopK[k=40].
-
-    Emits both top-K indices (int32) AND top-K values (fp16) so Swift
-    can apply temperature / top-p / repetition penalty over the
-    candidate set. Returning K=40 entries (320 byte total) instead of
-    full fp32 logits (V * 4 = 1 MB) keeps the per-step ANE→Swift
-    transfer ≈ 99.97% smaller, while leaving room for proper sampling.
-
-    Per chunk4_argmax_topk_parity memory: derive ranks from torch.topk
-    (not torch.argmax) — argmax has ANE-vs-CPU divergence on palettized
-    lm_heads.
+    """Body + final_norm + Conv2d lm_head, FULL fp16 logits (no topk).
+    All ANE-resident — Swift handles rep_penalty + argmax in fp32 over
+    the full vocab. Removes in-graph topk because rep_penalty applied
+    only over top-K (40-2048) couldn't kill iPhone A18 loops where the
+    correct fresh token is outside ANE's biased top-K. Full-vocab
+    rep_penalty solves this since "demote ALL recent tokens" reaches
+    every candidate, not just top-K.
     """
     def __init__(self, cfg, hf_model, start: int, max_seq: int):
         super().__init__(cfg, hf_model, start, cfg.num_hidden_layers, max_seq)
@@ -164,15 +167,13 @@ class MLKVTailChunk(MLKVBodyChunk):
 
     def forward(self, hidden_in, cos, sin, causal_mask, current_pos,
                 *ssm_states):
-        out = super().forward(hidden_in, cos, sin, causal_mask, current_pos,
-                               *ssm_states)
-        h = out[0]
-        ssm_outs = out[1:]
+        body_out = super().forward(hidden_in, cos, sin, causal_mask,
+                                    current_pos, *ssm_states)
+        h = body_out[0]
+        ssm_outs = body_out[1:]
         h = self.final_norm(h)
         logits = self.lm_head(h)                    # (1, 1, V) fp16
-        vals, idx = torch.topk(logits, k=TOPK_OUT, dim=-1)
-        # vals: (1, 1, K) fp16, idx: (1, 1, K) int64 → cast to int32
-        return (idx.to(torch.int32), vals, *ssm_outs)
+        return (logits, *ssm_outs)
 
 
 def _audit_ane(out_path: Path) -> float:
@@ -196,13 +197,19 @@ def _audit_ane(out_path: Path) -> float:
     return pct
 
 
-def convert_chunk(chunk, cfg, max_seq, out_path: Path, *, kind: str):
-    print(f"\n--- convert MLKV {kind} chunk layers [{chunk.start}, {chunk.end}) ---")
+def convert_chunk(chunk, cfg, max_seq, out_path: Path, kind: str):
+    """Convert MLKV chunk (kind='body' or 'tail').
+
+    body: emits hidden + SSM state outputs.
+    tail: emits top_indices + top_values + normed_hidden + SSM state
+          outputs (Swift uses normed_hidden + top_indices for fp32
+          re-rank against the mmap'd embed sidecar to fix iPhone fp16
+          tie issues — keeps the head fused on ANE for full speed).
+    """
+    print(f"\n--- convert MLKV {kind} chunk layers "
+          f"[{chunk.start}, {chunk.end}) ---")
     conv_shape, rec_shape = _ssm_state_shapes(cfg)
 
-    # Compute proper RoPE cos/sin shape — Qwen3.5 uses partial_rotary_factor=0.25,
-    # so rotary_dim = head_dim/4. Don't hand-roll the shape; let HF's rotary
-    # module emit it so the trace matches the layer's expected input rank.
     rot = Qwen3_5TextRotaryEmbedding(cfg).eval()
     pos_ids = torch.zeros(1, 1, dtype=torch.long)
     dummy = torch.zeros(1, 1, cfg.hidden_size)
@@ -232,13 +239,10 @@ def convert_chunk(chunk, cfg, max_seq, out_path: Path, *, kind: str):
         ct.TensorType(name="current_pos", shape=(1,), dtype=np.int32),
     ]
     if kind == "tail":
-        ct_outputs = [
-            ct.TensorType(name="top_indices", dtype=np.int32),
-            ct.TensorType(name="top_values",  dtype=np.float16),
-        ]
+        # Full fp16 logits — Swift handles rep_penalty + argmax in fp32.
+        ct_outputs = [ct.TensorType(name="logits", dtype=np.float16)]
     else:
         ct_outputs = [ct.TensorType(name="hidden", dtype=np.float16)]
-
     for i in chunk.lin_layer_indices:
         ct_inputs.append(ct.TensorType(
             name=f"conv_state_{i}", shape=conv_shape, dtype=np.float16))
@@ -265,6 +269,80 @@ def convert_chunk(chunk, cfg, max_seq, out_path: Path, *, kind: str):
     ct_model.save(str(out_path))
     size_mb = sum(f.stat().st_size for f in out_path.rglob('*') if f.is_file()) / 1e6
     print(f"  saved fp16 {out_path.name} ({size_mb:.0f} MB)")
+    _audit_ane(out_path)
+
+
+def convert_body_chunk(chunk, cfg, max_seq, out_path: Path):
+    convert_chunk(chunk, cfg, max_seq, out_path, kind="body")
+
+
+def convert_tail_chunk(chunk, cfg, max_seq, out_path: Path):
+    convert_chunk(chunk, cfg, max_seq, out_path, kind="tail")
+
+
+def convert_head_chunk(chunk, cfg, out_path: Path, mode: str = "fp32"):
+    """Stateless head: hidden_in (1, 1, H) → top_indices, top_values.
+
+    mode = "fp32"  : full fp32 graph (1GB), correct top-1, slowest GPU.
+    mode = "mixed" : fp16 default + fp32 ONLY for conv (lm_head matmul);
+                    final_norm/topk run fp16. Aim: keep correctness via
+                    fp32 reduction in the matmul while saving GPU
+                    cycles on small ops.
+    mode = "fp16"  : full fp16 graph (~250MB INT8). Fast but breaks
+                    fp16 ties → garbage output. Diagnostic only.
+
+    Why we need fp32 at all: the lm_head matmul reduction over
+    248320-vocab has many tokens whose fp32 logits land in the same
+    fp16 bucket (e.g. "**." vs "-mark" both ~25.41). Splitting
+    body+head into two Core ML models causes coremltools to re-order
+    the matmul vs. the OLD fused chunk_d, breaking ties differently →
+    wrong top-1 → garbage output (Paris-mark-mark-mark...). fp32
+    reduction in the matmul breaks ties correctly.
+    """
+    from coremltools.converters.mil.mil.passes.defs.quantization import FP16ComputePrecision
+    if mode == "fp16":
+        precision = ct.precision.FLOAT16
+    elif mode == "fp32":
+        precision = ct.precision.FLOAT32
+    elif mode == "mixed":
+        # Keep fp32 for the matmul AND the topk that reads it — if
+        # topk's input gets cast back to fp16, we lose the precision
+        # we just paid for and tie-break breaks again. transpose
+        # between conv (fp32) and topk also needs to stay fp32 to
+        # avoid intermediate cast.
+        def keep_lm_path_fp32(op):
+            if op.op_type in ("conv", "topk", "transpose"):
+                return False
+            return True
+        precision = FP16ComputePrecision(op_selector=keep_lm_path_fp32)
+    else:
+        raise ValueError(f"unknown mode {mode!r}")
+    print(f"\n--- convert MLKV head (final_norm + lm_head + topk[k=40]) ---")
+    example = (torch.zeros(1, 1, cfg.hidden_size, dtype=MODEL_DTYPE),)
+    t0 = time.time()
+    traced = torch.jit.trace(chunk, example, strict=False)
+    print(f"  traced in {time.time()-t0:.1f}s")
+    # Input always declared as fp16 so Swift can pass the body's fp16
+    # output directly. CoreML auto-inserts fp16→fp32 cast at the
+    # boundary when compute_precision=FLOAT32.
+    ct_inputs = [ct.TensorType(
+        name="hidden_in", shape=(1, 1, cfg.hidden_size), dtype=np.float16)]
+    ct_outputs = [
+        ct.TensorType(name="top_indices", dtype=np.int32),
+        ct.TensorType(name="top_values",  dtype=np.float16),
+    ]
+    t0 = time.time()
+    ct_model = ct.convert(
+        traced, convert_to="mlprogram",
+        inputs=ct_inputs, outputs=ct_outputs,
+        compute_precision=precision,
+        compute_units=ct.ComputeUnit.CPU_AND_GPU,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+    print(f"  converted in {time.time()-t0:.1f}s")
+    ct_model.save(str(out_path))
+    size_mb = sum(f.stat().st_size for f in out_path.rglob('*') if f.is_file()) / 1e6
+    print(f"  saved {out_path.name} ({size_mb:.0f} MB)")
     _audit_ane(out_path)
 
 
@@ -320,23 +398,47 @@ def main():
 
     export_embed_fp16(hf, chunks_dir / EMBED_BIN_NAME)
 
+    # 4 ANE body chunks — no in-graph final_norm/lm_head/topk. iPhone
+    # A18 ANE's fp16 final_norm + lm_head matmul produces a biased
+    # output that places the correct token outside even top-2048; the
+    # only working strategy is to do final_norm + lm_head matmul in
+    # Swift fp32 against the mmap'd embed sidecar (= lm_head weight
+    # under tied embeddings). Mac's separate fp32-head split path
+    # confirmed this works at clean quality. We dump the final_norm
+    # weight as a tiny sidecar so Swift can run RMSNorm in fp32.
     modules = []
     for ci, (start, end) in enumerate(boundaries):
-        is_last = ci == len(boundaries) - 1
-        if is_last:
+        if ci == len(boundaries) - 1:
+            # Last chunk: body + final_norm + lm_head, emit FULL fp16
+            # logits (no in-graph topk). Swift handles rep_penalty +
+            # argmax in fp32 over the full vocab.
             m = MLKVTailChunk(cfg, hf, start, args.max_seq)
         else:
             m = MLKVBodyChunk(cfg, hf, start, end, args.max_seq)
         modules.append(m.eval().to(MODEL_DTYPE))
+    # Dump final_norm weight (1024 fp16 = ~2 KB) as a sidecar.
+    fn_w = hf.model.norm.weight.detach().to(torch.float16).numpy()
+    (chunks_dir / "final_norm.bin").write_bytes(fn_w.tobytes())
+    print(f"  dumped final_norm.bin ({fn_w.nbytes} bytes, eps={cfg.rms_norm_eps})")
+    # Also dump rms_norm_eps so Swift uses the right epsilon.
+    import json as _json
+    (chunks_dir / "head_meta.json").write_text(_json.dumps({
+        "rms_norm_eps": float(cfg.rms_norm_eps),
+        "tie_word_embeddings": bool(cfg.tie_word_embeddings),
+        "vocab_size": int(cfg.vocab_size),
+        "hidden_size": int(cfg.hidden_size),
+    }))
     del hf
 
     chunk_names = CHUNK_NAMES[:args.num_chunks]
     for ci, (torch_m, name) in enumerate(zip(modules, chunk_names)):
-        is_last = ci == len(boundaries) - 1
-        kind = "tail" if is_last else "body"
+        is_tail = ci == len(boundaries) - 1
         fp16_path = fp16_dir / f"{name}.mlpackage"
         final_path = chunks_dir / f"{name}.mlpackage"
-        convert_chunk(torch_m, cfg, args.max_seq, fp16_path, kind=kind)
+        if is_tail:
+            convert_tail_chunk(torch_m, cfg, args.max_seq, fp16_path)
+        else:
+            convert_body_chunk(torch_m, cfg, args.max_seq, fp16_path)
         if args.nbits == 0:
             shutil.move(str(fp16_path), str(final_path))
         else:

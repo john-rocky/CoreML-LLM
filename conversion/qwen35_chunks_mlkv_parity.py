@@ -4,6 +4,12 @@ chunked decode build.
 KV cache lives in CoreML's MLState (managed via make_state()). SSM
 state (conv_state_X / rec_state_X per linear layer in the chunk) flows
 through input/output tensors like the original stateless build.
+
+Disk layout: 4 body chunks (chunk_a..chunk_d) + 1 head chunk
+(chunk_head). Body chunks emit only `hidden`; head chunk runs
+final_norm + lm_head + topk[k=40] and returns top_indices/top_values.
+The split lets the head run on a different compute unit (CPU+GPU on
+iPhone) for an fp32 lm_head accumulator while bodies stay on ANE.
 """
 from pathlib import Path
 import argparse
@@ -76,8 +82,14 @@ def run_decode(
             ssm_state[f"conv_state_{i}"] = states[2 * i].numpy().astype(np.float16)
             ssm_state[f"rec_state_{i}"]  = states[2 * i + 1].numpy().astype(np.float16)
 
+    recent = []  # closure list, mutated in-place
+    REP_PEN = 1.1
+    REP_WIN = 64
     def _step(tok_id: int, pos: int):
-        """Returns next_token (int) — chunk_d emits it via in-graph TopK."""
+        """All chunks except chunk_d emit hidden; chunk_d (tail) emits
+        FULL fp16 logits (1, 1, V). We cast to fp32, apply rep_penalty
+        over full vocab (not just top-K), and argmax. Same path Swift
+        will use on iPhone."""
         hidden = embed_weight[tok_id:tok_id + 1, :].reshape(1, 1, -1).astype(np.float16)
         cos_np = cos_table[pos:pos + 1].reshape(1, 1, -1)
         sin_np = sin_table[pos:pos + 1].reshape(1, 1, -1)
@@ -104,10 +116,17 @@ def run_decode(
                 ssm_state[f"rec_state_{i}"]  = out[f"new_rec_state_{i}"]
             if "hidden" in out:
                 hidden = out["hidden"].astype(np.float16)
-        # Greedy top-1 over the topk[k=40] result for parity (Swift adds
-        # temperature + top-p + rep-penalty at runtime).
-        top_idx = last_out["top_indices"][0, 0]
-        return int(top_idx[0])
+        # Tail (chunk_d): full fp16 logits.
+        logits = last_out["logits"][0, 0].astype(np.float32)
+        for tok in recent:
+            if 0 <= tok < logits.shape[0]:
+                if logits[tok] > 0: logits[tok] /= REP_PEN
+                else:               logits[tok] *= REP_PEN
+        nt = int(np.argmax(logits))
+        recent.append(nt)
+        while len(recent) > REP_WIN:
+            recent.pop(0)
+        return nt
 
     t_pre = time.time()
     next_token = -1

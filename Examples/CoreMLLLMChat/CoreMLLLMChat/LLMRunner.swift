@@ -576,7 +576,7 @@ final class LLMRunner {
         let gen = Qwen35MLKVGenerator(cfg: cfg)
         gen.setModelFolder(folder)
         do {
-            try gen.load()
+            try await gen.load()
         } catch {
             throw NSError(domain: "LLMRunner", code: 23,
                 userInfo: [NSLocalizedDescriptionKey:
@@ -612,9 +612,19 @@ final class LLMRunner {
             }
             return ["role": role, "content": m.content]
         }
-        let inputIds: [Int] = (try? tok.applyChatTemplate(messages: chatMessages))
-            ?? tok.encode(text: messages.last?.content ?? "")
+        // DIAGNOSTIC: log whether applyChatTemplate succeeds vs falls
+        // through to raw encode. If iPhone's swift-transformers can't
+        // handle Qwen3.5's macro/namespace Jinja template, applyChatTemplate
+        // returns nil → fallback to raw `tok.encode` → raw-prompt loop
+        // (QWEN35_LESSONS §5.2 documents "こんにちは → loop" without
+        // chat template). This print verifies the chat template path
+        // actually fired AND produced canonical IDs (e.g. "こんにちは"
+        // should yield 13 tokens including 85951).
+        let templated = try? tok.applyChatTemplate(messages: chatMessages)
+        let templateOK = templated != nil
+        let inputIds: [Int] = templated ?? tok.encode(text: messages.last?.content ?? "")
         let inputIdsInt32 = inputIds.map { Int32($0) }
+        print("[Qwen35MLKV.diag] templateApplied=\(templateOK) inputIds.count=\(inputIds.count) ids=\(inputIds.prefix(20))")
 
         let maxSeq = 2048
         let remaining = maxSeq - inputIds.count - 1

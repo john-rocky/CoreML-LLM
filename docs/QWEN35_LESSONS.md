@@ -322,3 +322,57 @@ Key commits on main (chronological):
 - v1.x (this branch) MLKV path: `fix/qwen35-mseq-reconcile`
 
 Feature branch (open): `fix/qwen35-mseq-reconcile` — MAX_SEQ=2048 + Gemma 4 ANE recipe + MLKV (KV in MLState, SSM stateless), 0.8B 51 tok/s / 2B 32 tok/s on Mac M4 ANE. See `docs/SESSION_2026_04_28_QWEN35_2K_ANE.md`.
+
+---
+
+## 12 · v1.8.0 — full-vocab rep_penalty unlocks iPhone ANE 49 tok/s clean (2026-04-29)
+
+iPhone A18 ANE has hardware-level fp16 reduction non-determinism on
+large-vocab matmul: where Mac M4 picks the fp32-correct top-1 from a
+tied logit pair, A18 picks the other. Symptoms:
+- `こんにちは` greedy → `おはる、おはる、…` tight loop on iPhone, clean
+  on Mac with the same INT8 mlpackage.
+- `Hello.` → ⭐️ wall on some iPhone runs.
+- Confirmed via Apple coremltools issues
+  [#2359](https://github.com/apple/coremltools/issues/2359) and
+  [#2625](https://github.com/apple/coremltools/issues/2625) — fp16
+  ANE precision is a known class of bugs without official fix.
+
+**Workaround that ships at 45-50 tok/s clean (beats prior 33 tok/s
+ceiling we thought was structural):**
+
+1. Build `chunk_d` with body + final_norm + lm_head, emit FULL fp16
+   logits (1, 1, 248320). Drop the in-graph topk[k=N] entirely.
+2. In Swift: cast fp16 → fp32 in batch via
+   `vImageConvert_Planar16FtoPlanarF` (~1 ms for 248K).
+3. **Apply rep_penalty over the FULL VOCAB**, not just top-K. This is
+   the key — top-K-only rep_penalty (v1.0 default) only reaches the
+   candidates ANE put in top-40, which on biased prompts are all
+   "おはる-flavored". Full-vocab demotion lets fresh tokens that ANE
+   ranked outside top-40 win after 2-3 self-correcting steps.
+4. `vDSP_maxvi` argmax for greedy (or full-vocab softmax for T>0).
+
+The fp16 ANE bias isn't fixed — it's MASKED. The first 1-2 generated
+tokens may still be "off" from Mac output, but the model self-corrects
+within 2-3 tokens because rep_penalty pushes all biased candidates
+below fresh ones.
+
+Body chunks unchanged. Only `chunk_d` schema changes (`logits` output
+instead of `top_indices`/`top_values`). KV-MLState and SSM state I/O
+unchanged. Output transfer ~485 KB/step (~2 ms iPhone bus), tiny next
+to the body's compute.
+
+**TTFT improvements (same patch):**
+- `gen.load()` now `async`, runs a single dummy `stepPredictPrefillOnly`
+  to JIT-compile ANE kernels. Eliminates the 200-500 ms first-prompt
+  stall.
+- Recurrent prefill skips Swift fp16→fp32 / rep_penalty / argmax for
+  prefill[0..N-2] — only the last prompt token needs sampling.
+
+**Final iPhone 17 Pro speeds (clean output, Japanese + English):**
+- 0.8B: 48→43 tok/s (10% throttle from continuous SSM-state I/O on ANE)
+- 2B: 27→25 tok/s
+
+Beats the previous v1.x split-head ceiling (0.8B 33 tok/s) by +45%.
+See `docs/QWEN35_FULL_VOCAB_REP_PENALTY.md` for the full discovery
+trail and `docs/QWEN35_FUTURE_IMPROVEMENTS.md` for what's left to try.

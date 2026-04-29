@@ -93,24 +93,25 @@ public final class ModelDownloader: NSObject {
             folderName: "qwen2.5-0.5b")
 
         /// Qwen3.5 0.8B — hybrid Gated-DeltaNet SSM + attention, text-only.
-        /// Ships the INT8 palettized decode mlpackage (754 MB) — same
-        /// semantic precision as fp16 (top-3 = 100% parity vs fp32 oracle),
-        /// half the bundle size. Prefill is performed via the same model
-        /// recurrently. Runs on CPU / GPU / ANE.
+        /// v1.8.0 — full-vocab rep_penalty workaround for iPhone A18 ANE
+        /// fp16 reduction bias. chunk_d emits FULL fp16 logits (248K)
+        /// instead of in-graph topk; Swift handles rep_penalty + argmax
+        /// in fp32 over the full vocab. Result: 48 → 43 tok/s clean on
+        /// iPhone 17 Pro (vs prior 33 tok/s ceiling), 50 tok/s on Mac M4.
+        /// Bundle: 4 INT8 ANE-resident chunks + raw fp16 embed sidecar.
         public static let qwen35_08b = ModelInfo(
-            id: "qwen3.5-0.8b", name: "Qwen3.5 0.8B (ANE)", size: "754 MB",
+            id: "qwen3.5-0.8b", name: "Qwen3.5 0.8B (ANE)", size: "1.2 GB",
             downloadURL: "https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML/resolve/main",
             folderName: "qwen3.5-0.8b")
 
         /// Qwen3.5 2B — same hybrid SSM/attention architecture as 0.8B,
-        /// just hidden_size doubled (1024→2048) and intermediate
-        /// (3072→6144). Shipped as 4 INT8 chunks (6 layers each, ~1.7 GB
-        /// fp16-dequantized per chunk) matching the Gemma 4 E4B pattern
-        /// that fits iPhone's single-mlprogram ANE compile budget.
-        /// 2-chunk at 2 GB fp16/chunk failed ANE and fell to GPU; 4-chunk
-        /// stays ANE-resident. Bigger = higher quality, slower vs 0.8B.
+        /// just hidden_size doubled (1024→2048). Shipped as 4 INT8 chunks
+        /// matching the Gemma 4 E4B pattern that fits iPhone's
+        /// single-mlprogram ANE compile budget. v1.8.0 ships the
+        /// full-vocab rep_penalty path (chunk_d emits 248K logits) for
+        /// 27 → 25 tok/s clean on iPhone 17 Pro, 32 tok/s on Mac M4.
         public static let qwen35_2b = ModelInfo(
-            id: "qwen3.5-2b", name: "Qwen3.5 2B (ANE)", size: "2.4 GB",
+            id: "qwen3.5-2b", name: "Qwen3.5 2B (ANE)", size: "2.8 GB",
             downloadURL: "https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML/resolve/main",
             folderName: "qwen3.5-2b")
 
@@ -1107,22 +1108,24 @@ public final class ModelDownloader: NSObject {
     /// the iPhone shipping path; the mseq128 monolithic INT4/INT8/fp16
     /// builds were retired.
     ///
-    /// Layout under `qwen3_5_0_8b_decode_chunks/`:
+    /// Layout under `qwen3_5_0_8b_decode_chunks_mlkv/` (v1.8.0):
     ///   chunk_a..c:       6 layers each (pure transformer body)
-    ///   chunk_d:          6 layers + final_norm + lm_head
-    ///   embed_weight.bin: raw fp16 embed_tokens, Swift mmaps directly
-    /// (Same Generator.swift code path as 2B; the loader detects hidden
-    /// size from chunk_a's `hidden_in` input spec.)
+    ///   chunk_d:          6 layers + final_norm + lm_head, emits FULL
+    ///                     fp16 logits (248K) — Swift does fp32 sampling
+    ///                     for the iPhone fp16 ANE bias workaround.
+    ///   embed_weight.bin: raw fp16 embed_tokens, Swift mmaps directly.
+    /// KV cache lives in MLState (slice_update); SSM state through
+    /// classic input/output. Beats prior `qwen3_5_0_8b_decode_chunks/`
+    /// path by ~+45% on iPhone clean (33 → 48 tok/s).
     private func buildQwen35FileList() {
-        let root = "qwen3_5_0_8b_decode_chunks"
-        // Per-chunk weight.bin sizes — INT8 palettized 0.8B is roughly
-        // 1/4 of 2B because hidden=1024 (vs 2048). chunk_d carries the
-        // 500 MB lm_head (248K × 1024 × 2 bytes).
+        let root = "qwen3_5_0_8b_decode_chunks_mlkv"
+        // Per-chunk weight.bin sizes — INT8 palettized. chunk_d carries
+        // the 250 MB lm_head (248K × 1024 INT8 + scales).
         let sizes: [(String, Int64)] = [
-            ("chunk_a.mlpackage", 90_000_000),   // 6 layers, ~88 MB INT8
-            ("chunk_b.mlpackage", 90_000_000),
-            ("chunk_c.mlpackage", 90_000_000),
-            ("chunk_d.mlpackage", 590_000_000),  // 6 layers + lm_head
+            ("chunk_a.mlpackage", 126_000_000),  // 6 layers, ~120 MB INT8
+            ("chunk_b.mlpackage", 123_000_000),
+            ("chunk_c.mlpackage", 126_000_000),
+            ("chunk_d.mlpackage", 360_000_000),  // 6 layers + lm_head + topk-emit
         ]
         var files: [DownloadFile] = []
         for (chunk, weightSize) in sizes {
@@ -1152,27 +1155,21 @@ public final class ModelDownloader: NSObject {
         nextFileIndex = 0
     }
 
-    /// Qwen3.5-2B CoreML layout on `mlboydaisuke/qwen3.5-2B-CoreML`.
-    /// 4 INT8 transformer chunks + 1 raw fp16 embed sidecar under
-    /// `qwen3_5_2b_decode_chunks/`:
+    /// Qwen3.5-2B v1.8.0 — same MLKV + full-fp16-logits layout as 0.8B.
+    /// Layout under `qwen3_5_2b_decode_chunks_mlkv/`:
     ///   chunk_a..c:       6 layers each (pure transformer body)
-    ///   chunk_d:          6 layers + final_norm + lm_head
-    ///   embed_weight.bin: raw fp16 embed_tokens, Swift mmaps directly
-    /// Embed is NOT an mlpackage so CoreML doesn't dequant its 1 GB
-    /// into CPU-resident memory — the mmap'd file stays in clean
-    /// virtual pages and only the few rows touched per prompt page in.
-    /// Every transformer chunk is ≤ 1 GB fp16, fitting iPhone's ANE
-    /// single-mlprogram compile envelope.
+    ///   chunk_d:          6 layers + final_norm + lm_head, emits 248K
+    ///                     fp16 logits for Swift fp32 sampling.
+    ///   embed_weight.bin: raw fp16 (vocab × 2048), 1 GB.
     private func buildQwen35_2B_FileList() {
-        let root = "qwen3_5_2b_decode_chunks"
+        let root = "qwen3_5_2b_decode_chunks_mlkv"
         // Per-chunk weight.bin sizes measured from the INT8 palettized
-        // output. chunk_d carries 1 GB of lm_head; body chunks are just
-        // 6 transformer layers.
+        // output. chunk_d carries the 500 MB lm_head INT8.
         let sizes: [(String, Int64)] = [
-            ("chunk_a.mlpackage", 340_000_000),  // 6 layers
-            ("chunk_b.mlpackage", 340_000_000),  // 6 layers
-            ("chunk_c.mlpackage", 340_000_000),  // 6 layers
-            ("chunk_d.mlpackage", 850_000_000),  // 6 layers + lm_head
+            ("chunk_a.mlpackage", 347_000_000),  // 6 layers, ~331 MB INT8
+            ("chunk_b.mlpackage", 340_000_000),
+            ("chunk_c.mlpackage", 347_000_000),
+            ("chunk_d.mlpackage", 850_000_000),  // 6 layers + lm_head + 248K logits emit
         ]
         var files: [DownloadFile] = []
         for (chunk, weightSize) in sizes {
