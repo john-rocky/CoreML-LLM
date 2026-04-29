@@ -15,6 +15,7 @@ let package = Package(
         .executable(name: "union-bitexact", targets: ["UnionBitExact"]),
         .executable(name: "determinism-oracle", targets: ["DeterminismOracle"]),
         .executable(name: "verify-k8-probe", targets: ["VerifyK8Probe"]),
+        .executable(name: "ane-residency-gate", targets: ["AneResidencyGate"]),
         // Standalone samples for the two Gemma-3-based models. These live in
         // the same package on purpose — a LocalAIKit-style wrapper can depend
         // on the `CoreMLLLM` library and use `FunctionGemma` / `EmbeddingGemma`
@@ -103,6 +104,16 @@ let package = Package(
             name: "EmbeddingGemmaDemo",
             dependencies: ["CoreMLLLM"],
             path: "Sources/embeddinggemma-demo",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // T2 ANE residency CI gate. Loads each chunk{1..4}.mlpackage in
+        // a model directory, queries MLComputePlan, and exits non-zero if
+        // any chunk's ANE op fraction drops below the threshold (default
+        // 99.5%). Optionally writes/diffs a JSON baseline.
+        .executableTarget(
+            name: "AneResidencyGate",
+            dependencies: ["CoreMLLLM"],
+            path: "Sources/ane-residency-gate",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]

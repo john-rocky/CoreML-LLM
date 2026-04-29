@@ -1,0 +1,26 @@
+[
+  {
+    "aneOps" : 1058,
+    "chunkName" : "chunk1",
+    "nonANE" : 0,
+    "totalOps" : 1058
+  },
+  {
+    "aneOps" : 914,
+    "chunkName" : "chunk2",
+    "nonANE" : 0,
+    "totalOps" : 914
+  },
+  {
+    "aneOps" : 824,
+    "chunkName" : "chunk3",
+    "nonANE" : 1,
+    "totalOps" : 825
+  },
+  {
+    "aneOps" : 832,
+    "chunkName" : "chunk4",
+    "nonANE" : 9,
+    "totalOps" : 841
+  }
+]
