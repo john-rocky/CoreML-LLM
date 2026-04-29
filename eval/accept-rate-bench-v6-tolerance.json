@@ -1,0 +1,1229 @@
+{
+  "K" : 3,
+  "generatedAt" : "2026-04-15T08:54:36Z",
+  "maxTokens" : 128,
+  "mode" : "all",
+  "modelDir" : "\/Users\/majimadaisuke\/Downloads\/coreml-llm-artifacts\/staging-2k-fast-prefill-tol\/gemma4-e2b",
+  "prompts" : [
+    {
+      "category" : "code",
+      "decodeVerifyAgreePrefix" : 3,
+      "drafters" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            5,
+            2,
+            1,
+            1
+          ],
+          "totalBursts" : 9
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            7,
+            1,
+            1,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            8,
+            1,
+            0,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            7,
+            1,
+            1,
+            0
+          ],
+          "totalBursts" : 9
+        }
+      },
+      "draftersArgmax" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            10,
+            3,
+            1,
+            3
+          ],
+          "totalBursts" : 17
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            6,
+            1,
+            1,
+            9
+          ],
+          "totalBursts" : 17
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            7,
+            1,
+            1,
+            8
+          ],
+          "totalBursts" : 17
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            6,
+            1,
+            1,
+            9
+          ],
+          "totalBursts" : 17
+        }
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            17,
+            1,
+            0,
+            0
+          ],
+          "totalBursts" : 18
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            17,
+            0,
+            1,
+            0
+          ],
+          "totalBursts" : 18
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            17,
+            1,
+            0,
+            0
+          ],
+          "totalBursts" : 18
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            17,
+            1,
+            0,
+            0
+          ],
+          "totalBursts" : 18
+        }
+      },
+      "emittedArgmaxLen" : 19,
+      "emittedLen" : 11,
+      "id" : "code-complete-sum",
+      "promptLen" : 49
+    },
+    {
+      "category" : "code",
+      "decodeVerifyAgreePrefix" : 9,
+      "drafters" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            83,
+            17,
+            11,
+            15
+          ],
+          "totalBursts" : 126
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            97,
+            7,
+            2,
+            20
+          ],
+          "totalBursts" : 126
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            100,
+            2,
+            1,
+            23
+          ],
+          "totalBursts" : 126
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            94,
+            2,
+            2,
+            28
+          ],
+          "totalBursts" : 126
+        }
+      },
+      "draftersArgmax" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            48,
+            16,
+            7,
+            2
+          ],
+          "totalBursts" : 73
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            66,
+            2,
+            2,
+            3
+          ],
+          "totalBursts" : 73
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            68,
+            2,
+            2,
+            1
+          ],
+          "totalBursts" : 73
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            65,
+            3,
+            2,
+            3
+          ],
+          "totalBursts" : 73
+        }
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            87,
+            1,
+            1,
+            0
+          ],
+          "totalBursts" : 89
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            89,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 89
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            89,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 89
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            89,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 89
+        }
+      },
+      "emittedArgmaxLen" : 75,
+      "emittedLen" : 128,
+      "id" : "code-explain-fib",
+      "promptLen" : 58
+    },
+    {
+      "category" : "code",
+      "decodeVerifyAgreePrefix" : 22,
+      "drafters" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            9,
+            2,
+            2,
+            7
+          ],
+          "totalBursts" : 20
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            12,
+            4,
+            3,
+            1
+          ],
+          "totalBursts" : 20
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            15,
+            3,
+            1,
+            1
+          ],
+          "totalBursts" : 20
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            12,
+            4,
+            3,
+            1
+          ],
+          "totalBursts" : 20
+        }
+      },
+      "draftersArgmax" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            9,
+            2,
+            2,
+            7
+          ],
+          "totalBursts" : 20
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            12,
+            4,
+            3,
+            1
+          ],
+          "totalBursts" : 20
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            15,
+            3,
+            1,
+            1
+          ],
+          "totalBursts" : 20
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            12,
+            4,
+            3,
+            1
+          ],
+          "totalBursts" : 20
+        }
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            33,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 33
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            33,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 33
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            33,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 33
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            33,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 33
+        }
+      },
+      "emittedArgmaxLen" : 22,
+      "emittedLen" : 22,
+      "id" : "code-refactor-loop",
+      "promptLen" : 57
+    },
+    {
+      "category" : "summary",
+      "decodeVerifyAgreePrefix" : 21,
+      "drafters" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            2,
+            1,
+            1,
+            15
+          ],
+          "totalBursts" : 19
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            2,
+            0,
+            0,
+            17
+          ],
+          "totalBursts" : 19
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            3,
+            0,
+            0,
+            16
+          ],
+          "totalBursts" : 19
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            2,
+            0,
+            0,
+            17
+          ],
+          "totalBursts" : 19
+        }
+      },
+      "draftersArgmax" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            2,
+            1,
+            1,
+            15
+          ],
+          "totalBursts" : 19
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            2,
+            0,
+            0,
+            17
+          ],
+          "totalBursts" : 19
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            3,
+            0,
+            0,
+            16
+          ],
+          "totalBursts" : 19
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            2,
+            0,
+            0,
+            17
+          ],
+          "totalBursts" : 19
+        }
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            21,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 21
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            20,
+            0,
+            1,
+            0
+          ],
+          "totalBursts" : 21
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            20,
+            0,
+            1,
+            0
+          ],
+          "totalBursts" : 21
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            20,
+            0,
+            1,
+            0
+          ],
+          "totalBursts" : 21
+        }
+      },
+      "emittedArgmaxLen" : 21,
+      "emittedLen" : 21,
+      "id" : "sum-para-ane",
+      "promptLen" : 71
+    },
+    {
+      "category" : "summary",
+      "decodeVerifyAgreePrefix" : 15,
+      "drafters" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            21,
+            10,
+            3,
+            5
+          ],
+          "totalBursts" : 39
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            33,
+            2,
+            1,
+            3
+          ],
+          "totalBursts" : 39
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            36,
+            1,
+            1,
+            1
+          ],
+          "totalBursts" : 39
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            33,
+            2,
+            1,
+            3
+          ],
+          "totalBursts" : 39
+        }
+      },
+      "draftersArgmax" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            18,
+            7,
+            1,
+            3
+          ],
+          "totalBursts" : 29
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            24,
+            0,
+            1,
+            4
+          ],
+          "totalBursts" : 29
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            25,
+            1,
+            1,
+            2
+          ],
+          "totalBursts" : 29
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            23,
+            1,
+            1,
+            4
+          ],
+          "totalBursts" : 29
+        }
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            40,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 40
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            40,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 40
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            40,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 40
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            40,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 40
+        }
+      },
+      "emittedArgmaxLen" : 31,
+      "emittedLen" : 41,
+      "id" : "sum-para-compiler",
+      "promptLen" : 82
+    },
+    {
+      "category" : "qa",
+      "decodeVerifyAgreePrefix" : 11,
+      "drafters" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            6,
+            2,
+            1,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            8,
+            0,
+            1,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            9,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            8,
+            0,
+            1,
+            0
+          ],
+          "totalBursts" : 9
+        }
+      },
+      "draftersArgmax" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            6,
+            2,
+            1,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            8,
+            0,
+            1,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            9,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            8,
+            0,
+            1,
+            0
+          ],
+          "totalBursts" : 9
+        }
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            9,
+            1,
+            1,
+            0
+          ],
+          "totalBursts" : 11
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            11,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 11
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            11,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 11
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            11,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 11
+        }
+      },
+      "emittedArgmaxLen" : 11,
+      "emittedLen" : 11,
+      "id" : "qa-where-is-swift",
+      "promptLen" : 59
+    },
+    {
+      "category" : "qa",
+      "decodeVerifyAgreePrefix" : 12,
+      "drafters" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            2,
+            0,
+            1,
+            7
+          ],
+          "totalBursts" : 10
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            4,
+            1,
+            1,
+            4
+          ],
+          "totalBursts" : 10
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            6,
+            0,
+            1,
+            3
+          ],
+          "totalBursts" : 10
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            4,
+            1,
+            1,
+            4
+          ],
+          "totalBursts" : 10
+        }
+      },
+      "draftersArgmax" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            2,
+            0,
+            1,
+            7
+          ],
+          "totalBursts" : 10
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            4,
+            1,
+            1,
+            4
+          ],
+          "totalBursts" : 10
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            6,
+            0,
+            1,
+            3
+          ],
+          "totalBursts" : 10
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            4,
+            1,
+            1,
+            4
+          ],
+          "totalBursts" : 10
+        }
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            12,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 12
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            12,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 12
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            12,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 12
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            12,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 12
+        }
+      },
+      "emittedArgmaxLen" : 12,
+      "emittedLen" : 12,
+      "id" : "qa-what-is-ane",
+      "promptLen" : 66
+    },
+    {
+      "category" : "chat",
+      "decodeVerifyAgreePrefix" : 10,
+      "drafters" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            37,
+            13,
+            4,
+            10
+          ],
+          "totalBursts" : 64
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            64,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 64
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            64,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 64
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            64,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 64
+        }
+      },
+      "draftersArgmax" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            11,
+            1,
+            1,
+            6
+          ],
+          "totalBursts" : 19
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            19,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 19
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            19,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 19
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            19,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 19
+        }
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            29,
+            0,
+            1,
+            0
+          ],
+          "totalBursts" : 30
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            30,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 30
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            30,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 30
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            30,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 30
+        }
+      },
+      "emittedArgmaxLen" : 21,
+      "emittedLen" : 66,
+      "id" : "chat-define-transformer",
+      "promptLen" : 23
+    },
+    {
+      "category" : "chat",
+      "decodeVerifyAgreePrefix" : 6,
+      "drafters" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            84,
+            27,
+            9,
+            6
+          ],
+          "totalBursts" : 126
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            123,
+            2,
+            1,
+            0
+          ],
+          "totalBursts" : 126
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            125,
+            1,
+            0,
+            0
+          ],
+          "totalBursts" : 126
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            123,
+            2,
+            1,
+            0
+          ],
+          "totalBursts" : 126
+        }
+      },
+      "draftersArgmax" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            9,
+            5,
+            2,
+            2
+          ],
+          "totalBursts" : 18
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            18,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 18
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            18,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 18
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            18,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 18
+        }
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            60,
+            4,
+            64,
+            0
+          ],
+          "totalBursts" : 128
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            42,
+            80,
+            6,
+            0
+          ],
+          "totalBursts" : 128
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            44,
+            78,
+            6,
+            0
+          ],
+          "totalBursts" : 128
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            42,
+            79,
+            7,
+            0
+          ],
+          "totalBursts" : 128
+        }
+      },
+      "emittedArgmaxLen" : 20,
+      "emittedLen" : 128,
+      "id" : "chat-explain-rope",
+      "promptLen" : 21
+    },
+    {
+      "category" : "chat",
+      "decodeVerifyAgreePrefix" : 2,
+      "drafters" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            4,
+            2,
+            2,
+            0
+          ],
+          "totalBursts" : 8
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            8,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 8
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            8,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 8
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            8,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 8
+        }
+      },
+      "draftersArgmax" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            3,
+            3,
+            1,
+            1
+          ],
+          "totalBursts" : 8
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            8,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 8
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            8,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 8
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            8,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 8
+        }
+      },
+      "draftersChain" : {
+        "cross-vocab-qwen" : {
+          "histogram" : [
+            9,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "prompt-lookup-n2" : {
+          "histogram" : [
+            9,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "prompt-lookup-n3" : {
+          "histogram" : [
+            9,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 9
+        },
+        "suffix-scan" : {
+          "histogram" : [
+            9,
+            0,
+            0,
+            0
+          ],
+          "totalBursts" : 9
+        }
+      },
+      "emittedArgmaxLen" : 10,
+      "emittedLen" : 10,
+      "id" : "chat-greeting",
+      "promptLen" : 31
+    }
+  ]
+}
