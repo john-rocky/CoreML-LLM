@@ -24,8 +24,8 @@ import Foundation
 
 
 @Observable
-final class Qwen3VL2BStatefulGenerator {
-    struct Config {
+public final class Qwen3VL2BStatefulGenerator {
+    public struct Config {
         let maxSeq: Int
         let vocab: Int
         let hiddenSize: Int
@@ -37,7 +37,7 @@ final class Qwen3VL2BStatefulGenerator {
         let ropeTheta: Float
         let computeUnits: MLComputeUnits
 
-        static let defaultFourChunk = Config(
+        public static let defaultFourChunk = Config(
             maxSeq: 2048, vocab: 151936,
             hiddenSize: 2048, numLayers: 28,
             numKVHeads: 8, headDim: 128,
@@ -45,7 +45,7 @@ final class Qwen3VL2BStatefulGenerator {
             ropeTheta: 5_000_000,
             computeUnits: .cpuAndNeuralEngine)
 
-        static let defaultTwoChunk = Config(
+        public static let defaultTwoChunk = Config(
             maxSeq: 2048, vocab: 151936,
             hiddenSize: 2048, numLayers: 28,
             numKVHeads: 8, headDim: 128,
@@ -54,11 +54,11 @@ final class Qwen3VL2BStatefulGenerator {
             computeUnits: .cpuAndNeuralEngine)
     }
 
-    var status = "Idle"
-    var running = false
-    var outputText = ""
-    var stats = ""
-    var auditText = ""
+    public var status = "Idle"
+    public var running = false
+    public var outputText = ""
+    public var stats = ""
+    public var auditText = ""
 
     private var cfg = Config.defaultFourChunk
 
@@ -78,9 +78,9 @@ final class Qwen3VL2BStatefulGenerator {
     private var chunk0Vision: MLModel?
     private var chunk0VisionPrefill: MLModel?
     private var headChunk: MLModel?
-    var hasVisionChunk: Bool { chunk0Vision != nil }
-    var hasMultifunctionPrefill: Bool { !bodyPrefillChunks.isEmpty }
-    var hasVisionMultifunctionPrefill: Bool { chunk0VisionPrefill != nil }
+    public var hasVisionChunk: Bool { chunk0Vision != nil }
+    public var hasMultifunctionPrefill: Bool { !bodyPrefillChunks.isEmpty }
+    public var hasVisionMultifunctionPrefill: Bool { chunk0VisionPrefill != nil }
 
     // Embed sidecar (mmap'd fp16 vocab x hidden).
     private var embedMmapBase: UnsafeMutableRawPointer?
@@ -156,7 +156,7 @@ final class Qwen3VL2BStatefulGenerator {
     private var persistedPosition: Int = 0
     private var persistedVisionFingerprint: ObjectIdentifier?
 
-    init(cfg: Config = .defaultFourChunk) {
+    public init(cfg: Config = .defaultFourChunk) {
         self.cfg = cfg
         cosTable = buildRope(isCos: true)
         sinTable = buildRope(isCos: false)
@@ -331,7 +331,7 @@ final class Qwen3VL2BStatefulGenerator {
 
     // MARK: - Resolve model directory
 
-    var modelFolderOverride: URL?
+    public var modelFolderOverride: URL?
 
     private func resolveURLs()
         -> (body: [URL], head: URL, embed: URL, chunk0Vision: URL?)?
@@ -381,7 +381,7 @@ final class Qwen3VL2BStatefulGenerator {
     /// chunk shows <95% ANE at runtime-preferred we know dispatch is
     /// forking to CPU/GPU for those ops, which stalls the pipeline.
     @available(iOS 17.0, *)
-    func audit() async {
+    public func audit() async {
         guard let r = resolveURLs() else {
             auditText = "FAIL — chunks not resolved"
             return
@@ -465,7 +465,7 @@ final class Qwen3VL2BStatefulGenerator {
     /// (decode) and T=prefillT (multifunction prefill) paths so neither
     /// surprises us on the first send. Throwaway states drop on
     /// return; persistedStates is untouched.
-    func prewarm() async throws {
+    public func prewarm() async throws {
         guard !bodyChunks.isEmpty, headChunk != nil else { return }
 
         // Source models for state creation (mirrors generate()'s logic).
@@ -564,14 +564,14 @@ final class Qwen3VL2BStatefulGenerator {
     /// Drop the cross-turn KV cache. Call from the chat UI when the
     /// user clears history, picks a new image, or otherwise breaks the
     /// prompt-prefix invariant the resume path depends on.
-    func resetPersistedState() {
+    public func resetPersistedState() {
         persistedStates = []
         persistedInputIds = []
         persistedPosition = 0
         persistedVisionFingerprint = nil
     }
 
-    func load() throws {
+    public func load() throws {
         guard let r = resolveURLs() else {
             throw NSError(domain: "Qwen3VL2BStateful", code: 40,
                 userInfo: [NSLocalizedDescriptionKey:
@@ -1100,7 +1100,7 @@ final class Qwen3VL2BStatefulGenerator {
 
     // MARK: - Generate
 
-    func generate(inputIds: [Int32], maxNewTokens: Int = 64,
+    public func generate(inputIds: [Int32], maxNewTokens: Int = 64,
                   eosTokenIds: Set<Int32> = [],
                   visionFeatures: Qwen3VL2BVisionFeatures? = nil,
                   imagePadTokenId: Int32 = 151655,

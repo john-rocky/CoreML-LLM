@@ -3,6 +3,7 @@
 // from a Qwen tokenizer). Produces a list of generated token IDs.
 // Detokenization is deliberately out of scope here.
 
+import CoreMLLLM
 import SwiftUI
 
 struct Qwen35GeneratorView: View {

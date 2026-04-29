@@ -220,8 +220,8 @@ private final class VL2BVisionChunk0Features: NSObject, MLFeatureProvider {
 
 
 @Observable
-final class Qwen3VL2BGenerator {
-    struct Config {
+public final class Qwen3VL2BGenerator {
+    public struct Config {
         let maxSeq: Int          // 2048
         let vocab: Int           // 151936
         let hiddenSize: Int      // 2560
@@ -233,20 +233,20 @@ final class Qwen3VL2BGenerator {
         let ropeTheta: Float     // 5_000_000
         let decodeUnits: MLComputeUnits
 
-        static let `default` = Config(
+        public static let `default` = Config(
             maxSeq: 2048, vocab: 151936, hiddenSize: 2048, numLayers: 28,
             numKVHeads: 8, headDim: 128, numBodyChunks: 4, layersPerChunk: 7,
             ropeTheta: 5_000_000.0,
             decodeUnits: .cpuAndNeuralEngine)
     }
 
-    var status = "Idle"
-    var running = false
-    var generatedIds: [Int32] = []
-    var prefillMs: Double = 0
-    var decodeMsAvg: Double = 0
-    var tokensPerSecond: Double = 0
-    var firstStepDebug: [(Int32, Float)] = []
+    public var status = "Idle"
+    public var running = false
+    public var generatedIds: [Int32] = []
+    public var prefillMs: Double = 0
+    public var decodeMsAvg: Double = 0
+    public var tokensPerSecond: Double = 0
+    public var firstStepDebug: [(Int32, Float)] = []
 
     private var cfg: Config
 
@@ -261,7 +261,7 @@ final class Qwen3VL2BGenerator {
     @ObservationIgnored private var chunk0Vision: MLModel?
     /// Whether chunk_0_vision is available on disk. Vision generation
     /// requires both the vision encoder AND this chunk.
-    var hasVisionChunk0: Bool { chunk0Vision != nil }
+    public var hasVisionChunk0: Bool { chunk0Vision != nil }
 
     /// Batched prefill body chunks — T tokens per forward. Optional; if
     /// absent the generator falls back to recurrent prefill via the
@@ -281,7 +281,7 @@ final class Qwen3VL2BGenerator {
     /// recurrent). The permanent fix is stateful `slice_update` (v1.5
     /// Phase 1 MLState + multifunction rewrite).
     @ObservationIgnored private let prefillT: Int = 8
-    var hasBatchedPrefill: Bool {
+    public var hasBatchedPrefill: Bool {
         prefillBodyChunks.count == cfg.numBodyChunks
     }
 
@@ -358,7 +358,7 @@ final class Qwen3VL2BGenerator {
     @ObservationIgnored private var fvPrefillDs2: MLFeatureValue?
     @ObservationIgnored private var fvPrefillVisualActive: MLFeatureValue?
 
-    init(cfg: Config = .default) {
+    public init(cfg: Config = .default) {
         self.cfg = cfg
         self.cosTable = buildRope(isCos: true)
         self.sinTable = buildRope(isCos: false)
@@ -444,7 +444,7 @@ final class Qwen3VL2BGenerator {
         return out
     }
 
-    var modelFolderOverride: URL?
+    public var modelFolderOverride: URL?
 
     /// Locate VL2B chunks + embed sidecar. Returns
     /// (bodyURLs, headURL, embedURL) or nil if any piece is missing.
@@ -563,7 +563,7 @@ final class Qwen3VL2BGenerator {
 
     // MARK: - Loading
 
-    func setComputeUnits(_ units: MLComputeUnits) {
+    public func setComputeUnits(_ units: MLComputeUnits) {
         cfg = Config(
             maxSeq: cfg.maxSeq, vocab: cfg.vocab,
             hiddenSize: cfg.hiddenSize, numLayers: cfg.numLayers,
@@ -579,7 +579,7 @@ final class Qwen3VL2BGenerator {
         status = "Idle (units changed, will reload on next run)"
     }
 
-    func load() throws {
+    public func load() throws {
         let dCfg = MLModelConfiguration(); dCfg.computeUnits = cfg.decodeUnits
         guard let resolved = resolveDecodeURLs() else {
             throw NSError(domain: "Qwen3VL2BGenerator", code: 40,
@@ -1221,7 +1221,7 @@ final class Qwen3VL2BGenerator {
     /// prompt through the same per-step path so we don't need a
     /// separate prefill mlpackage.
     @discardableResult
-    func generate(inputIds: [Int32], maxNewTokens: Int = 64,
+    public func generate(inputIds: [Int32], maxNewTokens: Int = 64,
                    temperature: Float = 0.0,
                    eosTokenIds: Set<Int32> = [],
                    visionFeatures: Qwen3VL2BVisionFeatures? = nil,

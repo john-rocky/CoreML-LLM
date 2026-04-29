@@ -4,6 +4,7 @@
 // targets: ≥25 tok/s decode AND < 500 MB phys_footprint during inference.
 
 import CoreML
+import CoreMLLLM
 import SwiftUI
 import Darwin.Mach
 
