@@ -89,6 +89,27 @@ print(model.model.layers[0].self_attn.scaling)
 
 **Getting this wrong produces coherent but completely wrong text.**
 
+### 4.5 Decode-Time KV State Layout — Critical for ANE
+
+Before writing the wrapper, decide the decode-path state layout.
+
+- **Monolithic INT4/INT8 > ~1.4 GB silently falls back to GPU on ANE.**
+  Plan chunking upfront if your param count × nbits/8 exceeds this.
+- **Default to mask-based state writes, not shift-based `cat`.** ANEC
+  rejects shift-based `cat([K[:,:,1:,:], k], dim=2)` for Qwen3 + Stateful
+  + tied-embedding combinations (error code -14). Mask-based rotating
+  buffer works on the same arch patterns that ship today plus the ones
+  that fail. See `docs/DECODE_STATE_LAYOUTS.md` §3 for the pattern.
+- **Per-step cost is `O(state_length)` on ANE.** Start with
+  `context_length=1024`, measure, then decide. For longer effective ctx,
+  use sliding-window attention (mask-based rotating, W=1024 default).
+- **Palettize with `mode="kmeans"` first.** Linear INT8 div-by-zero on
+  sparse tensors; kmeans is the safer default. See `docs/DECODE_STATE_LAYOUTS.md` §4.
+- **Parity test before CoreML conversion** (PyTorch HF vs your ANE model).
+  Pattern: `conversion/experiments/bonsai/bonsai_reference_oracle.py`.
+
+Full checklist: `docs/DECODE_STATE_LAYOUTS.md` §7.
+
 ### 5. Create Wrapper (if needed)
 
 If the model uses the same structure as Qwen2 (standard GQA, 2 norms, SiLU, no special features), the default `MonolithicWrapper` in `exporter.py` works.

@@ -10,6 +10,13 @@ ReDrafter (arXiv 2403.09919), SwiftKV
 
 ## Executive Summary — Top 5 New Findings
 
+0. **[2026-04-24 update] Per-step decode cost on ANE is `O(state_length)`,
+   not weight-bandwidth** — Ternary-Bonsai-1.7B measurements: halving ctx
+   (2048 → 1024) gave 2.56× decode speedup; halving weights (INT8 → INT4
+   at the same ctx) gave only +12%. For any new 1-2B model, start at
+   ctx=1024 and switch to mask-based rotating SWA if you need longer
+   effective context. See `docs/DECODE_STATE_LAYOUTS.md`.
+
 1. **Prefill bypass (TTFT -40%)** — Apple's AFM paper reveals: L15-34 never produce
    KV during prefill. Skip chunk3+4 for all prompt tokens except the last one.
    Zero model changes, zero quality loss. (AFM / SwiftKV)
