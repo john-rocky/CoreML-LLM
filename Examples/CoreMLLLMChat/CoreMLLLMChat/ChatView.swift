@@ -951,13 +951,20 @@ struct FashionReport {
     }
 
     /// Return every top-level balanced `{...}` substring (in source order),
-    /// skipping `{`/`}` characters inside JSON string literals.
+    /// skipping `{`/`}` characters inside JSON string literals. When the
+    /// scan ends with the outermost object still open (model's response
+    /// got truncated mid-stream by max_new_tokens), append a synthesised
+    /// "best-effort close" so the partial JSON can still be salvaged
+    /// by JSONSerialization. The salvage truncates back to the last
+    /// completed top-level field and closes any open structures with
+    /// matching `]` / `"` / `}` tokens.
     private static func balancedJSONSpans(in text: String) -> [String] {
         var spans: [String] = []
         var depth = 0
         var inString = false
         var escape = false
         var startIdx: String.Index?
+        var bracketStack: [Character] = []   // tracks { and [ in order, for salvage
         for idx in text.indices {
             let ch = text[idx]
             if escape {
@@ -974,20 +981,116 @@ struct FashionReport {
             }
             if inString { continue }
             if ch == "{" {
-                if depth == 0 { startIdx = idx }
+                if depth == 0 { startIdx = idx; bracketStack.removeAll() }
                 depth += 1
+                bracketStack.append("{")
+            } else if ch == "[" {
+                bracketStack.append("[")
+            } else if ch == "]" {
+                if bracketStack.last == "[" { bracketStack.removeLast() }
             } else if ch == "}" {
                 depth -= 1
+                if bracketStack.last == "{" { bracketStack.removeLast() }
                 if depth == 0, let s = startIdx {
                     spans.append(String(text[s...idx]))
                     startIdx = nil
+                    bracketStack.removeAll()
                 } else if depth < 0 {
                     depth = 0
                     startIdx = nil
+                    bracketStack.removeAll()
                 }
             }
         }
+
+        // Salvage path: outermost object never closed. Truncate back to
+        // the last "completed top-level field boundary" (last comma at
+        // depth 1 outside strings) and append the brackets needed to
+        // close every still-open structure. JSONSerialization is
+        // permissive enough to parse the result.
+        if let s = startIdx, !bracketStack.isEmpty {
+            let raw = String(text[s..<text.endIndex])
+            if let salvaged = trySalvageOpenJSON(raw) {
+                spans.append(salvaged)
+            }
+        }
         return spans
+    }
+
+    private static func trySalvageOpenJSON(_ raw: String) -> String? {
+        // Walk from the start, tracking depth + open-bracket stack +
+        // record positions of each comma at top-of-object level (depth==1
+        // wrt the outermost {). The last such comma is the safe truncation
+        // boundary — everything after it may be a half-written field.
+        var depth = 0
+        var inString = false
+        var escape = false
+        var stack: [Character] = []
+        var lastSafeBoundary: String.Index? = nil
+        for idx in raw.indices {
+            let ch = raw[idx]
+            if escape { escape = false; continue }
+            if ch == "\\" { escape = true; continue }
+            if ch == "\"" { inString.toggle(); continue }
+            if inString { continue }
+            switch ch {
+            case "{":
+                depth += 1
+                stack.append("{")
+            case "[":
+                stack.append("[")
+            case "]":
+                if stack.last == "[" { stack.removeLast() }
+            case "}":
+                depth -= 1
+                if stack.last == "{" { stack.removeLast() }
+            case ",":
+                // Boundary at outermost object level: depth == 1 AND the
+                // top of stack is the outer `{` (no array open between).
+                if depth == 1 && stack.last == "{" {
+                    lastSafeBoundary = idx
+                }
+            default:
+                break
+            }
+        }
+        guard let boundary = lastSafeBoundary else {
+            // No top-level field completed yet; can't salvage.
+            return nil
+        }
+        // Truncate to the last safe boundary, then close all still-open
+        // structures with matching brackets. We don't try to salvage
+        // strings — if the truncation lands inside one, the closing
+        // sequence won't help, JSONSerialization will reject and we
+        // skip the span.
+        var truncated = String(raw[..<boundary])
+        // Close from innermost to outermost.
+        // Re-walk the truncated text to compute the final stack state.
+        var depth2 = 0
+        var stack2: [Character] = []
+        var inString2 = false
+        var escape2 = false
+        for ch in truncated {
+            if escape2 { escape2 = false; continue }
+            if ch == "\\" { escape2 = true; continue }
+            if ch == "\"" { inString2.toggle(); continue }
+            if inString2 { continue }
+            switch ch {
+            case "{": depth2 += 1; stack2.append("{")
+            case "[": stack2.append("[")
+            case "]": if stack2.last == "[" { stack2.removeLast() }
+            case "}": depth2 -= 1; if stack2.last == "{" { stack2.removeLast() }
+            default: break
+            }
+        }
+        if inString2 {
+            // The truncation point landed inside a string literal; close it.
+            truncated.append("\"")
+        }
+        for open in stack2.reversed() {
+            truncated.append(open == "{" ? "}" : "]")
+        }
+        return truncated
     }
 
     private static func buildItem(from dict: [String: Any]) -> Item {
