@@ -155,6 +155,22 @@ public final class ModelDownloader: NSObject {
             downloadURL: "",
             folderName: "gemma4-e2b-fashion")
 
+        /// Qwen3-VL 2B Fashion — MB dress/casual theory vision advisor on the
+        /// 2B Qwen base. PEFT LoRA fine-tune on 750+ outfit photos with
+        /// target_ratio pinned to 0.70 (single-function "everyday 7:3" app
+        /// positioning). Fused via fuse_lora.py and converted via the
+        /// stateful + multifunction path (build_qwen3_vl_2b_stateful_*),
+        /// reusing the base `vision.mlpackage` since LoRA targets
+        /// `language_model.*` only. Sideload-only under
+        /// `Documents/Models/qwen3-vl-2b-fashion/`. Outputs JSON with
+        /// items / overall_dress_ratio / target_ratio (always 0.70) /
+        /// tpo_assumption / verdict (街着 7:3 framing) / advice.
+        public static let qwen3vl2bFashion = ModelInfo(
+            id: "qwen3-vl-2b-fashion", name: "Qwen3-VL 2B Fashion (MB)",
+            size: "2.9 GB",
+            downloadURL: "",
+            folderName: "qwen3-vl-2b-fashion")
+
         /// Gemma 4 E2B + EAGLE-3 speculative — same 4.6B E2B base but with
         /// decode chunks that emit `hidden_at_L{8,17,34}` taps plus three
         /// extra mlmodelc bundles (`eagle3_draft`, `eagle3_fusion`,
@@ -220,7 +236,7 @@ public final class ModelDownloader: NSObject {
             let experimental =
                 ProcessInfo.processInfo.environment["LLM_SHOW_EXPERIMENTAL"] == "1"
                 || UserDefaults.standard.bool(forKey: "showExperimentalModels")
-            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, gemma4e2bFashion, qwen25_05b, qwen35_08b, qwen35_2b, qwen3vl_2b, qwen3vl_2b_stateful]
+            var list: [ModelInfo] = [gemma4e2b, gemma4e4b, gemma4e2bFashion, qwen25_05b, qwen35_08b, qwen35_2b, qwen3vl_2b, qwen3vl_2b_stateful, qwen3vl2bFashion]
             if experimental {
                 list.insert(gemma4e2bEagle3, at: 2)  // after gemma4e4b
                 list.insert(gemma4e2bLookaheadProbe, at: 3)  // after EAGLE-3

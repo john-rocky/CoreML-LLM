@@ -6,6 +6,9 @@ struct ChatView: View {
     @State private var runner = LLMRunner()
     @State private var messages: [ChatMessage] = []
     @State private var inputText = ""
+    /// Folder name (e.g. "qwen3-vl-2b-fashion") of the currently loaded
+    /// model, used to gate domain-specific UX like the Fashion auto-prompt.
+    @State private var activeModelFolder: String?
     @State private var showModelPicker = false
     /// Per-token streaming text lives on its own @Observable so that only
     /// the streaming bubble (and nothing else in ChatView's body) is
@@ -339,6 +342,7 @@ struct ChatView: View {
         // project — breaking multi-model switching.
         let folder = folderURL
         let modelURL = folder.appendingPathComponent("model.mlpackage")
+        activeModelFolder = folder.lastPathComponent
         messages.append(ChatMessage(role: .system, content: "Loading \(folder.lastPathComponent)..."))
         // Detached so the synchronous MLModel(contentsOf:) calls inside
         // loadChunked can't block the main actor / UI thread.
@@ -619,9 +623,29 @@ struct ChatView: View {
                 // generator's vision fingerprint will mismatch on the
                 // next generate, forcing a fresh KV state.
                 imageDisplayedInChat = false
+                // Auto-prompt when the active model is the Fashion FT
+                // (Gemma 4 or Qwen3-VL) and the input is empty. Editable
+                // before send. No effect on other models.
+                await MainActor.run {
+                    let isFashion = activeModelFolder == "gemma4-e2b-fashion"
+                        || activeModelFolder == "qwen3-vl-2b-fashion"
+                    if isFashion,
+                       inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        inputText = Self.fashionAutoPrompt
+                    }
+                }
             }
         }
     }
+
+    /// Trained user prompt for the Fashion LoRAs. Mirrors
+    /// `vision/scripts/prepare_train.py:PROMPT` so on-device inputs match
+    /// the training distribution and trip the structured-JSON output path.
+    private static let fashionAutoPrompt =
+        "画像のコーディネートを「MBドレス/カジュアル理論」で採点してください。"
+        + "各アイテムの4軸スコア(色/シルエット/素材/清潔感/フィット)、基本ドレス度、"
+        + "加重ドレス度、ドレスラベル、全体のドレス比率、想定TPO、推奨比率、verdict、"
+        + "改善アドバイスをJSONで出力してください。"
 
     private func clearImage() {
         selectedPhoto = nil
@@ -782,11 +806,17 @@ struct MessageBubble: View {
                     }
                     .frame(maxWidth: 280)
                 }
-                Text(message.content)
-                    .padding(.horizontal, 14).padding(.vertical, 10)
-                    .background(backgroundColor)
-                    .foregroundStyle(message.role == .user ? .white : .primary)
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                if message.role == .assistant,
+                   let report = FashionReport.parse(from: message.content) {
+                    FashionReportCard(report: report, raw: message.content)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    Text(message.content)
+                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .background(backgroundColor)
+                        .foregroundStyle(message.role == .user ? .white : .primary)
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                }
             }
             if message.role != .user { Spacer(minLength: 60) }
         }
@@ -807,3 +837,434 @@ struct MessageBubble: View {
 }
 
 #Preview { ChatView() }
+// MARK: - Fashion report rendering
+//
+// Assistant output from the Gemma 4 E2B Fashion LoRA is a JSON document
+// following MB dress/casual theory. When we can parse it, render as a
+// structured card instead of a raw text bubble. All fields are optional
+// because on-device int4 decoding occasionally drifts from the trained
+// schema — we render whatever we got and fall back to raw text if the
+// parse returns nothing useful.
+
+struct FashionReport {
+    struct Scores {
+        let color: Double?
+        let silhouette: Double?
+        let material: Double?
+        let design: Double?
+    }
+    struct Item {
+        let category: String?
+        let description: String?
+        let scores: Scores?
+        let item_dress_score: Double?
+    }
+
+    let items: [Item]
+    let overall_dress_ratio: Double?
+    let tpo_assumption: String?
+    let target_ratio: Double?
+    let verdict: String?
+    let advice: String?
+
+    /// Non-empty if any of the top-level schema fields survived parsing.
+    var isRenderable: Bool {
+        !items.isEmpty
+            || overall_dress_ratio != nil
+            || tpo_assumption != nil
+            || verdict != nil
+            || advice != nil
+    }
+
+    // ---- Parsing ----
+    //
+    // The on-device int4 decoder drifts from the trained schema in many
+    // ways: aliased keys (`attributes` for `scores`, `dress_score` for
+    // `item_dress_score`, `overall_ratio` for `overall_dress_ratio`),
+    // positional arrays where dicts were expected (`scores: [c,s,m,d]`),
+    // and occasionally several malformed JSON blobs concatenated. We use
+    // a tolerant parse that walks JSONSerialization output via dictionary
+    // lookups + alias tables, then merges results across every balanced
+    // top-level `{...}` span found in the text.
+
+    private static let topRatioKeys = [
+        "overall_dress_ratio", "overall_ratio", "ratio",
+    ]
+    private static let topTPOKeys = ["tpo_assumption", "durationType", "target_tpo", "tpo"]
+    private static let topTargetKeys = ["target_ratio"]
+    private static let topVerdictKeys = ["verdict"]
+    private static let topAdviceKeys = ["advice", "comment"]
+    private static let itemDescriptionKeys = ["description", "item", "name"]
+    private static let itemDressScoreKeys = ["item_dress_score", "dress_score", "score_break"]
+    private static let scoresContainerKeys = ["scores", "attributes", "score"]
+    private static let scoresPositionalAxes = ["color", "silhouette", "material", "design"]
+
+    static func parse(from text: String) -> FashionReport? {
+        let cleaned = stripNoise(text)
+        guard !cleaned.isEmpty else { return nil }
+
+        var items: [Item] = []
+        var ratio: Double?
+        var tpo: String?
+        var target: Double?
+        var verdict: String?
+        var advice: String?
+
+        // Walk every balanced {...} span. Multi-blob outputs are merged so
+        // a fragmented response (items in one blob, overall_ratio in another)
+        // still produces a coherent card.
+        for span in balancedJSONSpans(in: cleaned) {
+            guard let data = span.data(using: .utf8),
+                  let raw = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
+                  let dict = raw as? [String: Any]
+            else { continue }
+
+            if let arr = dict["items"] as? [Any] {
+                for case let entry as [String: Any] in arr {
+                    items.append(buildItem(from: entry))
+                }
+            }
+            if ratio == nil, let v = lookupDouble(topRatioKeys, in: dict) { ratio = v }
+            if tpo == nil, let v = lookupString(topTPOKeys, in: dict) { tpo = v }
+            if target == nil, let v = lookupDouble(topTargetKeys, in: dict) { target = v }
+            if verdict == nil, let v = lookupString(topVerdictKeys, in: dict) { verdict = v }
+            if advice == nil, let v = lookupString(topAdviceKeys, in: dict) { advice = v }
+        }
+
+        let report = FashionReport(
+            items: items,
+            overall_dress_ratio: ratio,
+            tpo_assumption: tpo,
+            target_ratio: target,
+            verdict: verdict,
+            advice: advice)
+        return report.isRenderable ? report : nil
+    }
+
+    private static func stripNoise(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "<channel|>", with: "")
+            .replacingOccurrences(of: "<|channel|>", with: "")
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Return every top-level balanced `{...}` substring (in source order),
+    /// skipping `{`/`}` characters inside JSON string literals.
+    private static func balancedJSONSpans(in text: String) -> [String] {
+        var spans: [String] = []
+        var depth = 0
+        var inString = false
+        var escape = false
+        var startIdx: String.Index?
+        for idx in text.indices {
+            let ch = text[idx]
+            if escape {
+                escape = false
+                continue
+            }
+            if ch == "\\" {
+                escape = true
+                continue
+            }
+            if ch == "\"" {
+                inString.toggle()
+                continue
+            }
+            if inString { continue }
+            if ch == "{" {
+                if depth == 0 { startIdx = idx }
+                depth += 1
+            } else if ch == "}" {
+                depth -= 1
+                if depth == 0, let s = startIdx {
+                    spans.append(String(text[s...idx]))
+                    startIdx = nil
+                } else if depth < 0 {
+                    depth = 0
+                    startIdx = nil
+                }
+            }
+        }
+        return spans
+    }
+
+    private static func buildItem(from dict: [String: Any]) -> Item {
+        let category = dict["category"] as? String
+        let description = lookupString(itemDescriptionKeys, in: dict)
+        let scores = buildScores(from: scoresContainerKeys.compactMap { dict[$0] }.first)
+        let dressScore = lookupDouble(itemDressScoreKeys, in: dict)
+        return Item(category: category, description: description,
+                    scores: scores, item_dress_score: dressScore)
+    }
+
+    private static func buildScores(from value: Any?) -> Scores? {
+        if let dict = value as? [String: Any] {
+            // Object form. Pick known axes; ignore unknown keys.
+            return Scores(
+                color: dict["color"] as? Double ?? (dict["color"] as? NSNumber)?.doubleValue,
+                silhouette: dict["silhouette"] as? Double ?? (dict["silhouette"] as? NSNumber)?.doubleValue,
+                material: dict["material"] as? Double ?? (dict["material"] as? NSNumber)?.doubleValue,
+                design: dict["design"] as? Double ?? (dict["design"] as? NSNumber)?.doubleValue)
+        }
+        if let arr = value as? [Any] {
+            // Positional form: [color, silhouette, material, design]. Tolerate
+            // any combination of Double / Int / NSNumber. Truncate to 4.
+            let nums = arr.prefix(scoresPositionalAxes.count).map { v -> Double? in
+                (v as? Double) ?? (v as? NSNumber)?.doubleValue
+            }
+            guard nums.contains(where: { $0 != nil }) else { return nil }
+            let pad = Array(repeating: Double?.none, count: max(0, 4 - nums.count))
+            let padded = Array(nums) + pad
+            return Scores(
+                color: padded[0],
+                silhouette: padded[1],
+                material: padded[2],
+                design: padded[3])
+        }
+        return nil
+    }
+
+    private static func lookupDouble(_ keys: [String], in dict: [String: Any]) -> Double? {
+        for k in keys {
+            if let v = dict[k] as? Double { return v }
+            if let v = dict[k] as? NSNumber { return v.doubleValue }
+            if let s = dict[k] as? String, let v = Double(s) { return v }
+        }
+        return nil
+    }
+
+    private static func lookupString(_ keys: [String], in dict: [String: Any]) -> String? {
+        for k in keys {
+            if let v = dict[k] as? String, !v.isEmpty { return v }
+        }
+        return nil
+    }
+}
+
+struct FashionReportCard: View {
+    let report: FashionReport
+    /// Raw model output kept so the user can copy/inspect the JSON when needed.
+    let raw: String
+    @State private var showingRaw = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if let ratio = report.overall_dress_ratio {
+                DressRatioGauge(ratio: ratio, target: report.target_ratio)
+            }
+
+            HStack(spacing: 8) {
+                if let tpo = report.tpo_assumption {
+                    Chip(text: "TPO: \(tpo)")
+                }
+                if let target = report.target_ratio {
+                    Chip(text: String(format: "Target %.2f", target))
+                }
+            }
+
+            if !report.items.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Items")
+                        .font(.caption).foregroundStyle(.secondary)
+                    ForEach(Array(report.items.enumerated()), id: \.offset) { _, item in
+                        FashionItemRow(item: item)
+                    }
+                }
+            }
+
+            if let verdict = report.verdict, !verdict.isEmpty {
+                VerdictBlock(text: verdict)
+            }
+
+            if let advice = report.advice, !advice.isEmpty {
+                AdviceCard(text: advice)
+            }
+
+            Button(showingRaw ? "Hide JSON" : "Show JSON") {
+                showingRaw.toggle()
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            if showingRaw {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    Text(raw)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .padding(8)
+                        .background(Color(.systemGray6))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+            }
+        }
+        .padding(14)
+        .background(Color(.systemGray6))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+    }
+}
+
+private struct DressRatioGauge: View {
+    let ratio: Double
+    let target: Double?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Dress ratio")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Text(String(format: "%.2f", clamped))
+                    .font(.title2.monospacedDigit().weight(.semibold))
+            }
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color(.systemGray5))
+                    Capsule()
+                        .fill(LinearGradient(
+                            colors: [.blue, .purple],
+                            startPoint: .leading, endPoint: .trailing))
+                        .frame(width: proxy.size.width * clamped)
+                    if let target {
+                        let x = proxy.size.width * min(max(target, 0), 1)
+                        Rectangle()
+                            .fill(Color.orange)
+                            .frame(width: 2)
+                            .offset(x: x - 1)
+                    }
+                }
+            }
+            .frame(height: 10)
+            HStack {
+                Text("Casual").font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                Text("Dress").font(.caption2).foregroundStyle(.secondary)
+            }
+            // MB rule of thumb caption. The model emits TPO-specific targets
+            // (smart_casual=0.70, weekend=0.60, business=0.95 …) but MB's
+            // public framing is the 7:3 town-wear answer; reinforcing it in
+            // the card keeps the demo tied to his vocabulary regardless of
+            // which TPO the model picks.
+            HStack(spacing: 6) {
+                Text("MB理論")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.orange)
+                Text("街着の正解は 7:3 (0.70)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    private var clamped: Double { min(max(ratio, 0), 1) }
+}
+
+private struct Chip: View {
+    let text: String
+    var body: some View {
+        Text(text)
+            .font(.caption)
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(Color(.systemGray5))
+            .clipShape(Capsule())
+    }
+}
+
+private struct FashionItemRow: View {
+    let item: FashionReport.Item
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(item.category ?? "item")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                if let score = item.item_dress_score {
+                    Text(String(format: "%.2f", min(max(score, 0), 1)))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let desc = item.description, !desc.isEmpty {
+                Text(desc)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let scores = item.scores {
+                VStack(spacing: 3) {
+                    ScoreBar(label: "color", value: scores.color)
+                    ScoreBar(label: "silhouette", value: scores.silhouette)
+                    ScoreBar(label: "material", value: scores.material)
+                    ScoreBar(label: "design", value: scores.design)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color(.systemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+private struct ScoreBar: View {
+    let label: String
+    let value: Double?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(width: 64, alignment: .leading)
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color(.systemGray5))
+                    if let v = value {
+                        Capsule()
+                            .fill(Color.blue.opacity(0.7))
+                            .frame(width: proxy.size.width * min(max(v, 0), 1))
+                    }
+                }
+            }
+            .frame(height: 5)
+            Text(value.map { String(format: "%.2f", min(max($0, 0), 1)) } ?? "—")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 32, alignment: .trailing)
+        }
+    }
+}
+
+private struct VerdictBlock: View {
+    let text: String
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Rectangle()
+                .fill(Color.accentColor)
+                .frame(width: 3)
+            Text(text)
+                .font(.subheadline.italic())
+                .foregroundStyle(.primary)
+        }
+    }
+}
+
+private struct AdviceCard: View {
+    let text: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Advice")
+                .font(.caption).foregroundStyle(.secondary)
+            Text(text)
+                .font(.subheadline)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .background(Color.accentColor.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+}
