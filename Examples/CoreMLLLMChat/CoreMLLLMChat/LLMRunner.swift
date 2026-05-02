@@ -771,7 +771,10 @@ final class LLMRunner {
                     "prompt (\(inputIdsInt32.count) tokens) exceeds max_seq=\(maxSeq). "
                     + "Clear chat or shorten."])
         }
-        let maxNew = min(remaining, 1024)
+        // Fashion FT output is structured JSON (4-5 items × ~150 tokens
+        // each + verdict + advice) and brushes against 1024 on busy
+        // outfits — bump to 1500 so 5-item bodies + advice fit cleanly.
+        let maxNew = min(remaining, 1500)
 
         var eosSet: Set<Int32> = [151643, 151644, 151645]
         if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
