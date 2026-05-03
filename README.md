@@ -12,7 +12,7 @@ Add the package, name a model, generate.
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/john-rocky/CoreML-LLM", from: "1.4.0")
+.package(url: "https://github.com/john-rocky/CoreML-LLM", from: "1.9.0")
 ```
 
 ```swift
@@ -29,7 +29,7 @@ let answer = try await llm.generate("What is the capital of France?")
 | Model | Size | Task | iPhone 17 Pro decode | HuggingFace |
 |---|---:|---|---:|---|
 | **Gemma 4 E2B** | 5.4 GB (4.4 GB text-only) | Text + image + video + audio | **34.2 tok/s** | [mlboydaisuke/gemma-4-E2B-coreml](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
-| **Gemma 4 E4B** | 5.5 GB | Text | ~14 tok/s | [mlboydaisuke/gemma-4-E4B-coreml](https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml) |
+| **Gemma 4 E4B** | 8.16 GB multimodal / 5.5 GB text-only | Text + image + video + audio | **15.7 tok/s** | [multimodal](https://huggingface.co/mlboydaisuke/gemma-4-E4B-multimodal-coreml) · [text-only](https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml) |
 | **Qwen3.5 2B** | 2.8 GB | Text | **~27 tok/s** | [mlboydaisuke/qwen3.5-2B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML) |
 | **Qwen3.5 0.8B** | 1.2 GB | Text | **~48 tok/s** | [mlboydaisuke/qwen3.5-0.8B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML) |
 | **Qwen3-VL 2B (stateful)** | 2.3 GB | Text + image | **~24 tok/s** | [mlboydaisuke/qwen3-vl-2b-stateful-coreml](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-stateful-coreml) |
@@ -42,10 +42,11 @@ let answer = try await llm.generate("What is the capital of France?")
 All numbers are iPhone 17 Pro A19 Pro, 2048-token context, ANE-only (no GPU fallback at runtime unless noted). Methodology: [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 
 **Which one should I pick?**
-- Multimodal (image / video / audio) → **Gemma 4 E2B**
+- Multimodal (image / video / audio), fastest → **Gemma 4 E2B** (34 tok/s)
+- Multimodal, highest quality → **Gemma 4 E4B (multimodal)** (15.7 tok/s)
 - Image + text chat, lowest memory + fastest follow-up → **Qwen3-VL 2B (stateful)**
 - Text-only, maximum quality under ≤3 GB → **Qwen3.5 2B**
-- Text-only, maximum quality → **Gemma 4 E4B**
+- Text-only, maximum quality → **Gemma 4 E4B (text-only)**
 - Text-only, fast + chat-strong → **Qwen3.5 0.8B** (48 tok/s)
 - Text-only, smallest at high tok/s on iPhone → **LFM2.5 350M** (52 tok/s, 810 MB) [†](#lfm2-license)
 - Tool / function calling → **FunctionGemma-270M**
@@ -82,7 +83,7 @@ Set your development team → build to an iOS 18+ device → **Get Model** → d
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/john-rocky/CoreML-LLM", from: "1.4.0"),
+    .package(url: "https://github.com/john-rocky/CoreML-LLM", from: "1.9.0"),
 ]
 ```
 
@@ -191,8 +192,9 @@ Design docs, benchmarks, and per-model conversion notes live in [docs/](docs/REA
 
 ## What's new
 
-Current release: **v1.8.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases)).
+Current release: **v1.9.0** ([release notes](https://github.com/john-rocky/CoreML-LLM/releases/tag/v1.9.0)).
 
+- **v1.9.0** — Gemma 4 E4B multimodal (text + image + video + audio) on iPhone 17 Pro at **15.7 tok/s** decode. Topology II 3-chunk decode (`chunk1` + `chunk2_3way` + `chunk3_3way`) + legacy 4-chunk `prefill_b8` multifunction with vision-aware bidirectional mask. E4B-built `vision.ane.mlmodelc` (output `[1, 256, 2560]`) + Conformer audio + Swift two-stage projection (1024 → 1536 → 2560, non-square `embed_proj`). New picker entry "Gemma 4 E4B (multimodal)" auto-downloads from [`mlboydaisuke/gemma-4-E4B-multimodal-coreml`](https://huggingface.co/mlboydaisuke/gemma-4-E4B-multimodal-coreml) (~8.16 GB); text-only entry kept at the existing HF repo. Build + sideload guide: [docs/E4B_MULTIMODAL_BUILD.md](docs/E4B_MULTIMODAL_BUILD.md).
 - **v1.8.0** — Qwen3.5 0.8B / 2B full-vocab rep_penalty masks iPhone A18 fp16 ANE reduction bias. 0.8B: 48 tok/s, 2B: 27 tok/s on iPhone 17 Pro, all clean output across English + Japanese. +45 % over the prior v1.x ceiling. See [docs/QWEN35_FULL_VOCAB_REP_PENALTY.md](docs/QWEN35_FULL_VOCAB_REP_PENALTY.md).
 - **v1.7.0** — Gemma 4 E2B 3-chunk decode is the picker default + multimodal opt-out toggle. The new `gemma4e2b3way` ModelInfo ships `chunk2_3way` (L8-24 merged) + `chunk3_3way` (L25-34 + lm_head) and re-uses legacy `chunk1` + 4-chunk prefill graphs (vision-aware bidirectional mask preserved). Decode `c1+c2+c4` (chunk3 nil) — 3 ANE dispatches/step, **34.2 tok/s** on iPhone 17 Pro A19 Pro. The 4-chunk legacy entry stays as `Gemma 4 E2B (4-chunk legacy)`. ModelPickerView's "Download Options → Include multimodal" toggle drops vision/video/audio encoders + sidecars when off (~1 GB savings, text-only install). finishDownload now hardlinks shared decode↔prefill weights instead of copying (`chunk1↔prefill_chunk1` and `chunk3_3way↔prefill_chunk4`, **−682 MB on disk**).
 - **v1.6.0** — Qwen3-VL 2B stateful Phase 2: cross-turn KV reuse + ANE prewarm. Same-prompt 2nd TTFT **4 s → 125 ms** (~32×), vision-chat 2nd-turn TTFT 125 ms (target was <500 ms). LCP-matched MLState resume + image-pinned-to-first-user-turn prompt builder + per-chunk dummy predict at load (231 ms total).
