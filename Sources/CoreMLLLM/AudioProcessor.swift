@@ -23,21 +23,32 @@ public enum AudioProcessor {
     // MARK: - Projection weights (loaded from .npy files)
 
     /// Loaded projection weights for Swift-side computation.
+    /// Two-stage projection: 1024 → outDim (output_proj) → finalDim (embed_proj).
+    /// E2B: outDim=1536, finalDim=1536 (square embed_proj).
+    /// E4B: outDim=1536, finalDim=2560 (non-square embed_proj — projects up to LM hidden).
     public struct ProjectionWeights {
-        let outputProjWeight: [Float]  // (1536, 1024) row-major
-        let outputProjBias: [Float]    // (1536,)
-        let embedProjWeight: [Float]   // (1536, 1536) row-major
+        let outputProjWeight: [Float]  // (outDim, 1024) row-major
+        let outputProjBias: [Float]    // (outDim,)
+        let embedProjWeight: [Float]   // (finalDim, outDim) row-major
         let inDim: Int                 // 1024
-        let outDim: Int                // 1536
+        let outDim: Int                // 1536 (audio_soft_token_size)
+        let finalDim: Int              // LM hidden size (1536 E2B / 2560 E4B)
 
         /// Load projection weights from .npy files in the model directory.
         public static func load(from directory: URL) throws -> ProjectionWeights {
             let opW = try loadNpyFloat16(directory.appendingPathComponent("output_proj_weight.npy"))
             let opB = try loadNpyFloat16(directory.appendingPathComponent("output_proj_bias.npy"))
             let epW = try loadNpyFloat16(directory.appendingPathComponent("embed_proj_weight.npy"))
+            // outDim = output_proj_bias length = audio_soft_token_size (1536).
+            // inDim  = output_proj_weight.count / outDim = 1024.
+            // finalDim = embed_proj_weight.count / outDim = LM hidden (E2B 1536, E4B 2560).
+            let outDim = opB.count
+            let inDim = opW.count / outDim
+            let finalDim = epW.count / outDim
             return ProjectionWeights(
                 outputProjWeight: opW, outputProjBias: opB,
-                embedProjWeight: epW, inDim: 1024, outDim: 1536)
+                embedProjWeight: epW,
+                inDim: inDim, outDim: outDim, finalDim: finalDim)
         }
 
         /// Load a float16 numpy file as [Float].
@@ -182,26 +193,28 @@ public enum AudioProcessor {
             }
         }
 
-        // embed_proj: (S, 1536) @ W^T(1536, 1536) → (S, 1536)
-        var features = [Float](repeating: 0, count: S * outDim)
+        // embed_proj: (S, outDim) @ W^T(finalDim, outDim) → (S, finalDim).
+        // E2B: finalDim==outDim==1536 (square). E4B: finalDim=2560 != outDim=1536.
+        let finalDim = proj.finalDim
+        var features = [Float](repeating: 0, count: S * finalDim)
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    Int32(S), Int32(outDim), Int32(outDim),
+                    Int32(S), Int32(finalDim), Int32(outDim),
                     1.0, projected, Int32(outDim),
                     proj.embedProjWeight, Int32(outDim),
-                    0.0, &features, Int32(outDim))
+                    0.0, &features, Int32(finalDim))
 
         // fp32 → fp16 batch conversion via Accelerate
         let result = try! MLMultiArray(
-            shape: [1, NSNumber(value: S), NSNumber(value: outDim)],
+            shape: [1, NSNumber(value: S), NSNumber(value: finalDim)],
             dataType: .float16)
-        let rp = result.dataPointer.bindMemory(to: UInt16.self, capacity: S * outDim)
+        let rp = result.dataPointer.bindMemory(to: UInt16.self, capacity: S * finalDim)
         features.withUnsafeBufferPointer { src in
             var srcBuf = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.baseAddress!),
-                                        height: 1, width: vImagePixelCount(S * outDim),
-                                        rowBytes: S * outDim * 4)
+                                        height: 1, width: vImagePixelCount(S * finalDim),
+                                        rowBytes: S * finalDim * 4)
             var dstBuf = vImage_Buffer(data: rp, height: 1,
-                                        width: vImagePixelCount(S * outDim),
-                                        rowBytes: S * outDim * 2)
+                                        width: vImagePixelCount(S * finalDim),
+                                        rowBytes: S * finalDim * 2)
             vImageConvert_PlanarFtoPlanar16F(&srcBuf, &dstBuf, 0)
         }
 
