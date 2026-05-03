@@ -180,9 +180,13 @@ def build_chunk2_merged(base, ctx: int, out_pkg: str, *, quantize: bool) -> None
     max_hd = hd_f
     nkv = cfg.num_key_value_heads
 
-    mc = MergedChunk23(base).eval()
+    boundaries = compute_chunk_boundaries(cfg)
+    own_range = boundaries[1]
+    shared_range = boundaries[2]
+    mc = MergedChunk23(base, own_range=own_range, shared_range=shared_range).eval()
     ns, nf = mc.num_sliding, mc.num_full
-    print(f"\n=== chunk2_3way (L{mc.START_C2}-{mc.END_C3-1}, 17 layers) ===")
+    n_layers = (mc.END_C2 - mc.START_C2) + (mc.END_C3 - mc.START_C3)
+    print(f"\n=== chunk2_3way (L{mc.START_C2}-{mc.END_C3-1}, {n_layers} layers) ===")
     print(f"    own-KV: {ns} sliding + {nf} full")
 
     sample = (

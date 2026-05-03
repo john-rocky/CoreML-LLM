@@ -20,21 +20,26 @@ from .gemma4_swa_chunks import _run_layer_swa, _layer_kv_map
 
 
 class MergedChunk23(nn.Module):
-    """Layers 8-24: chunk2 (L8-14) + chunk3 (L15-24) merged.
+    """Merged chunk2 + chunk3 (own KV + KV-shared). Boundaries default
+    to E2B (own=L8-14, shared=L15-24). For E4B pass own_range /
+    shared_range from `compute_chunk_boundaries(cfg)`
+    (E4B: own=L12-23, shared=L24-32).
 
-    Own KV: L8-14 (5 sliding + 2 full). Shared KV: L15-24 (all shared from L13/L14).
-    kv13/kv14 stay internal — never leave the ANE.
-
-    Outputs: hidden_states, K/V for L8-14, BUT NOT kv13/kv14 (internal).
-    chunk4 still needs kv14 → output it for chunk4.
+    kv13/kv14 stay internal — never leave the ANE. Outputs: hidden_states,
+    K/V for own layers, kv13/kv14 (chunk4 still needs them).
     """
-    START_C2, END_C2 = 8, 15  # chunk2 layers
-    START_C3, END_C3 = 15, 25  # chunk3 layers
+    DEFAULT_OWN = (8, 15)       # E2B own-KV layers
+    DEFAULT_SHARED = (15, 25)   # E2B KV-shared layers
 
-    def __init__(self, model: Gemma4Model):
+    def __init__(self, model: Gemma4Model,
+                 own_range: tuple[int, int] | None = None,
+                 shared_range: tuple[int, int] | None = None):
         super().__init__()
         self.config = model.config
-        # All layers 8-24
+        own = own_range if own_range is not None else self.DEFAULT_OWN
+        shared = shared_range if shared_range is not None else self.DEFAULT_SHARED
+        self.START_C2, self.END_C2 = own
+        self.START_C3, self.END_C3 = shared
         self.layers_c2 = nn.ModuleList([model.layers[i] for i in range(self.START_C2, self.END_C2)])
         self.layers_c3 = nn.ModuleList([model.layers[i] for i in range(self.START_C3, self.END_C3)])
         self.sliding_map, self.full_map = _layer_kv_map(self.START_C2, self.END_C2, model.config)

@@ -193,14 +193,17 @@ def _run_layer_swa_stateful(
             V_for_attn = V_sliding_slice
 
         # Producer alias outputs — same kv13/kv14 naming as the recurrent
-        # build so chunks 3/4 see no input-name change. These are slice
-        # views over the producer's just-updated state buffer.
+        # build so chunks 3/4 see no input-name change. .clone() forces
+        # a fresh tensor (rather than a slice-view over the just-updated
+        # state buffer): iPhone ANE 18 fails MIL→EIR translation with
+        # `std::bad_cast` when a state-slice is used as both an input
+        # to subsequent shared layers AND a public chunk output.
         if layer_idx == config.kv_sliding_producer:
-            kv_store_13_k = K_for_attn[..., :config.head_dim]
-            kv_store_13_v = V_for_attn[..., :config.head_dim]
+            kv_store_13_k = K_for_attn[..., :config.head_dim].clone()
+            kv_store_13_v = V_for_attn[..., :config.head_dim].clone()
         elif layer_idx == config.kv_full_producer:
-            kv_store_14_k = K_for_attn[..., :config.global_head_dim]
-            kv_store_14_v = V_for_attn[..., :config.global_head_dim]
+            kv_store_14_k = K_for_attn[..., :config.global_head_dim].clone()
+            kv_store_14_v = V_for_attn[..., :config.global_head_dim].clone()
     else:
         # Shared layer: read producer KV from the alias inputs.
         if is_full:
@@ -587,11 +590,11 @@ def _run_layer_swa_stateful_prefill(
             V_for_attn = V_sliding_slice
 
         if layer_idx == config.kv_sliding_producer:
-            kv_store_13_k = K_for_attn[..., :config.head_dim]
-            kv_store_13_v = V_for_attn[..., :config.head_dim]
+            kv_store_13_k = K_for_attn[..., :config.head_dim].clone()
+            kv_store_13_v = V_for_attn[..., :config.head_dim].clone()
         elif layer_idx == config.kv_full_producer:
-            kv_store_14_k = K_for_attn[..., :config.global_head_dim]
-            kv_store_14_v = V_for_attn[..., :config.global_head_dim]
+            kv_store_14_k = K_for_attn[..., :config.global_head_dim].clone()
+            kv_store_14_v = V_for_attn[..., :config.global_head_dim].clone()
     else:
         if is_full:
             K_for_attn = kv_store_14_k
@@ -838,17 +841,27 @@ class SWAStatefulChunk4Prefill(SWAStatefulChunk4):
 
 
 class SWAStatefulMergedChunk23(_StatefulChunkBase):
-    """Merged stateful chunk for L8-24. Owns KV state for L8-14, runs
-    L15-24 KV-shared internally. Eliminates the 4-chunk's chunk_2 →
-    chunk_3 hidden-state round-trip (~+5-10% Mac decode).
+    """Merged stateful chunk that owns the lower-half KV span and runs
+    the upper-half KV-shared internally. Eliminates the 4-chunk's
+    chunk_2 → chunk_3 hidden-state round-trip (~+5-10% Mac decode).
+
+    Boundaries default to E2B (own=L8-14, shared=L15-24). For E4B pass
+    own_range / shared_range derived from compute_chunk_boundaries(cfg)
+    (E4B: own=L12-23, shared=L24-32).
     """
-    START_OWN, END_OWN = 8, 15      # own-KV layers (= old chunk_2)
-    START_SHARED, END_SHARED = 15, 25  # KV-shared layers (= old chunk_3)
+    DEFAULT_OWN = (8, 15)       # E2B own-KV layers (= old chunk_2)
+    DEFAULT_SHARED = (15, 25)   # E2B KV-shared layers (= old chunk_3)
 
     def __init__(self, model: Gemma4Model, ctx: int = 2048,
-                 use_linear: bool = False):
+                 use_linear: bool = False,
+                 own_range: tuple[int, int] | None = None,
+                 shared_range: tuple[int, int] | None = None):
+        own = own_range if own_range is not None else self.DEFAULT_OWN
+        shared = shared_range if shared_range is not None else self.DEFAULT_SHARED
+        self.START_OWN, self.END_OWN = own
+        self.START_SHARED, self.END_SHARED = shared
         # Init base with the OWN-KV span so the kv_cache_* buffers size
-        # to L8-14 only. KV-shared layers don't need state slots.
+        # to chunk_2 only. KV-shared layers don't need state slots.
         super().__init__(model, self.START_OWN, self.END_OWN, ctx)
         self.layers_shared = nn.ModuleList([
             model.layers[i] for i in range(self.START_SHARED, self.END_SHARED)
@@ -905,8 +918,11 @@ class SWAStatefulMergedChunk23(_StatefulChunkBase):
 class SWAStatefulMergedChunk23Prefill(SWAStatefulMergedChunk23):
     """T=N prefill variant of the merged middle chunk."""
 
-    def __init__(self, model, ctx=2048, use_linear=False, T: int = 8):
-        super().__init__(model, ctx, use_linear=use_linear)
+    def __init__(self, model, ctx=2048, use_linear=False, T: int = 8,
+                 own_range: tuple[int, int] | None = None,
+                 shared_range: tuple[int, int] | None = None):
+        super().__init__(model, ctx, use_linear=use_linear,
+                         own_range=own_range, shared_range=shared_range)
         self.T = T
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
@@ -1054,11 +1070,11 @@ def _run_layer_swa_stateful_single(
             V_for_attn = kv_cache_unified[2*oi+1:2*oi+2, :, :W, :hd]
 
         if layer_idx == config.kv_sliding_producer:
-            kv_store_13_k = K_for_attn[..., :config.head_dim]
-            kv_store_13_v = V_for_attn[..., :config.head_dim]
+            kv_store_13_k = K_for_attn[..., :config.head_dim].clone()
+            kv_store_13_v = V_for_attn[..., :config.head_dim].clone()
         elif layer_idx == config.kv_full_producer:
-            kv_store_14_k = K_for_attn[..., :config.global_head_dim]
-            kv_store_14_v = V_for_attn[..., :config.global_head_dim]
+            kv_store_14_k = K_for_attn[..., :config.global_head_dim].clone()
+            kv_store_14_v = V_for_attn[..., :config.global_head_dim].clone()
     else:
         if is_full:
             K_for_attn = kv_store_14_k
@@ -1169,11 +1185,11 @@ def _run_layer_swa_stateful_prefill_single(
             V_for_attn = kv_cache_unified[2*oi+1:2*oi+2, :, :W, :hd]
 
         if layer_idx == config.kv_sliding_producer:
-            kv_store_13_k = K_for_attn[..., :config.head_dim]
-            kv_store_13_v = V_for_attn[..., :config.head_dim]
+            kv_store_13_k = K_for_attn[..., :config.head_dim].clone()
+            kv_store_13_v = V_for_attn[..., :config.head_dim].clone()
         elif layer_idx == config.kv_full_producer:
-            kv_store_14_k = K_for_attn[..., :config.global_head_dim]
-            kv_store_14_v = V_for_attn[..., :config.global_head_dim]
+            kv_store_14_k = K_for_attn[..., :config.global_head_dim].clone()
+            kv_store_14_v = V_for_attn[..., :config.global_head_dim].clone()
     else:
         if is_full:
             K_for_attn = kv_store_14_k
@@ -1351,13 +1367,23 @@ class SWAStatefulChunk1PrefillSingle(SWAStatefulChunk1Single):
 
 
 class SWAStatefulMergedChunk23Single(_StatefulSingleChunkBase):
-    """3-chunk merged middle (L8-24) with unified state buffer.
-    Owns L8-14 KV; runs L15-24 KV-shared internally. Emits kv13/kv14
-    aliases for the final chunk_3."""
-    START_OWN, END_OWN = 8, 15
-    START_SHARED, END_SHARED = 15, 25
+    """3-chunk merged middle with unified state buffer.
+    Owns chunk_2 KV; runs chunk_3 KV-shared internally. Emits kv13/kv14
+    aliases for the final chunk_3.
 
-    def __init__(self, model, ctx=2048, use_linear=False):
+    Boundaries default to E2B (own=L8-14, shared=L15-24). For E4B pass
+    own_range / shared_range from compute_chunk_boundaries(cfg)
+    (E4B: own=L12-23, shared=L24-32)."""
+    DEFAULT_OWN = (8, 15)
+    DEFAULT_SHARED = (15, 25)
+
+    def __init__(self, model, ctx=2048, use_linear=False,
+                 own_range: tuple[int, int] | None = None,
+                 shared_range: tuple[int, int] | None = None):
+        own = own_range if own_range is not None else self.DEFAULT_OWN
+        shared = shared_range if shared_range is not None else self.DEFAULT_SHARED
+        self.START_OWN, self.END_OWN = own
+        self.START_SHARED, self.END_SHARED = shared
         super().__init__(model, self.START_OWN, self.END_OWN, ctx)
         self.layers_shared = nn.ModuleList([
             model.layers[i] for i in range(self.START_SHARED, self.END_SHARED)
@@ -1406,8 +1432,11 @@ class SWAStatefulMergedChunk23Single(_StatefulSingleChunkBase):
 class SWAStatefulMergedChunk23PrefillSingle(SWAStatefulMergedChunk23Single):
     """T=N prefill variant of merged middle with unified state."""
 
-    def __init__(self, model, ctx=2048, use_linear=False, T: int = 8):
-        super().__init__(model, ctx, use_linear=use_linear)
+    def __init__(self, model, ctx=2048, use_linear=False, T: int = 8,
+                 own_range: tuple[int, int] | None = None,
+                 shared_range: tuple[int, int] | None = None):
+        super().__init__(model, ctx, use_linear=use_linear,
+                         own_range=own_range, shared_range=shared_range)
         self.T = T
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,

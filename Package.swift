@@ -16,6 +16,7 @@ let package = Package(
         .executable(name: "determinism-oracle", targets: ["DeterminismOracle"]),
         .executable(name: "verify-k8-probe", targets: ["VerifyK8Probe"]),
         .executable(name: "ane-residency-gate", targets: ["AneResidencyGate"]),
+        .executable(name: "gemma4mm-smoke", targets: ["Gemma4MMSmoke"]),
         // Standalone samples for the two Gemma-3-based models. These live in
         // the same package on purpose — a LocalAIKit-style wrapper can depend
         // on the `CoreMLLLM` library and use `FunctionGemma` / `EmbeddingGemma`
@@ -89,6 +90,17 @@ let package = Package(
             name: "VerifyK8Probe",
             dependencies: ["CoreMLLLM"],
             path: "Sources/verify-k8-probe",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // Mac smoke test for Gemma4StatefulMultimodalEngine — text-only
+        // generate to catch engine bugs without an iPhone trip.
+        .executableTarget(
+            name: "Gemma4MMSmoke",
+            dependencies: [
+                "CoreMLLLM",
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Sources/gemma4mm-smoke",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // FunctionGemma-270M standalone CLI. Does NOT combine with Gemma 4 —
