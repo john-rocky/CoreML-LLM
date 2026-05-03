@@ -82,12 +82,16 @@ sys.path.insert(0, ROOT)
 from build_gemma4_e2b_stateful_chunks import (
     _resolve_hf_dir,
     convert_chunk1_prefill,
+    convert_chunk2_prefill,
     convert_chunk_shared_prefill,
 )
 from build_gemma4_e2b_stateful_3chunks import convert_chunk2_merged_prefill
 from models.gemma4 import Gemma4Model
 from models.gemma4_swa_chunks import compute_chunk_boundaries
-from models.gemma4_swa_stateful_chunks import SWAStatefulChunk4Prefill
+from models.gemma4_swa_stateful_chunks import (
+    SWAStatefulChunk3Prefill,
+    SWAStatefulChunk4Prefill,
+)
 
 
 def main():
@@ -108,9 +112,17 @@ def main():
     ap.add_argument("--linear-projections", action="store_true",
                     help="Plan 3 Linear projections (cml9 PR #2577) — "
                          "default on for Stage 3 / Stage 8 ship parity.")
-    ap.add_argument("--only", choices=("chunk1", "chunk2_3way", "chunk3"),
+    ap.add_argument("--only", choices=("chunk1", "chunk2_3way", "chunk3",
+                                        "chunk2_own", "chunk3_shared",
+                                        "chunk4_final"),
                     default=None,
-                    help="Build only one chunk (debug; default builds all 3).")
+                    help="Build only one chunk (debug).")
+    ap.add_argument("--four-chunk", action="store_true",
+                    help="Build 4-chunk variant: chunk_1, chunk_2 (own only), "
+                         "chunk_3 (KV-shared no lm_head), chunk_4 (KV-shared "
+                         "+ lm_head). Use when E4B chunk_2 merged graph is "
+                         "rejected by iPhone ANE 18 (std::bad_cast at "
+                         "MIL→EIR translation). Default off (3-chunk merged).")
     args = ap.parse_args()
 
     if args.output is None:
@@ -140,11 +152,19 @@ def main():
     shared_range = boundaries[2]
     c4_start, c4_end = boundaries[3]
 
-    paths = {
-        "chunk1": os.path.join(args.output, f"chunk_1_prefill_T{args.t}.mlpackage"),
-        "chunk2_3way": os.path.join(args.output, f"chunk_2_3way_prefill_T{args.t}.mlpackage"),
-        "chunk3": os.path.join(args.output, f"chunk_3_prefill_T{args.t}.mlpackage"),
-    }
+    if args.four_chunk:
+        paths = {
+            "chunk1": os.path.join(args.output, f"chunk_1_prefill_T{args.t}.mlpackage"),
+            "chunk2_own": os.path.join(args.output, f"chunk_2_prefill_T{args.t}.mlpackage"),
+            "chunk3_shared": os.path.join(args.output, f"chunk_3_prefill_T{args.t}.mlpackage"),
+            "chunk4_final": os.path.join(args.output, f"chunk_4_prefill_T{args.t}.mlpackage"),
+        }
+    else:
+        paths = {
+            "chunk1": os.path.join(args.output, f"chunk_1_prefill_T{args.t}.mlpackage"),
+            "chunk2_3way": os.path.join(args.output, f"chunk_2_3way_prefill_T{args.t}.mlpackage"),
+            "chunk3": os.path.join(args.output, f"chunk_3_prefill_T{args.t}.mlpackage"),
+        }
 
     t0 = time.time()
     if args.only in (None, "chunk1"):
@@ -156,28 +176,71 @@ def main():
             nbits=args.nbits,
             use_linear=args.linear_projections,
         )
-    if args.only in (None, "chunk2_3way"):
-        convert_chunk2_merged_prefill(
-            base=base, ctx=args.ctx, T=args.t,
-            out_path=paths["chunk2_3way"],
-            nbits=args.nbits,
-            use_linear=args.linear_projections,
-            own_range=own_range,
-            shared_range=shared_range,
-        )
-    if args.only in (None, "chunk3"):
-        convert_chunk_shared_prefill(
-            chunk_cls=SWAStatefulChunk4Prefill,
-            base=base,
-            c_start=c4_start, c_end=c4_end,
-            ctx=args.ctx, T=args.t,
-            out_path=paths["chunk3"],
-            nbits=args.nbits,
-            use_linear=args.linear_projections,
-        )
+    if args.four_chunk:
+        # 4-chunk path: chunk_2 = own only, chunk_3 = KV-shared (no lm_head),
+        # chunk_4 = KV-shared + lm_head. Splits the 3-chunk merged middle so
+        # each subgraph stays under iPhone ANE 18 compile budget.
+        own_start, own_end = own_range
+        shared_start, shared_end = shared_range
+        if args.only in (None, "chunk2_own"):
+            convert_chunk2_prefill(
+                base=base,
+                c_start=own_start, c_end=own_end,
+                ctx=args.ctx, T=args.t,
+                out_path=paths["chunk2_own"],
+                nbits=args.nbits,
+                use_linear=args.linear_projections,
+            )
+        if args.only in (None, "chunk3_shared"):
+            convert_chunk_shared_prefill(
+                chunk_cls=SWAStatefulChunk3Prefill,
+                base=base,
+                c_start=shared_start, c_end=shared_end,
+                ctx=args.ctx, T=args.t,
+                out_path=paths["chunk3_shared"],
+                nbits=args.nbits,
+                name="CHUNK 3 (KV-shared, no lm_head)",
+                with_lm_head=False,
+                use_linear=args.linear_projections,
+            )
+        if args.only in (None, "chunk4_final"):
+            convert_chunk_shared_prefill(
+                chunk_cls=SWAStatefulChunk4Prefill,
+                base=base,
+                c_start=c4_start, c_end=c4_end,
+                ctx=args.ctx, T=args.t,
+                out_path=paths["chunk4_final"],
+                nbits=args.nbits,
+                name="CHUNK 4 (KV-shared + lm_head)",
+                with_lm_head=True,
+                use_linear=args.linear_projections,
+            )
+    else:
+        if args.only in (None, "chunk2_3way"):
+            convert_chunk2_merged_prefill(
+                base=base, ctx=args.ctx, T=args.t,
+                out_path=paths["chunk2_3way"],
+                nbits=args.nbits,
+                use_linear=args.linear_projections,
+                own_range=own_range,
+                shared_range=shared_range,
+            )
+        if args.only in (None, "chunk3"):
+            convert_chunk_shared_prefill(
+                chunk_cls=SWAStatefulChunk4Prefill,
+                base=base,
+                c_start=c4_start, c_end=c4_end,
+                ctx=args.ctx, T=args.t,
+                out_path=paths["chunk3"],
+                nbits=args.nbits,
+                name="CHUNK 3 (final)",
+                with_lm_head=True,
+                use_linear=args.linear_projections,
+            )
     print(f"\n[build] DONE in {time.time()-t0:.0f}s")
     print("=" * 60)
-    print(f"3-chunk merged stateful single-function prefill (T={args.t}):")
+    layout = "4-chunk" if args.four_chunk else "3-chunk merged"
+    print(f"{layout} stateful single-function prefill (T={args.t}):")
     for label, path in paths.items():
         if not os.path.exists(path):
             continue

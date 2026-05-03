@@ -193,14 +193,17 @@ def _run_layer_swa_stateful(
             V_for_attn = V_sliding_slice
 
         # Producer alias outputs — same kv13/kv14 naming as the recurrent
-        # build so chunks 3/4 see no input-name change. These are slice
-        # views over the producer's just-updated state buffer.
+        # build so chunks 3/4 see no input-name change. .clone() forces
+        # a fresh tensor (rather than a slice-view over the just-updated
+        # state buffer): iPhone ANE 18 fails MIL→EIR translation with
+        # `std::bad_cast` when a state-slice is used as both an input
+        # to subsequent shared layers AND a public chunk output.
         if layer_idx == config.kv_sliding_producer:
-            kv_store_13_k = K_for_attn[..., :config.head_dim]
-            kv_store_13_v = V_for_attn[..., :config.head_dim]
+            kv_store_13_k = K_for_attn[..., :config.head_dim].clone()
+            kv_store_13_v = V_for_attn[..., :config.head_dim].clone()
         elif layer_idx == config.kv_full_producer:
-            kv_store_14_k = K_for_attn[..., :config.global_head_dim]
-            kv_store_14_v = V_for_attn[..., :config.global_head_dim]
+            kv_store_14_k = K_for_attn[..., :config.global_head_dim].clone()
+            kv_store_14_v = V_for_attn[..., :config.global_head_dim].clone()
     else:
         # Shared layer: read producer KV from the alias inputs.
         if is_full:
@@ -587,11 +590,11 @@ def _run_layer_swa_stateful_prefill(
             V_for_attn = V_sliding_slice
 
         if layer_idx == config.kv_sliding_producer:
-            kv_store_13_k = K_for_attn[..., :config.head_dim]
-            kv_store_13_v = V_for_attn[..., :config.head_dim]
+            kv_store_13_k = K_for_attn[..., :config.head_dim].clone()
+            kv_store_13_v = V_for_attn[..., :config.head_dim].clone()
         elif layer_idx == config.kv_full_producer:
-            kv_store_14_k = K_for_attn[..., :config.global_head_dim]
-            kv_store_14_v = V_for_attn[..., :config.global_head_dim]
+            kv_store_14_k = K_for_attn[..., :config.global_head_dim].clone()
+            kv_store_14_v = V_for_attn[..., :config.global_head_dim].clone()
     else:
         if is_full:
             K_for_attn = kv_store_14_k
@@ -1067,11 +1070,11 @@ def _run_layer_swa_stateful_single(
             V_for_attn = kv_cache_unified[2*oi+1:2*oi+2, :, :W, :hd]
 
         if layer_idx == config.kv_sliding_producer:
-            kv_store_13_k = K_for_attn[..., :config.head_dim]
-            kv_store_13_v = V_for_attn[..., :config.head_dim]
+            kv_store_13_k = K_for_attn[..., :config.head_dim].clone()
+            kv_store_13_v = V_for_attn[..., :config.head_dim].clone()
         elif layer_idx == config.kv_full_producer:
-            kv_store_14_k = K_for_attn[..., :config.global_head_dim]
-            kv_store_14_v = V_for_attn[..., :config.global_head_dim]
+            kv_store_14_k = K_for_attn[..., :config.global_head_dim].clone()
+            kv_store_14_v = V_for_attn[..., :config.global_head_dim].clone()
     else:
         if is_full:
             K_for_attn = kv_store_14_k
@@ -1182,11 +1185,11 @@ def _run_layer_swa_stateful_prefill_single(
             V_for_attn = kv_cache_unified[2*oi+1:2*oi+2, :, :W, :hd]
 
         if layer_idx == config.kv_sliding_producer:
-            kv_store_13_k = K_for_attn[..., :config.head_dim]
-            kv_store_13_v = V_for_attn[..., :config.head_dim]
+            kv_store_13_k = K_for_attn[..., :config.head_dim].clone()
+            kv_store_13_v = V_for_attn[..., :config.head_dim].clone()
         elif layer_idx == config.kv_full_producer:
-            kv_store_14_k = K_for_attn[..., :config.global_head_dim]
-            kv_store_14_v = V_for_attn[..., :config.global_head_dim]
+            kv_store_14_k = K_for_attn[..., :config.global_head_dim].clone()
+            kv_store_14_v = V_for_attn[..., :config.global_head_dim].clone()
     else:
         if is_full:
             K_for_attn = kv_store_14_k

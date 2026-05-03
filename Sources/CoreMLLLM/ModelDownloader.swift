@@ -288,6 +288,34 @@ public final class ModelDownloader: NSObject {
             downloadURL: "",
             folderName: "gemma4-e4b-stateful-linear")
 
+        /// Gemma 4 E2B (stateful Linear decode + T=288 single-function
+        /// prefill + vision/video/audio multimodal). Stage 8 candidate.
+        /// Decode reuses the 3-chunk merged Linear bundle from
+        /// `gemma4e2bStatefulLinear`; prefill is a separate set of three
+        /// T=288 single-function mlpackages under `prefill_T288/`. After
+        /// each prefill pass the engine memcpys kv_cache_sliding +
+        /// kv_cache_full from the prefill MLState into the decode
+        /// MLState (multifunction T>1 + dual MLState is rejected by
+        /// iPhone ANE 18 — single-function works). Bundle ships under
+        /// `gemma4_e2b_stateful_chunks/` so the engine layout matches
+        /// the existing stateful entries.
+        /// Sideload-only until iPhone 17 Pro Phase B validation closes.
+        public static let gemma4e2bStatefulMultimodal = ModelInfo(
+            id: "gemma4-e2b-stateful-multimodal",
+            name: "Gemma 4 E2B (stateful, multimodal)", size: "4.0 GB",
+            downloadURL: "",
+            folderName: "gemma4-e2b-stateful-multimodal")
+
+        /// Gemma 4 E4B (stateful Linear decode + T=288 prefill +
+        /// multimodal). Same engine class as the E2B variant; layer
+        /// counts come from `model_config.json` so the runtime is
+        /// dimension-agnostic. Sideload-only until iPhone validation.
+        public static let gemma4e4bStatefulMultimodal = ModelInfo(
+            id: "gemma4-e4b-stateful-multimodal",
+            name: "Gemma 4 E4B (stateful, multimodal)", size: "5.0 GB",
+            downloadURL: "",
+            folderName: "gemma4-e4b-stateful-multimodal")
+
         /// Visible in the UI picker. EAGLE-3 / LookAhead probe variants are
         /// hidden unless `LLM_SHOW_EXPERIMENTAL=1` is set (or the
         /// UserDefaults key `showExperimentalModels` is true). Keeps the
@@ -324,6 +352,8 @@ public final class ModelDownloader: NSObject {
                 list.insert(gemma4e2bStateful, at: 5)        // Conv2d variant
                 list.insert(gemma4e4bStateful, at: 6)        // E4B Stage 2 Conv2d
                 list.insert(gemma4e4bStatefulLinear, at: 7)  // E4B Stage 2 Linear
+                list.insert(gemma4e2bStatefulMultimodal, at: 8)  // Stage 8 E2B
+                list.insert(gemma4e4bStatefulMultimodal, at: 9)  // Stage 8 E4B
             }
             return list
         }
