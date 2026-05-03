@@ -165,8 +165,26 @@ public final class ModelDownloader: NSObject {
         /// + USB sideload to `Documents/Models/gemma4-e4b/` is also supported —
         /// the app treats the folder as "downloaded" once present.
         public static let gemma4e4b = ModelInfo(
-            id: "gemma4-e4b", name: "Gemma 4 E4B", size: "5.5 GB",
+            id: "gemma4-e4b", name: "Gemma 4 E4B (text-only)", size: "5.5 GB",
             downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E4B-coreml/resolve/main",
+            folderName: "gemma4-e4b")
+
+        /// Gemma 4 E4B — multimodal (text + image + video + audio).
+        /// Same legacy 4-chunk text decoder as `gemma4e4b` plus Topology II
+        /// `chunk2_3way` / `chunk3_3way` for 3-chunk decode (saves one ANE
+        /// dispatch per token), E4B-specific `vision.ane.mlmodelc`
+        /// (output `[1, 256, 2560]`), `audio.mlmodelc` + Swift two-stage
+        /// projection sidecars (`output_proj_*` 1024→1536, `embed_proj`
+        /// 1536→2560 — non-square, matches LM hidden). Validated 2026-05-03
+        /// on iPhone 17 Pro at 15.7 tok/s decode + correct outputs across
+        /// all four input modalities.
+        ///
+        /// Set `LLM_VISION_FORCE_ANE=1` (Xcode scheme env var) to route the
+        /// vision encoder through ANE.
+        public static let gemma4e4bMultimodal = ModelInfo(
+            id: "gemma4-e4b-multimodal",
+            name: "Gemma 4 E4B (multimodal)", size: "7.6 GB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E4B-multimodal-coreml/resolve/main",
             folderName: "gemma4-e4b")
 
         /// Gemma 4 E2B Fashion — MB dress/casual theory vision advisor.
@@ -341,7 +359,7 @@ public final class ModelDownloader: NSObject {
             //                         docs/SESSION_2026_04_27_STAGE6_MULTIMODAL.md).
             var list: [ModelInfo] = [
                 gemma4e2b3way, gemma4e2b, gemma4e2bStatefulLinear,
-                gemma4e4b, gemma4e2bFashion,
+                gemma4e4bMultimodal, gemma4e4b, gemma4e2bFashion,
                 qwen25_05b, qwen35_08b, qwen35_2b,
                 qwen3vl_2b, qwen3vl_2b_stateful,
                 lfm2_5_350m,
@@ -1087,6 +1105,10 @@ public final class ModelDownloader: NSObject {
             buildE4BFileList()
             return
         }
+        if model.id == "gemma4-e4b-multimodal" {
+            buildE4BMultimodalFileList()
+            return
+        }
         if model.id == "gemma4-e2b-stateful-linear" {
             buildGemma4StatefulLinearFileList()
             return
@@ -1620,6 +1642,118 @@ public final class ModelDownloader: NSObject {
             .init(remotePath: "sin_sliding.npy", localPath: "sin_sliding.npy", estimatedSize: 2_097_280),
             .init(remotePath: "cos_full.npy", localPath: "cos_full.npy", estimatedSize: 4_194_432),
             .init(remotePath: "sin_full.npy", localPath: "sin_full.npy", estimatedSize: 4_194_432),
+        ]
+
+        var largeFiles: [DownloadFile] = []
+        var smallFiles: [DownloadFile] = []
+        let threshold: Int64 = 10_000_000
+        for file in chunkFiles + extraFiles {
+            if file.estimatedSize >= threshold {
+                largeFiles.append(file)
+            } else {
+                smallFiles.append(file)
+            }
+        }
+        largeFiles.sort { $0.estimatedSize > $1.estimatedSize }
+        pendingFiles = largeFiles + smallFiles
+        totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
+        completedBytes = 0
+        nextFileIndex = 0
+    }
+
+    /// File list for `gemma4-e4b-multimodal` — superset of the E4B
+    /// legacy text-only bundle plus Topology II 3-chunk decode chunks
+    /// (`chunk2_3way`, `chunk3_3way`), E4B-built vision encoder
+    /// (`vision.ane.mlmodelc` output `[1, 256, 2560]`), audio encoder +
+    /// Swift projection sidecars (`output_proj_*.npy` 1024→1536,
+    /// `embed_proj_weight.npy` 1536→2560), and `mel_filterbank.bin`.
+    /// Sizes are from `mlboydaisuke/gemma-4-E4B-multimodal-coreml`.
+    private func buildE4BMultimodalFileList() {
+        // Legacy chunks 1-4 (same byte content as gemma-4-E4B-coreml).
+        // The legacy chunks don't ship metadata.json (only the newer
+        // 3-way and encoder chunks do).
+        func legacyChunk(_ name: String, weightSize: Int64,
+                          milSize: Int64) -> [DownloadFile] {
+            [.init(remotePath: "\(name).mlmodelc/weights/weight.bin",
+                   localPath: "\(name).mlmodelc/weights/weight.bin", estimatedSize: weightSize),
+             .init(remotePath: "\(name).mlmodelc/coremldata.bin",
+                   localPath: "\(name).mlmodelc/coremldata.bin", estimatedSize: 1_500),
+             .init(remotePath: "\(name).mlmodelc/model.mil",
+                   localPath: "\(name).mlmodelc/model.mil", estimatedSize: milSize),
+             .init(remotePath: "\(name).mlmodelc/analytics/coremldata.bin",
+                   localPath: "\(name).mlmodelc/analytics/coremldata.bin", estimatedSize: 250)]
+        }
+        // Newer chunks (3-way decode + encoders) include metadata.json.
+        func newerMlc(_ name: String, weightSize: Int64,
+                       milSize: Int64, metaSize: Int64) -> [DownloadFile] {
+            [.init(remotePath: "\(name).mlmodelc/weights/weight.bin",
+                   localPath: "\(name).mlmodelc/weights/weight.bin", estimatedSize: weightSize),
+             .init(remotePath: "\(name).mlmodelc/coremldata.bin",
+                   localPath: "\(name).mlmodelc/coremldata.bin", estimatedSize: 1_000),
+             .init(remotePath: "\(name).mlmodelc/model.mil",
+                   localPath: "\(name).mlmodelc/model.mil", estimatedSize: milSize),
+             .init(remotePath: "\(name).mlmodelc/metadata.json",
+                   localPath: "\(name).mlmodelc/metadata.json", estimatedSize: metaSize),
+             .init(remotePath: "\(name).mlmodelc/analytics/coremldata.bin",
+                   localPath: "\(name).mlmodelc/analytics/coremldata.bin", estimatedSize: 250)]
+        }
+
+        let chunkFiles =
+              legacyChunk("chunk1", weightSize: 585_970_432, milSize: 1_288_448)
+            + legacyChunk("chunk2", weightSize: 572_196_992, milSize: 1_277_032)
+            + legacyChunk("chunk3", weightSize: 412_740_736, milSize: 597_340)
+            + legacyChunk("chunk4", weightSize: 753_797_440, milSize: 608_413)
+            + newerMlc("chunk2_3way", weightSize: 984_936_000,
+                        milSize: 917_977, metaSize: 8_741)
+            + newerMlc("chunk3_3way", weightSize: 753_797_440,
+                        milSize: 303_969, metaSize: 6_697)
+            + newerMlc("vision.ane", weightSize: 342_227_200,
+                        milSize: 709_941, metaSize: 2_694)
+            + newerMlc("audio", weightSize: 146_087_488,
+                        milSize: 858_362, metaSize: 2_342)
+
+        let extraFiles: [DownloadFile] = [
+            .init(remotePath: "model_config.json",
+                  localPath: "model_config.json", estimatedSize: 800),
+            .init(remotePath: "hf_model/tokenizer.json",
+                  localPath: "hf_model/tokenizer.json", estimatedSize: 32_169_626),
+            .init(remotePath: "hf_model/tokenizer_config.json",
+                  localPath: "hf_model/tokenizer_config.json", estimatedSize: 2_200),
+            .init(remotePath: "hf_model/config.json",
+                  localPath: "hf_model/config.json", estimatedSize: 5_200),
+            .init(remotePath: "hf_model/generation_config.json",
+                  localPath: "hf_model/generation_config.json", estimatedSize: 300),
+            .init(remotePath: "embed_tokens_q8.bin",
+                  localPath: "embed_tokens_q8.bin", estimatedSize: 671_088_640),
+            .init(remotePath: "embed_tokens_scales.bin",
+                  localPath: "embed_tokens_scales.bin", estimatedSize: 524_288),
+            .init(remotePath: "embed_tokens_per_layer_q8.bin",
+                  localPath: "embed_tokens_per_layer_q8.bin", estimatedSize: 2_818_572_288),
+            .init(remotePath: "embed_tokens_per_layer_scales.bin",
+                  localPath: "embed_tokens_per_layer_scales.bin", estimatedSize: 524_288),
+            .init(remotePath: "per_layer_projection.bin",
+                  localPath: "per_layer_projection.bin", estimatedSize: 55_050_240),
+            .init(remotePath: "per_layer_norm_weight.bin",
+                  localPath: "per_layer_norm_weight.bin", estimatedSize: 512),
+            .init(remotePath: "cos_sliding.npy",
+                  localPath: "cos_sliding.npy", estimatedSize: 2_097_280),
+            .init(remotePath: "sin_sliding.npy",
+                  localPath: "sin_sliding.npy", estimatedSize: 2_097_280),
+            .init(remotePath: "cos_full.npy",
+                  localPath: "cos_full.npy", estimatedSize: 4_194_432),
+            .init(remotePath: "sin_full.npy",
+                  localPath: "sin_full.npy", estimatedSize: 4_194_432),
+            // Audio sidecars (Swift two-stage projection).
+            .init(remotePath: "audio_config.json",
+                  localPath: "audio_config.json", estimatedSize: 400),
+            .init(remotePath: "mel_filterbank.bin",
+                  localPath: "mel_filterbank.bin", estimatedSize: 131_584),
+            .init(remotePath: "output_proj_weight.npy",
+                  localPath: "output_proj_weight.npy", estimatedSize: 3_145_856),
+            .init(remotePath: "output_proj_bias.npy",
+                  localPath: "output_proj_bias.npy", estimatedSize: 3_200),
+            .init(remotePath: "embed_proj_weight.npy",
+                  localPath: "embed_proj_weight.npy", estimatedSize: 7_864_448),
         ]
 
         var largeFiles: [DownloadFile] = []
