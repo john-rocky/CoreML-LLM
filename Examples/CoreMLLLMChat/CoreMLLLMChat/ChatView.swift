@@ -890,7 +890,7 @@ struct FashionReport {
     private static let topRatioKeys = [
         "overall_dress_ratio", "overall_ratio", "ratio",
     ]
-    private static let topTPOKeys = ["tpo_assumption", "durationType", "target_tpo", "tpo"]
+    private static let topTPOKeys = ["tpo_assumption", "tp_assumption", "durationType", "target_tpo", "tpo"]
     private static let topTargetKeys = ["target_ratio"]
     private static let topVerdictKeys = ["verdict"]
     private static let topAdviceKeys = ["advice", "comment"]
