@@ -639,13 +639,17 @@ struct ChatView: View {
     }
 
     /// Trained user prompt for the Fashion LoRAs. Mirrors
-    /// `vision/scripts/prepare_train.py:PROMPT` so on-device inputs match
-    /// the training distribution and trip the structured-JSON output path.
+    /// `vision/scripts/prepare_train.py:PROMPT` byte-exactly so on-device
+    /// inputs match the training distribution and trip the structured-JSON
+    /// output path. v3 schema: 5 axes (color/silhouette/material/design/
+    /// item_type) + coordinate_silhouette (I/A/Y/off + style_score).
     private static let fashionAutoPrompt =
-        "画像のコーディネートを「MBドレス/カジュアル理論」で採点してください。"
-        + "各アイテムの4軸スコア(色/シルエット/素材/清潔感/フィット)、基本ドレス度、"
-        + "加重ドレス度、ドレスラベル、全体のドレス比率、想定TPO、推奨比率、verdict、"
-        + "改善アドバイスをJSONで出力してください。"
+        "画像のコーディネートを MB ドレス/カジュアル理論で採点し JSON で出力してください。"
+        + "items: [{category, description, "
+        + "scores:{color, silhouette, material, design, item_type}, item_dress_score}], "
+        + "overall_dress_ratio, "
+        + "coordinate_silhouette:{type, style_score, rationale}, "
+        + "target_ratio, verdict, advice"
 
     private func clearImage() {
         selectedPhoto = nil
@@ -852,6 +856,8 @@ struct FashionReport {
         let silhouette: Double?
         let material: Double?
         let design: Double?
+        /// v3 5th axis: garment-type baseline (independent of color/cut/etc).
+        let item_type: Double?
     }
     struct Item {
         let category: String?
@@ -860,10 +866,20 @@ struct FashionReport {
         let item_dress_score: Double?
     }
 
+    /// v3 outfit-level style axis: I/A/Y silhouette classification.
+    struct CoordinateSilhouette {
+        let type: String?      // "I" | "A" | "Y" | "off"
+        let style_score: Double?
+        let rationale: String?
+    }
+
     let items: [Item]
     let overall_dress_ratio: Double?
+    /// Legacy v2 field; kept for parser tolerance against old model output.
+    /// Not rendered in v3 card UI.
     let tpo_assumption: String?
     let target_ratio: Double?
+    let coordinate_silhouette: CoordinateSilhouette?
     let verdict: String?
     let advice: String?
 
@@ -871,7 +887,7 @@ struct FashionReport {
     var isRenderable: Bool {
         !items.isEmpty
             || overall_dress_ratio != nil
-            || tpo_assumption != nil
+            || coordinate_silhouette != nil
             || verdict != nil
             || advice != nil
     }
@@ -894,10 +910,18 @@ struct FashionReport {
     private static let topTargetKeys = ["target_ratio"]
     private static let topVerdictKeys = ["verdict"]
     private static let topAdviceKeys = ["advice", "comment"]
+    private static let topCoordSilhouetteKeys = [
+        "coordinate_silhouette", "outfit_silhouette", "style_silhouette",
+    ]
     private static let itemDescriptionKeys = ["description", "item", "name"]
     private static let itemDressScoreKeys = ["item_dress_score", "dress_score", "score_break"]
     private static let scoresContainerKeys = ["scores", "attributes", "score"]
-    private static let scoresPositionalAxes = ["color", "silhouette", "material", "design"]
+    /// v3 positional fallback: 5 axes (item_type added 5th).
+    private static let scoresPositionalAxes = ["color", "silhouette", "material", "design", "item_type"]
+    private static let itemTypeKeys = ["item_type", "type", "garment_type", "category_score"]
+    private static let silhouetteTypeKeys = ["type", "silhouette_type", "shape"]
+    private static let silhouetteStyleScoreKeys = ["style_score", "score", "completion"]
+    private static let silhouetteRationaleKeys = ["rationale", "reason", "note"]
 
     static func parse(from text: String) -> FashionReport? {
         let cleaned = stripNoise(text)
@@ -909,6 +933,7 @@ struct FashionReport {
         var target: Double?
         var verdict: String?
         var advice: String?
+        var silhouette: CoordinateSilhouette?
 
         // Walk every balanced {...} span. Multi-blob outputs are merged so
         // a fragmented response (items in one blob, overall_ratio in another)
@@ -929,6 +954,19 @@ struct FashionReport {
             if target == nil, let v = lookupDouble(topTargetKeys, in: dict) { target = v }
             if verdict == nil, let v = lookupString(topVerdictKeys, in: dict) { verdict = v }
             if advice == nil, let v = lookupString(topAdviceKeys, in: dict) { advice = v }
+            if silhouette == nil {
+                let sValue = topCoordSilhouetteKeys.compactMap { dict[$0] }.first
+                if let sDict = sValue as? [String: Any] {
+                    silhouette = CoordinateSilhouette(
+                        type: lookupString(silhouetteTypeKeys, in: sDict),
+                        style_score: lookupDouble(silhouetteStyleScoreKeys, in: sDict),
+                        rationale: lookupString(silhouetteRationaleKeys, in: sDict))
+                } else if let sStr = sValue as? String {
+                    // Tolerate flat string form: "coordinate_silhouette":"I"
+                    silhouette = CoordinateSilhouette(
+                        type: sStr, style_score: nil, rationale: nil)
+                }
+            }
         }
 
         let report = FashionReport(
@@ -936,6 +974,7 @@ struct FashionReport {
             overall_dress_ratio: ratio,
             tpo_assumption: tpo,
             target_ratio: target,
+            coordinate_silhouette: silhouette,
             verdict: verdict,
             advice: advice)
         return report.isRenderable ? report : nil
@@ -1096,35 +1135,44 @@ struct FashionReport {
     private static func buildItem(from dict: [String: Any]) -> Item {
         let category = dict["category"] as? String
         let description = lookupString(itemDescriptionKeys, in: dict)
-        let scores = buildScores(from: scoresContainerKeys.compactMap { dict[$0] }.first)
-        let dressScore = lookupDouble(itemDressScoreKeys, in: dict)
+        let scoresValue = scoresContainerKeys.compactMap { dict[$0] }.first
+        let scores = buildScores(from: scoresValue)
+        var dressScore = lookupDouble(itemDressScoreKeys, in: dict)
+        // int8 drift fallback: model occasionally nests item_dress_score
+        // inside the scores object instead of at item level. Pull it back.
+        if dressScore == nil, let nested = scoresValue as? [String: Any] {
+            dressScore = lookupDouble(itemDressScoreKeys, in: nested)
+        }
         return Item(category: category, description: description,
                     scores: scores, item_dress_score: dressScore)
     }
 
     private static func buildScores(from value: Any?) -> Scores? {
         if let dict = value as? [String: Any] {
-            // Object form. Pick known axes; ignore unknown keys.
+            // Object form. Pick known axes; ignore unknown keys. v3 adds
+            // a 5th axis `item_type` (with aliases for drift tolerance).
             return Scores(
                 color: dict["color"] as? Double ?? (dict["color"] as? NSNumber)?.doubleValue,
                 silhouette: dict["silhouette"] as? Double ?? (dict["silhouette"] as? NSNumber)?.doubleValue,
                 material: dict["material"] as? Double ?? (dict["material"] as? NSNumber)?.doubleValue,
-                design: dict["design"] as? Double ?? (dict["design"] as? NSNumber)?.doubleValue)
+                design: dict["design"] as? Double ?? (dict["design"] as? NSNumber)?.doubleValue,
+                item_type: lookupDouble(itemTypeKeys, in: dict))
         }
         if let arr = value as? [Any] {
-            // Positional form: [color, silhouette, material, design]. Tolerate
-            // any combination of Double / Int / NSNumber. Truncate to 4.
+            // Positional form: [color, silhouette, material, design, item_type].
+            // Tolerate any combination of Double / Int / NSNumber. Truncate to 5.
             let nums = arr.prefix(scoresPositionalAxes.count).map { v -> Double? in
                 (v as? Double) ?? (v as? NSNumber)?.doubleValue
             }
             guard nums.contains(where: { $0 != nil }) else { return nil }
-            let pad = Array(repeating: Double?.none, count: max(0, 4 - nums.count))
+            let pad = Array(repeating: Double?.none, count: max(0, 5 - nums.count))
             let padded = Array(nums) + pad
             return Scores(
                 color: padded[0],
                 silhouette: padded[1],
                 material: padded[2],
-                design: padded[3])
+                design: padded[3],
+                item_type: padded.count > 4 ? padded[4] : nil)
         }
         return nil
     }
@@ -1158,12 +1206,17 @@ struct FashionReportCard: View {
                 DressRatioGauge(ratio: ratio, target: report.target_ratio)
             }
 
-            HStack(spacing: 8) {
-                if let tpo = report.tpo_assumption {
-                    Chip(text: "TPO: \(tpo)")
-                }
-                if let target = report.target_ratio {
-                    Chip(text: String(format: "Target %.2f", target))
+            // v3 silhouette chip ("Iライン (0.85)" etc). Replaces the v2 TPO
+            // chip — TPO was dropped from the schema in favor of pin-70.
+            if let silhouette = report.coordinate_silhouette {
+                HStack(spacing: 8) {
+                    SilhouetteChip(silhouette: silhouette)
+                    if let rationale = silhouette.rationale, !rationale.isEmpty {
+                        Text(rationale)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
                 }
             }
 
@@ -1276,6 +1329,41 @@ private struct Chip: View {
     }
 }
 
+/// v3 outfit-level style chip. Shows "Iライン (0.85)" for I/A/Y types or
+/// "シルエット off" for off. Orange tint mirrors the MB理論 7:3 caption
+/// under DressRatioGauge so silhouette + dress are visually paired.
+private struct SilhouetteChip: View {
+    let silhouette: FashionReport.CoordinateSilhouette
+
+    var body: some View {
+        let label = displayLabel
+        let isOff = (silhouette.type?.lowercased() == "off")
+        Text(label)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(isOff ? Color.secondary : Color.orange)
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(
+                (isOff ? Color(.systemGray5) : Color.orange.opacity(0.15))
+            )
+            .clipShape(Capsule())
+    }
+
+    private var displayLabel: String {
+        let t = (silhouette.type ?? "").uppercased()
+        let scoreSuffix = silhouette.style_score
+            .map { String(format: " (%.2f)", min(max($0, 0), 1)) } ?? ""
+        switch t {
+        case "I": return "Iライン" + scoreSuffix
+        case "A": return "Aライン" + scoreSuffix
+        case "Y": return "Yライン" + scoreSuffix
+        case "OFF", "":
+            return "シルエット off" + scoreSuffix
+        default:
+            return t + "ライン" + scoreSuffix
+        }
+    }
+}
+
 private struct FashionItemRow: View {
     let item: FashionReport.Item
 
@@ -1303,6 +1391,7 @@ private struct FashionItemRow: View {
                     ScoreBar(label: "silhouette", value: scores.silhouette)
                     ScoreBar(label: "material", value: scores.material)
                     ScoreBar(label: "design", value: scores.design)
+                    ScoreBar(label: "item_type", value: scores.item_type)
                 }
             }
         }
