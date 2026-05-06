@@ -41,7 +41,15 @@ public final class MtpDraftSource {
     ) throws {
         let cfg = configuration ?? {
             let c = MLModelConfiguration()
-            c.computeUnits = .cpuAndNeuralEngine
+            // 2026-05-06 diagnostic: ANE fp16/INT4 numerics differ enough
+            // from CPU fp32 to crater drafter accept on Mac. Set
+            // MTP_DRAFTER_DEVICE=cpu / gpu / ane to override.
+            switch ProcessInfo.processInfo.environment["MTP_DRAFTER_DEVICE"] {
+            case "cpu": c.computeUnits = .cpuOnly
+            case "gpu": c.computeUnits = .cpuAndGPU
+            case "ane": c.computeUnits = .cpuAndNeuralEngine
+            default:    c.computeUnits = .cpuAndNeuralEngine
+            }
             return c
         }()
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
@@ -241,5 +249,13 @@ public final class MtpDraftSource {
     }
 
     /// Whether to use speculative path for the next burst.
-    public var shouldSpeculate: Bool { rollingAcceptance >= fallbackThreshold }
+    /// Set MTP_FORCE_SPECULATE=1 to bypass the fallback threshold (debugging /
+    /// raw accept measurement). Production should leave it on so the engine
+    /// stops paying drafter cost when accept collapses.
+    public var shouldSpeculate: Bool {
+        if ProcessInfo.processInfo.environment["MTP_FORCE_SPECULATE"] == "1" {
+            return true
+        }
+        return rollingAcceptance >= fallbackThreshold
+    }
 }

@@ -201,6 +201,12 @@ public final class CoreMLLLM: @unchecked Sendable {
         onProgress: ((String) -> Void)? = nil
     ) async throws -> CoreMLLLM {
         onProgress?("Reading config...")
+        if ThermalThrottle.lite {
+            print("[Load] LLM_LOAD_LITE=1 — skipping vision/EAGLE-3 prewarm + finalPrewarm tail")
+        }
+        if ThermalThrottle.baseCoolMs != 300 {
+            print("[Load] LLM_LOAD_COOL_MS=\(ThermalThrottle.baseCoolMs) (default 300)")
+        }
         let config = try ModelConfig.load(from: directory)
 
         // Tokenizer
@@ -566,6 +572,7 @@ public final class CoreMLLLM: @unchecked Sendable {
         // ChunkedEngine.load, leaving the first user decode ~50ms slower
         // per step and the first spec burst ~100ms slower.
         if let engine = llm.chunkedEngine {
+            await ThermalThrottle.coolDown(label: "pre-final-prewarm")
             do {
                 try engine.finalPrewarm()
             } catch {
@@ -589,7 +596,9 @@ public final class CoreMLLLM: @unchecked Sendable {
         // cost behind user typing time.
         if let url = llm.visionModelURL,
            let cfg = llm.visionConfig,
-           !llm.visionUsesANEBuild {
+           !llm.visionUsesANEBuild,
+           !ThermalThrottle.lite {
+            await ThermalThrottle.coolDown(label: "pre-vision-gpu")
             do {
                 let t0 = CFAbsoluteTimeGetCurrent()
                 let m = try MLModel(contentsOf: url, configuration: cfg)
@@ -637,7 +646,8 @@ public final class CoreMLLLM: @unchecked Sendable {
         }
         if let url = llm.visionModelURL,
            let cfg = llm.visionConfig,
-           llm.visionUsesANEBuild {
+           llm.visionUsesANEBuild,
+           !ThermalThrottle.lite {
             // Load the vision MLModel synchronously *and* attach it
             // to `llm.visionModel` before the first user prompt. Then
             // kick off a dry forward on a utility queue so the ANE
@@ -647,6 +657,7 @@ public final class CoreMLLLM: @unchecked Sendable {
             // MLModel instance the prewarm warmed, otherwise we eat
             // the 500 ms compile cost again. Attaching synchronously
             // on the caller's thread guarantees that.
+            await ThermalThrottle.coolDown(label: "pre-vision-ane")
             do {
                 let t0 = CFAbsoluteTimeGetCurrent()
                 let m = try MLModel(contentsOf: url, configuration: cfg)
@@ -692,7 +703,9 @@ public final class CoreMLLLM: @unchecked Sendable {
         // Also warm the EAGLE-3 draft + fusion mlpackages if loaded —
         // one dry forward through each so the first user burst doesn't
         // eat the ANE compile cost for these two graphs.
-        if let sl = llm.speculativeLoop, let engine = llm.chunkedEngine {
+        if let sl = llm.speculativeLoop, let engine = llm.chunkedEngine,
+           !ThermalThrottle.lite {
+            await ThermalThrottle.coolDown(label: "pre-eagle3-prewarm")
             do {
                 _ = try sl.drawBurst(
                     target: engine,

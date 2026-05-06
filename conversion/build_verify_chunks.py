@@ -86,11 +86,47 @@ def trace_and_convert(model, sample_inputs, input_specs, output_names, quantize=
 
     if quantize:
         t = time.time()
+        nbits = int(os.environ.get("PALETTIZE_NBITS", "4"))
+        granularity = os.environ.get("PALETTIZE_GRANULARITY", "per_grouped_channel")
+        group_size = int(os.environ.get("PALETTIZE_GROUP_SIZE", "32"))
+        per_channel_scale = os.environ.get("PALETTIZE_PCS", "0") == "1"
+        # PALETTIZE_KEEP_FP_KV=1 → keep `*_self_attn_(k|v)_proj_weight` as fp16
+        # (skip palettize for those ops). The K/V cache is computed from these
+        # weights, and INT4 noise on the K cache (cosine 0.978 vs fp16 0.993)
+        # cuts MTP per-slot accept on chat code from ~0.55 (vendor) to ~0.20
+        # (ours). Keeping ~5 % of weights fp16 raises chunk size ~3 %; the
+        # rest of the model stays INT4 for ANE bandwidth.
+        keep_fp_kv = os.environ.get("PALETTIZE_KEEP_FP_KV", "0") == "1"
+        # Optionally also keep q_proj + o_proj fp16. Higher size hit but
+        # cleaner attention output → cleaner K writes for next layer.
+        keep_fp_attn = os.environ.get("PALETTIZE_KEEP_FP_ATTN", "0") == "1"
+        cfg_kw = dict(nbits=nbits, granularity=granularity,
+                      enable_per_channel_scale=per_channel_scale)
+        if granularity == "per_grouped_channel":
+            cfg_kw["group_size"] = group_size
+        global_cfg = ct.optimize.coreml.OpPalettizerConfig(**cfg_kw)
+        op_name_configs = {}
+        patterns = []
+        if keep_fp_kv:
+            patterns += ["self_attn_k_proj", "self_attn_v_proj"]
+        if keep_fp_attn:
+            patterns += ["self_attn_q_proj", "self_attn_o_proj"]
+        if patterns:
+            from coremltools.optimize.coreml import get_weights_metadata
+            md = get_weights_metadata(mlmodel, weight_threshold=2048)
+            for name in md.keys():
+                if any(p in name for p in patterns):
+                    op_name_configs[name] = None
+            print(f"    keep_fp patterns={patterns} — skipping "
+                  f"{len(op_name_configs)} weights (kept fp16); "
+                  f"sample: {list(op_name_configs)[:2]}")
         cfg = ct.optimize.coreml.OptimizationConfig(
-            global_config=ct.optimize.coreml.OpPalettizerConfig(
-                nbits=4, granularity="per_grouped_channel", group_size=32))
+            global_config=global_cfg,
+            op_name_configs=op_name_configs if op_name_configs else None)
         mlmodel = ct.optimize.coreml.palettize_weights(mlmodel, cfg)
-        print(f"    palettized in {time.time()-t:.1f}s")
+        print(f"    palettized nbits={nbits} {granularity}"
+              f"{' g='+str(group_size) if granularity=='per_grouped_channel' else ''} "
+              f"pcs={per_channel_scale} keep_fp_kv={keep_fp_kv} in {time.time()-t:.1f}s")
 
     return mlmodel
 
@@ -135,6 +171,10 @@ def main():
                         help="Context length (default: registry entry's default)")
     parser.add_argument("--no-quantize", action="store_true",
                         help="Skip int4 palettization")
+    parser.add_argument("--awq-state", type=str, default=None,
+                        help="Optional AWQ-smoothed state_dict (.pt) to load "
+                             "after Gemma4Model.from_pretrained. Use "
+                             "conversion/awq_smooth_gemma4.py to generate.")
     parser.add_argument("--keep-tmp", action="store_true",
                         help="Keep the _tmp/chunkN_{decode,verify}.mlpackage "
                              "intermediates so standalone verify-only chunks "
@@ -161,6 +201,16 @@ def main():
     print(f"Loading {args.model} from {hf_dir}...")
     base = Gemma4Model.from_pretrained(hf_dir, context_length=CTX)
     base.eval()
+
+    if args.awq_state:
+        print(f"Loading AWQ-smoothed state from {args.awq_state}")
+        sd = torch.load(args.awq_state, map_location="cpu", weights_only=True)
+        missing, unexpected = base.load_state_dict(sd, strict=False)
+        if unexpected:
+            print(f"  WARNING: {len(unexpected)} unexpected keys (ignored)")
+        if missing:
+            print(f"  WARNING: {len(missing)} missing keys (kept original)")
+        print(f"  AWQ state loaded ({len(sd)} tensors)")
 
     hidden = base.config.hidden_size
     pld = base.config.hidden_size_per_layer_input

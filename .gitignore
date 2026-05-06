@@ -17,7 +17,11 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.mtp_venv/
 *.egg
+
+# External tooling (cloned, not part of this project)
+/mlx/
 
 # Xcode
 *.xcuserstate

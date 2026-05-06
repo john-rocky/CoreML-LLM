@@ -61,6 +61,11 @@ class ANERMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # All fp16 for ANE compatibility (no float32 cast)
         # Matches ANEMLL's LlamaRMSNorm pattern.
+        # 2026-05-06: tried fp32 cast inside this op to chase per-chunk
+        # cosine vs HF; the cast is stripped by `compute_precision=FLOAT16`
+        # at conversion time, so it had no effect. Genuine fp32 norm
+        # requires either build-time op-selector to keep norm fp32 or
+        # FLOAT32 compute_precision (slower / no ANE).
         doubled = torch.cat([x, -x], dim=-1)
         normed = F.layer_norm(
             doubled,
@@ -69,7 +74,6 @@ class ANERMSNorm(nn.Module):
             bias=None,
             eps=float(self.eps),
         )
-        # Drop mirror half: use chunk to avoid dynamic slice during trace
         normed, _ = torch.chunk(normed, 2, dim=-1)
         return normed * self.weight
 

@@ -1,6 +1,11 @@
 # Gemma 4 Official MTP Drafter — Cross-Device Handoff
 
-**Status:** 2026-05-06. New work, captured for pick-up on another device.
+**Status:** 2026-05-06. Mac bench complete; iPhone push deferred. MTP
+path is structurally working but acceptance is too low to ship at K=8.
+See `docs/SESSION_2026_05_06_MTP_MAC.md` for the full Mac findings, the
+five distinct bugs uncovered (incl. a target-build divergence from HF
+RoPE spec), and the remaining knowns to investigate before another push.
+Also see **Session log (2026-05-06)** at the bottom of this file.
 
 ## TL;DR
 
@@ -169,3 +174,108 @@ If Step 3 passes, drafter quality is verified at the algorithm level. Then proce
 - 11c implementation: commit `9840a09` (2026-04-17, "feat(11c): write-after-accept verify protocol — Mac-validated")
 - Speculative survey (2026-04-22): `docs/SPECULATIVE_DECODING_SURVEY.md` — explicitly identified L-MTP as the only credible path
 - Round 8 (2026-04-26): `docs/ROUND8_FINDINGS.md` — drafter excluded by user choice, not because dead
+
+## Session log (2026-05-06) — Mac Studio port complete
+
+### Done
+
+- **Architecture surveyed.** Pulled `config.json` + `model.safetensors` from
+  `google/gemma-4-E2B-it-assistant`. Confirmed structural similarity to the
+  obsolete LiteRT drafter (4 layers, hidden=256, 3 SWA + 1 full,
+  vocab=262144). Three additions vs LiteRT, all integrated:
+  - **`layer_scalar`** — per-layer learned scalar applied at the very end
+    of each `Gemma4TextDecoderLayer` (`hidden_states *= self.layer_scalar`).
+    Values for E2B: L0=0.042, L1=0.246, L2=0.426, L3=0.120.
+  - **`masked_embedding`** — `(num_centroids=2048, vocab_per_centroid=128)`
+    centroid-based fast lm_head. NOT implemented in our port; we run the full
+    `lm_head = embed_tokens.weight` (262144, 256) tied path. Empirically the
+    masked centroid path's job is purely a decode speedup that in most
+    positions agrees with full-lm_head top-1; for K=3..6 drafting argmax-
+    based comparison this is acceptable.
+  - **No final logit softcapping.** `final_logit_softcapping: null` —
+    removed the `tanh(x/30)*30` from the LiteRT graph.
+
+- **PyTorch port:** `conversion/mtp_drafter_model.py` — full rewrite.
+  HF safetensors loader replaces the LiteRT TFLite parser. RMSNorm matches
+  Gemma 4 spec (`y = normed * weight`, no `(1+w)`). Partial-rotary RoPE
+  for full attention (`theta=1e6`, `partial_rotary_factor=0.25` → 64 rotated
+  + 192 nope angles per half).
+
+- **Parity proven:** `conversion/test_mtp_parity.py --full-lm-head`
+  yields **logits cosine = 1.000005, hidden cosine = 1.000000, top-5 5/5**
+  vs the official `transformers >= 5.7.0` reference. Our port is bit-exact.
+
+- **CoreML build:** `conversion/build_mtp_drafter.py` — full rewrite.
+  ANE-friendly module (Linear→Conv2d(1,1), `ANERMSNorm`). RoPE cos/sin are
+  inputs (no internal precompute), so the Swift caller's existing
+  `reshapeRoPEForDrafter` half-length convention is preserved → no Swift
+  changes needed. ANE module agrees with PyTorch reference to top-1
+  match + proj cosine 0.999428 (fp16 → fp16 round-off).
+
+- **Swift I/O contract verified unchanged.** `MtpDraftSource.swift` and
+  `MtpSpeculativeEngine.swift` already use the exact same input/output
+  names (`embed_token`, `proj_act`, `kv13_k/v`, `kv14_k/v`, `cos_swa/full`,
+  `sin_swa/full`, `mask_swa/full`, `top_k_indices/values`, `proj_act_out`).
+  Drop-in replacement.
+
+### Build the drafter on Mac
+
+```bash
+# 1. Set up env (separate from main venv to keep transformers==5.5.0 pinned).
+python3 -m venv .mtp_venv
+.mtp_venv/bin/pip install "transformers==5.8.0" "torch>=2.5" \
+    safetensors huggingface-hub coremltools
+
+# 2. PyTorch port (~30 sec, downloads ~80 MB BF16 from HF).
+.mtp_venv/bin/python conversion/mtp_drafter_model.py \
+    --output output/mtp_probe/mtp_drafter.pt
+
+# 3. Sanity vs HF reference (~60 sec).
+.mtp_venv/bin/python conversion/test_mtp_parity.py --full-lm-head
+
+# 4. CoreML build (~3 min on Mac Studio M3 Ultra; INT4 palettization adds ~1 min).
+.mtp_venv/bin/python conversion/build_mtp_drafter.py \
+    --hf-repo google/gemma-4-E2B-it-assistant \
+    --output mtp_drafter.mlpackage \
+    --palettize-int4
+```
+
+Drop `mtp_drafter.mlpackage` into the existing Gemma 4 bundle alongside the
+3-chunk stateful files. `CoreMLLLM.swift` already auto-loads it when present.
+
+### Open items (require iPhone or further work)
+
+1. **iPhone empirical bench.** The PR is gated on rolling acceptance ≥ 0.50
+   on the 20-prompt SpecBench corpus. Run `[SpecDbg]` capture for 30 bursts
+   on iPhone 17 Pro vs the 3-chunk stateful baseline (~31 tok/s).
+
+2. **Embedding scale.** The HF drafter's `inputs_embeds` is the
+   target-scaled embedding (`embed_tokens.weight * sqrt(hidden_size)`),
+   but `ChunkedEngine.lookupRawEmbed` returns the unscaled Int8-dequantized
+   row. Pre-existing concern from the LiteRT era — possibly a no-op (the
+   first `pre_projection` Linear can absorb the scale during training) but
+   if iPhone acceptance is very low, this is the first thing to fix.
+
+3. **Step-0 `proj_act` seed.** `MtpSpeculativeEngine.swift` initialises
+   `carryState` to **zeros** on the first burst. The HF training-time
+   convention is to use the **target's L34 hidden** (`lastHiddenAtL34`,
+   already exposed by `ChunkedEngine`). Trivial Swift change if iPhone
+   metrics show first-burst acceptance is low.
+
+4. **RoPE convention drift.** `conversion/generate_rope.py` produces FULL
+   rotation tables for the full-attention layer (theta=1e6, no partial),
+   while the HF drafter was trained with `partial_rotary_factor=0.25`.
+   Since the drafter and target use the same target-side cos/sin tables,
+   K and Q rotate consistently with each other; quality is the only
+   question. Verify on iPhone before re-converting the target.
+
+5. **Sibling drafters.** `google/gemma-4-E4B-it-assistant`,
+   `26B-A4B-it-assistant`, `31B-it-assistant` ship the same architecture
+   family. Once E2B is validated, only `target_hidden`,
+   `sliding_window`, `context_length` need adjusting in
+   `MtpDrafterConfig`.
+
+6. **Centroid (`masked_embedding`) path.** Currently bypassed for full
+   lm_head. If acceptance is materially worse than the HF blog's "up to
+   2×" claim, port `Gemma4AssistantMaskedEmbedder` (top-32 centroid lookup
+   + scatter) into both `mtp_drafter_model.py` and `build_mtp_drafter.py`.

@@ -160,6 +160,19 @@ final class ChunkedEngine {
     var lastHiddenAtL17: MLMultiArray?
     var lastHiddenAtL34: MLMultiArray?
 
+    /// chunk4 `hidden_states_out` from the most recent decode T=1 step
+    /// (post-final-norm). Matches HF's `last_hidden_state` and is what the
+    /// MTP drafter expects as its carry seed on the first burst.
+    var lastDecodeHiddenStateOut: MLMultiArray?
+
+    /// Per-chunk hidden_states_out captures from the most recent decode
+    /// T=1 step. Used by the chunk-by-chunk parity audit vs HF.
+    /// Populated only when `MTP_CHUNK_DUMP` env var is set (so production
+    /// decode skips the extra retain).
+    var lastChunk1Hidden: MLMultiArray?
+    var lastChunk2Hidden: MLMultiArray?
+    var lastChunk3Hidden: MLMultiArray?
+
     /// Most recent token produced by `predictStep`. Used to hand the next
     /// `tTokNext` back to `SpeculativeLoop.drawBurst` after a commit burst.
     private(set) var lastArgmaxAfterDecode: Int = 0
@@ -543,6 +556,13 @@ final class ChunkedEngine {
                 default: break
                 }
                 if idx < chunkWork.count {
+                    // Sequential mode: give the ANE compile daemon a beat
+                    // to clock down before the next chunk's compile burst.
+                    // No-op in parallel mode (cap > 1) where the chunks
+                    // already overlap.
+                    if cap == 1 {
+                        await ThermalThrottle.coolDown(label: "chunk-gap")
+                    }
                     let (nextName, nextCfg) = chunkWork[idx]
                     group.addTask {
                         (nextName, try loadOne(nextName, config: nextCfg))
@@ -840,6 +860,7 @@ final class ChunkedEngine {
         // may load additional models (EAGLE-3 draft/fusion, cross-vocab Qwen,
         // etc.) which can evict this ANE cache — call engine.finalPrewarm()
         // at end of full load to re-warm decode + verify paths.
+        await ThermalThrottle.coolDown(label: "pre-early-prewarm")
         let warmT0 = CFAbsoluteTimeGetCurrent()
         for i in 0..<4 {
             _ = try engine.predictStep(tokenID: 0, position: i)
@@ -903,23 +924,27 @@ final class ChunkedEngine {
     /// Call once from CoreMLLLM.load after everything is loaded.
     public func finalPrewarm() throws {
         let t0 = CFAbsoluteTimeGetCurrent()
+        let lite = ThermalThrottle.lite
         // Warm prefill path first — the N=prefillN batched prefill graph is
         // a separate ANE specialization from decode. Without this, the first
         // user prompt pays a cold-compile hit (~100-300ms) on top of normal
         // prefill latency. 1-token input is enough: the buffer width is
         // still prefillN, so ANE compiles the full-shape path.
-        if hasPrefill {
+        if hasPrefill && !lite {
             _ = try? runPrefill(tokenIDs: [0])
         }
-        // 8 T=1 decode steps (double the early prewarm) so ANE has more
-        // dispatch samples to stabilize.
-        for i in 0..<8 {
+        // 4 T=1 decode steps. Combined with the 4-step early prewarm this
+        // gives ANE 8 total dispatches across the load, which empirically
+        // matches the previous "8 here" count for steady-state without
+        // doubling the load-time ANE peak. Lower with LLM_LOAD_COOL_MS=0
+        // if you need the original back-to-back behaviour.
+        for i in 0..<4 {
             _ = try predictStep(tokenID: 0, position: i)
         }
         // Warm verify path too — verify_qK is a separate compiled graph
         // that predictStep never touches, so first verifyCandidates is
         // otherwise a cold ANE hit (~100ms extra on first spec burst).
-        if hasVerify {
+        if hasVerify && !lite {
             let dummy: [Int32] = Array(repeating: 0, count: verifyK)
             _ = try? verifyCandidates(tokens: dummy, startPosition: 0)
         }
@@ -928,7 +953,7 @@ final class ChunkedEngine {
         // (~63ms vs 36ms steady on iPhone 17 Pro, v0.8.0). Simulate the
         // runtime prefill→decode handoff one extra time to pre-pay that
         // per-configuration setup cost.
-        if hasPrefill {
+        if hasPrefill && !lite {
             _ = try? runPrefill(tokenIDs: [0])
             for i in 1...2 {
                 _ = try? predictStep(tokenID: 0, position: i)
@@ -936,7 +961,8 @@ final class ChunkedEngine {
         }
         reset()
         let dt = CFAbsoluteTimeGetCurrent() - t0
-        print("[Load] Final prewarm (prefill + decode + verify + transition) done in \(String(format: "%.2f", dt))s")
+        let suffix = lite ? " [lite: decode-only]" : ""
+        print("[Load] Final prewarm done in \(String(format: "%.2f", dt))s\(suffix)")
     }
 
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel?, chunk4: MLModel,
@@ -1315,6 +1341,14 @@ final class ChunkedEngine {
             lastHiddenAtL17 = nil
         }
 
+        // Per-chunk parity audit: capture chunk1/2/3 hidden_states_out so
+        // we can A/B against HF target's per-layer hidden states.
+        if ProcessInfo.processInfo.environment["MTP_CHUNK_DUMP"] != nil {
+            lastChunk1Hidden = h1
+            lastChunk2Hidden = h2
+            lastChunk3Hidden = h3
+        }
+
         // Chunk 4
         let tC4Start = CFAbsoluteTimeGetCurrent()
         var d4 = shared; d4["hidden_states"] = MLFeatureValue(multiArray: h3)
@@ -1323,6 +1357,10 @@ final class ChunkedEngine {
         let out4 = try chunk4.prediction(from: in4)
         // EAGLE-3 hidden tap (present only in EAGLE-3 decode chunks).
         lastHiddenAtL34 = out4.featureValue(for: "hidden_at_L34")?.multiArrayValue
+        // Post-final-norm hidden — present on every decode chunk4 and used
+        // by the MTP drafter as its first-burst carry seed (HF
+        // `last_hidden_state` semantics).
+        lastDecodeHiddenStateOut = out4.featureValue(for: "hidden_states_out")?.multiArrayValue
         let tC4End = CFAbsoluteTimeGetCurrent()
         profileANEWait += (tC4End - tC4Wait0)
         profileC4 += (tC4End - tC4Start)

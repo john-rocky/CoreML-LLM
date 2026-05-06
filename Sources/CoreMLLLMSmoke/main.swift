@@ -9,6 +9,7 @@
 //     decode must still work when no cross-vocab / MTP drafter is present.
 //   * Emit tok/s so we can see whether the decode path is healthy.
 
+import CoreML
 import CoreMLLLM
 import Foundation
 
@@ -35,20 +36,29 @@ struct Smoke {
             !target.hasPrefix("/") && !target.hasPrefix("./") && !target.hasPrefix("../")
             && !FileManager.default.fileExists(atPath: target)
 
+        // Allow forcing target compute unit via SMOKE_TARGET_DEVICE env.
+        let smokeUnits: MLComputeUnits
+        switch ProcessInfo.processInfo.environment["SMOKE_TARGET_DEVICE"] {
+        case "cpu":      smokeUnits = .cpuOnly
+        case "gpu":      smokeUnits = .cpuAndGPU
+        case "ane":      smokeUnits = .cpuAndNeuralEngine
+        case "all":      smokeUnits = .all
+        default:         smokeUnits = .cpuAndNeuralEngine
+        }
+
         do {
             let t0 = CFAbsoluteTimeGetCurrent()
             let llm: CoreMLLLM
+            let onProgress: (String) -> Void = { print("[load] \($0)") }
             if looksLikeRepo {
-                print("[smoke] loading via repo: \(target)")
-                llm = try await CoreMLLLM.load(repo: target) { msg in
-                    print("[load] \(msg)")
-                }
+                print("[smoke] loading via repo: \(target)  device=\(smokeUnits)")
+                llm = try await CoreMLLLM.load(
+                    repo: target, computeUnits: smokeUnits, onProgress: onProgress)
             } else {
                 let modelDir = URL(fileURLWithPath: target)
-                print("[smoke] loading model from: \(modelDir.path)")
-                llm = try await CoreMLLLM.load(from: modelDir) { msg in
-                    print("[load] \(msg)")
-                }
+                print("[smoke] loading model from: \(modelDir.path)  device=\(smokeUnits)")
+                llm = try await CoreMLLLM.load(
+                    from: modelDir, computeUnits: smokeUnits, onProgress: onProgress)
             }
             let dt = CFAbsoluteTimeGetCurrent() - t0
             print("[smoke] loaded in \(String(format: "%.1f", dt))s — model=\(llm.modelName)")
