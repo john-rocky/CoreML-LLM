@@ -50,11 +50,28 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 
 class MtpDrafterConfig:
+    """Default = E2B drafter geometry. Use `MtpDrafterConfig.e4b()` for E4B.
+
+    The two variants differ only in `target_hidden` (E2B: 1536, E4B: 2560);
+    everything else (drafter internal hidden=256, 4 layers, num_centroids,
+    centroid top-k, vocab) is identical between the two official drafters.
+    """
     hidden_size: int = 256          # internal dim
     input_size: int = 3072          # 2 × target hidden (1536)
     target_hidden: int = 1536       # target model hidden_size
     num_layers: int = 4
     layer_types = ("sliding_attention",) * 3 + ("full_attention",)
+
+    @classmethod
+    def for_target(cls, target_hidden: int) -> "MtpDrafterConfig":
+        cfg = cls()
+        cfg.target_hidden = target_hidden
+        cfg.input_size = 2 * target_hidden
+        return cfg
+
+    @classmethod
+    def e4b(cls) -> "MtpDrafterConfig":
+        return cls.for_target(2560)
 
     # SWA layers (0-2)
     swa_num_heads: int = 4

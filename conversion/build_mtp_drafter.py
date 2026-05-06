@@ -373,9 +373,14 @@ def main():
                          "top-K). Drafter network was trained against this "
                          "restricted vocab; full lm_head argmax can give "
                          "untrained top-1 tokens.")
+    ap.add_argument("--target", choices=["e2b", "e4b"], default="e2b",
+                    help="Target backbone variant. e2b=hidden 1536 (default), "
+                         "e4b=hidden 2560. Drafter geometry is otherwise "
+                         "identical between the two official assistants.")
     args = ap.parse_args()
 
-    cfg = MtpDrafterConfig()
+    cfg = (MtpDrafterConfig.e4b() if args.target == "e4b"
+           else MtpDrafterConfig())
     cfg.centroid_lm_head = args.centroid_lm_head
     W = args.sliding_window
     C = args.context_length
