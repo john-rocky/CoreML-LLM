@@ -309,11 +309,22 @@ final class LLMRunner {
         // PLD union instead so the verify path is actually exercised. Without
         // this, the default mtpEnabled=true silently falls through to no-spec
         // when the MTP drafter mlmodel is incompatible with the engine config.
-        if ProcessInfo.processInfo.environment["SPECULATIVE_PROFILE"] != nil {
+        //
+        // 2026-05-07: with the centroid MTP drafter shipping (`--centroid-lm-head`
+        // build) the MTP path now works on iPhone. Set MTP_FORCE=1 to keep MTP
+        // enabled instead of falling through to the union path.
+        let mtpForce = ProcessInfo.processInfo.environment["MTP_FORCE"] == "1"
+        if ProcessInfo.processInfo.environment["SPECULATIVE_PROFILE"] != nil
+           && !mtpForce {
             llm!.mtpEnabled = false
             llm!.drafterUnionEnabled = true
             llm!.crossVocabEnabled = true
             print("[LLMRunner] SPECULATIVE_PROFILE=1 — mtp=off union=on cv=on")
+        } else if mtpForce {
+            llm!.mtpEnabled = true
+            llm!.drafterUnionEnabled = false
+            llm!.crossVocabEnabled = false
+            print("[LLMRunner] MTP_FORCE=1 — mtp=on (centroid drafter path)")
         }
 
         // 11c iPhone diagnostic: SPEC_OFF=1 disables ALL speculative paths so
