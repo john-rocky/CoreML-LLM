@@ -63,15 +63,20 @@ class MtpDrafterConfig:
     layer_types = ("sliding_attention",) * 3 + ("full_attention",)
 
     @classmethod
-    def for_target(cls, target_hidden: int) -> "MtpDrafterConfig":
+    def for_target(cls, target_hidden: int, num_kv_heads: int = 1) -> "MtpDrafterConfig":
         cfg = cls()
         cfg.target_hidden = target_hidden
         cfg.input_size = 2 * target_hidden
+        cfg.num_kv_heads = num_kv_heads
         return cfg
 
     @classmethod
     def e4b(cls) -> "MtpDrafterConfig":
-        return cls.for_target(2560)
+        # E4B-it-assistant has num_key_value_heads=2 (GQA n_rep=2 vs Q heads=4).
+        return cls.for_target(2560, num_kv_heads=2)
+
+    # Default for E2B: num_kv_heads=1 (no GQA on drafter side).
+    num_kv_heads: int = 1
 
     # SWA layers (0-2)
     swa_num_heads: int = 4

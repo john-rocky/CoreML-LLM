@@ -223,6 +223,46 @@ assert max(out["top_k_indices"]) > 1024  # not stuck in fp16-quantised range
 * **Drafter on ANE vs GPU**: the cluster path's gather + scatter ops may
   force GPU fallback. ANE-only drafter would be even faster.
 
+## E4B variant
+
+`google/gemma-4-E4B-it-assistant` differs from E2B-it-assistant in only two
+config fields:
+
+* `backbone_hidden_size`: 1536 → 2560 (target hidden)
+* `num_key_value_heads`: 1 → 2 (drafter GQA, n_rep=2 vs Q heads=4)
+
+Use `--target e4b` to build:
+
+```bash
+~/.pyenv/versions/lama-cml/bin/python conversion/build_mtp_drafter.py \
+  --hf-repo google/gemma-4-E4B-it-assistant \
+  --output /tmp/mtp_drafter_centroid_e4b.mlpackage \
+  --sliding-window 512 --context-length 2048 \
+  --centroid-lm-head --target e4b
+```
+
+`MtpDrafterConfig.e4b()` sets `target_hidden=2560` + `num_kv_heads=2`.
+`MtpLayerANE` repeat-interleaves K/V along the head dim when
+`n_rep > 1` so the same builder handles both variants. Swift-side
+`MtpSpeculativeEngine.transposeLastTwoDims` was generalised from
+shape-`(1,1,A,B)` to multi-head `(1,H,A,B)` for the V-cache pre-transpose.
+
+### E4B Mac bench (K=3, K_USE=2, ANE, constpm1)
+
+| Content | base tok/s | centroid tok/s | speedup | per-slot accept |
+|---|---|---|---|---|
+| Repetitive ("yes" × 30) | 15.5 | **35.6** | **2.30×** | 0.67 |
+| Fibonacci recursion | 15.5 | 14.3 | 0.92× | 0.07 |
+| Translation list | 15.6 | 13.7 | 0.87× | 0.05 |
+
+**E4B MTP is content-dependent in a sharper way than E2B.** Baseline is
+slow (15 tok/s vs E2B's 33), so drafter+verify overhead matters more —
+chat code with 0.05-0.07 per-slot accept gives a net regression. Repeat
+content stays a clear win at 2.30×.
+
+The vendor's 2.11× on Fibonacci therefore can't be reproduced with INT4
+target on either E2B or E4B; their demo likely runs bf16 weights.
+
 ## What was tried but didn't help (negative results)
 
 * **AWQ-style activation-aware smoothing on target**: net-neutral (+/- noise).

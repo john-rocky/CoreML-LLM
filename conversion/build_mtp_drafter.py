@@ -106,14 +106,18 @@ class MtpDrafterANE(nn.Module):
         self.in_e = nn.Conv2d(TH, H, 1, bias=False, dtype=MODEL_DTYPE)
         self.in_p = nn.Conv2d(TH, H, 1, bias=False, dtype=MODEL_DTYPE)
 
+        num_kv = getattr(cfg, "num_kv_heads", 1)
         self.layers = nn.ModuleList()
         for i in range(cfg.num_layers):
             if cfg.layer_types[i] == "sliding_attention":
                 self.layers.append(
-                    MtpLayerANE(H, cfg.swa_num_heads, cfg.swa_head_dim, FFN, eps))
+                    MtpLayerANE(H, cfg.swa_num_heads, cfg.swa_head_dim,
+                                FFN, eps, num_kv=num_kv))
             else:
                 self.layers.append(
-                    MtpLayerANE(H, cfg.full_num_heads, cfg.full_head_dim, FFN, eps))
+                    MtpLayerANE(H, cfg.full_num_heads, cfg.full_head_dim,
+                                FFN, eps, num_kv=num_kv))
+        self.num_kv = num_kv
 
         self.final_norm = ANERMSNorm(H, eps)
         # post_projection: hidden(256) -> target_hidden(1536) for next step.
@@ -205,12 +209,21 @@ class MtpDrafterANE(nn.Module):
 
 
 class MtpLayerANE(nn.Module):
-    """Drafter layer with sandwich norms + per-layer scalar (Gemma 4 spec)."""
+    """Drafter layer with sandwich norms + per-layer scalar (Gemma 4 spec).
 
-    def __init__(self, H: int, nh: int, hd: int, ffn: int, eps: float):
+    `num_kv` is the number of KV heads in the target's shared cache. When
+    `num_kv == nh` no GQA expansion is needed; otherwise the K/V from the
+    target's cache is repeat_interleave'd to match Q's head count
+    (n_rep = nh // num_kv).
+    """
+
+    def __init__(self, H: int, nh: int, hd: int, ffn: int, eps: float,
+                 num_kv: int = 1):
         super().__init__()
         self.nh = nh
         self.hd = hd
+        self.num_kv = num_kv
+        self.n_rep = nh // num_kv
 
         self.input_layernorm = ANERMSNorm(H, eps)
         self.post_attention_layernorm = ANERMSNorm(H, eps)
@@ -258,14 +271,22 @@ class MtpLayerANE(nn.Module):
         q = (q * cos_full) + (rot * sin_full)
         q = q.to(MODEL_DTYPE)
 
-        # Q @ K^T:  Q (1,nh,1,hd) @ K^T (1,1,hd,ctx) → (1,nh,1,ctx).
-        k_t = kv_k.transpose(-2, -1).to(MODEL_DTYPE)
+        # GQA: K/V come in as (1, num_kv, ctx, hd). Repeat to match Q head count.
+        if self.n_rep > 1:
+            kv_k_eff = kv_k.repeat_interleave(self.n_rep, dim=1)  # (1, nh, ctx, hd)
+            kv_v_eff = kv_v.repeat_interleave(self.n_rep, dim=1)  # (1, nh, hd, ctx)
+        else:
+            kv_k_eff = kv_k
+            kv_v_eff = kv_v
+
+        # Q @ K^T:  Q (1,nh,1,hd) @ K^T (1,nh,hd,ctx) → (1,nh,1,ctx).
+        k_t = kv_k_eff.transpose(-2, -1).to(MODEL_DTYPE)
         attn = torch.matmul(q.float(), k_t.float())
         attn = attn + mask.float()
         attn = F.softmax(attn, dim=-1).to(MODEL_DTYPE)
 
-        # Attn @ V^T: V is stored (1,1,hd,ctx); V^T (1,1,ctx,hd).
-        v_t = kv_v.transpose(-2, -1).to(MODEL_DTYPE)
+        # Attn @ V^T: V is stored (1,nh,hd,ctx); V^T (1,nh,ctx,hd).
+        v_t = kv_v_eff.transpose(-2, -1).to(MODEL_DTYPE)
         out = torch.matmul(attn.float(), v_t.float()).to(MODEL_DTYPE)  # (1,nh,1,hd)
 
         out_nchw = out.reshape(1, self.nh * self.hd, 1, 1)
@@ -409,14 +430,15 @@ def main():
     load_ane_weights(ane, ref)
 
     # 3. Smoke forward.
-    print("\nForward smoke (zeros) ...")
+    nkv = getattr(cfg, "num_kv_heads", 1)
+    print(f"\nForward smoke (zeros) ... num_kv_heads={nkv}")
     with torch.no_grad():
         embed = torch.zeros(1, 1, TH, dtype=MODEL_DTYPE)
         proj = torch.zeros(1, 1, TH, dtype=MODEL_DTYPE)
-        kv13_k = torch.zeros(1, 1, W, cfg.swa_head_dim, dtype=MODEL_DTYPE)
-        kv13_v = torch.zeros(1, 1, cfg.swa_head_dim, W, dtype=MODEL_DTYPE)
-        kv14_k = torch.zeros(1, 1, C, cfg.full_head_dim, dtype=MODEL_DTYPE)
-        kv14_v = torch.zeros(1, 1, cfg.full_head_dim, C, dtype=MODEL_DTYPE)
+        kv13_k = torch.zeros(1, nkv, W, cfg.swa_head_dim, dtype=MODEL_DTYPE)
+        kv13_v = torch.zeros(1, nkv, cfg.swa_head_dim, W, dtype=MODEL_DTYPE)
+        kv14_k = torch.zeros(1, nkv, C, cfg.full_head_dim, dtype=MODEL_DTYPE)
+        kv14_v = torch.zeros(1, nkv, cfg.full_head_dim, C, dtype=MODEL_DTYPE)
         # Caller passes only the first half of the mirror-duplicated cos/sin.
         cos_s = torch.ones(1, cfg.swa_head_dim // 2, dtype=MODEL_DTYPE)
         sin_s = torch.zeros(1, cfg.swa_head_dim // 2, dtype=MODEL_DTYPE)
@@ -445,10 +467,10 @@ def main():
         inputs=[
             ct.TensorType(name="embed_token", shape=(1, 1, TH), dtype=fp16),
             ct.TensorType(name="proj_act",    shape=(1, 1, TH), dtype=fp16),
-            ct.TensorType(name="kv13_k",      shape=(1, 1, W, cfg.swa_head_dim), dtype=fp16),
-            ct.TensorType(name="kv13_v",      shape=(1, 1, cfg.swa_head_dim, W), dtype=fp16),
-            ct.TensorType(name="kv14_k",      shape=(1, 1, C, cfg.full_head_dim), dtype=fp16),
-            ct.TensorType(name="kv14_v",      shape=(1, 1, cfg.full_head_dim, C), dtype=fp16),
+            ct.TensorType(name="kv13_k",      shape=(1, nkv, W, cfg.swa_head_dim), dtype=fp16),
+            ct.TensorType(name="kv13_v",      shape=(1, nkv, cfg.swa_head_dim, W), dtype=fp16),
+            ct.TensorType(name="kv14_k",      shape=(1, nkv, C, cfg.full_head_dim), dtype=fp16),
+            ct.TensorType(name="kv14_v",      shape=(1, nkv, cfg.full_head_dim, C), dtype=fp16),
             ct.TensorType(name="cos_swa",     shape=(1, cfg.swa_head_dim // 2), dtype=fp16),
             ct.TensorType(name="sin_swa",     shape=(1, cfg.swa_head_dim // 2), dtype=fp16),
             ct.TensorType(name="cos_full",    shape=(1, cfg.full_head_dim // 2), dtype=fp16),

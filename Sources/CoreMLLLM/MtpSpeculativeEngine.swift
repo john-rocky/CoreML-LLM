@@ -370,25 +370,36 @@ public final class MtpSpeculativeEngine {
         return result
     }
 
-    /// Transpose the last two dimensions of a rank-4 MLMultiArray [1, 1, A, B] → [1, 1, B, A].
-    /// Used for V caches: ChunkedEngine stores V as (1, 1, seq, hd) but the
-    /// MTP drafter expects (1, 1, hd, seq) (Google TFLite pre-transposed layout).
+    /// Transpose the last two dimensions of a rank-4 MLMultiArray
+    /// [1, H, A, B] → [1, H, B, A]. Used for V caches: ChunkedEngine stores V
+    /// as (1, num_kv_heads, seq, hd) but the MTP drafter expects
+    /// (1, num_kv_heads, hd, seq) (Google TFLite pre-transposed layout).
+    /// Supports multi-head (E4B target = 2 KV heads).
     static func transposeLastTwoDims(_ a: MLMultiArray) throws -> MLMultiArray {
         let shape = a.shape.map { $0.intValue }
-        guard shape.count == 4, shape[0] == 1, shape[1] == 1 else {
+        guard shape.count == 4, shape[0] == 1 else {
             throw SpeculativeError.verifyFailed(
                 "transposeLastTwoDims: unexpected shape \(a.shape)")
         }
+        let H = shape[1]
         let A = shape[2]
         let B = shape[3]
         let out = try MLMultiArray(
-            shape: [1, 1, NSNumber(value: B), NSNumber(value: A)], dataType: .float16)
-        let src = a.dataPointer.bindMemory(to: UInt16.self, capacity: A * B)
-        let dst = out.dataPointer.bindMemory(to: UInt16.self, capacity: A * B)
-        // src layout: src[i, j] = src[i*B + j], want dst[j, i] = dst[j*A + i]
-        for i in 0..<A {
-            for j in 0..<B {
-                dst[j * A + i] = src[i * B + j]
+            shape: [1, NSNumber(value: H),
+                    NSNumber(value: B), NSNumber(value: A)],
+            dataType: .float16)
+        let src = a.dataPointer.bindMemory(to: UInt16.self, capacity: H * A * B)
+        let dst = out.dataPointer.bindMemory(to: UInt16.self, capacity: H * A * B)
+        // src layout: src[h, i, j] = src[h*A*B + i*B + j]
+        // dst layout: dst[h, j, i] = dst[h*B*A + j*A + i]
+        for h in 0..<H {
+            let srcBase = h * A * B
+            let dstBase = h * B * A
+            for i in 0..<A {
+                let srcRow = srcBase + i * B
+                for j in 0..<B {
+                    dst[dstBase + j * A + i] = src[srcRow + j]
+                }
             }
         }
         return out
