@@ -308,6 +308,13 @@ public final class MtpSpeculativeEngine {
         totalAccepted += matchCount
         totalEmitted += emitted.count
 
+        // Drive the drafter's rolling-acceptance EMA so `shouldSpeculate`
+        // can fall back to baseline decode when the per-burst accept
+        // drops below `fallbackThreshold`. Without this update the rate
+        // sits at the initial 1.0 forever — MTP keeps running even when
+        // it's actively hurting tok/s (iPhone ANE 18 numerics issue).
+        drafter.recordBurst(matched: matchCount, K_USE: max(1, compareLen))
+
         SpecProfile.logBurst(
             engine: "mtp", cycle: totalRounds,
             draftMs: draftMs, verifyMs: verifyMs, commitMs: 0,

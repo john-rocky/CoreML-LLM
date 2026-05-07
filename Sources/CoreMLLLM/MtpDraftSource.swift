@@ -27,10 +27,27 @@ public final class MtpDraftSource {
     /// Number of draft tokens per burst.
     public let K: Int
 
-    /// Rolling acceptance rate for adaptive fallback.
+    /// Rolling acceptance rate for adaptive fallback. Bumped from initial
+    /// 1.0 by `recordBurst` after each MTP cycle. EMA with alpha=0.10 →
+    /// half-life ~7 rounds, so a stretch of low accept drives the rate
+    /// below `fallbackThreshold` quickly.
     private(set) public var rollingAcceptance: Double = 1.0
-    private let rollingAlpha: Double = 0.05
-    public var fallbackThreshold: Double = 0.30
+    private let rollingAlpha: Double = 0.10
+    /// Default 0.40 = "give MTP a fair shake but bail if accept drops".
+    /// Tuned so iPhone E2B that pulls 0.20-0.30 falls back to baseline
+    /// (which is faster than MTP at that accept), Mac which sustains
+    /// 0.40+ stays in MTP path.
+    public var fallbackThreshold: Double = 0.40
+
+    /// External update hook for engines that drive their own
+    /// draft/verify loop (MtpSpeculativeEngine). They compute matchCount
+    /// per round and call this so `shouldSpeculate` can fall back to
+    /// non-speculative decode when accept collapses on a given device.
+    public func recordBurst(matched: Int, K_USE: Int) {
+        guard K_USE > 0 else { return }
+        let rate = Double(matched) / Double(K_USE)
+        rollingAcceptance = rollingAlpha * rate + (1 - rollingAlpha) * rollingAcceptance
+    }
 
     // MARK: - Init
 
