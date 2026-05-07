@@ -2697,9 +2697,27 @@ extension ChunkedEngine: SpeculativeTarget {
         //     - else (correction, or beyond the verify range), run a T=1 predictStep
         //       to compute and write its K/V.
         //   Then advance currentPosition by tokens.count.
+        //
+        // MTP_PREDICTSTEP_COMMIT=1 (diagnostic): bypass commitKVSlices entirely
+        // and re-run T=1 predictStep for EVERY accepted token. The K/V written
+        // this way matches the no-MTP decode path bit-for-bit, so any
+        // numerical drift introduced by the verify chunk's T=K batched math
+        // is eliminated. Slower per cycle (each accept = +30 ms decode on
+        // iPhone) but tells us whether iPhone ANE 18's verify-side K cache
+        // is the cause of the alternation pattern.
+        let bypassVerifyCommit = ProcessInfo.processInfo
+            .environment["MTP_PREDICTSTEP_COMMIT"] == "1"
         let N = tokens.count
         if N == 0 { return }
         let P = currentPosition
+
+        if bypassVerifyCommit {
+            for t in 0..<N {
+                _ = try predictStep(tokenID: Int(tokens[t]), position: P + t)
+            }
+            currentPosition = P + N
+            return
+        }
 
         let inputs = lastVerifyInputTokens
         let K = inputs.count
