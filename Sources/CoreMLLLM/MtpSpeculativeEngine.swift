@@ -332,13 +332,18 @@ public final class MtpSpeculativeEngine {
         drafter.shouldSpeculate
     }
 
-    /// Reset state for new conversation.
+    /// Reset state for new conversation. Also reseeds the drafter's
+    /// rolling acceptance so a previous prompt's bad-content fallback
+    /// doesn't stick (different prompts have different accept rates;
+    /// each gets ~3-5 rounds to prove it can sustain MTP before the
+    /// EMA bails again).
     func reset() {
         carryState = nil
         isBootstrapped = false
         totalRounds = 0
         totalAccepted = 0
         totalEmitted = 0
+        drafter.resetRollingAcceptance()
         // Reset adaptive K to the starting value (MTP_K_USE override or 2).
         let envKUseStr = ProcessInfo.processInfo.environment["MTP_K_USE"]
         if let s = envKUseStr, let v = Int(s), v > 0 {

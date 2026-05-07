@@ -55,6 +55,13 @@ public final class MtpDraftSource {
         rollingAcceptance = rollingAlpha * rate + (1 - rollingAlpha) * rollingAcceptance
     }
 
+    /// Reset the rolling acceptance EMA back to the init value so a new
+    /// conversation/prompt can earn its way back into the MTP path even
+    /// if the previous prompt collapsed accept rate to zero.
+    public func resetRollingAcceptance() {
+        rollingAcceptance = 0.55
+    }
+
     // MARK: - Init
 
     public init(
