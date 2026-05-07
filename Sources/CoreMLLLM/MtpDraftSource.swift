@@ -41,8 +41,9 @@ public final class MtpDraftSource {
     /// decode" break-even point on Mac/iPhone INT4 chunks: cycle ≈ 45 ms,
     /// emit per cycle = 1 + K_USE * accept; baseline ≈ 32 ms / 1 emit.
     /// MTP wins when (1 + 2 * accept) / 45 > 1 / 32 → accept > 0.20.
-    /// We bail at 0.40 so a noisy burst doesn't keep us in a losing path.
-    public var fallbackThreshold: Double = 0.40
+    /// 0.35 gives margin: alternating 0/2-2/2 pattern stable at 0.5 stays
+    /// in MTP comfortably; iPhone messy 0.30 average bails consistently.
+    public var fallbackThreshold: Double = 0.35
 
     /// External update hook for engines that drive their own
     /// draft/verify loop (MtpSpeculativeEngine). They compute matchCount
