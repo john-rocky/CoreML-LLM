@@ -27,16 +27,21 @@ public final class MtpDraftSource {
     /// Number of draft tokens per burst.
     public let K: Int
 
-    /// Rolling acceptance rate for adaptive fallback. Bumped from initial
-    /// 1.0 by `recordBurst` after each MTP cycle. EMA with alpha=0.10 →
-    /// half-life ~7 rounds, so a stretch of low accept drives the rate
-    /// below `fallbackThreshold` quickly.
-    private(set) public var rollingAcceptance: Double = 1.0
-    private let rollingAlpha: Double = 0.10
-    /// Default 0.40 = "give MTP a fair shake but bail if accept drops".
-    /// Tuned so iPhone E2B that pulls 0.20-0.30 falls back to baseline
-    /// (which is faster than MTP at that accept), Mac which sustains
-    /// 0.40+ stays in MTP path.
+    /// Rolling acceptance rate for adaptive fallback. Initialised at the
+    /// fallback threshold + small margin so the very first miss-streak
+    /// fires fallback within ~3-5 rounds (instead of 17 when starting
+    /// from 1.0). EMA alpha=0.20 — half-life ~3 rounds:
+    ///   * Two consecutive 0/2 rounds from 0.55 → drops to 0.354 (bail).
+    ///   * Strict 0/2-2/2 alternation stabilises around 0.50 (stay in MTP).
+    /// This gives MTP a fair shot when accept rate is high while bailing
+    /// fast on iPhone-style patterns where most rounds are 0/2.
+    private(set) public var rollingAcceptance: Double = 0.55
+    private let rollingAlpha: Double = 0.20
+    /// Threshold tuned around the "MTP cycle is slower than baseline
+    /// decode" break-even point on Mac/iPhone INT4 chunks: cycle ≈ 45 ms,
+    /// emit per cycle = 1 + K_USE * accept; baseline ≈ 32 ms / 1 emit.
+    /// MTP wins when (1 + 2 * accept) / 45 > 1 / 32 → accept > 0.20.
+    /// We bail at 0.40 so a noisy burst doesn't keep us in a losing path.
     public var fallbackThreshold: Double = 0.40
 
     /// External update hook for engines that drive their own
