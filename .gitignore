@@ -45,3 +45,4 @@ output/
 Examples/CoreMLLLMChat/gemma4-e2b/
 .claude/
 *.mlpkg
+Examples/CoreMLLLMChat/CoreMLLLMChat/Resources/qwen3-vl-2b-fashion/

@@ -22,6 +22,7 @@
 		'F1000004' = {isa = PBXBuildFile; fileRef = F2000004; };
 		'F1000005' = {isa = PBXBuildFile; fileRef = F2000005; };
 		'F1000006' = {isa = PBXBuildFile; fileRef = F2000006; };
+		'F1000010' = {isa = PBXBuildFile; fileRef = F2000010; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -40,6 +41,7 @@
 		'F2000004' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainView.swift; sourceTree = "<group>"; };
 		'F2000005' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnalyzingView.swift; sourceTree = "<group>"; };
 		'F2000006' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultView.swift; sourceTree = "<group>"; };
+		'F2000010' = {isa = PBXFileReference; lastKnownFileType = folder; name = "qwen3-vl-2b-fashion"; path = "Resources/qwen3-vl-2b-fashion"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -80,6 +82,7 @@
 				B2000004,
 				B2000009,
 				B2000007,
+				F2000010,
 			);
 			path = CoreMLLLMChat;
 			sourceTree = "<group>";
@@ -154,6 +157,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B1000007,
+				F1000010,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
