@@ -1100,11 +1100,20 @@ final class Qwen3VL2BStatefulGenerator {
 
     // MARK: - Generate
 
+    /// Generate up to `maxNewTokens` after `inputIds`. Decode is greedy
+    /// (chunk_head bakes argmax into the CoreML graph). When
+    /// `tokenTransform` is supplied, every model-emitted token is
+    /// passed through it before being appended / streamed / fed back
+    /// into the next step. Use this to apply a schema constraint (the
+    /// returned token, not the model's argmax, is what advances KV
+    /// state on the next step). The `onToken` callback observes the
+    /// transformed tokens.
     func generate(inputIds: [Int32], maxNewTokens: Int = 64,
                   eosTokenIds: Set<Int32> = [],
                   visionFeatures: Qwen3VL2BVisionFeatures? = nil,
                   imagePadTokenId: Int32 = 151655,
                   gridH: Int = 14, gridW: Int = 14,
+                  tokenTransform: ((Int32) -> Int32)? = nil,
                   onToken: ((Int32) -> Void)? = nil) async throws -> [Int32] {
         guard !bodyChunks.isEmpty, headChunk != nil else {
             throw NSError(domain: "Qwen3VL2BStateful", code: 60,
@@ -1312,13 +1321,20 @@ final class Qwen3VL2BStatefulGenerator {
         }
 
         // Decode — the prefill's last step already produced the first
-        // decode token (prefillPredicted). Emit it, then continue looping.
+        // decode token (prefillPredicted). Emit it, then continue
+        // looping. When `tokenTransform` is set, every model argmax
+        // (prefillPredicted + each `next`) is passed through it before
+        // append / stream / feed-back. The transformed token is what
+        // KV state advances on, so a constraint that substitutes a
+        // structural token correctly carries through the rest of the
+        // generation.
         let decodeStart = CFAbsoluteTimeGetCurrent()
         var decoded: [Int32] = []
         if maxNewTokens > 0 {
-            decoded.append(prefillPredicted)
-            onToken?(prefillPredicted)
-            lastToken = prefillPredicted
+            let firstEmit = tokenTransform?(prefillPredicted) ?? prefillPredicted
+            decoded.append(firstEmit)
+            onToken?(firstEmit)
+            lastToken = firstEmit
         }
         while decoded.count < maxNewTokens {
             if eosTokenIds.contains(lastToken) { break }
@@ -1326,9 +1342,10 @@ final class Qwen3VL2BStatefulGenerator {
             let next = try await stepPredict(
                 token: lastToken, position: position,
                 states: states, collectTimings: true)
-            decoded.append(next)
-            onToken?(next)
-            lastToken = next
+            let emit = tokenTransform?(next) ?? next
+            decoded.append(emit)
+            onToken?(emit)
+            lastToken = emit
             position += 1
         }
         let t1 = CFAbsoluteTimeGetCurrent()

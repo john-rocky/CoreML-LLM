@@ -7,55 +7,39 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		32404BC1AC91219654BB4034 /* Qwen35GeneratorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */; };
-		370C4C3589D85D9148AED4C9 /* Qwen35BenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8714748BF0A5E81B6E3499A /* Qwen35BenchmarkView.swift */; };
 		3D7B40A686C6B3EA9089FC5A /* Qwen35Generator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */; };
 		C1A1B2C3D4E5F6A7B8C9D000 /* Qwen3VL2BGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2A1B2C3D4E5F6A7B8C9D001 /* Qwen3VL2BGenerator.swift */; };
 		C1A1B2C3D4E5F6A7B8C9D002 /* Qwen3VL2BVisionEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2A1B2C3D4E5F6A7B8C9D003 /* Qwen3VL2BVisionEncoder.swift */; };
-		72EA4F4B993C82EAA1F18FF1 /* qwen3_5_oracle_ios.json in Resources */ = {isa = PBXBuildFile; fileRef = 96644CCA8CDD9D651ACBD01D /* qwen3_5_oracle_ios.json */; };
-		79D8443C9596EB593A5FE1EC /* Qwen35DecodeBenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A83A47DE9322C639B9EFD102 /* Qwen35DecodeBenchmarkView.swift */; };
-		'B1000001' = {isa = PBXBuildFile; fileRef = B2000001; };
-		'B1000002' = {isa = PBXBuildFile; fileRef = B2000002; };
 		'B1000003' = {isa = PBXBuildFile; fileRef = B2000003; };
 		'B1000004' = {isa = PBXBuildFile; fileRef = B2000004; };
-		'B1000006' = {isa = PBXBuildFile; fileRef = B2000006; };
 		'B1000007' = {isa = PBXBuildFile; fileRef = B2000007; };
 		'B1000008' = {isa = PBXBuildFile; productRef = B9000001; };
-		'B100000A' = {isa = PBXBuildFile; fileRef = B200000A; };
 		'B1000010' = {isa = PBXBuildFile; productRef = B9000003; };
-		B60E4AB380E7B9E215F1B15E /* Qwen35DecodeBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */; };
-		EF8840D7959C1AB14894FE13 /* Qwen35Benchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = A640406284DC310A703609F0 /* Qwen35Benchmark.swift */; };
-		CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */; };
-		D1E20000000000000000BE01 /* GateZeroBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE02 /* GateZeroBenchmark.swift */; };
-		D1E20000000000000000BE03 /* GateZeroBenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */; };
 		D1E20000000000000000BE05 /* Qwen3VL2BStatefulGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE06 /* Qwen3VL2BStatefulGenerator.swift */; };
-		D1E20000000000000000BE07 /* Qwen3VL2BStatefulGeneratorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE08 /* Qwen3VL2BStatefulGeneratorView.swift */; };
+		'F1000001' = {isa = PBXBuildFile; fileRef = F2000001; };
+		'F1000002' = {isa = PBXBuildFile; fileRef = F2000002; };
+		'F1000003' = {isa = PBXBuildFile; fileRef = F2000003; };
+		'F1000004' = {isa = PBXBuildFile; fileRef = F2000004; };
+		'F1000005' = {isa = PBXBuildFile; fileRef = F2000005; };
+		'F1000006' = {isa = PBXBuildFile; fileRef = F2000006; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35Generator.swift; path = CoreMLLLMChat/Qwen35Generator.swift; sourceTree = SOURCE_ROOT; };
 		C2A1B2C3D4E5F6A7B8C9D001 /* Qwen3VL2BGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen3VL2BGenerator.swift; path = CoreMLLLMChat/Qwen3VL2BGenerator.swift; sourceTree = SOURCE_ROOT; };
 		C2A1B2C3D4E5F6A7B8C9D003 /* Qwen3VL2BVisionEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen3VL2BVisionEncoder.swift; path = CoreMLLLMChat/Qwen3VL2BVisionEncoder.swift; sourceTree = SOURCE_ROOT; };
-		96644CCA8CDD9D651ACBD01D /* qwen3_5_oracle_ios.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; name = qwen3_5_oracle_ios.json; path = CoreMLLLMChat/qwen3_5_oracle_ios.json; sourceTree = SOURCE_ROOT; };
-		A640406284DC310A703609F0 /* Qwen35Benchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35Benchmark.swift; path = CoreMLLLMChat/Qwen35Benchmark.swift; sourceTree = SOURCE_ROOT; };
-		A83A47DE9322C639B9EFD102 /* Qwen35DecodeBenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35DecodeBenchmarkView.swift; path = CoreMLLLMChat/Qwen35DecodeBenchmarkView.swift; sourceTree = SOURCE_ROOT; };
-		AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35GeneratorView.swift; path = CoreMLLLMChat/Qwen35GeneratorView.swift; sourceTree = SOURCE_ROOT; };
-		'B2000001' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreMLLLMChatApp.swift; sourceTree = "<group>"; };
-		'B2000002' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		'B2000003' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessage.swift; sourceTree = "<group>"; };
 		'B2000004' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LLMRunner.swift; sourceTree = "<group>"; };
-		'B2000006' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelPickerView.swift; sourceTree = "<group>"; };
 		'B2000007' = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		'B2000009' = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CoreMLLLMChat.entitlements; sourceTree = "<group>"; };
-		'B200000A' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorder.swift; sourceTree = "<group>"; };
-		'B3000001' = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CoreMLLLMChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35DecodeBenchmark.swift; path = CoreMLLLMChat/Qwen35DecodeBenchmark.swift; sourceTree = SOURCE_ROOT; };
-		F8714748BF0A5E81B6E3499A /* Qwen35BenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35BenchmarkView.swift; path = CoreMLLLMChat/Qwen35BenchmarkView.swift; sourceTree = SOURCE_ROOT; };
-		DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35ChatView.swift; path = CoreMLLLMChat/Qwen35ChatView.swift; sourceTree = SOURCE_ROOT; };
-		D1E20000000000000000BE02 /* GateZeroBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GateZeroBenchmark.swift; path = CoreMLLLMChat/GateZeroBenchmark.swift; sourceTree = SOURCE_ROOT; };
-		D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GateZeroBenchmarkView.swift; path = CoreMLLLMChat/GateZeroBenchmarkView.swift; sourceTree = SOURCE_ROOT; };
+		'B3000001' = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MBFashion.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D1E20000000000000000BE06 /* Qwen3VL2BStatefulGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen3VL2BStatefulGenerator.swift; path = CoreMLLLMChat/Qwen3VL2BStatefulGenerator.swift; sourceTree = SOURCE_ROOT; };
-		D1E20000000000000000BE08 /* Qwen3VL2BStatefulGeneratorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen3VL2BStatefulGeneratorView.swift; path = CoreMLLLMChat/Qwen3VL2BStatefulGeneratorView.swift; sourceTree = SOURCE_ROOT; };
+		'F2000001' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MBFashionApp.swift; sourceTree = "<group>"; };
+		'F2000002' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
+		'F2000003' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeView.swift; sourceTree = "<group>"; };
+		'F2000004' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainView.swift; sourceTree = "<group>"; };
+		'F2000005' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnalyzingView.swift; sourceTree = "<group>"; };
+		'F2000006' = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -76,32 +60,24 @@
 			children = (
 				B5000002,
 				B5000003,
-				96644CCA8CDD9D651ACBD01D /* qwen3_5_oracle_ios.json */,
-				A640406284DC310A703609F0 /* Qwen35Benchmark.swift */,
-				F8714748BF0A5E81B6E3499A /* Qwen35BenchmarkView.swift */,
-				CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */,
-				A83A47DE9322C639B9EFD102 /* Qwen35DecodeBenchmarkView.swift */,
 				4A1D4FF98B69913D28EA1C29 /* Qwen35Generator.swift */,
 				C2A1B2C3D4E5F6A7B8C9D001 /* Qwen3VL2BGenerator.swift */,
 				C2A1B2C3D4E5F6A7B8C9D003 /* Qwen3VL2BVisionEncoder.swift */,
-				AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */,
-				DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */,
-				D1E20000000000000000BE02 /* GateZeroBenchmark.swift */,
-				D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */,
 				D1E20000000000000000BE06 /* Qwen3VL2BStatefulGenerator.swift */,
-				D1E20000000000000000BE08 /* Qwen3VL2BStatefulGeneratorView.swift */,
 			);
 			sourceTree = "<group>";
 		};
 		'B5000002' = {
 			isa = PBXGroup;
 			children = (
-				B2000001,
-				B2000002,
+				F2000001,
+				F2000002,
+				F2000003,
+				F2000004,
+				F2000005,
+				F2000006,
 				B2000003,
 				B2000004,
-				B2000006,
-				B200000A,
 				B2000009,
 				B2000007,
 			);
@@ -131,12 +107,12 @@
 			);
 			dependencies = (
 			);
-			name = CoreMLLLMChat;
+			name = MBFashion;
 			packageProductDependencies = (
 				B9000001,
 				B9000003,
 			);
-			productName = CoreMLLLMChat;
+			productName = MBFashion;
 			productReference = B3000001;
 			productType = "com.apple.product-type.application";
 		};
@@ -178,7 +154,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				B1000007,
-				72EA4F4B993C82EAA1F18FF1 /* qwen3_5_oracle_ios.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -189,25 +164,18 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				B1000001,
-				B1000002,
+				F1000001,
+				F1000002,
+				F1000003,
+				F1000004,
+				F1000005,
+				F1000006,
 				B1000003,
 				B1000004,
-				B1000006,
-				B100000A,
-				EF8840D7959C1AB14894FE13 /* Qwen35Benchmark.swift in Sources */,
-				370C4C3589D85D9148AED4C9 /* Qwen35BenchmarkView.swift in Sources */,
-				B60E4AB380E7B9E215F1B15E /* Qwen35DecodeBenchmark.swift in Sources */,
-				79D8443C9596EB593A5FE1EC /* Qwen35DecodeBenchmarkView.swift in Sources */,
 				3D7B40A686C6B3EA9089FC5A /* Qwen35Generator.swift in Sources */,
 				C1A1B2C3D4E5F6A7B8C9D000 /* Qwen3VL2BGenerator.swift in Sources */,
 				C1A1B2C3D4E5F6A7B8C9D002 /* Qwen3VL2BVisionEncoder.swift in Sources */,
-				32404BC1AC91219654BB4034 /* Qwen35GeneratorView.swift in Sources */,
-				CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */,
-				D1E20000000000000000BE01 /* GateZeroBenchmark.swift in Sources */,
-				D1E20000000000000000BE03 /* GateZeroBenchmarkView.swift in Sources */,
 				D1E20000000000000000BE05 /* Qwen3VL2BStatefulGenerator.swift in Sources */,
-				D1E20000000000000000BE07 /* Qwen3VL2BStatefulGeneratorView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -224,20 +192,21 @@
 				DEVELOPMENT_TEAM = MFN25KNUGJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = CoreMLLLMChat/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "MB Fashion";
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UIFileSharingEnabled = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait";
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.CoreMLLLMChat;
+				PRODUCT_BUNDLE_IDENTIFIER = com.daisuke.MBFashion;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
@@ -255,20 +224,21 @@
 				DEVELOPMENT_TEAM = MFN25KNUGJ;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = CoreMLLLMChat/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "MB Fashion";
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UIFileSharingEnabled = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait";
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.CoreMLLLMChat;
+				PRODUCT_BUNDLE_IDENTIFIER = com.daisuke.MBFashion;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;

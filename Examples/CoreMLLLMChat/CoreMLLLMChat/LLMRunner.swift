@@ -46,6 +46,14 @@ final class LLMRunner {
     // stays on the v1.4.0 generator, text goes through this one.
     private var qwen3vl2bStatefulGenerator: Qwen3VL2BStatefulGenerator?
 
+    /// JSON-schema constraint applied to the fashion FT's structured
+    /// output. Non-nil only when the loaded folder is the fashion
+    /// model (`qwen3-vl-2b-fashion`); other Qwen3-VL variants run
+    /// unconstrained. Lives across generate() calls — reset() is
+    /// called at the start of each one. See JSONSchemaConstraint.swift
+    /// for the state machine + schema definition.
+    private var fashionSchemaConstraint: FashionV3Constraint?
+
     // Gemma 4 E2B stateful path: MLState + slice_update KV. Selected
     // when `gemma4_e2b_stateful_chunks/` is present. Independent of the
     // legacy ChunkedEngine path — runs through Gemma4StatefulEngine
@@ -94,6 +102,7 @@ final class LLMRunner {
             qwen3vl2bStatefulGenerator = nil
             qwen3vl2bTokenizer = nil
             qwen3vl2bVisionEncoder = nil
+            fashionSchemaConstraint = nil
             gemma4StatefulEngine = nil
             gemma4StatefulTokenizer = nil
             cachedVisionImage = nil
@@ -674,6 +683,21 @@ final class LLMRunner {
         qwen3vl2bStatefulGenerator = gen
         qwen3vl2bTokenizer = tok
 
+        // JSON schema constraint: enabled only for the fashion fine-tune,
+        // detected by folder name (download path is fixed). Probing the
+        // tokenizer once at load amortizes the ~150k vocab scan that
+        // builds the quote-containing / number-continuation token sets.
+        // For other Qwen3-VL bundles (base instruct, future variants),
+        // generate() runs unconstrained.
+        if folder.path.contains("qwen3-vl-2b-fashion") {
+            let fashionTokens = FashionTokens.probing(tok)
+            fashionSchemaConstraint = FashionV3Constraint(tokens: fashionTokens)
+            print("[LLMRunner] fashion schema constraint enabled "
+                  + "(folder=\(folder.lastPathComponent))")
+        } else {
+            fashionSchemaConstraint = nil
+        }
+
         // Optional vision: encoder + chunk_0_vision must both be present
         // to enable image input. If either is missing, fall back to
         // text-only.
@@ -781,6 +805,17 @@ final class LLMRunner {
         var eosSet: Set<Int32> = [151643, 151644, 151645]
         if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
 
+        // Reset the fashion schema constraint to its initial state at
+        // the start of each generate() call. The constraint persists
+        // across calls (same loaded model), so without reset the second
+        // image's decode would resume mid-document. Captured below as
+        // a closure for the generator's tokenTransform parameter.
+        fashionSchemaConstraint?.reset()
+        let constraint = fashionSchemaConstraint
+        let tokenTransform: ((Int32) -> Int32)? = constraint.map { c in
+            { argmax in c.nextToken(modelArgmax: argmax) }
+        }
+
         return AsyncStream { continuation in
             Task { [weak self] in
                 defer { Task { @MainActor in self?.isGenerating = false } }
@@ -796,6 +831,7 @@ final class LLMRunner {
                         maxNewTokens: maxNew,
                         eosTokenIds: eosSet,
                         visionFeatures: visionFeatures,
+                        tokenTransform: tokenTransform,
                         onToken: { [weak self] tokenId in
                             tokenCount += 1
                             if eosSet.contains(tokenId) { return }

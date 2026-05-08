@@ -168,7 +168,10 @@ public final class ModelDownloader: NSObject {
         public static let qwen3vl2bFashion = ModelInfo(
             id: "qwen3-vl-2b-fashion", name: "Qwen3-VL 2B Fashion (MB)",
             size: "2.9 GB",
-            downloadURL: "",
+            // HF bundle is uploaded by the user from the v3 fuse + stateful
+            // build; placeholder until that drop lands. Empty `downloadURL`
+            // would force sideload-only, breaking TestFlight UX.
+            downloadURL: "https://huggingface.co/mlboydaisuke/qwen3-vl-2b-fashion-coreml/resolve/main",
             folderName: "qwen3-vl-2b-fashion")
 
         /// Gemma 4 E2B + EAGLE-3 speculative — same 4.6B E2B base but with
