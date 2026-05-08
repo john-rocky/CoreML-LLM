@@ -190,6 +190,32 @@ public final class MtpDraftSource {
         maskSwa: MLMultiArray,
         maskFull: MLMultiArray
     ) throws -> (tokenID: Int32, projActOut: MLMultiArray) {
+        let r = try draftOneFull(
+            embedToken: embedToken, projAct: projAct,
+            kv13K: kv13K, kv13V: kv13V, kv14K: kv14K, kv14V: kv14V,
+            cosSwa: cosSwa, sinSwa: sinSwa, cosFull: cosFull, sinFull: sinFull,
+            maskSwa: maskSwa, maskFull: maskFull)
+        return (r.topKIds[0], r.projActOut)
+    }
+
+    /// Single-step draft that returns the full top-K (id, logit) pairs in
+    /// addition to the carry. Used by the rejection-sampling path so the
+    /// engine can compute drafter probabilities for the sampled token.
+    public func draftOneFull(
+        embedToken: MLMultiArray,
+        projAct: MLMultiArray,
+        kv13K: MLMultiArray,
+        kv13V: MLMultiArray,
+        kv14K: MLMultiArray,
+        kv14V: MLMultiArray,
+        cosSwa: MLMultiArray,
+        sinSwa: MLMultiArray,
+        cosFull: MLMultiArray,
+        sinFull: MLMultiArray,
+        maskSwa: MLMultiArray,
+        maskFull: MLMultiArray
+    ) throws -> (topKIds: [Int32], topKLogits: [Float],
+                 projActOut: MLMultiArray) {
         let input = try MLDictionaryFeatureProvider(dictionary: [
             "embed_token": embedToken,
             "proj_act": projAct,
@@ -206,14 +232,46 @@ public final class MtpDraftSource {
         ])
         let output = try model.prediction(from: input)
         guard let topKIds = output.featureValue(for: "top_k_indices")?.multiArrayValue,
+              let topKValues = output.featureValue(for: "top_k_values")?.multiArrayValue,
               let projActOut = output.featureValue(for: "proj_act_out")?.multiArrayValue
         else {
             throw SpeculativeError.verifyFailed("MTP drafter missing outputs")
         }
-        let tokenId: Int32 = topKIds.dataPointer
-            .bindMemory(to: Int32.self, capacity: 1)
-            .pointee
-        return (tokenId, projActOut)
+        let n = topKIds.count
+        let idsPtr = topKIds.dataPointer.bindMemory(to: Int32.self, capacity: n)
+        let valsPtr = topKValues.dataPointer.bindMemory(to: UInt16.self, capacity: n)
+        var ids = [Int32](repeating: 0, count: n)
+        var logits = [Float](repeating: 0, count: n)
+        for i in 0..<n {
+            ids[i] = idsPtr[i]
+            logits[i] = Float(_floatFromFP16(valsPtr[i]))
+        }
+        return (ids, logits, projActOut)
+    }
+
+    @inline(__always)
+    private func _floatFromFP16(_ bits: UInt16) -> Float {
+        // Standard fp16 → fp32 conversion via bit manipulation.
+        let sign = UInt32(bits & 0x8000) << 16
+        let exp  = UInt32(bits & 0x7C00) >> 10
+        let mant = UInt32(bits & 0x03FF)
+        let result: UInt32
+        if exp == 0 {
+            if mant == 0 { result = sign }
+            else {
+                // subnormal
+                var m = mant
+                var e: UInt32 = 0
+                while (m & 0x0400) == 0 { m <<= 1; e &+= 1 }
+                m &= 0x03FF
+                result = sign | ((127 &- 15 &- e) << 23) | (m << 13)
+            }
+        } else if exp == 0x1F {
+            result = sign | 0x7F800000 | (mant << 13)
+        } else {
+            result = sign | ((exp &+ (127 &- 15)) << 23) | (mant << 13)
+        }
+        return Float(bitPattern: result)
     }
 
     /// Full speculative decode burst: draft → verify → accept.

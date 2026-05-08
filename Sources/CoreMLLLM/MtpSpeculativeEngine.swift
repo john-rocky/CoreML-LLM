@@ -40,6 +40,13 @@ public final class MtpSpeculativeEngine {
     private(set) var totalAccepted = 0
     private(set) var totalEmitted = 0
 
+    /// Sampling temperature for the rejection-sampling MTP path. `0` keeps
+    /// the legacy greedy path (drafter argmax compared to target argmax).
+    /// `> 0` switches to proper speculative-sampling: drafter samples from
+    /// its top-K, target samples from its full vocab via `logits_fp16`,
+    /// acceptance uses the standard min(1, p_t / p_d) rule.
+    public var samplingTemperature: Float = 0.0
+
     /// acc0 = num_accepted / (num_rounds * K)
     var acceptanceRate: Double {
         totalRounds == 0 ? 0 : Double(totalAccepted) / Double(totalRounds * K)
@@ -143,23 +150,50 @@ public final class MtpSpeculativeEngine {
         }
         // The MTP drafter (per build_mtp_drafter.py metadata) expects V
         // transposed as (1, 1, head_dim, seq). ChunkedEngine stores V as
-        // (1, 1, seq, head_dim), so we transpose the last two dims once per cycle.
+        // (1, 1, seq, head_dim). The kv14V mirror is updated incrementally
+        // by ChunkedEngine after every chunk2 invocation, so MTP reads it
+        // for free (was 25 ms full transpose, now 0 ms here).
+        let _trT0 = CFAbsoluteTimeGetCurrent()
         let kv13V = try Self.transposeLastTwoDims(kv13VRaw)
-        let kv14V = try Self.transposeLastTwoDims(kv14VRaw)
+        let _trT1 = CFAbsoluteTimeGetCurrent()
+        // ChunkedEngine maintains a pre-transposed mirror of kv14V that is
+        // updated incrementally in chunk2 hooks, so the per-round 21 ms
+        // full transpose is replaced by a pointer read.
+        let kv14V: MLMultiArray
+        if let kv14VT = engine.lastKV14V_T {
+            kv14V = kv14VT
+        } else {
+            kv14V = try Self.transposeLastTwoDims(kv14VRaw)
+        }
+        let _trT2 = CFAbsoluteTimeGetCurrent()
+        if totalRounds < 5 || totalRounds % 10 == 0 {
+            print(String(format:
+                "[MTP setup] transpose13=%.1fms transpose14=%.1fms",
+                (_trT1 - _trT0) * 1000.0,
+                (_trT2 - _trT1) * 1000.0))
+        }
 
         // Build mask ONCE per cycle at the last committed position.
         // The drafter reads target KV (positions 0..pos-1), so mask allows 0..pos-1.
         // 2026-05-06 diagnostic: HF candidate generator's drafter sees K
         // cache covering ONLY [0..pos-2] (the bootstrap output's K wasn't
         // computed yet in HF's flow, but our predictStep writes it into
-        // KV[pos-1]). Override mask offset via MTP_MASK_OFFSET (default 1
-        // = our existing behaviour, exclude pos itself; try 2 to also
-        // exclude pos-1 = bootstrap K).
+        // KV[pos-1]). Default 1 on both platforms (drafter sees clean K
+        // written by predictStep commit on iOS, by verify slice on Mac).
+        // 2026-05-08: tried offset=2 default on iOS (HF semantics, hide
+        // latest K) — broke accept rate (0.95 → 0.45 alternation) and
+        // corrupted output. Drafter needs the latest K when it's clean.
         let maskOffset = Int(ProcessInfo.processInfo
             .environment["MTP_MASK_OFFSET"] ?? "1") ?? 1
         let maskPos = pos - maskOffset
+        let _mT0 = CFAbsoluteTimeGetCurrent()
         let maskSwa = try engine.makeDrafterSWAMask(position: max(maskPos, 0))
         let maskFull = try engine.makeDrafterFullMask(position: max(maskPos, 0))
+        let _mT1 = CFAbsoluteTimeGetCurrent()
+        if totalRounds < 5 || totalRounds % 10 == 0 {
+            print(String(format: "[MTP setup] masks=%.1fms",
+                (_mT1 - _mT0) * 1000.0))
+        }
 
         // Draft K tokens with per-step RoPE updates.
         // HF gemma4_assistant trains with inputs_embeds = embed_tokens.weight
@@ -288,7 +322,9 @@ public final class MtpSpeculativeEngine {
         // slices. Bumping currentPosition directly leaves the cache stale.
         let committed = matchCount + 1
         let committedTokens = Array(emitted.prefix(committed))
+        let commitT0 = CFAbsoluteTimeGetCurrent()
         try engine.commitAccepted(committedTokens)
+        let commitMs = (CFAbsoluteTimeGetCurrent() - commitT0) * 1000.0
 
         // Extract carry state from verify hidden states.
         // lastVerifyHiddenStates: (1, K, hidden) — matchCount indexes the
@@ -317,7 +353,7 @@ public final class MtpSpeculativeEngine {
 
         SpecProfile.logBurst(
             engine: "mtp", cycle: totalRounds,
-            draftMs: draftMs, verifyMs: verifyMs, commitMs: 0,
+            draftMs: draftMs, verifyMs: verifyMs, commitMs: commitMs,
             accepted: matchCount, compareLen: compareLen,
             emitted: emitted.count, rolling: drafter.rollingAcceptance)
 
@@ -400,17 +436,31 @@ public final class MtpSpeculativeEngine {
             shape: [1, NSNumber(value: H),
                     NSNumber(value: B), NSNumber(value: A)],
             dataType: .float16)
-        let src = a.dataPointer.bindMemory(to: UInt16.self, capacity: H * A * B)
-        let dst = out.dataPointer.bindMemory(to: UInt16.self, capacity: H * A * B)
-        // src layout: src[h, i, j] = src[h*A*B + i*B + j]
-        // dst layout: dst[h, j, i] = dst[h*B*A + j*A + i]
+        let srcBase0 = a.dataPointer.bindMemory(to: UInt16.self, capacity: H * A * B)
+        let dstBase0 = out.dataPointer.bindMemory(to: UInt16.self, capacity: H * A * B)
+        // 64×64 tile (8 KB src + 8 KB dst, both fit L1). Inner loop writes
+        // dst contiguously (stride 1), reads src strided — better than the
+        // reverse since write traffic dominates on iPhone ANE-cohabiting
+        // workloads. Outer i tile parallelised across cores to amortise
+        // the 1M-element kv14V transpose (was 77 ms single-threaded).
+        let TILE = 64
+        let numTilesI = (A + TILE - 1) / TILE
         for h in 0..<H {
             let srcBase = h * A * B
             let dstBase = h * B * A
-            for i in 0..<A {
-                let srcRow = srcBase + i * B
-                for j in 0..<B {
-                    dst[dstBase + j * A + i] = src[srcRow + j]
+            DispatchQueue.concurrentPerform(iterations: numTilesI) { tileIdx in
+                let i0 = tileIdx * TILE
+                let iEnd = min(i0 + TILE, A)
+                var j0 = 0
+                while j0 < B {
+                    let jEnd = min(j0 + TILE, B)
+                    for j in j0..<jEnd {
+                        let dstRow = dstBase + j * A
+                        for i in i0..<iEnd {
+                            dstBase0[dstRow + i] = srcBase0[srcBase + i * B + j]
+                        }
+                    }
+                    j0 += TILE
                 }
             }
         }

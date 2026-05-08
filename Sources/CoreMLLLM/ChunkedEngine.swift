@@ -260,6 +260,13 @@ final class ChunkedEngine {
     private(set) var lastKV13V: MLMultiArray?
     private(set) var lastKV14K: MLMultiArray?
     private(set) var lastKV14V: MLMultiArray?
+    /// Pre-transposed mirror of `lastKV14V` for the MTP drafter (which
+    /// expects V as `(1, H, hd, ctx)` instead of our cache layout
+    /// `(1, H, ctx, hd)`). Updated incrementally — only the new
+    /// columns each chunk2 output advances are copied — so the
+    /// per-MTP-round cost drops from ~25 ms (full transpose of 1 M
+    /// fp16 elements) to <1 ms (a few hundred fp16 elements).
+    private(set) var lastKV14V_T: MLMultiArray?
 
     // 11c write-after-accept: per-T raw K/V slices captured from the last
     // verify call, used by commitAccepted to selectively write only the
@@ -1098,8 +1105,18 @@ final class ChunkedEngine {
     private var lsProbeTotal: Int = 0
     private var lsProbeMatch: Int = 0
 
+    /// Run a T=1 decode step.
+    ///
+    /// `skipChunk4=true` returns -1 and skips chunk4 (LM head + KV-shared
+    /// layers 25-34). Used by `commitAccepted` bypass path: when re-running
+    /// predictStep purely to write clean K/V into chunks 1-3, the chunk4
+    /// argmax/hidden output is discarded, so 10-12 ms per call is wasted.
+    /// Note: skipChunk4 also skips updating `lastDecodeHiddenStateOut` /
+    /// `lastHiddenAtL34`; callers that need a fresh drafter carry seed must
+    /// run at least one final step with `skipChunk4=false`.
     func predictStep(tokenID: Int, position: Int,
-                     imageEmbedding: MLMultiArray? = nil) throws -> Int {
+                     imageEmbedding: MLMultiArray? = nil,
+                     skipChunk4: Bool = false) throws -> Int {
         let ctx = config.contextLength
         let W = config.slidingWindow
         let hidden = config.hiddenSize
@@ -1306,6 +1323,10 @@ final class ChunkedEngine {
         profileCopyBack += (tC2Cb1 - tC2Cb0)
         lastKV13K = kv13_k; lastKV13V = kv13_v
         lastKV14K = kv14_k; lastKV14V = kv14_v
+        // Decode T=1 writes one new full-attention column at `position`.
+        // Mirror it transposed for the MTP drafter (skips its 25 ms
+        // per-round fp16 transpose of the 1 M-element kv14V).
+        mirrorKV14VTransposed(startPos: position, count: 1)
         let tC2End = CFAbsoluteTimeGetCurrent()
         profileC2 += (tC2End - tC2Start)
 
@@ -1349,7 +1370,14 @@ final class ChunkedEngine {
             lastChunk3Hidden = h3
         }
 
-        // Chunk 4
+        // Chunk 4 (LM head + KV-shared layers 25-34). Skipped when caller
+        // only needs K/V cache writes from chunks 1-3 (e.g. predictStep-
+        // commit path during MTP burst).
+        if skipChunk4 {
+            profilePredict += (CFAbsoluteTimeGetCurrent() - t1)
+            profileCount += 1
+            return -1
+        }
         let tC4Start = CFAbsoluteTimeGetCurrent()
         var d4 = shared; d4["hidden_states"] = MLFeatureValue(multiArray: h3)
         let in4 = try MLDictionaryFeatureProvider(dictionary: d4)
@@ -1565,6 +1593,8 @@ final class ChunkedEngine {
         let kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
         lastKV13K = kv13_k; lastKV13V = kv13_v
         lastKV14K = kv14_k; lastKV14V = kv14_v
+        // Prefill batched-write of `realLen` columns starting at 0.
+        mirrorKV14VTransposed(startPos: 0, count: realLen)
 
         let sharedKV: [String: MLFeatureValue] = [
             "kv13_k": MLFeatureValue(multiArray: kv13_k), "kv13_v": MLFeatureValue(multiArray: kv13_v),
@@ -1778,6 +1808,10 @@ final class ChunkedEngine {
         let kv14v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
         lastKV13K = kv13k; lastKV13V = kv13v
         lastKV14K = kv14k; lastKV14V = kv14v
+        // Verify wrote K new full-attention columns at [startPosition,
+        // startPosition+K-1]. Mirror them transposed so the next MTP
+        // drafter round can read kv14V_T directly.
+        mirrorKV14VTransposed(startPos: startPosition, count: K)
         // Remember verify inputs for commitAccepted's match check.
         lastVerifyInputTokens = tokens
 
@@ -1918,6 +1952,7 @@ final class ChunkedEngine {
         let kv14v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
         lastKV13K = kv13k; lastKV13V = kv13v
         lastKV14K = kv14k; lastKV14V = kv14v
+        mirrorKV14VTransposed(startPos: startPosition, count: K)
         lastVerifyInputTokens = tokens
 
         let shared: [String: MLFeatureValue] = [
@@ -2536,6 +2571,46 @@ final class ChunkedEngine {
     func makeDrafterFullMask(position: Int) throws -> MLMultiArray {
         try makeCausalMask(position: position, length: config.contextLength)
     }
+
+    /// Mirror `lastKV14V` (shape `(1, H, ctx, hd)`) into `lastKV14V_T`
+    /// (shape `(1, H, hd, ctx)`), copying only the freshly-written
+    /// columns in `[startPos, startPos+count)`. Allocates the mirror
+    /// lazily on first call. Cheap (~1 KB strided write per column).
+    func mirrorKV14VTransposed(startPos: Int, count: Int) {
+        guard let src = lastKV14V else { return }
+        let shape = src.shape.map { $0.intValue }
+        guard shape.count == 4, shape[0] == 1 else { return }
+        let H = shape[1]
+        let ctx = shape[2]
+        let hd = shape[3]
+        if lastKV14V_T == nil {
+            let buf = try? MLMultiArray(
+                shape: [1, NSNumber(value: H),
+                        NSNumber(value: hd), NSNumber(value: ctx)],
+                dataType: .float16)
+            // Zero-init: unwritten columns are masked out by drafter, but
+            // garbage fp16 (could include NaN) can poison softmax even when
+            // multiplied by a softmax-zero attention weight.
+            if let buf {
+                memset(buf.dataPointer, 0, buf.count * MemoryLayout<UInt16>.stride)
+            }
+            lastKV14V_T = buf
+        }
+        guard let dst = lastKV14V_T else { return }
+        let srcPtr = src.dataPointer.bindMemory(to: UInt16.self, capacity: H * ctx * hd)
+        let dstPtr = dst.dataPointer.bindMemory(to: UInt16.self, capacity: H * hd * ctx)
+        let endPos = min(startPos + count, ctx)
+        for h in 0..<H {
+            let srcLayer = h * ctx * hd
+            let dstLayer = h * hd * ctx
+            for p in startPos..<endPos {
+                let srcRow = srcLayer + p * hd          // contiguous read
+                for d in 0..<hd {
+                    dstPtr[dstLayer + d * ctx + p] = srcPtr[srcRow + d]
+                }
+            }
+        }
+    }
 }
 
 // MARK: - EAGLE-3 speculative decoding (Phase 2B)
@@ -2698,20 +2773,32 @@ extension ChunkedEngine: SpeculativeTarget {
         //       to compute and write its K/V.
         //   Then advance currentPosition by tokens.count.
         //
-        // MTP_PREDICTSTEP_COMMIT=1 (diagnostic): bypass commitKVSlices entirely
-        // and re-run T=1 predictStep for EVERY accepted token. The K/V written
-        // this way matches the no-MTP decode path bit-for-bit, so any
-        // numerical drift introduced by the verify chunk's T=K batched math
-        // is eliminated. Slower per cycle (each accept = +30 ms decode on
-        // iPhone) but tells us whether iPhone ANE 18's verify-side K cache
-        // is the cause of the alternation pattern.
-        let bypassVerifyCommit = ProcessInfo.processInfo
+        // bypassVerifyCommit: re-run T=1 predictStep for EVERY accepted token
+        // instead of committing the verify chunk's K/V slices.
+        //
+        // 2026-05-08: with the fp16 K/V proj verify chunks, the verify slice
+        // K is clean enough on iPhone ANE 18 to skip the predictStep commit
+        // (~30 ms per accepted token saved). Hard-off on iOS so a leftover
+        // scheme `MTP_PREDICTSTEP_COMMIT=1` from a previous diagnostic
+        // session can't silently re-enable the slow path. macOS keeps the
+        // env override for testing the all-INT4 dirty-K hypothesis.
+        #if os(iOS)
+        let bypassVerifyCommit = false
+        #else
+        let bypassVerifyCommit: Bool = ProcessInfo.processInfo
             .environment["MTP_PREDICTSTEP_COMMIT"] == "1"
+        #endif
         let N = tokens.count
         if N == 0 { return }
         let P = currentPosition
 
         if bypassVerifyCommit {
+            // 2026-05-08: tried `skipChunk4` for first N-1 commits (chunk4 =
+            // KV-shared layers 25-34 + LM head, so theoretically no K/V
+            // writes lost). On iPhone in stateful mode this corrupted output
+            // ("Yes 1 2 3 4 ..." instead of "Yes Yes Yes ..."). Reverting
+            // to full chunk1-4 predictStep per token keeps correctness.
+            // The K-only fast path is the proper fix (separate model).
             for t in 0..<N {
                 _ = try predictStep(tokenID: Int(tokens[t]), position: P + t)
             }

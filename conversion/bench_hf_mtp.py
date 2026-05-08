@@ -25,6 +25,40 @@ PROMPTS = {
         "points, with a Python code example showing each.",
     "qsort":
         "def quicksort(arr):",
+    "household":
+        "List 20 common household objects.\n\n"
+        "For each item, provide its name in bold, followed by a "
+        "two-sentence description. The first sentence should describe "
+        "what the object is used for, and the second sentence should "
+        "state which room in a house it is typically found in.",
+    # --- Probe prompt diversity ---
+    "json":
+        "Return a JSON array of 15 cities, each object containing "
+        "fields: name, country, population, latitude, longitude, "
+        "and a one-line trivia. Format strictly as valid JSON.",
+    "translate":
+        "Translate the following 10 sentences from English to French.\n"
+        "1. Hello, how are you today?\n2. The cat is on the table.\n"
+        "3. I would like a cup of coffee.\n4. Where is the train station?\n"
+        "5. We are going to the beach tomorrow.\n6. She reads books every "
+        "evening.\n7. They live in a small village.\n8. The weather is "
+        "very nice.\n9. Could you help me, please?\n10. I love this song.",
+    "qa_long":
+        "Explain how a transformer language model generates text, "
+        "from input tokenisation to output sampling. Cover embeddings, "
+        "self-attention, KV cache, sampling temperature, and how "
+        "speculative decoding accelerates inference. Use full "
+        "sentences and aim for ~400 words.",
+    "code_class":
+        "Write a Python class `LRUCache` with get(key) and put(key, "
+        "value) methods, both O(1). Include type hints, a docstring, "
+        "and 3 unit tests using pytest.",
+    "count_to_50":
+        "Count from 1 to 50. Output exactly: 1, 2, 3, ..., 50.",
+    "markdown_table":
+        "Make a markdown table comparing 8 popular programming "
+        "languages along these columns: Name, First released, "
+        "Typing, Memory model, Typical use case.",
 }
 
 
@@ -35,6 +69,9 @@ def main():
     ap.add_argument("--device", default="mps", choices=["mps", "cpu"])
     ap.add_argument("--max-new-tokens", type=int, default=128)
     ap.add_argument("--prompts", nargs="*", default=list(PROMPTS.keys()))
+    ap.add_argument("--sample", action="store_true",
+                    help="Use rejection sampling (do_sample=True, temp=0.7)")
+    ap.add_argument("--temperature", type=float, default=0.7)
     args = ap.parse_args()
 
     print(f"Loading target {args.target} (bf16) on {args.device} ...")
@@ -55,18 +92,20 @@ def main():
         text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         ids = tok(text, return_tensors="pt").to(args.device)
 
+        sample_kw = ({"do_sample": True, "temperature": args.temperature}
+                     if args.sample else {"do_sample": False})
         for mode, kwargs in [
             ("no_MTP", {}),
             ("MTP",    {"assistant_model": assistant}),
         ]:
             # warm-up (cuts compile/cache cost)
-            _ = target.generate(**ids, max_new_tokens=8, do_sample=False, **kwargs)
+            _ = target.generate(**ids, max_new_tokens=8, **sample_kw, **kwargs)
             torch.mps.synchronize() if args.device == "mps" else None
 
             t0 = time.perf_counter()
             out = target.generate(
                 **ids, max_new_tokens=args.max_new_tokens,
-                do_sample=False, **kwargs)
+                **sample_kw, **kwargs)
             torch.mps.synchronize() if args.device == "mps" else None
             dt = time.perf_counter() - t0
             n_new = out.shape[1] - ids["input_ids"].shape[1]

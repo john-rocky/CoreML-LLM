@@ -1262,9 +1262,14 @@ public final class CoreMLLLM: @unchecked Sendable {
                                     tokenCount += 1
                                 }
                             } else if let se = mtpSpec, se.shouldSpeculate {
+                                let cycleT0 = CFAbsoluteTimeGetCurrent()
+                                let specT0 = cycleT0
                                 let emitted = try autoreleasepool {
                                     try se.speculateStep(nextID: &nid)
                                 }
+                                let specMs = (CFAbsoluteTimeGetCurrent() - specT0) * 1000.0
+                                let yieldT0 = CFAbsoluteTimeGetCurrent()
+                                var yieldedCount = 0
                                 for tok in emitted {
                                     if eosIDs.contains(Int(tok)) {
                                         nid = tok
@@ -1273,6 +1278,15 @@ public final class CoreMLLLM: @unchecked Sendable {
                                     let text = mutableSelf.tokenizer.decode(tokens: [Int(tok)])
                                     continuation.yield(text)
                                     tokenCount += 1
+                                    yieldedCount += 1
+                                }
+                                let yieldMs = (CFAbsoluteTimeGetCurrent() - yieldT0) * 1000.0
+                                let cycleMs = (CFAbsoluteTimeGetCurrent() - cycleT0) * 1000.0
+                                if tokenCount < 60 || tokenCount % 30 == 0 {
+                                    print(String(format:
+                                        "[MTP cycle] spec=%.1fms yield=%.1fms total=%.1fms emit=%d (yield/tok=%.1fms)",
+                                        specMs, yieldMs, cycleMs, yieldedCount,
+                                        yieldedCount > 0 ? yieldMs / Double(yieldedCount) : 0))
                                 }
                             } else if let se = unionSpec, se.shouldSpeculate {
                                 let emitted = try autoreleasepool {
