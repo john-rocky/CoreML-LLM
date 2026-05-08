@@ -456,6 +456,38 @@ public final class ModelDownloader: NSObject {
         if fileManager.fileExists(atPath: pkg.appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin").path) {
             return pkg
         }
+
+        // Bundle.main fallback for app-bundled models (e.g. MBFashion's
+        // TestFlight build ships the Qwen3-VL stateful Fashion FT inside
+        // the IPA at <BundleResources>/<folderName>/qwen3_vl_2b_stateful_chunks/).
+        // Documents/Models/<folderName>/ takes precedence (sideload
+        // override for dev iteration). Bundle is the canonical source
+        // for end-user installs that have no separate download step.
+        if let bundleURL = Bundle.main.url(forResource: model.folderName,
+                                            withExtension: nil),
+           fileManager.fileExists(atPath: bundleURL.path)
+        {
+            let bundledStateful = bundleURL.appendingPathComponent("qwen3_vl_2b_stateful_chunks")
+            let bundledEmbed = bundledStateful.appendingPathComponent("embed_weight.bin")
+            func bundledStatefulChunkExists(_ base: String) -> Bool {
+                let mlc = bundledStateful
+                    .appendingPathComponent("\(base).mlmodelc")
+                    .appendingPathComponent("weights/weight.bin")
+                if fileManager.fileExists(atPath: mlc.path) { return true }
+                let pkg = bundledStateful
+                    .appendingPathComponent("\(base).mlpackage")
+                    .appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")
+                return fileManager.fileExists(atPath: pkg.path)
+            }
+            if fileManager.fileExists(atPath: bundledEmbed.path)
+                && bundledStatefulChunkExists("chunk_0")
+                && bundledStatefulChunkExists("chunk_1")
+                && bundledStatefulChunkExists("chunk_head")
+            {
+                return bundledStateful
+            }
+        }
+
         return nil
     }
 
