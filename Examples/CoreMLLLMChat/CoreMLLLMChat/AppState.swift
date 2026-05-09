@@ -175,15 +175,19 @@ final class AppState: ObservableObject {
         phaseTag &+= 1
     }
 
-    /// Trained user prompt for the Fashion LoRA. Must mirror
-    /// `vision/scripts/prepare_train.py:PROMPT` byte-for-byte so the
-    /// inference distribution matches the training distribution and the
-    /// structured-JSON output path triggers reliably.
+    /// Trained user prompt for the Fashion LoRA. Must mirror the prompt
+    /// the loaded model was trained on byte-for-byte.
+    ///
+    /// Reverted to the v2 70-pin wording: live-test feedback flagged that
+    /// the v3 5-axis Opus-relabel build under-detected bottoms / shoes
+    /// in most photos. v2 70-pin handled item enumeration noticeably
+    /// better, so we ship that bundle and pair it with its own training
+    /// prompt. The cosmetic "4軸スコア" / "清潔感"/"フィット" mismatch
+    /// against the actual JSON schema is what v2 was trained on, so
+    /// keep it to keep the inference distribution tight.
     static let fashionAutoPrompt =
-        "画像のコーディネートを MB ドレス/カジュアル理論で採点し JSON で出力してください。"
-        + "items: [{category, description, "
-        + "scores:{color, silhouette, material, design, item_type}, item_dress_score}], "
-        + "overall_dress_ratio, "
-        + "coordinate_silhouette:{type, style_score, rationale}, "
-        + "target_ratio, verdict, advice"
+        "画像のコーディネートを「MBドレス/カジュアル理論」で採点してください。"
+        + "各アイテムの4軸スコア(色/シルエット/素材/清潔感/フィット)、基本ドレス度、"
+        + "加重ドレス度、ドレスラベル、全体のドレス比率、想定TPO、推奨比率、verdict、"
+        + "改善アドバイスをJSONで出力してください。"
 }

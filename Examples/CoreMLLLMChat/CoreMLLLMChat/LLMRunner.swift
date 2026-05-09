@@ -683,20 +683,17 @@ final class LLMRunner {
         qwen3vl2bStatefulGenerator = gen
         qwen3vl2bTokenizer = tok
 
-        // JSON schema constraint: enabled only for the fashion fine-tune,
-        // detected by folder name (download path is fixed). Probing the
-        // tokenizer once at load amortizes the ~150k vocab scan that
-        // builds the quote-containing / number-continuation token sets.
-        // For other Qwen3-VL bundles (base instruct, future variants),
-        // generate() runs unconstrained.
-        if folder.path.contains("qwen3-vl-2b-fashion") {
-            let fashionTokens = FashionTokens.probing(tok)
-            fashionSchemaConstraint = FashionV3Constraint(tokens: fashionTokens)
-            print("[LLMRunner] fashion schema constraint enabled "
-                  + "(folder=\(folder.lastPathComponent))")
-        } else {
-            fashionSchemaConstraint = nil
-        }
+        // JSON schema constraint: temporarily disabled while we ship the
+        // v2 70-pin bundle (4-axis schema, no coordinate_silhouette, has
+        // tpo_assumption). The constraint state machine is hard-coded to
+        // v3's schema (5-axis + coord_silhouette, no TPO) and would mask
+        // out the exact tokens v2 needs. Re-enable when v3 schema model
+        // ships, or rewrite the constraint to be schema-agnostic.
+        fashionSchemaConstraint = nil
+        _ = FashionV3Constraint.self  // keep symbol referenced for build
+        _ = folder // suppress unused-let warning
+        print("[LLMRunner] fashion schema constraint disabled "
+              + "(folder=\(folder.lastPathComponent), shipping v2 70-pin)")
 
         // Optional vision: encoder + chunk_0_vision must both be present
         // to enable image input. If either is missing, fall back to

@@ -600,7 +600,12 @@ public struct FashionItemRow: View {
                     ScoreBar(label: "silhouette", value: scores.silhouette)
                     ScoreBar(label: "material", value: scores.material)
                     ScoreBar(label: "design", value: scores.design)
-                    ScoreBar(label: "item_type", value: scores.item_type)
+                    // v3 5th axis. v2 model output omits item_type — hide
+                    // the row in that case rather than render an empty
+                    // "—" bar that looks broken.
+                    if scores.item_type != nil {
+                        ScoreBar(label: "item_type", value: scores.item_type)
+                    }
                 }
             }
         }
