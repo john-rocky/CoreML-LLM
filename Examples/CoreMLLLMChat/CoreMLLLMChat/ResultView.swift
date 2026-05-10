@@ -78,11 +78,14 @@ struct ResultView: View {
                     .padding(.bottom, 4)
             }
 
-            // v0.1: SilhouetteChip is hidden when the model returns "off".
-            // Training data over-classifies partial-body and exposed-leg
-            // photos as "off"; until v4 retraining tightens the off rule,
-            // hide the chip rather than show a likely-wrong "off" pill.
-            if let silhouette = report.coordinate_silhouette,
+            // SilhouetteChip is hidden when the silhouette is "off". The
+            // value comes from `displayCoordinateSilhouette` which uses
+            // the v3 model's explicit field when present, or derives
+            // I/A/Y/off from per-item silhouette scores when not (v2
+            // model). Hidden on "off" because that's typically a
+            // low-confidence partial photo or a genuine no-contrast
+            // outfit — showing a wrong "off" pill is worse than nothing.
+            if let silhouette = report.displayCoordinateSilhouette,
                let type = silhouette.type,
                type.lowercased() != "off"
             {

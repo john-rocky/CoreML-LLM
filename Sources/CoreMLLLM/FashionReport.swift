@@ -97,6 +97,55 @@ public struct FashionReport: Sendable {
             || advice != nil
     }
 
+    /// Coordinate silhouette to render. Returns the model-emitted value
+    /// when present (v3 schema). Otherwise derives one from per-item
+    /// silhouette scores so v2 outputs (which lack the field) still get
+    /// an outfit-level chip.
+    ///
+    /// Derivation rule (silhouette score ≥ 0.5 ⇒ "tight/fitted"):
+    ///     top tight + bot tight  → I    (上下とも fitted)
+    ///     top loose + bot tight  → Y    (上ゆったり + 下スキニー)
+    ///     top tight + bot loose  → A    (上タイト + 下ボリューム)
+    ///     top loose + bot loose  → off  (no contrast)
+    /// Outer overrides top when present (アウター着用時はアウターで判定).
+    public var displayCoordinateSilhouette: CoordinateSilhouette? {
+        if let cs = coordinate_silhouette { return cs }
+        return Self.deriveCoordinateSilhouette(from: items)
+    }
+
+    private static func deriveCoordinateSilhouette(from items: [Item]) -> CoordinateSilhouette? {
+        let topItem = items.first(where: { $0.category?.lowercased() == "outer" })
+            ?? items.first(where: { $0.category?.lowercased() == "top" })
+        let bottomItem = items.first(where: { $0.category?.lowercased() == "bottom" })
+        guard let top = topItem?.scores?.silhouette,
+              let bottom = bottomItem?.scores?.silhouette
+        else { return nil }
+
+        let threshold = 0.5
+        let topTight = top >= threshold
+        let bottomTight = bottom >= threshold
+        let type: String
+        let styleScore: Double
+        switch (topTight, bottomTight) {
+        case (true, true):
+            type = "I"
+            styleScore = (top + bottom) / 2.0
+        case (false, true):
+            type = "Y"
+            styleScore = min(1.0, abs(bottom - top) + 0.4)
+        case (true, false):
+            type = "A"
+            styleScore = min(1.0, abs(top - bottom) + 0.4)
+        case (false, false):
+            type = "off"
+            styleScore = (top + bottom) / 2.0
+        }
+        return CoordinateSilhouette(
+            type: type,
+            style_score: max(0.0, min(1.0, styleScore)),
+            rationale: nil)
+    }
+
     // ---- Parsing ----
     //
     // The on-device int4 decoder drifts from the trained schema in many
