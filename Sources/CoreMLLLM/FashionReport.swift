@@ -102,11 +102,19 @@ public struct FashionReport: Sendable {
     /// silhouette scores so v2 outputs (which lack the field) still get
     /// an outfit-level chip.
     ///
-    /// Derivation rule (silhouette score ≥ 0.5 ⇒ "tight/fitted"):
-    ///     top tight + bot tight  → I    (上下とも fitted)
-    ///     top loose + bot tight  → Y    (上ゆったり + 下スキニー)
-    ///     top tight + bot loose  → A    (上タイト + 下ボリューム)
-    ///     top loose + bot loose  → off  (no contrast)
+    /// Derivation uses **relative difference** rather than absolute
+    /// thresholds, so cases like "top フィット気味 (0.45) + bottom ルーズ
+    /// (0.30)" still get classified as A — the top IS relatively tighter
+    /// than the bottom even though both are below 0.5. Absolute
+    /// thresholding ("≥0.5 = tight") would call both loose and miss the
+    /// A line.
+    ///
+    /// Rule (gap = 0.15):
+    ///     diff > +gap         → A    (top relatively tighter than bottom)
+    ///     diff < -gap         → Y    (bottom relatively tighter)
+    ///     |diff| ≤ gap, avg ≥ 0.45  → I  (both similarly fitted, straight line)
+    ///     |diff| ≤ gap, avg < 0.45  → off (both similarly loose, no shape)
+    ///
     /// Outer overrides top when present (アウター着用時はアウターで判定).
     public var displayCoordinateSilhouette: CoordinateSilhouette? {
         if let cs = coordinate_silhouette { return cs }
@@ -121,24 +129,23 @@ public struct FashionReport: Sendable {
               let bottom = bottomItem?.scores?.silhouette
         else { return nil }
 
-        let threshold = 0.5
-        let topTight = top >= threshold
-        let bottomTight = bottom >= threshold
+        let diff = top - bottom        // positive = top tighter
+        let avg = (top + bottom) / 2.0
+        let gap = 0.15
         let type: String
         let styleScore: Double
-        switch (topTight, bottomTight) {
-        case (true, true):
-            type = "I"
-            styleScore = (top + bottom) / 2.0
-        case (false, true):
-            type = "Y"
-            styleScore = min(1.0, abs(bottom - top) + 0.4)
-        case (true, false):
+        if diff > gap {
             type = "A"
-            styleScore = min(1.0, abs(top - bottom) + 0.4)
-        case (false, false):
+            styleScore = min(1.0, diff + 0.4)
+        } else if diff < -gap {
+            type = "Y"
+            styleScore = min(1.0, -diff + 0.4)
+        } else if avg >= 0.45 {
+            type = "I"
+            styleScore = avg
+        } else {
             type = "off"
-            styleScore = (top + bottom) / 2.0
+            styleScore = avg
         }
         return CoordinateSilhouette(
             type: type,
