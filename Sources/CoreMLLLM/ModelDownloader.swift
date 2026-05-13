@@ -1798,6 +1798,25 @@ public final class ModelDownloader: NSObject {
     private func extractZipNative(from zipURL: URL, to destDir: URL) throws {
         let data = try Data(contentsOf: zipURL)
         guard data.count > 22 else { throw DownloadError.extractionFailed }
+
+        func readUInt16LE(at offset: Int) throws -> UInt16 {
+            guard offset >= 0, offset + 1 < data.count else {
+                throw DownloadError.extractionFailed
+            }
+            return UInt16(data[offset])
+                | (UInt16(data[offset + 1]) << 8)
+        }
+
+        func readUInt32LE(at offset: Int) throws -> UInt32 {
+            guard offset >= 0, offset + 3 < data.count else {
+                throw DownloadError.extractionFailed
+            }
+            return UInt32(data[offset])
+                | (UInt32(data[offset + 1]) << 8)
+                | (UInt32(data[offset + 2]) << 16)
+                | (UInt32(data[offset + 3]) << 24)
+        }
+
         var eocdOffset = data.count - 22
         while eocdOffset >= 0 {
             if data[eocdOffset] == 0x50 && data[eocdOffset+1] == 0x4B &&
@@ -1805,24 +1824,24 @@ public final class ModelDownloader: NSObject {
             eocdOffset -= 1
         }
         guard eocdOffset >= 0 else { throw DownloadError.extractionFailed }
-        let cdOffset = Int(data[eocdOffset+16..<eocdOffset+20].withUnsafeBytes { $0.load(as: UInt32.self) })
-        let cdCount = Int(data[eocdOffset+10..<eocdOffset+12].withUnsafeBytes { $0.load(as: UInt16.self) })
+        let cdOffset = Int(try readUInt32LE(at: eocdOffset + 16))
+        let cdCount = Int(try readUInt16LE(at: eocdOffset + 10))
         var pos = cdOffset
         for _ in 0..<cdCount {
             guard data[pos] == 0x50, data[pos+1] == 0x4B else { break }
-            let uncompSize = Int(data[pos+24..<pos+28].withUnsafeBytes { $0.load(as: UInt32.self) })
-            let nameLen = Int(data[pos+28..<pos+30].withUnsafeBytes { $0.load(as: UInt16.self) })
-            let extraLen = Int(data[pos+30..<pos+32].withUnsafeBytes { $0.load(as: UInt16.self) })
-            let commentLen = Int(data[pos+32..<pos+34].withUnsafeBytes { $0.load(as: UInt16.self) })
-            let localOffset = Int(data[pos+42..<pos+46].withUnsafeBytes { $0.load(as: UInt32.self) })
+            let uncompSize = Int(try readUInt32LE(at: pos + 24))
+            let nameLen = Int(try readUInt16LE(at: pos + 28))
+            let extraLen = Int(try readUInt16LE(at: pos + 30))
+            let commentLen = Int(try readUInt16LE(at: pos + 32))
+            let localOffset = Int(try readUInt32LE(at: pos + 42))
             let name = String(data: data[pos+46..<pos+46+nameLen], encoding: .utf8) ?? ""
             let destPath = destDir.appendingPathComponent(name)
             if name.hasSuffix("/") {
                 try fileManager.createDirectory(at: destPath, withIntermediateDirectories: true)
             } else {
                 try fileManager.createDirectory(at: destPath.deletingLastPathComponent(), withIntermediateDirectories: true)
-                let lnl = Int(data[localOffset+26..<localOffset+28].withUnsafeBytes { $0.load(as: UInt16.self) })
-                let lel = Int(data[localOffset+28..<localOffset+30].withUnsafeBytes { $0.load(as: UInt16.self) })
+                let lnl = Int(try readUInt16LE(at: localOffset + 26))
+                let lel = Int(try readUInt16LE(at: localOffset + 28))
                 let ds = localOffset + 30 + lnl + lel
                 try Data(data[ds..<ds+uncompSize]).write(to: destPath)
             }
