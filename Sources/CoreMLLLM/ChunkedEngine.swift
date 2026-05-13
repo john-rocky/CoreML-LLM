@@ -266,7 +266,12 @@ final class ChunkedEngine {
     }
 
     var hasVerify: Bool {
-        verifyChunk1 != nil && verifyChunk2 != nil
+        // 3-chunk topology has no verify_chunk3 — chain is v1->v2->v4 with
+        // L15-24 merged into v2. Don't require v3 in that mode.
+        if is3ChunkDecode {
+            return verifyChunk1 != nil && verifyChunk2 != nil && verifyChunk4 != nil
+        }
+        return verifyChunk1 != nil && verifyChunk2 != nil
             && verifyChunk3 != nil && verifyChunk4 != nil
     }
 
@@ -738,11 +743,22 @@ final class ChunkedEngine {
             applyHints(verifyConfig)
 
             let verifyT0 = CFAbsoluteTimeGetCurrent()
+            // 3-chunk topology II uses chunk2_3way / chunk3_3way; 4-chunk
+            // legacy uses chunk2/chunk3/chunk4. Pick the right pair so
+            // verify_qK loads against the actual decode chunks.
+            let v2Name = is3Chunk ? "chunk2_3way" : "chunk2"
+            let v3Name: String? = is3Chunk ? nil : "chunk3"
+            let v4Name = is3Chunk ? "chunk3_3way" : "chunk4"
+            var verifyTargets: [(String, URL?)] = [
+                ("v1", findModel("chunk1")),
+                ("v2", findModel(v2Name)),
+                ("v4", findModel(v4Name)),
+            ]
+            if let v3n = v3Name {
+                verifyTargets.insert(("v3", findModel(v3n)), at: 2)
+            }
             try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
-                for (name, url) in [("v1", findModel("chunk1")),
-                                     ("v2", findModel("chunk2")),
-                                     ("v3", findModel("chunk3")),
-                                     ("v4", findModel("chunk4"))] {
+                for (name, url) in verifyTargets {
                     guard let u = url else { continue }
                     group.addTask {
                         let m = try MLModel(contentsOf: u, configuration: verifyConfig)
@@ -759,7 +775,13 @@ final class ChunkedEngine {
                     }
                 }
             }
-            if v1 != nil && v2 != nil && v3 != nil && v4 != nil {
+            // In 3-chunk topology v3 is intentionally nil; verifyCandidates
+            // chains v1 -> v2 -> v4 (skipping v3) the same way decode chains
+            // chunk1 -> chunk2_3way -> chunk3_3way.
+            let verifyReady = is3Chunk
+                ? (v1 != nil && v2 != nil && v4 != nil)
+                : (v1 != nil && v2 != nil && v3 != nil && v4 != nil)
+            if verifyReady {
                 // Detect K from verify chunk4's token_ids output shape
                 if let desc = v4!.modelDescription.outputDescriptionsByName["token_ids"],
                    let c = desc.multiArrayConstraint, c.shape.count >= 2 {
@@ -2258,17 +2280,23 @@ final class ChunkedEngine {
             "kv14_k": MLFeatureValue(multiArray: kv14k), "kv14_v": MLFeatureValue(multiArray: kv14v),
         ]
 
-        // Verify chunk 3
-        var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
-        let in3 = try MLDictionaryFeatureProvider(dictionary: d3)
-        let out3p: MLFeatureProvider
-        if let backings = verifyOutBackings3, !backings.isEmpty {
-            let opts = MLPredictionOptions(); opts.outputBackings = backings
-            out3p = try verifyChunk3!.prediction(from: in3, options: opts)
+        // Verify chunk 3 (4-chunk mode only). 3-chunk topology II merged
+        // L15-24 into chunk2_3way, so we feed h2 straight into chunk4.
+        let h3: MLMultiArray
+        if let v3 = verifyChunk3 {
+            var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
+            let in3 = try MLDictionaryFeatureProvider(dictionary: d3)
+            let out3p: MLFeatureProvider
+            if let backings = verifyOutBackings3, !backings.isEmpty {
+                let opts = MLPredictionOptions(); opts.outputBackings = backings
+                out3p = try v3.prediction(from: in3, options: opts)
+            } else {
+                out3p = try v3.prediction(from: in3)
+            }
+            h3 = out3p.featureValue(for: "hidden_states_out")!.multiArrayValue!
         } else {
-            out3p = try verifyChunk3!.prediction(from: in3)
+            h3 = h2
         }
-        let h3 = out3p.featureValue(for: "hidden_states_out")!.multiArrayValue!
 
         // Verify chunk 4: returns per-position token IDs (1, K) + hidden_states
         var d4 = shared; d4["hidden_states"] = MLFeatureValue(multiArray: h3)
@@ -2715,10 +2743,15 @@ final class ChunkedEngine {
             "kv14_k": MLFeatureValue(multiArray: kv14k), "kv14_v": MLFeatureValue(multiArray: kv14v),
         ]
 
-        // Verify chunk 3
-        var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
-        let h3 = try verifyChunk3!.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
-            .featureValue(for: "hidden_states_out")!.multiArrayValue!
+        // Verify chunk 3 (4-chunk mode only; 3-chunk merges L15-24 into chunk2).
+        let h3: MLMultiArray
+        if let v3 = verifyChunk3 {
+            var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
+            h3 = try v3.prediction(from: MLDictionaryFeatureProvider(dictionary: d3))
+                .featureValue(for: "hidden_states_out")!.multiArrayValue!
+        } else {
+            h3 = h2
+        }
 
         // Verify chunk 4
         var d4 = shared; d4["hidden_states"] = MLFeatureValue(multiArray: h3)

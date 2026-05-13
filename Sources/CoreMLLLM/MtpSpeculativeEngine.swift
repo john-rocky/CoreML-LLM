@@ -963,7 +963,13 @@ public final class MtpSpeculativeEngine {
                 // best lossless-ish trade we can make without retraining.
                 return 16
                 #else
-                return 1  // Mac: opt-in via env. iPhone is the production target.
+                // 2026-05-13: Mac default = 16 (was 1 / strict-only). Empirical
+                // Mac M ANE bench with centroid drafter shows top-K=16 lifts
+                // narrative essay 32.9 → 41.9 tok/s (+27%) and code generation
+                // 41.9 → 59.9 tok/s (+43%). The same quality-validated sweet
+                // spot as iPhone. Override with MTP_FLY_TOPK=1 for strict-only
+                // bench comparisons.
+                return 16
                 #endif
             }()
             // FLy needs per-position logits to rank drafter's token. Source
