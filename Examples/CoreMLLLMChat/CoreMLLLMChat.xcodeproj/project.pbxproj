@@ -21,6 +21,7 @@
 		B100000A /* AudioRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = B200000A /* AudioRecorder.swift */; };
 		B1000010 /* CoreMLLLM in Frameworks */ = {isa = PBXBuildFile; productRef = B9000003 /* CoreMLLLM */; };
 		B60E4AB380E7B9E215F1B15E /* Qwen35DecodeBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */; };
+		B6AB0001E7B9E215F1B15E5A /* AutoBench.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFAB0001E7B9E215F1B15E5A /* AutoBench.swift */; };
 		CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */; };
 		D1E20000000000000000BE01 /* GateZeroBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE02 /* GateZeroBenchmark.swift */; };
 		D1E20000000000000000BE03 /* GateZeroBenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */; };
@@ -43,6 +44,7 @@
 		B200000A /* AudioRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorder.swift; sourceTree = "<group>"; };
 		B3000001 /* CoreMLLLMChat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CoreMLLLMChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen35DecodeBenchmark.swift; path = CoreMLLLMChat/Qwen35DecodeBenchmark.swift; sourceTree = SOURCE_ROOT; };
+		CFAB0001E7B9E215F1B15E5A /* AutoBench.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AutoBench.swift; path = CoreMLLLMChat/AutoBench.swift; sourceTree = SOURCE_ROOT; };
 		D1E20000000000000000BE02 /* GateZeroBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GateZeroBenchmark.swift; path = CoreMLLLMChat/GateZeroBenchmark.swift; sourceTree = SOURCE_ROOT; };
 		D1E20000000000000000BE04 /* GateZeroBenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GateZeroBenchmarkView.swift; path = CoreMLLLMChat/GateZeroBenchmarkView.swift; sourceTree = SOURCE_ROOT; };
 		D1E20000000000000000BE08 /* Qwen3VL2BStatefulGeneratorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Qwen3VL2BStatefulGeneratorView.swift; path = CoreMLLLMChat/Qwen3VL2BStatefulGeneratorView.swift; sourceTree = SOURCE_ROOT; };
@@ -72,6 +74,7 @@
 				A640406284DC310A703609F0 /* Qwen35Benchmark.swift */,
 				F8714748BF0A5E81B6E3499A /* Qwen35BenchmarkView.swift */,
 				CFCA443D88C77BE08F8E926D /* Qwen35DecodeBenchmark.swift */,
+				CFAB0001E7B9E215F1B15E5A /* AutoBench.swift */,
 				A83A47DE9322C639B9EFD102 /* Qwen35DecodeBenchmarkView.swift */,
 				AEA048688C67BFE52A1F8C98 /* Qwen35GeneratorView.swift */,
 				DE1F0A12B3D5E7F9123456CD /* Qwen35ChatView.swift */,
@@ -186,6 +189,7 @@
 				EF8840D7959C1AB14894FE13 /* Qwen35Benchmark.swift in Sources */,
 				370C4C3589D85D9148AED4C9 /* Qwen35BenchmarkView.swift in Sources */,
 				B60E4AB380E7B9E215F1B15E /* Qwen35DecodeBenchmark.swift in Sources */,
+				B6AB0001E7B9E215F1B15E5A /* AutoBench.swift in Sources */,
 				79D8443C9596EB593A5FE1EC /* Qwen35DecodeBenchmarkView.swift in Sources */,
 				32404BC1AC91219654BB4034 /* Qwen35GeneratorView.swift in Sources */,
 				CE8F0A12B3D5E7F91234DEFA /* Qwen35ChatView.swift in Sources */,

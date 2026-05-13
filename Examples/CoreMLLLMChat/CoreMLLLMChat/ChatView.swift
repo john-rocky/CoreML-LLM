@@ -210,6 +210,11 @@ struct ChatView: View {
             }
             .navigationTitle(runner.isLoaded ? runner.modelName : "CoreML LLM")
             .navigationBarTitleDisplayMode(.inline)
+            #if os(iOS)
+            .task {
+                await AutoBench.runIfRequested(runner: runner)
+            }
+            #endif
             .toolbar {
                 // Show "Switch" only when a model is already loaded.
                 // The "Get Model" entry point lives in the big in-view button
