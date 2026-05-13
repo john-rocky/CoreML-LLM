@@ -185,6 +185,42 @@ same time isn't burned twice.
   If decode outputs differ token-by-token, drafter retraining is
   prerequisite to MTP win on B.
 
+## 11. Claimed iPhone K_USE=1 +24% without ruling out warm-vs-cold drafter
+
+* **What I did**: ran iPhone K_USE sweep (narrative→code prompts).
+  K_USE=1 code = 50.61 tok/s, K_USE=2 code = 40.89 tok/s. Concluded
+  K_USE=1 wins +24 % and shipped it as iOS default in commit `6d51439`.
+* **What was true**: K_USE=1's win was conditional on the drafter being
+  **warm** — it had been pre-activated by the preceding narrative
+  prompt in the sweep. When K_USE=1 was tested with code as the
+  ONLY/FIRST prompt (cold drafter), accept dropped to 0/1, rolling EMA
+  decayed past the 0.30 threshold within 3 cycles, and MTP auto-bailed
+  for the rest of the run → 31.02 tok/s (parity, not +24 %).
+  K_USE=2 survives the cold-start window because per-cycle accept
+  patterns like 1/2 keep rolling EMA above threshold.
+* **Cost**: shipped wrong iOS default, had to revert in commit
+  `e9af22d`.
+* **Rule going forward**: any "iPhone +N % on prompt X" bench claim
+  must (a) verify with prompt X as both 1st AND 2nd of the sweep, OR
+  (b) include a discard warmup prompt before the timed prompts.
+  AutoBench now does (b) by default (commit `bc5b04a`); skip via
+  `LLM_AUTOBENCH_NO_WARMUP=1`.
+
+## 12. Killed devicectl prematurely with `| head -N`
+
+* **What I did**: piped console output through `grep ... | head -40`
+  during the first iPhone AutoBench run. `head` exited after 40
+  matches → SIGPIPE upstream → devicectl terminated the device
+  console session → on-device app continued running but its output
+  was no longer captured.
+* **Cost**: false "bench incomplete" appearance, second launch
+  attempt failed because the app was still finishing the first run
+  on-device, FBSOpenApplicationErrorDomain confusion.
+* **Rule going forward**: capture full devicectl console output to a
+  file (`> /tmp/bench.log 2>&1 &`), then grep AFTER the launch
+  finishes. Never put `head -N` in the pipeline behind a
+  `devicectl --console` invocation.
+
 ## What I'd do over
 
 * First action of any "MTP slow" investigation: **`du -sh */mtp_drafter*.mlmodelc`** to find every drafter on disk.
