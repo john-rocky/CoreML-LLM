@@ -159,6 +159,32 @@ same time isn't burned twice.
   prompt classes (narrative / technical free-form / structured list /
   code).
 
+## 10. Invested 3-5h in 3-chunk + MTP build without checking decode parity first
+
+* **What I did**: agreed to build `MergedChunk23Verify` + verify
+  multifunction chunks for 3-chunk topology, expecting +5-10 tok/s on
+  top of the 4-chunk MTP ceiling (memory's "3-chunk T=1 33.4 → MTP
+  fold-in math suggested 50-70 tok/s").
+* **What was true**: 3-chunk decode output text diverges from 4-chunk
+  at ~15 tokens (confirmed with side-by-side `"Write a Python function
+  to compute Fibonacci."` smoke). The drafter (trained on 4-chunk
+  hidden-state distribution) sees a different L34 hidden state from
+  the 3-chunk path and per-slot accept drops from 0.49 → 0.14 on code.
+  3-chunk + MTP ends up 25-38% SLOWER than 4-chunk + MTP across all
+  four prompt classes.
+* **What I should have done first**: 5-minute T=1 output text A/B
+  between `bundle_diff_logits/` (4-chunk) and `bundle_3way_mf/`
+  (3-chunk). If outputs diverge, the drafter-trained-for-4-chunk
+  assumption breaks and 3-chunk + MTP is dead before any verify
+  multifunction is built.
+* **Recovery**: 4-chunk + MTP + centroid drafter + FLy K=16 stays the
+  ship config. Build artifacts archived in
+  `output/gemma4-e2b/chunks_3way_fp16kv_mf/` and `bundle_3way_mf/`.
+* **Rule going forward**: any "topology B + MTP > topology A + MTP"
+  claim requires first proving decode parity between topology A and B.
+  If decode outputs differ token-by-token, drafter retraining is
+  prerequisite to MTP win on B.
+
 ## What I'd do over
 
 * First action of any "MTP slow" investigation: **`du -sh */mtp_drafter*.mlmodelc`** to find every drafter on disk.
