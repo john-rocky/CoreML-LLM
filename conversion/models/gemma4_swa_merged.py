@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax
 
 from .gemma4 import Gemma4Model
-from .gemma4_swa_chunks import _run_layer_swa, _layer_kv_map
+from .gemma4_swa_chunks import _run_layer_swa, _run_layer_verify, _layer_kv_map
 
 
 class MergedChunk23(nn.Module):
@@ -115,4 +115,96 @@ class MergedChunk23(nn.Module):
 
         # Output kv14 for chunk4 (still needs it)
         return (hidden_states, K_sliding_out, V_sliding_out, K_full_out, V_full_out,
+                kv13_k, kv13_v, kv14_k, kv14_v)
+
+
+class MergedChunk23Verify(nn.Module):
+    """Verify (Q=K) version of MergedChunk23.
+
+    Combines:
+      * own-KV verify for L8-14 (mirrors SWAVerifyChunk2) — emits per-T
+        K/V slices that Swift commitAccepted copies into persistent cache.
+      * KV-shared verify for L15-24 (mirrors SWAVerifyChunk3) — reads
+        the internal kv13/kv14 produced by L13/L14 in this same chunk,
+        no cache writes.
+
+    Output kv13/kv14 are exposed so chunk3_3way's verify (L25-34 +
+    lm_head) can consume them, identical to MergedChunk23 decode.
+    """
+    DEFAULT_OWN = (8, 15)
+    DEFAULT_SHARED = (15, 25)
+
+    def __init__(self, model: Gemma4Model, seq_len: int,
+                 own_range: tuple[int, int] | None = None,
+                 shared_range: tuple[int, int] | None = None):
+        super().__init__()
+        self.config = model.config
+        self.seq_len = seq_len
+        own = own_range if own_range is not None else self.DEFAULT_OWN
+        shared = shared_range if shared_range is not None else self.DEFAULT_SHARED
+        self.START_C2, self.END_C2 = own
+        self.START_C3, self.END_C3 = shared
+        self.layers_c2 = nn.ModuleList([model.layers[i] for i in range(self.START_C2, self.END_C2)])
+        self.layers_c3 = nn.ModuleList([model.layers[i] for i in range(self.START_C3, self.END_C3)])
+        self.sliding_map, self.full_map = _layer_kv_map(self.START_C2, self.END_C2, model.config)
+        self.sliding_layer_indices = sorted(self.sliding_map.keys(),
+                                            key=lambda k: self.sliding_map[k])
+        self.full_layer_indices = sorted(self.full_map.keys(),
+                                         key=lambda k: self.full_map[k])
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                update_indicator, per_layer_combined, cos_s, sin_s, cos_f, sin_f,
+                K_sliding_in, V_sliding_in, K_full_in, V_full_in):
+        config = self.config
+        K = self.seq_len
+
+        kv13_k = kv13_v = kv14_k = kv14_v = None
+        sliding_slices_k = [None] * len(self.sliding_layer_indices)
+        sliding_slices_v = [None] * len(self.sliding_layer_indices)
+        full_slices_k = [None] * len(self.full_layer_indices)
+        full_slices_v = [None] * len(self.full_layer_indices)
+
+        # L8-14 own-KV verify (writes new K/V slices)
+        for local_idx in range(self.END_C2 - self.START_C2):
+            layer_idx = self.START_C2 + local_idx
+            (hidden_states, K_sliding_in, V_sliding_in, K_full_in, V_full_in,
+             kv13_k, kv13_v, kv14_k, kv14_v,
+             new_k_slice, new_v_slice) = _run_layer_verify(
+                self.layers_c2[local_idx], layer_idx, hidden_states, K,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                update_indicator,
+                K_sliding_in, V_sliding_in, K_full_in, V_full_in,
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                self.sliding_map, self.full_map,
+            )
+            if layer_idx in self.sliding_map:
+                sliding_slices_k[self.sliding_map[layer_idx]] = new_k_slice
+                sliding_slices_v[self.sliding_map[layer_idx]] = new_v_slice
+            elif layer_idx in self.full_map:
+                full_slices_k[self.full_map[layer_idx]] = new_k_slice
+                full_slices_v[self.full_map[layer_idx]] = new_v_slice
+
+        # L15-24 KV-shared verify (reads internal kv13/14, no cache writes)
+        for local_idx in range(self.END_C3 - self.START_C3):
+            layer_idx = self.START_C3 + local_idx
+            (hidden_states, *_) = _run_layer_verify(
+                self.layers_c3[local_idx], layer_idx, hidden_states, K,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                None,  # no update_indicator for shared layers
+                None, None, None, None,
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                {}, {},  # empty maps — shared layers don't index slot
+            )
+
+        new_K_sliding = torch.cat(sliding_slices_k, dim=0)
+        new_V_sliding = torch.cat(sliding_slices_v, dim=0)
+        new_K_full = torch.cat(full_slices_k, dim=0)
+        new_V_full = torch.cat(full_slices_v, dim=0)
+
+        return (hidden_states,
+                new_K_sliding, new_V_sliding, new_K_full, new_V_full,
                 kv13_k, kv13_v, kv14_k, kv14_v)
