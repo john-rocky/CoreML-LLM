@@ -46,8 +46,30 @@ case "$SWEEP" in
     KEYS=("MTP_L5_ASYNC_DISABLE")
     VALUES=("0" "1")
     ;;
+  pld_prefetch)
+    KEYS=("MTP_PLD_PREFETCH_ENABLE")
+    VALUES=("0" "1")
+    ;;
+  self_bail)
+    KEYS=("MTP_SELF_BAIL_DISABLE")
+    VALUES=("0" "1")
+    ;;
+  fast_pred)
+    KEYS=("LLM_FAST_PREDICTION")
+    VALUES=("0" "1")
+    ;;
+  draft_pos_mode)
+    KEYS=("MTP_DRAFT_POS_MODE")
+    VALUES=("constpm1" "perstep" "constpos")
+    ;;
+  drafter_device)
+    KEYS=("MTP_DRAFTER_DEVICE")
+    VALUES=("ane" "cpu" "gpu")
+    ;;
   *)
-    echo "Unknown sweep: $SWEEP (known: k_use, fly_topk, bail_threshold, chunk_pipeline, l5_async)" >&2
+    echo "Unknown sweep: $SWEEP" >&2
+    echo "known: k_use, fly_topk, bail_threshold, chunk_pipeline, l5_async," >&2
+    echo "       pld_prefetch, self_bail, fast_pred, draft_pos_mode, drafter_device" >&2
     exit 1
     ;;
 esac
