@@ -91,11 +91,18 @@ case "$SWEEP" in
     KEYS=("LLM_DECODE_QOS")
     VALUES=("userinitiated" "high" "utility")
     ;;
+  per_prompt_kuse)
+    # Round E — sense first-cycle matchCount and pick sticky K_USE=1
+    # (full match → drafter on streak) or K-1 (partial → keep buffer).
+    KEYS=("MTP_PER_PROMPT_KUSE")
+    VALUES=("0" "1")
+    ;;
   *)
     echo "Unknown sweep: $SWEEP" >&2
     echo "known: k_use, fly_topk, bail_threshold, chunk_pipeline, l5_async," >&2
     echo "       pld_prefetch, self_bail, fast_pred, draft_pos_mode, drafter_device," >&2
-    echo "       ping_pong, lookahead, prefix_cache, sampling_temp, decode_qos" >&2
+    echo "       ping_pong, lookahead, prefix_cache, sampling_temp, decode_qos," >&2
+    echo "       per_prompt_kuse" >&2
     exit 1
     ;;
 esac

@@ -75,6 +75,7 @@ echo "bash scripts/iphone_autobench_sweep.sh pld_prefetch code     # +/- prefetc
 echo "bash scripts/iphone_autobench_sweep.sh ping_pong code        # S2 explicit sweep"
 echo "bash scripts/iphone_autobench_sweep.sh bail_threshold narrative"
 echo "bash scripts/iphone_autobench_sweep.sh decode_qos code"
+echo "bash scripts/iphone_autobench_sweep.sh per_prompt_kuse code  # Round E one-shot adapter"
 echo ""
 echo "# Day 2 — T7 per-channel INT4 (Mac build first, 30-90 min)"
 echo "bash scripts/build_per_channel_chunks.sh"

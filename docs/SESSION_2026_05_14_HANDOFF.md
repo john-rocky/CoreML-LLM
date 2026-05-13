@@ -95,17 +95,33 @@ recover some narrative MTP gain at the cost of some net-negative
 cycles; 0.35-0.40 may bail too eagerly. Empirical sweet spot lives
 somewhere in this range; today's default was a snap judgment.
 
-### Round E — Per-prompt K_USE adapter (Swift change)
+### Round E — Per-prompt K_USE adapter (SHIPPED 2026-05-14 night)
 
-Heuristic: after the bootstrap MTP cycle, check `accepted` count.
-* `accepted == K_USE_default` (i.e. drafter immediately matches):
-  drop K_USE to 1 for this prompt → save verify time.
-* `accepted < K_USE_default`: keep K_USE at K-1 for cold/uncertain
-  cycles.
+Heuristic: after the first non-fallback spec cycle, sense `matchCount`.
+* `matchCount == compareLen` (K-1 full match): drafter on streak → stick
+  `K_USE = 1` for the rest of the prompt → save the K-1 → 1 drafter
+  step (~6 ms iPhone) per cycle while keeping 2 tokens/cycle on
+  continued full accept.
+* otherwise: stick `K_USE = K-1` (default) so partial-match cycles
+  keep rolling acceptance above the 0.30 bail threshold.
 
-Approx +5-10 % on code, neutral elsewhere. ~1-2 hour Swift change.
-File: `Sources/CoreMLLLM/MtpSpeculativeEngine.swift` line 384
-(`envKUseStr` block).
+Reset on `reset()` so each prompt re-senses. Sticky (one-shot) so a
+mid-prompt accept dip doesn't flip back — flipping every cycle was
+the HF +2/-1 schedule that already lost (-10 pp vs static).
+
+Opt-in: `MTP_PER_PROMPT_KUSE=1`. Skipped silently when user sets
+`MTP_K_USE` explicitly or `MTP_K_ADAPTIVE=1`.
+
+Approx +5-10 % on code, neutral on narrative (narrative auto-bails
+to T=1 anyway; adapter won't fire because the first MTP cycle
+never gets to full-match before EMA decays).
+
+Bench:
+```bash
+bash scripts/iphone_autobench_sweep.sh per_prompt_kuse code
+```
+Compares `MTP_PER_PROMPT_KUSE=0` (current default K-1) vs `=1` (adapter
+on). Cool iPhone, 10-min gap between runs.
 
 ## AutoBench command reference
 

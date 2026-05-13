@@ -94,6 +94,22 @@ public final class MtpSpeculativeEngine {
     // Bounded by [1, K]. Initial value follows the static MTP_K_USE setting.
     private var kUseAdaptive: Int = 2
 
+    // Round E — per-prompt K_USE adapter (MTP_PER_PROMPT_KUSE=1).
+    // After the first spec cycle on a new prompt, sense matchCount:
+    //   * full match on K-1 slots → drafter is on a streak for this prompt
+    //     (typical for code / structured / repetitive output) → switch to
+    //     K_USE=1 for the rest of the prompt. Saves one drafter chain step
+    //     (~6 ms iPhone) per cycle while still emitting 2 tokens per cycle
+    //     on continued full accept.
+    //   * partial match (or zero) → keep K_USE=K-1 (default). Two-slot
+    //     drafting gives more chances to maintain rolling acceptance EMA
+    //     above bail threshold on narrative / uncertain prompts.
+    // Reset on `reset()` (new conversation).
+    // Skipped entirely if `MTP_K_USE` is set explicitly (user override
+    // wins) or if `MTP_K_ADAPTIVE=1` is on (HF schedule active).
+    private var perPromptKUseOverride: Int?
+    private var perPromptKUseSensed: Bool = false
+
     // L12 — subset LM head (iPhone 1.5× lever). Computed once at init from
     // `MTP_SUBSET_LM_HEAD=1` and `engine.hasSubsetLMHead`. When true, every
     // greedy + FLy verify cycle (i.e. when not in tree mode or rejection-
@@ -381,12 +397,18 @@ public final class MtpSpeculativeEngine {
         // MTP_K_ADAPTIVE=1.
         let adaptive = ProcessInfo.processInfo
             .environment["MTP_K_ADAPTIVE"] == "1"
+        let perPromptAdapter = !adaptive
+            && ProcessInfo.processInfo
+                .environment["MTP_PER_PROMPT_KUSE"] == "1"
         let envKUseStr = ProcessInfo.processInfo.environment["MTP_K_USE"]
+        let userOverrode = envKUseStr.flatMap { Int($0) } != nil
         let kEffective: Int
         if adaptive {
             kEffective = max(1, min(K, kUseAdaptive))
         } else if let s = envKUseStr, let v = Int(s) {
             kEffective = v <= 0 ? K : min(K, v)
+        } else if perPromptAdapter, let v = perPromptKUseOverride {
+            kEffective = max(1, min(K, v))
         } else {
             // Default: K-1 (use all draft slots that have a paired verify
             // slot for argmax comparison). For K=3 this gives kEffective=2.
@@ -1257,6 +1279,25 @@ public final class MtpSpeculativeEngine {
             kUseAdaptive = max(1, kUseAdaptive - 1)
         }
 
+        // Round E — per-prompt K_USE adapter. One-shot sensing after the
+        // first non-fallback spec cycle this prompt. Sticky for the rest
+        // of the prompt (reset() clears).
+        if perPromptAdapter && !perPromptKUseSensed && !userOverrode
+            && compareLen >= 1 {
+            perPromptKUseSensed = true
+            if matchCount == compareLen && compareLen >= 2 {
+                // Full match on K-1 slots → drafter on streak for this
+                // prompt → minimize cost per cycle.
+                perPromptKUseOverride = 1
+            } else {
+                // Partial / zero match → keep K-1 for next cycles. Sets
+                // override explicitly so subsequent cycles take the same
+                // path through the branch above (no reset on subsequent
+                // matchCount swings — adapter is one-shot, not adaptive).
+                perPromptKUseOverride = max(1, K - 1)
+            }
+        }
+
         // Update metrics
         totalRounds += 1
         totalAccepted += matchCount
@@ -1315,6 +1356,9 @@ public final class MtpSpeculativeEngine {
         } else {
             kUseAdaptive = min(K, 2)
         }
+        // Round E — per-prompt sense fires on first cycle of next prompt.
+        perPromptKUseOverride = nil
+        perPromptKUseSensed = false
     }
 
     // MARK: - Private
