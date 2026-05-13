@@ -23,6 +23,12 @@ session's empirical Mac + iPhone push without re-deriving the constraints.
   per-prompt K_USE adapter implemented and opt-in via
   `MTP_PER_PROMPT_KUSE=1`. No default change. Telemetry line emits
   one decision per prompt for grep-friendly bench post-mortem.
+* **Overnight 2026-05-14 (commit `019854d`)**: Round F SuffixDecoding
+  wired into MTP / DrafterUnion / LookaheadEngine. The engine code
+  existed as 559 LOC of dead code — `union.suffix` was never set.
+  Now opt-in via `LLM_SUFFIX_DRAFT=1` (load trie) +
+  `MTP_SUFFIX_DRAFT=1` (consult inside MTP). Lossless by construction.
+  See Round F below.
 
 ## Validated baselines
 
@@ -126,6 +132,52 @@ bash scripts/iphone_autobench_sweep.sh per_prompt_kuse code
 ```
 Compares `MTP_PER_PROMPT_KUSE=0` (current default K-1) vs `=1` (adapter
 on). Cool iPhone, 10-min gap between runs.
+
+### Round F — SuffixDecoding inside MTP path (SHIPPED 2026-05-14 night)
+
+Cross-session persistent suffix trie. Implementation existed
+(`SuffixSpeculativeEngine`, `SuffixTree`, ~559 LOC) but had never been
+wired — `DrafterUnion.suffix` / `LookaheadEngine.suffix` were
+unconditionally nil. This commit wires the shared trie into
+DrafterUnion + LookaheadEngine + **MtpSpeculativeEngine** (a new
+integration), with `<Documents>/suffix_tree.json` persistence
+(`saveEvery=256` on iOS — every ~10 s of decode, vs the original 64
+that would have stalled every couple seconds).
+
+In the MTP path: after L5 / PLD miss, the trie is queried with
+`emittedHistory + nextID` as context. Hit (≥ `kEffective` proposals
+returned) skips the drafter chain entirely (~6-12 ms iPhone saved per
+cycle). Verify still strict-checks → **lossless**. The trie grows via
+`applyCommit` so subsequent cycles, prompts, and sessions benefit.
+
+Opt-in two-stage:
+1. Launch: `LLM_SUFFIX_DRAFT=1` (loads the trie from Documents).
+2. Per-cycle: `MTP_SUFFIX_DRAFT=1` (consults the trie inside MTP cycles).
+
+Cold-start tells: first generation has empty trie → no benefit (one
+small per-cycle CPU lookup that misses, microseconds). Trie grows
+with accepted commits. Second-and-later generations on similar prompts
+get cross-session matches. Within-prompt benefit fires on repetitive
+output (lists, code, templated text).
+
+Bench:
+```bash
+bash scripts/iphone_autobench_sweep.sh suffix_draft code
+# sweep script auto-sets LLM_SUFFIX_DRAFT=1 alongside MTP_SUFFIX_DRAFT.
+```
+For the cleanest measurement, run twice in a row — the first pass
+seeds the trie, the second pass reads it. Cool iPhone, 10-min gap
+between paired runs.
+
+Expectations:
+* Code BST cold: parity-ish (trie is empty)
+* Code BST warm (after seed gen): +5-15 % if intra-prompt suffix
+  matches fire on `{` / `}` / `;` / `for (i...)` patterns
+* Narrative: parity (no repetition — trie produces few hits)
+
+If empirical confirms positive gain → flip `MTP_SUFFIX_DRAFT=1` default
+on inside `MtpSpeculativeEngine` (similar precedent: `MTP_L5_ASYNC` is
+default-on).
 
 ## AutoBench command reference
 
