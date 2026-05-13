@@ -873,6 +873,75 @@ class SWAVerifyChunk3(nn.Module):
         return hidden_states
 
 
+class SWAVerifyChunk4Subset(nn.Module):
+    """Subset-vocab verify chunk4. Computes logits only over a caller-
+    provided candidate set (M tokens, typically 1024) instead of full
+    262144 vocab. The 600M-param dense lm_head matmul becomes a 2.4M-param
+    gather+matmul on ANE/CPU → ~7-10 ms savings per cycle on iPhone.
+
+    Lossless WHEN candidate set covers target's true argmax — typically the
+    union of: drafter top-K proposals across K-1 steps, PLD n-gram history
+    matches, top-N most-frequent tokens (~500), recent emit history (~30).
+    On miss, the predicted argmax-within-subset is wrong (lossy); a high-
+    confidence threshold post-check can route to a full-vocab fallback.
+
+    Output token_ids in shape (1, K) like SWAVerifyChunk4. Caller passes
+    `candidate_ids: (M,) int32`. Inside, we gather lm_head rows, sparse
+    matmul, sparse argmax, then index back into candidate_ids to recover
+    the predicted token IDs.
+    """
+
+    def __init__(self, model: Gemma4Model, seq_len: int,
+                 start: int = 25, end: int = 35,
+                 num_candidates: int = 1024):
+        super().__init__()
+        self.config = model.config
+        self.seq_len = seq_len
+        self.start = start
+        self.end = end
+        self.num_candidates = num_candidates
+        self.layers = nn.ModuleList([model.layers[i] for i in range(start, end)])
+        self.norm = model.norm
+        # No lm_head — Swift does sparse matmul outside.
+        self.softcap = model.softcap
+
+    def forward(self, hidden_states, causal_mask_full, causal_mask_sliding,
+                per_layer_combined, cos_s, sin_s, cos_f, sin_f,
+                kv13_k, kv13_v, kv14_k, kv14_v):
+        """Variant that SKIPS the LM head entirely — outputs post-norm
+        hidden state. Swift caller does sparse matmul (gather + matmul) on
+        a separately-loaded lm_head weight buffer. This avoids the dynamic
+        gather op inside ANE (which caused mask-shape conversion bugs)
+        and gives Swift full control over the candidate set per-cycle.
+
+        Output: hidden_states (raw, K positions of 1536-dim) +
+                normed_hidden (post-final-norm, ready for sparse matmul).
+        """
+        config = self.config
+        K = self.seq_len
+
+        for local_idx in range(self.end - self.start):
+            layer_idx = self.start + local_idx
+            (hidden_states, _, _, _, _,
+             _, _, _, _, _, _) = _run_layer_verify(
+                self.layers[local_idx], layer_idx, hidden_states, K,
+                cos_s, sin_s, cos_f, sin_f,
+                causal_mask_full, causal_mask_sliding,
+                None, None, None, None, None,
+                config, per_layer_combined,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                {}, {},
+            )
+
+        normed = self.norm(hidden_states)  # (1, K, hidden)
+        # Skip LM head entirely — Swift handles sparse matmul on normed.
+        # CTX=2048 must be passed explicitly to build script (default 512
+        # collapses full-attention mask). With correct CTX, removing LM
+        # head saves ~150-200 MB of mlmodelc size AND ~7-10 ms verify cost
+        # on iPhone ANE per cycle.
+        return normed, hidden_states
+
+
 class SWAVerifyChunk4(nn.Module):
     """Verify version of chunk4: Q=K, shared KV + final norm + lm_head.
 
@@ -919,5 +988,11 @@ class SWAVerifyChunk4(nn.Module):
             logits = torch.tanh(logits / self.softcap) * self.softcap
         # Per-position argmax
         token_ids = torch.argmax(logits, dim=-1).to(torch.int32)  # (1, K)
-        # Return hidden_states for MTP drafter carry state
+        # logits emission is opt-in via MTP_EMIT_LOGITS=1. Greedy MTP only
+        # needs token_ids + hidden_states; the 262144 × K fp16 logits buffer
+        # adds verify cycle IO + ANE materialisation cost (~3-10ms iPhone)
+        # for no greedy benefit. Sampling rejection path requires the full
+        # logits — opt-in only when sampling is the target.
+        if os.environ.get("MTP_EMIT_LOGITS", "0") == "1":
+            return token_ids, hidden_states, logits
         return token_ids, hidden_states

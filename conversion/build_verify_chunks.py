@@ -574,8 +574,17 @@ def main():
     vc4 = SWAVerifyChunk4(base, seq_len=K, start=c4_start, end=c4_end).eval()
     s4_verify = shared_kv_samples(K)
     in4_verify = shared_kv_inputs(K)
+    # SWAVerifyChunk4 returns (token_ids, hidden_states_out[, logits_fp16]).
+    # Set MTP_EMIT_LOGITS=1 in env to emit the full-vocab logits (262144 × K
+    # × fp16 = 1.5MB per cycle) needed by rejection sampling. Default off
+    # to save the verify cycle IO + ANE materialisation cost on iPhone for
+    # the greedy path.
+    emit_logits = os.environ.get("MTP_EMIT_LOGITS", "0") == "1"
+    verify_outputs = ["token_ids", "hidden_states_out"]
+    if emit_logits:
+        verify_outputs.append("logits_fp16")
     verify4 = trace_and_convert(vc4, s4_verify, in4_verify,
-                                ["token_ids", "hidden_states_out"],
+                                verify_outputs,
                                 quantize=quantize)
     save_temp(verify4, f"{tmp}/chunk4_verify.mlpackage")
     del verify4

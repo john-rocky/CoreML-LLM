@@ -67,6 +67,17 @@ for f in embed_tokens_q8.bin embed_tokens_scales.bin \
   fi
 done
 
+# 2b. L12 subset LM head artifacts (auto-enabled on iOS when present):
+# chunk4_subset.mlmodelc + lm_head_fp16.bin + frequent_tokens.bin.
+# Pull from canonical locations if not already in $BUNDLE; otherwise push
+# from $BUNDLE.
+LM_HEAD_BIN="$ROOT/output/gemma4-e2b/lm_head_fp16.bin"
+SUBSET_DIR="$ROOT/output/gemma4-e2b/chunks_subset/chunk4_subset.mlmodelc"
+FREQ_BIN="$ROOT/output/gemma4-e2b/frequent_tokens.bin"
+if [ -d "$SUBSET_DIR" ]; then push_one "$SUBSET_DIR"; fi
+if [ -f "$LM_HEAD_BIN" ]; then push_one "$LM_HEAD_BIN"; fi
+if [ -f "$FREQ_BIN" ]; then push_one "$FREQ_BIN"; fi
+
 # 3. Drafter — push the centroid version if present, else fall back to
 #    the bundle's drafter (older full-vocab build).
 if [ -d "$CENTROID_DRAFTER" ]; then

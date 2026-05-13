@@ -72,14 +72,32 @@ def main():
     ap.add_argument("--sample", action="store_true",
                     help="Use rejection sampling (do_sample=True, temp=0.7)")
     ap.add_argument("--temperature", type=float, default=0.7)
+    ap.add_argument("--int4", action="store_true",
+                    help="Load both target and assistant via bitsandbytes "
+                         "NF4 4-bit quantization (compute in bf16). "
+                         "Apples-to-apples vs our CoreML INT4 stack.")
     args = ap.parse_args()
 
-    print(f"Loading target {args.target} (bf16) on {args.device} ...")
-    target = AutoModelForCausalLM.from_pretrained(
-        args.target, dtype=torch.bfloat16).eval().to(args.device)
-    print(f"Loading assistant {args.assistant} (bf16) on {args.device} ...")
-    assistant = AutoModelForCausalLM.from_pretrained(
-        args.assistant, dtype=torch.bfloat16).eval().to(args.device)
+    if args.int4:
+        from transformers import BitsAndBytesConfig
+        qcfg = BitsAndBytesConfig(load_in_4bit=True,
+                                  bnb_4bit_quant_type="nf4",
+                                  bnb_4bit_compute_dtype=torch.bfloat16)
+        print(f"Loading target {args.target} (NF4 4-bit) on {args.device} ...")
+        target = AutoModelForCausalLM.from_pretrained(
+            args.target, quantization_config=qcfg,
+            device_map=args.device, dtype=torch.bfloat16).eval()
+        print(f"Loading assistant {args.assistant} (NF4 4-bit) on {args.device} ...")
+        assistant = AutoModelForCausalLM.from_pretrained(
+            args.assistant, quantization_config=qcfg,
+            device_map=args.device, dtype=torch.bfloat16).eval()
+    else:
+        print(f"Loading target {args.target} (bf16) on {args.device} ...")
+        target = AutoModelForCausalLM.from_pretrained(
+            args.target, dtype=torch.bfloat16).eval().to(args.device)
+        print(f"Loading assistant {args.assistant} (bf16) on {args.device} ...")
+        assistant = AutoModelForCausalLM.from_pretrained(
+            args.assistant, dtype=torch.bfloat16).eval().to(args.device)
     tok = AutoTokenizer.from_pretrained(args.target)
 
     print(f"\nMax new tokens: {args.max_new_tokens}")

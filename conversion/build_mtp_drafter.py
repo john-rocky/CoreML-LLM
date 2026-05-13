@@ -132,6 +132,12 @@ class MtpDrafterANE(nn.Module):
         # 4096 candidates → top-K. Set via --centroid-lm-head.
         self.centroid_lm_head = bool(getattr(cfg, "centroid_lm_head", False))
         self.num_centroids = 2048
+        # Output width for the drafter's top-K (id, logit) pairs. Greedy
+        # speculative decoding only reads element 0, so 8 is plenty. The
+        # rejection-sampling MTP path needs a wider distribution to avoid
+        # `p_d(x_d) = 0` for off-top-K tokens; bump to 256 (or up to 4096
+        # in centroid mode) to give sampling enough drafter mass.
+        self.top_k_out = int(getattr(cfg, "top_k_out", 8))
         self.top_k_centroids = 32
         self.vocab_size_per_centroid = V // self.num_centroids   # = 128
         self.centroids = nn.Conv2d(H, self.num_centroids, 1, bias=False, dtype=MODEL_DTYPE)
@@ -190,8 +196,21 @@ class MtpDrafterANE(nn.Module):
                 0, selected_canonical_flat.long())
             h_2d = h.reshape(1, -1)
             selected_logits = (h_2d.float() @ sel_emb.float().transpose(0, 1)).squeeze(0)
-            # Top-K over the 4096-element selected vocab.
-            top_k_vals_sel, top_k_pos_sel = torch.topk(selected_logits, k=8)
+            # logsumexp over the 4096-token candidate set, computed as
+            # `max + log(Σ exp(l - max))`. We output ONLY the residual
+            # `log_z_residual` ∈ [0, log(4096)] ≈ [0, 8.3]; Swift adds
+            # back top_k_values[0] (= max selected_logit) to get the
+            # full LSE. This avoids fp16 overflow that hits when
+            # `exp(logit)` is materialised in fp16 during CoreML
+            # conversion (logits up to +30 → exp = 1e13 ≫ fp16 65504).
+            sel_max = selected_logits.max()
+            full_logsumexp = torch.log(
+                torch.exp(selected_logits - sel_max).sum())
+            # Top-K over the 4096-element selected vocab. Width is
+            # configurable via `cfg.top_k_out` (greedy needs only 8;
+            # rejection sampling wants ≥ 256 for non-zero p_d coverage).
+            k_out = min(self.top_k_out, selected_logits.shape[-1])
+            top_k_vals_sel, top_k_pos_sel = torch.topk(selected_logits, k=k_out)
             # Final gather: int32 token IDs at the K positions.
             top_k_ids = selected_canonical_flat.index_select(
                 0, top_k_pos_sel.to(torch.int64))
@@ -199,13 +218,22 @@ class MtpDrafterANE(nn.Module):
             # Full vocab argmax (legacy path).
             logits = F.linear(h.float(), self.lm_head_weight.float())
             logits = logits.squeeze(0).squeeze(0)  # (V,)
-            top_k_vals_sel, top_k_ids = torch.topk(logits, k=8)
+            log_max = logits.max()
+            full_logsumexp = torch.log(torch.exp(logits - log_max).sum())
+            top_k_vals_sel, top_k_ids = torch.topk(logits, k=self.top_k_out)
 
         h_nchw = h.permute(0, 2, 1).unsqueeze(2)
         proj_out_nchw = self.post_projection(h_nchw)
         proj_out = proj_out_nchw.squeeze(2).permute(0, 2, 1)
 
-        return top_k_ids.to(torch.int32), top_k_vals_sel.to(MODEL_DTYPE), proj_out
+        # full_logsumexp returned as a 1-element fp16 tensor so callers
+        # can compute proper p_d(x) = exp(logit_d(x)/T - lse/T) instead of
+        # the top-K-truncated softmax (which over-estimates p_d → too many
+        # rejections in speculative sampling).
+        return (top_k_ids.to(torch.int32),
+                top_k_vals_sel.to(MODEL_DTYPE),
+                proj_out,
+                full_logsumexp.reshape(1).to(MODEL_DTYPE))
 
 
 class MtpLayerANE(nn.Module):
@@ -384,6 +412,10 @@ def main():
     ap.add_argument("--output", default="mtp_drafter.mlpackage")
     ap.add_argument("--palettize-int4", action="store_true",
                     help="INT4 palettize (group_size=32) — recommended for ANE.")
+    ap.add_argument("--palettize-nbits", type=int, default=0,
+                    help="Palettize with arbitrary nbits (2, 3, 4, 6, 8). "
+                         "Overrides --palettize-int4. INT2 saves 8x vs fp16; "
+                         "iPhone ANE may load faster from cache.")
     ap.add_argument("--sliding-window", type=int, default=512,
                     help="Sliding-window K/V length (matches target's kv13).")
     ap.add_argument("--context-length", type=int, default=8192,
@@ -398,11 +430,17 @@ def main():
                     help="Target backbone variant. e2b=hidden 1536 (default), "
                          "e4b=hidden 2560. Drafter geometry is otherwise "
                          "identical between the two official assistants.")
+    ap.add_argument("--top-k", type=int, default=8,
+                    help="Output width for top_k_indices/top_k_values. "
+                         "Default 8 (greedy compatible). Set 256+ for the "
+                         "rejection-sampling path so p_d(x_d) is non-zero "
+                         "across the drafter's plausible candidates.")
     args = ap.parse_args()
 
     cfg = (MtpDrafterConfig.e4b() if args.target == "e4b"
            else MtpDrafterConfig())
     cfg.centroid_lm_head = args.centroid_lm_head
+    cfg.top_k_out = args.top_k
     W = args.sliding_window
     C = args.context_length
     H = cfg.hidden_size
@@ -446,11 +484,12 @@ def main():
         sin_f = torch.zeros(1, cfg.full_head_dim // 2, dtype=MODEL_DTYPE)
         mask_s = torch.zeros(1, 1, 1, W, dtype=MODEL_DTYPE)
         mask_f = torch.zeros(1, 1, 1, C, dtype=MODEL_DTYPE)
-        ids, vals, proj_out = ane(embed, proj, kv13_k, kv13_v, kv14_k, kv14_v,
-                                   cos_s, sin_s, cos_f, sin_f, mask_s, mask_f)
-    print(f"  top_k_indices {tuple(ids.shape)} {ids.dtype}")
-    print(f"  top_k_values  {tuple(vals.shape)} {vals.dtype}")
-    print(f"  proj_act_out  {tuple(proj_out.shape)} {proj_out.dtype}")
+        ids, vals, proj_out, lse = ane(embed, proj, kv13_k, kv13_v, kv14_k, kv14_v,
+                                        cos_s, sin_s, cos_f, sin_f, mask_s, mask_f)
+    print(f"  top_k_indices  {tuple(ids.shape)} {ids.dtype}")
+    print(f"  top_k_values   {tuple(vals.shape)} {vals.dtype}")
+    print(f"  proj_act_out   {tuple(proj_out.shape)} {proj_out.dtype}")
+    print(f"  full_logsumexp {tuple(lse.shape)} {lse.dtype}")
 
     # 4. coremltools convert.
     print("\nConverting to CoreML ...")
@@ -482,6 +521,7 @@ def main():
             ct.TensorType(name="top_k_indices", dtype=np.int32),
             ct.TensorType(name="top_k_values"),
             ct.TensorType(name="proj_act_out"),
+            ct.TensorType(name="full_logsumexp"),
         ],
         convert_to="mlprogram",
         compute_units=ct.ComputeUnit.CPU_AND_NE,
@@ -495,12 +535,13 @@ def main():
         minimum_deployment_target=ct.target.iOS18,
     )
 
-    if args.palettize_int4:
-        print("  Palettizing weights INT4 (group_size=32) ...")
+    if args.palettize_nbits > 0 or args.palettize_int4:
+        nbits = args.palettize_nbits if args.palettize_nbits > 0 else 4
+        print(f"  Palettizing weights INT{nbits} (group_size=32) ...")
         import coremltools.optimize.coreml as cto
         pal_cfg = cto.OptimizationConfig(
             global_config=cto.OpPalettizerConfig(
-                mode="kmeans", nbits=4,
+                mode="kmeans", nbits=nbits,
                 granularity="per_grouped_channel", group_size=32,
             )
         )
