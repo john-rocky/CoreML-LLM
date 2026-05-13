@@ -66,10 +66,36 @@ case "$SWEEP" in
     KEYS=("MTP_DRAFTER_DEVICE")
     VALUES=("ane" "cpu" "gpu")
     ;;
+  ping_pong)
+    # S2 — re-enable verify outputBackings with A/B alternation.
+    KEYS=("MTP_VERIFY_BACKINGS_PING_PONG")
+    VALUES=("0" "1")
+    ;;
+  lookahead)
+    # L20 — Jacobi/Lookahead engine.
+    KEYS=("LLM_LOOKAHEAD_ENABLE")
+    VALUES=("0" "1")
+    ;;
+  prefix_cache)
+    # L21 — multi-turn TTFT (note: only relevant for multi-turn).
+    KEYS=("LLM_PREFIX_CACHE")
+    VALUES=("0" "1")
+    ;;
+  sampling_temp)
+    # L22 — rejection-sampling MTP path. 0 = greedy (default).
+    KEYS=("MTP_TEMPERATURE")
+    VALUES=("0.0" "0.5" "0.7" "1.0")
+    ;;
+  decode_qos)
+    # L16/L17 — decode loop QoS (high=peak, utility=anti-thermal).
+    KEYS=("LLM_DECODE_QOS")
+    VALUES=("userinitiated" "high" "utility")
+    ;;
   *)
     echo "Unknown sweep: $SWEEP" >&2
     echo "known: k_use, fly_topk, bail_threshold, chunk_pipeline, l5_async," >&2
-    echo "       pld_prefetch, self_bail, fast_pred, draft_pos_mode, drafter_device" >&2
+    echo "       pld_prefetch, self_bail, fast_pred, draft_pos_mode, drafter_device," >&2
+    echo "       ping_pong, lookahead, prefix_cache, sampling_temp, decode_qos" >&2
     exit 1
     ;;
 esac

@@ -2633,6 +2633,7 @@ final class ChunkedEngine {
                 chunks12Ms, chunk3Ms, chunk4Ms, matmulMs))
         }
 
+        flipVerifyCycleParity()
         return SubsetVerifyResult(
             argmax: argmaxGlobal,
             argmaxLocalIdx: argmaxLocal,
@@ -2898,6 +2899,7 @@ final class ChunkedEngine {
             }
             topKOut.append(best)
         }
+        flipVerifyCycleParity()
         return (argmax, topKOut)
     }
 
