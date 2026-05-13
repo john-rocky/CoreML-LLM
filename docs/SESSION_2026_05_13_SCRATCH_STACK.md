@@ -4,6 +4,25 @@ Continuation of the iPhone Gemma 4 E2B 1.5× hunt. User directive:
 `全部 mac で検証してとことん手法をてんこ盛りに` — no iPhone testing this
 session, verify everything on Mac, stack as many CPU-side wins as possible.
 
+## Headline win: Mac default FLy K=16 + centroid drafter
+
+Once the canonical bundle + canonical drafter + canonical FLy default are
+all aligned, Mac decode goes:
+
+| prompt class | T=1 (32 tok/s) | MTP+FLy16+centroid | gain |
+|---|---|---|---|
+| narrative essay | 32.0 | **43.1** (acc 0.23) | **+35%** |
+| technical free-form | 32.0 | **41.6** (acc 0.20) | **+30%** |
+| structured list (30) | 32.0 | **49.4** (acc 0.30) | **+54%** |
+| code generation | 32.0 | **63.9** (acc 0.49) | **+100%** |
+
+User's "freeform 22%" memory matches narrative acc 0.23 exactly — the
+production drafter has always been capable, but the **Mac default was
+strict-only since the FLy work shipped on iPhone**, so any Mac bench
+that didn't explicitly set `MTP_FLY_TOPK=16` saw only the strict ~+2%
+narrative number. Commit `perf(mtp-mac): enable FLy top-K=16 default on
+Mac` fixed this — Mac now matches iPhone production defaults.
+
 ## Top finding: Mac canonical bundle gap
 
 Spent a long time chasing a "drafter regression" (Mac MTP-on acc 0%
