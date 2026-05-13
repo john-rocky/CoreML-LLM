@@ -72,6 +72,20 @@ struct Smoke {
                 print("[smoke] UNION_TRIP=1 — mtp=off union=on cv=on")
             }
 
+            // MTP sampling temperature overrides for free-form sampling tests.
+            // MTP_TEMPERATURE = target T (rejection acceptance scale).
+            // MTP_DRAFTER_TEMP = drafter T (overrides MTP_TEMPERATURE if set).
+            if let s = ProcessInfo.processInfo.environment["MTP_TEMPERATURE"],
+               let v = Float(s) {
+                llm.mtpSamplingTemperature = v
+                print("[smoke] MTP_TEMPERATURE=\(v) — sampling on")
+            }
+            if let s = ProcessInfo.processInfo.environment["MTP_DRAFTER_TEMP"],
+               let v = Float(s) {
+                llm.mtpDrafterTemperature = v
+                print("[smoke] MTP_DRAFTER_TEMP=\(v)")
+            }
+
             print("[smoke] prompt: \(prompt)")
             print("[smoke] max_tokens=\(maxTokens)")
 

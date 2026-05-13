@@ -89,6 +89,23 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// Toggle MTP speculation on/off for benchmarking.
     public var mtpEnabled: Bool = true
 
+    /// Sampling temperature for the MTP rejection-sampling path. `0` keeps
+    /// the greedy argmax path (current production). `> 0` switches to
+    /// canonical speculative sampling — drafter samples top-K, target
+    /// samples full vocab, acceptance = min(1, p_t/p_d). HF Mac MPS bf16
+    /// reference (gemma-4-E2B-it-assistant): household 1.13× greedy →
+    /// 1.52× at T=1.0; translate 0.74× → 1.68×.
+    public var mtpSamplingTemperature: Float {
+        get { mtpEngine?.samplingTemperature ?? 0.0 }
+        set { mtpEngine?.samplingTemperature = newValue }
+    }
+    /// Optional drafter-side temperature override for MTP sampling. `0`
+    /// keeps `mtpSamplingTemperature` for both drafter and acceptance.
+    public var mtpDrafterTemperature: Float {
+        get { mtpEngine?.drafterTemperature ?? 0.0 }
+        set { mtpEngine?.drafterTemperature = newValue }
+    }
+
     // Cross-vocabulary (Qwen -> Gemma) speculative decoding — Route B
     private var crossVocabEngine: CrossVocabSpeculativeEngine?
     /// Underlying Qwen drafter, also re-used by `drafterUnion`. Held
@@ -237,7 +254,13 @@ public final class CoreMLLLM: @unchecked Sendable {
             ProcessInfo.processInfo.environment["LLM_EAGLE3_ENABLE"] == "1"
         let specProfile =
             ProcessInfo.processInfo.environment["SPECULATIVE_PROFILE"] != nil
+        // iOS: always load verify chunks (MTP path is the production path).
+        // macOS keeps the env gate so the no-spec baseline path stays measurable.
+        #if os(iOS)
+        let loadVerify = true
+        #else
         let loadVerify = eagle3Enabled || specProfile
+        #endif
         let loadCV = specProfile
         if eagle3Enabled || specProfile {
             print("[Load] speculative gates: "
@@ -377,9 +400,44 @@ public final class CoreMLLLM: @unchecked Sendable {
             do {
                 let drafterSource = try MtpDraftSource(
                     modelURL: mtpURL, K: engine.verifyK)
-                llm.mtpEngine = MtpSpeculativeEngine(
+                let mtpEng = MtpSpeculativeEngine(
                     engine: engine, drafter: drafterSource)
+                // Optional: enable rejection-sampling MTP path. Default 0
+                // (greedy). Set MTP_TEMPERATURE>0 (e.g. 1.0) to switch to
+                // speculative-sampling — useful for free-form text where
+                // greedy accept is bottlenecked by drafter argmax bias.
+                if let tempStr = ProcessInfo.processInfo.environment["MTP_TEMPERATURE"],
+                   let temp = Float(tempStr), temp > 0 {
+                    mtpEng.samplingTemperature = temp
+                    print("[MTP] sampling temperature=\(temp)")
+                }
+                // Optional asymmetric drafter temperature: softens drafter
+                // sampling without softening target verification.
+                if let tdStr = ProcessInfo.processInfo.environment["MTP_DRAFTER_T"],
+                   let td = Float(tdStr), td > 0 {
+                    mtpEng.drafterTemperature = td
+                    print("[MTP] drafter temperature=\(td) (asymmetric)")
+                }
+                llm.mtpEngine = mtpEng
                 print("[MTP] Drafter loaded (K=\(engine.verifyK))")
+                // Pre-compile the drafter ANE graph with a dummy call.
+                // First production call is otherwise ~50 ms cold (vs ~13 ms
+                // warm on iPhone 17 Pro). Cumulative with the verify_qK
+                // cold-start (~400 ms first call), MTP cycle #1 was 522 ms
+                // = killing UI tok/s for short outputs. Prewarm pushes both
+                // ANE caches into memory so cycle #1 is closer to warm.
+                let pwT0 = CFAbsoluteTimeGetCurrent()
+                do {
+                    try drafterSource.prewarm(
+                        targetHidden: engine.config.hiddenSize,
+                        slidingWindow: engine.config.slidingWindow,
+                        contextLength: engine.config.contextLength)
+                    let dt = (CFAbsoluteTimeGetCurrent() - pwT0) * 1000.0
+                    print(String(format:
+                        "[MTP] drafter prewarm done in %.1f ms", dt))
+                } catch {
+                    print("[MTP] drafter prewarm failed: \(error)")
+                }
             } catch {
                 print("[MTP] Failed to load drafter: \(error)")
             }

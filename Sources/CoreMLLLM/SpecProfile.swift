@@ -45,10 +45,14 @@ enum SpecProfile {
     /// Cached at first access. Re-read is cheap but env access is not
     /// guaranteed thread-safe across processes; cache once.
     static let isEnabled: Bool = {
+        #if os(iOS)
+        return true
+        #else
         if ProcessInfo.processInfo.environment["SPECULATIVE_PROFILE"] != nil {
             return true
         }
         return UserDefaults.standard.bool(forKey: "SPECULATIVE_PROFILE")
+        #endif
     }()
 
     /// Chat-CV residual investigation (docs/PHASE_B_CHAT_CV_RESIDUAL.md).

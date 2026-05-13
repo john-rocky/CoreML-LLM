@@ -37,13 +37,54 @@ public final class MtpDraftSource {
     /// fast on iPhone-style patterns where most rounds are 0/2.
     private(set) public var rollingAcceptance: Double = 0.55
     private let rollingAlpha: Double = 0.20
-    /// Threshold tuned around the "MTP cycle is slower than baseline
-    /// decode" break-even point on Mac/iPhone INT4 chunks: cycle ≈ 45 ms,
-    /// emit per cycle = 1 + K_USE * accept; baseline ≈ 32 ms / 1 emit.
-    /// MTP wins when (1 + 2 * accept) / 45 > 1 / 32 → accept > 0.20.
-    /// 0.35 gives margin: alternating 0/2-2/2 pattern stable at 0.5 stays
-    /// in MTP comfortably; iPhone messy 0.30 average bails consistently.
-    public var fallbackThreshold: Double = 0.35
+    /// Bail threshold. Platform-aware because MTP cycle latency differs:
+    ///   Mac:   cycle ≈ 30-35 ms, break-even accept ≈ 0.05
+    ///   iPhone: cycle ≈ 45-50 ms, break-even accept ≈ 0.20
+    /// 2026-05-11 Mac bench: lowering Mac threshold 0.35 → 0.10 recovers
+    /// the ~10 tok/s lost to premature bail on translate (44 forced vs 33
+    /// auto-bail). iPhone stays conservative because free-form accept
+    /// typically 0.11-0.16, below iPhone break-even.
+    // 2026-05-13: unified never-bail for iOS too. Earlier iOS=0.25 threshold
+    // killed FLy top-K=16 wins after 7-8 rounds of intermittent accepts (the
+    // EMA drifts below 0.25 even when FLy hits 50% of slots), causing the
+    // iPhone to silently fall back to plain decode. Mac never-bail behaviour
+    // sustains MTP for 45+ rounds at avg 38% accept — that's the source of
+    // Mac's 1.5× number. Pay 15ms per miss cycle to capture FLy wins.
+    public var fallbackThreshold: Double = 0.0
+    /// Hard bail: N consecutive `matched=0` rounds short-circuit the EMA.
+    /// Platform-aware:
+    ///   iPhone: 2 (cycle 45-50ms, drafter zero-rounds costly)
+    ///   Mac:    disabled (Int.max) — Mac cycle (30ms) tolerates any zero
+    ///   streak; bail loses the next-accept that recoups overhead. Once
+    ///   bailed, no recovery path → only bail iPhone where overhead > gain.
+    private(set) public var consecutiveZeroRounds: Int = 0
+    // 2026-05-13: never-bail on both platforms (was iOS=2). See
+    // `fallbackThreshold` comment.
+    public var consecutiveZeroBailLimit: Int = Int.max
+
+    /// Bail recovery counter (2026-05-12): after we hit the hard bail above
+    /// the original logic kept MTP off for the rest of the generation. Free-
+    /// form chat output drifts in/out of drafter-aligned regions (普通名詞
+    /// followed by 述語など), so a permanent latch loses recoverable wins.
+    /// `tokensSinceBail` counts post-bail target steps and, when it crosses
+    /// `bailRecoveryInterval`, we let MTP probe again. The next round resets
+    /// the counter if matched > 0; otherwise we re-bail and wait another
+    /// interval. Net cost per failed retry: ~10 ms (one wasted draft+verify).
+    private(set) public var tokensSinceBail: Int = 0
+    public var bailRecoveryInterval: Int = 16
+
+    /// EMA adaptive bypass (llama.cpp §15 pattern, M4 Max-validated). When
+    /// rolling acceptance drops below `emaBypassThreshold`, skip the drafter
+    /// for `emaBypassCooldown` rounds, then recheck on the next round. Lifted
+    /// fiction prompts from 0.36× to 0.85× and idiomatic from 1.21× to 1.34×
+    /// in the llama.cpp E2B Q4_K_M bench. Different from `consecutiveZeroBail`:
+    /// EMA-based recovery lets drafter probe periodically instead of dying
+    /// permanently, so a prompt that warms up after a slow start can rejoin.
+    public var emaBypassThreshold: Double = 0.30
+    public var emaBypassCooldown: Int = 5
+    public var emaWarmupRounds: Int = 4
+    private(set) public var skipCooldown: Int = 0
+    private(set) public var roundsSeen: Int = 0
 
     /// External update hook for engines that drive their own
     /// draft/verify loop (MtpSpeculativeEngine). They compute matchCount
@@ -53,6 +94,20 @@ public final class MtpDraftSource {
         guard K_USE > 0 else { return }
         let rate = Double(matched) / Double(K_USE)
         rollingAcceptance = rollingAlpha * rate + (1 - rollingAlpha) * rollingAcceptance
+        roundsSeen += 1
+        if matched == 0 {
+            consecutiveZeroRounds += 1
+        } else {
+            consecutiveZeroRounds = 0
+            tokensSinceBail = 0
+        }
+    }
+
+    /// EMA bypass bookkeeping. Called by the engine when `shouldSpeculate`
+    /// returns false so the cooldown counter advances and a recheck fires
+    /// when it reaches zero.
+    public func tickBypassCooldown() {
+        if skipCooldown > 0 { skipCooldown -= 1 }
     }
 
     /// Reset the rolling acceptance EMA back to the init value so a new
@@ -60,6 +115,10 @@ public final class MtpDraftSource {
     /// if the previous prompt collapsed accept rate to zero.
     public func resetRollingAcceptance() {
         rollingAcceptance = 0.55
+        consecutiveZeroRounds = 0
+        skipCooldown = 0
+        roundsSeen = 0
+        tokensSinceBail = 0
     }
 
     // MARK: - Init
@@ -74,6 +133,13 @@ public final class MtpDraftSource {
             // 2026-05-06 diagnostic: ANE fp16/INT4 numerics differ enough
             // from CPU fp32 to crater drafter accept on Mac. Set
             // MTP_DRAFTER_DEVICE=cpu / gpu / ane to override.
+            // 2026-05-13: iOS default flipped back to ANE. Real-device
+            // measurement showed CPU draft = 10 ms per call vs ANE ~6 ms
+            // historically. Mac bench projection: CPU drafter → iPhone 1.4×
+            // avg / 2-of-5 prompts ≥1.5× ; ANE drafter → 1.5× avg / 3-of-5
+            // ≥1.5×. The earlier "Mac CPU 2.2ms beat ANE" (task #57)
+            // measurement was Mac M3 CPU, which has much higher single-
+            // thread throughput than iPhone A18 P-core. ANE wins on iPhone.
             switch ProcessInfo.processInfo.environment["MTP_DRAFTER_DEVICE"] {
             case "cpu": c.computeUnits = .cpuOnly
             case "gpu": c.computeUnits = .cpuAndGPU
@@ -87,6 +153,52 @@ public final class MtpDraftSource {
         }
         self.model = try MLModel(contentsOf: modelURL, configuration: cfg)
         self.K = K
+    }
+
+    /// Pre-compile the drafter's ANE graph by issuing a single dummy
+    /// inference. Without this, the first drafter call after app launch
+    /// (or after iPhone ANE goes idle) takes 60-70 ms instead of warm
+    /// 13 ms — adding ~50 ms to MTP cycle #1 cold-start latency.
+    /// All-zero inputs are sufficient to exercise the compile path; the
+    /// returned tokens are discarded.
+    public func prewarm(
+        targetHidden: Int = 1536,
+        slidingWindow: Int = 512,
+        contextLength: Int = 2048,
+        slidingHeadDim: Int = 256,
+        fullHeadDim: Int = 512
+    ) throws {
+        func zerosFP16(_ shape: [Int]) throws -> MLMultiArray {
+            let arr = try MLMultiArray(
+                shape: shape.map { NSNumber(value: $0) }, dataType: .float16)
+            memset(arr.dataPointer, 0,
+                   arr.count * MemoryLayout<UInt16>.stride)
+            return arr
+        }
+        let H = targetHidden
+        let W = slidingWindow
+        let C = contextLength
+        let hdSwa = slidingHeadDim
+        let hdFull = fullHeadDim
+        let embed = try zerosFP16([1, 1, H])
+        let proj = try zerosFP16([1, 1, H])
+        let kv13K = try zerosFP16([1, 1, W, hdSwa])
+        let kv13V = try zerosFP16([1, 1, hdSwa, W])
+        let kv14K = try zerosFP16([1, 1, C, hdFull])
+        let kv14V = try zerosFP16([1, 1, hdFull, C])
+        let cosSwa = try zerosFP16([1, hdSwa / 2])
+        let sinSwa = try zerosFP16([1, hdSwa / 2])
+        let cosFull = try zerosFP16([1, hdFull / 2])
+        let sinFull = try zerosFP16([1, hdFull / 2])
+        let maskSwa = try zerosFP16([1, 1, 1, W])
+        let maskFull = try zerosFP16([1, 1, 1, C])
+        _ = try draftOne(
+            embedToken: embed, projAct: proj,
+            kv13K: kv13K, kv13V: kv13V,
+            kv14K: kv14K, kv14V: kv14V,
+            cosSwa: cosSwa, sinSwa: sinSwa,
+            cosFull: cosFull, sinFull: sinFull,
+            maskSwa: maskSwa, maskFull: maskFull)
     }
 
     // MARK: - Drafting
@@ -215,7 +327,7 @@ public final class MtpDraftSource {
         maskSwa: MLMultiArray,
         maskFull: MLMultiArray
     ) throws -> (topKIds: [Int32], topKLogits: [Float],
-                 projActOut: MLMultiArray) {
+                 projActOut: MLMultiArray, fullLogSumExp: Float?) {
         let input = try MLDictionaryFeatureProvider(dictionary: [
             "embed_token": embedToken,
             "proj_act": projAct,
@@ -246,7 +358,19 @@ public final class MtpDraftSource {
             ids[i] = idsPtr[i]
             logits[i] = Float(_floatFromFP16(valsPtr[i]))
         }
-        return (ids, logits, projActOut)
+        // `full_logsumexp` is now `log(Σ exp(logit - max))` — the
+        // residual after subtracting the max logit, so it always fits
+        // fp16 (∈ [0, log(N)] ≈ [0, 8.3] for N=4096). To recover the
+        // true LSE, add the max logit back, which is the first entry of
+        // `top_k_values` (the drafter sorts top-K by descending logit).
+        var lse: Float? = nil
+        if let lseArr = output.featureValue(for: "full_logsumexp")?.multiArrayValue,
+           lseArr.count > 0, !logits.isEmpty {
+            let lsePtr = lseArr.dataPointer.bindMemory(to: UInt16.self, capacity: 1)
+            let residual = Float(_floatFromFP16(lsePtr[0]))
+            lse = logits[0] + residual
+        }
+        return (ids, logits, projActOut, lse)
     }
 
     @inline(__always)
@@ -344,6 +468,24 @@ public final class MtpDraftSource {
         if ProcessInfo.processInfo.environment["MTP_FORCE_SPECULATE"] == "1" {
             return true
         }
+        // Hard bail on consecutive 0-accept rounds: stops drafter cost
+        // accumulation when the prompt domain is clearly off. Recovery probe:
+        // every `bailRecoveryInterval` committed tokens we let the drafter
+        // re-test the prompt — long generations can pass through drafter-
+        // aligned regions (反復語, particles, common suffixes) that we'd
+        // otherwise miss with the original permanent latch.
+        if consecutiveZeroRounds >= consecutiveZeroBailLimit {
+            tokensSinceBail += 1
+            if tokensSinceBail >= bailRecoveryInterval {
+                tokensSinceBail = 0
+                consecutiveZeroRounds = 0  // allow a fresh probe round
+                return true
+            }
+            return false
+        }
         return rollingAcceptance >= fallbackThreshold
     }
+
+    /// No-op kept for ABI compatibility with engine that calls it after bail.
+    public func didBypass() {}
 }

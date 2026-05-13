@@ -290,6 +290,9 @@ final class LLMRunner {
             print("[LLMRunner] probe.marker detected — SPECULATIVE_PROFILE=1 + LLM_LOOKAHEAD_ENABLE=1 forced")
         }
 
+        // 2026-05-12 GPU drafter empirically slower on iPhone (13-15 ms warm
+        // vs ANE 6 ms). Reverted. CPU also tested and slower (#57). ANE is
+        // the right device for the centroid drafter on iPhone.
         llm = try await CoreMLLLM.load(from: folder) { [weak self] status in
             Task { @MainActor in
                 self?.loadingStatus = status
@@ -318,7 +321,11 @@ final class LLMRunner {
         llm!.mtpEnabled = true
         llm!.drafterUnionEnabled = false
         llm!.crossVocabEnabled = false
-        print("[LLMRunner] mtp=on (centroid drafter, iOS default)")
+        // 2026-05-11 Mac sweep: sampling at any temperature ≤ greedy on
+        // free-form (translate/household/qa_long all tested). Stay greedy.
+        llm!.mtpSamplingTemperature = 0.0
+        llm!.mtpDrafterTemperature = 0.0
+        print("[LLMRunner] mtp=on (centroid drafter, iOS default, greedy, CPU drafter)")
         #else
         let useUnion = ProcessInfo.processInfo
             .environment["SPECULATIVE_PROFILE"] == "1"

@@ -57,7 +57,27 @@
             isEnabled = "YES">
          </EnvironmentVariable>
          <EnvironmentVariable
-            key = "LLM_VISION_FORCE_ANE"
+            key = "SPECULATIVE_PROFILE"
+            value = "1"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "MTP_FORCE"
+            value = "1"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "MTP_DRAFTER_DEVICE"
+            value = "cpu"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "MTP_FORCE_DECODE_AFTER_ACCEPT"
+            value = "1"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "MTP_PREDICTSTEP_COMMIT"
             value = "1"
             isEnabled = "YES">
          </EnvironmentVariable>
