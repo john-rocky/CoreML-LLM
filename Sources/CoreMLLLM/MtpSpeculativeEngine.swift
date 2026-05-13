@@ -1285,16 +1285,22 @@ public final class MtpSpeculativeEngine {
         if perPromptAdapter && !perPromptKUseSensed && !userOverrode
             && compareLen >= 1 {
             perPromptKUseSensed = true
+            let chosen: Int
             if matchCount == compareLen && compareLen >= 2 {
                 // Full match on K-1 slots → drafter on streak for this
                 // prompt → minimize cost per cycle.
-                perPromptKUseOverride = 1
+                chosen = 1
             } else {
                 // Partial / zero match → keep K-1 for next cycles. Sets
                 // override explicitly so subsequent cycles take the same
                 // path through the branch above (no reset on subsequent
                 // matchCount swings — adapter is one-shot, not adaptive).
-                perPromptKUseOverride = max(1, K - 1)
+                chosen = max(1, K - 1)
+            }
+            perPromptKUseOverride = chosen
+            if SpecProfile.isEnabled {
+                print("[MTP/PerPromptKUse] cycle=\(totalRounds + 1) "
+                    + "match=\(matchCount)/\(compareLen) → K_USE=\(chosen)")
             }
         }
 
