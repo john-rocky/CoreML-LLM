@@ -1,5 +1,17 @@
 # iPhone Lever Vault (2026-05-14)
 
+**⚠️ SUPERSEDED BY `docs/RESEARCH_FINDINGS_2026_05_13.md` FOR TIER-S LEVERS**
+
+The Tier 1-6 below was an early brainstorm that included speculative
+padding (L16-L46). After 6 parallel research agents investigated 2026
+H1 papers + Apple disclosures + competing iPhone LLM projects + ANE
+empirical tricks, the high-conviction shortlist is in
+`RESEARCH_FINDINGS_2026_05_13.md`. Read THAT first.
+
+Below sections L1-L8 remain valid (env-only sweeps with concrete
+commands); L16-L46 are kept only as historical brainstorm and should
+NOT be acted on without re-checking against the research findings.
+
 Untested levers researched 2026-05-13 evening for tomorrow's iPhone
 session. Every entry has been cross-checked against existing memory
 to avoid duplication.
