@@ -7,7 +7,7 @@ session's empirical Mac + iPhone push without re-deriving the constraints.
 
 ## Quick state
 
-* Branch: `feat/mtp-iphone-perf` (17 commits ahead of `fc31660`).
+* Branch: `feat/mtp-iphone-perf` (19 commits ahead of `fc31660`).
 * Production iPhone defaults (from today's commits, all confirmed
   empirically on iPhone 17 Pro):
   * 4-chunk + MTP + FLy K=16 + centroid drafter + fp16 K/V verify chunks
@@ -19,6 +19,10 @@ session's empirical Mac + iPhone push without re-deriving the constraints.
 * Bundle layout on iPhone: `Documents/Models/gemma4-e2b/`
   (dereferenced copy of `output/gemma4-e2b/bundle_diff_logits/` + the
   149 MB centroid drafter).
+* **Overnight 2026-05-14 (commits `93e8c5f`, `7b69320`)**: Round E
+  per-prompt K_USE adapter implemented and opt-in via
+  `MTP_PER_PROMPT_KUSE=1`. No default change. Telemetry line emits
+  one decision per prompt for grep-friendly bench post-mortem.
 
 ## Validated baselines
 
