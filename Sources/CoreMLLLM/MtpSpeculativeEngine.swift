@@ -388,24 +388,21 @@ public final class MtpSpeculativeEngine {
         } else if let s = envKUseStr, let v = Int(s) {
             kEffective = v <= 0 ? K : min(K, v)
         } else {
-            // 2026-05-13 iPhone empirical (iPhone 17 Pro AutoBench, 4-chunk +
-            // FLy K=16 + centroid drafter):
-            //   K_USE=1 code Python BST:   50.61 tok/s, 148 stable MTP cycles
-            //   K_USE=2 code (was default): 40.89 tok/s
-            // K_USE=1 wins +24% on iPhone because iPhone verify cycle scales
-            // sub-linearly with K_USE; the single-draft cycle (1 draft + 1
-            // verify slot + 1 bonus slot) finishes ~17 ms/tok at acc 1.0.
+            // Default: K-1 (use all draft slots that have a paired verify
+            // slot for argmax comparison). For K=3 this gives kEffective=2.
             //
-            // Mac: K_USE=2 still slightly beats K_USE=1 on code (Mac verify
-            // cycle is cheap enough that 2 drafts amortise per cycle), so
-            // keep Mac default at K-1.
+            // 2026-05-13 iPhone empirical caveat — K_USE=1 can win +24%
+            // on code prompts (BST etc) WHEN the drafter is already
+            // warmed up from a prior prompt. On cold-start the single
+            // proposal misses → accept 0/1 → rolling EMA dips below
+            // fallback threshold → auto-bail to T=1. K_USE=2 emits two
+            // proposals per cycle so partial-match (1/2) keeps the
+            // rolling EMA above threshold and MTP stays engaged through
+            // the warmup. Therefore K-1 is the robust iPhone default.
             //
-            // Override per-run with MTP_K_USE=N env on either platform.
-            #if os(iOS)
-            kEffective = 1
-            #else
+            // To opt into K_USE=1 (e.g. for warm-bench-only runs), set
+            // MTP_K_USE=1 via the env knob.
             kEffective = max(1, K - 1)
-            #endif
         }
         // Rejection-sampling path: drafter samples from its top-K with
         // temperature T, target verifies via full-vocab logits and accepts
