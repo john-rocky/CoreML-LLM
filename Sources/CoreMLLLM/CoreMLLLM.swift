@@ -512,6 +512,48 @@ public final class CoreMLLLM: @unchecked Sendable {
             }
         }
 
+        // SuffixDecoding drafter (arxiv 2411.04975, Snowflake ArcticInference,
+        // NeurIPS 2025 Spotlight). Zero-model-cost drafter: persistent
+        // cross-session trie of committed token sequences. Plugs into
+        // DrafterUnion + LookaheadEngine as an additional zero-cost
+        // proposal source — verify still strict-checks → lossless by
+        // construction. Useful on multi-turn chat (trie accumulates),
+        // structured outputs (templates / code with repeated patterns),
+        // long generations (intra-prompt suffix matches).
+        //
+        // Opt-in via LLM_SUFFIX_DRAFT=1 until we have iPhone bench data.
+        // Persisted to <Documents>/suffix_tree.json (autosave every 64
+        // commits). On cold load with no file present, starts empty —
+        // first generation builds the tree without speedup; later gens
+        // benefit. Safe to ship default-on once Mac parity is verified.
+        if ProcessInfo.processInfo.environment["LLM_SUFFIX_DRAFT"] == "1",
+           llm.drafterUnion != nil || llm.lookaheadEngine != nil
+            || llm.mtpEngine != nil {
+            do {
+                let sfx = try SuffixSpeculativeEngine.loadDefault()
+                // Persist less aggressively on iOS — disk write on the
+                // decode thread can stall a token. Default 256 commits
+                // (~10 s of MTP-on decode) keeps the dirty window small
+                // without blocking the hot path every couple seconds.
+                // Override via LLM_SUFFIX_SAVE_EVERY.
+                if let s = ProcessInfo.processInfo
+                    .environment["LLM_SUFFIX_SAVE_EVERY"],
+                   let v = Int(s), v > 0 {
+                    sfx.saveEvery = v
+                } else {
+                    sfx.saveEvery = 256
+                }
+                llm.drafterUnion?.suffix = sfx
+                llm.lookaheadEngine?.suffix = sfx
+                llm.mtpEngine?.suffixEngine = sfx
+                print("[SuffixDraft] enabled — tree=\(sfx.tree.approximateNodeCount) nodes, "
+                    + "saveEvery=\(sfx.saveEvery), "
+                    + "persisted to \(sfx.persistURL?.path ?? "<none>")")
+            } catch {
+                print("[SuffixDraft] failed to load: \(error)")
+            }
+        }
+
         // Vision model (optional, lazy loaded on first image).
         //
         // Default is the legacy variable-grid GPU build
@@ -1227,6 +1269,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                         lookaheadSpec?.reset()
                         lookaheadSpec?.setPrefillHistory(tokens.map { Int32($0) })
                         mtpSpec?.reset()
+                        mtpSpec?.setPromptTokens(tokens.map { Int32($0) })
                         unionSpec?.reset()
                         unionSpec?.setPrefillHistory(tokens.map { Int32($0) })
                         cvSpec?.reset()

@@ -56,9 +56,20 @@ public final class MtpSpeculativeEngine {
     /// once per conversation so PLD sees prompt repeats, not just output.
     func setPromptTokens(_ tokens: [Int32]) {
         emittedHistory = tokens
+        suffixEngine?.setPrefillHistory(tokens)
     }
     var pldHitsThisGeneration: Int = 0
     var pldProbesThisGeneration: Int = 0
+
+    // SuffixDecoding drafter inside MTP path (arxiv 2411.04975).
+    // Persistent cross-session trie lookup. When a hit produces ≥ kEffective
+    // proposals, the drafter chain is skipped (~6-12 ms iPhone saved).
+    // Strictly opt-in via MTP_SUFFIX_DRAFT=1 — wiring assigned by the
+    // CoreMLLLM init path when LLM_SUFFIX_DRAFT=1 is set globally.
+    // Verify still strict-checks → lossless by construction.
+    var suffixEngine: SuffixSpeculativeEngine?
+    var suffixHitsThisGeneration: Int = 0
+    var suffixProbesThisGeneration: Int = 0
 
     // L5 — async drafter parallel-to-verify (cross-cycle speculation).
     //
@@ -490,6 +501,17 @@ public final class MtpSpeculativeEngine {
                 .environment["MTP_PLD_PREFETCH_ENABLE"] == "1"
         var pldHit = false
 
+        // SuffixDecoding inside MTP. Lookup persistent cross-session trie
+        // when both L5 and PLD missed (matches DrafterUnion's
+        // PL3 > Suffix > PL2 priority order). Hit when trie produces ≥
+        // kEffective tokens; reuses `pldHit` skip flag so the drafter
+        // chain is bypassed (~6-12 ms iPhone saved). Trie is read-only
+        // here — applyCommit feeds it back at end of cycle.
+        let suffixEnabled = !useTree && !useSampling
+            && suffixEngine != nil
+            && ProcessInfo.processInfo
+                .environment["MTP_SUFFIX_DRAFT"] == "1"
+
         // L5 — async drafter speculation hit check (cross-cycle).
         // If previous cycle's verify produced full accept (matchCount==K-1)
         // AND background drafter for this cycle predicted nextID correctly,
@@ -539,6 +561,25 @@ public final class MtpSpeculativeEngine {
                 }
             } else if totalRounds < 4 {
                 print("[PLD miss] r=\(totalRounds) (history=\(emittedHistory.count))")
+            }
+        }
+
+        if suffixEnabled, !pldHit, let sfx = suffixEngine {
+            suffixProbesThisGeneration += 1
+            var ctx = emittedHistory
+            ctx.append(nextID)
+            let sfxProps = sfx.drawBurst(context: ctx, K: kEffective)
+            if sfxProps.count >= kEffective {
+                suffixHitsThisGeneration += 1
+                proposals = Array(sfxProps.prefix(kEffective))
+                pldHit = true  // shared "skip drafter loop" flag
+                if totalRounds < 8 {
+                    print("[Suffix hit] r=\(totalRounds) "
+                        + "proposals=\(proposals)")
+                }
+            } else if totalRounds < 4 {
+                print("[Suffix miss] r=\(totalRounds) "
+                    + "got=\(sfxProps.count)/\(kEffective)")
             }
         }
 
@@ -1234,6 +1275,14 @@ public final class MtpSpeculativeEngine {
             emittedHistory.append(contentsOf: committedTokens.dropFirst())
         }
 
+        // SuffixDecoding: feed committed tokens (excluding the seed nextID
+        // already known to the trie) so future cycles benefit. Idempotent;
+        // commit only the delta. Tree persists across sessions per
+        // SuffixSpeculativeEngine.saveEvery.
+        if let sfx = suffixEngine, committedTokens.count > 1 {
+            sfx.applyCommit(tokens: Array(committedTokens.dropFirst()))
+        }
+
         // L5 — wait for background drafter to complete, validate, store/clear.
         // sync block on serial queue ensures background async closure finished.
         if l5Enabled {
@@ -1355,6 +1404,11 @@ public final class MtpSpeculativeEngine {
         emittedHistory.removeAll(keepingCapacity: true)
         pldHitsThisGeneration = 0
         pldProbesThisGeneration = 0
+        // Suffix: reset per-generation counters; trie itself persists
+        // across conversations (cross-session knowledge is the point).
+        suffixHitsThisGeneration = 0
+        suffixProbesThisGeneration = 0
+        suffixEngine?.reset()
         // Reset adaptive K to the starting value (MTP_K_USE override or 2).
         let envKUseStr = ProcessInfo.processInfo.environment["MTP_K_USE"]
         if let s = envKUseStr, let v = Int(s), v > 0 {

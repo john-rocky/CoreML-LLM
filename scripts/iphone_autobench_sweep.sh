@@ -97,12 +97,20 @@ case "$SWEEP" in
     KEYS=("MTP_PER_PROMPT_KUSE")
     VALUES=("0" "1")
     ;;
+  suffix_draft)
+    # SuffixDecoding inside MTP path (arxiv 2411.04975). Requires
+    # LLM_SUFFIX_DRAFT=1 at app launch to load the trie; this sweep
+    # toggles MTP_SUFFIX_DRAFT for cycle-time use. Pair with
+    # `LLM_SUFFIX_DRAFT=1` env in the launch line.
+    KEYS=("MTP_SUFFIX_DRAFT")
+    VALUES=("0" "1")
+    ;;
   *)
     echo "Unknown sweep: $SWEEP" >&2
     echo "known: k_use, fly_topk, bail_threshold, chunk_pipeline, l5_async," >&2
     echo "       pld_prefetch, self_bail, fast_pred, draft_pos_mode, drafter_device," >&2
     echo "       ping_pong, lookahead, prefix_cache, sampling_temp, decode_qos," >&2
-    echo "       per_prompt_kuse" >&2
+    echo "       per_prompt_kuse, suffix_draft" >&2
     exit 1
     ;;
 esac
@@ -111,11 +119,21 @@ OUT="/tmp/iphone_sweep_${SWEEP}.tsv"
 echo -e "sweep\tknob\tprompt\ttok/s" > "$OUT"
 
 KEY="${KEYS[0]}"
+# Side-channel knobs that need to be set in tandem with the sweep key.
+# Example: SuffixDecoding requires LLM_SUFFIX_DRAFT=1 at app launch to
+# load the trie (a per-app setting), while MTP_SUFFIX_DRAFT toggles
+# per-cycle use. Sweeping MTP_SUFFIX_DRAFT without LLM_SUFFIX_DRAFT would
+# leave the trie unloaded and the sweep would silently no-op.
+EXTRA_KV=""
+case "$SWEEP" in
+  suffix_draft) EXTRA_KV=', "LLM_SUFFIX_DRAFT": "1"' ;;
+esac
+
 for V in "${VALUES[@]}"; do
   echo "=== $SWEEP: $KEY=$V ==="
   LOG="/tmp/iphone_sweep_${SWEEP}_${V}.log"
-  ENV_JSON=$(printf '{"LLM_AUTOBENCH": "1", "LLM_AUTOBENCH_MAX_TOKENS": "256", "LLM_AUTOBENCH_PROMPTS": "%s", "%s": "%s"}' \
-                "$PROMPTS" "$KEY" "$V")
+  ENV_JSON=$(printf '{"LLM_AUTOBENCH": "1", "LLM_AUTOBENCH_MAX_TOKENS": "256", "LLM_AUTOBENCH_PROMPTS": "%s", "%s": "%s"%s}' \
+                "$PROMPTS" "$KEY" "$V" "$EXTRA_KV")
   xcrun devicectl device process launch \
     --device "$DEVICE" --console \
     --environment-variables "$ENV_JSON" \
