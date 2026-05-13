@@ -259,6 +259,235 @@ iPhone-side may benefit.
 
 Cost: full chunk rebuild + drafter rebuild compatible. 2-3 hours.
 
+## More env-only levers (L16-L25, no rebuild)
+
+### L16. LLM_DECODE_QOS=high — promote decode loop to perf cores
+
+```bash
+xcrun devicectl device process launch --device "$DEVICE" --console \
+  --environment-variables '{"LLM_AUTOBENCH": "1", "LLM_AUTOBENCH_PROMPTS": "narrative,code", "LLM_DECODE_QOS": "high"}' \
+  com.example.CoreMLLLMChat > /tmp/L16_qos_high.log 2>&1
+```
+
+Decode loop QoS defaults to `.userInitiated` (inherited from UI). Set
+`high` to bias toward P-cores. Comment says "trades tok/s loss for
+cooler operation" for utility; `high` is the inverse direction. May
+help short-burst peak tok/s; risk: hotter thermal escalation.
+
+### L17. LLM_DECODE_QOS=utility — anti-thermal sustained mode
+
+```bash
+xcrun devicectl device process launch --device "$DEVICE" --console \
+  --environment-variables '{"LLM_AUTOBENCH": "1", "LLM_AUTOBENCH_PROMPTS": "narrative,code", "LLM_DECODE_QOS": "utility"}' \
+  com.example.CoreMLLLMChat > /tmp/L17_qos_utility.log 2>&1
+```
+
+Bias toward E-cores. Lower peak, but **may sustain longer without
+thermal=serious** — interesting for chat-bot UX (long sessions).
+
+### L18. MTP_MARS_ENABLE=1 — Margin-Aware Verification (lossy)
+
+```bash
+xcrun devicectl device process launch --device "$DEVICE" --console \
+  --environment-variables '{"LLM_AUTOBENCH": "1", "LLM_AUTOBENCH_PROMPTS": "code", "MTP_MARS_ENABLE": "1"}' \
+  com.example.CoreMLLLMChat > /tmp/L18_mars.log 2>&1
+```
+
+Accept drafter token iff equals target's top-2 AND z2/z1 ≥ theta
+(default 0.9). arxiv 2601.15498. Memory note: "1.5-1.8× initial
+claim was incoherent output." Quality-bounded; verify output coherent
+before claiming gain.
+
+### L19. MTP_CSD_ENABLE=1 — Calibrated Speculative Decoding
+
+```bash
+xcrun devicectl device process launch --device "$DEVICE" --console \
+  --environment-variables '{"LLM_AUTOBENCH": "1", "LLM_AUTOBENCH_PROMPTS": "code", "MTP_CSD_ENABLE": "1"}' \
+  com.example.CoreMLLLMChat > /tmp/L19_csd.log 2>&1
+```
+
+arxiv 2604.13634. Historical bias correction: after λ historical
+(drafter, target_top1) divergences, rescue subsequent occurrences
+when z_drafter ≥ z_top1 + log τ. Default λ=2, τ=0.01. Same lossy
+caveat as MARS.
+
+### L20. LLM_LOOKAHEAD_ENABLE=1 — Jacobi/Lookahead (drafter-free)
+
+```bash
+xcrun devicectl device process launch --device "$DEVICE" --console \
+  --environment-variables '{"LLM_AUTOBENCH": "1", "LLM_AUTOBENCH_PROMPTS": "narrative,code", "LLM_LOOKAHEAD_ENABLE": "1"}' \
+  com.example.CoreMLLLMChat > /tmp/L20_lookahead.log 2>&1
+```
+
+Drafter-free speculative path. Memory `project_drafter_structurally_dead`
+mentions "shipped opt-in 2026-04-22" with mac +5-72 % by workload
+(structured > free-form), iPhone "verify_qK=8 GO gate" but iPhone
+production left ON only in probe bundle. Untested with today's
+fc31660 stack. Could complement MTP.
+
+### L21. LLM_PREFIX_CACHE=1 — multi-turn TTFT (not tok/s)
+
+```bash
+xcrun devicectl device process launch --device "$DEVICE" --console \
+  --environment-variables '{"LLM_AUTOBENCH": "1", "LLM_AUTOBENCH_PROMPTS": "narrative", "LLM_PREFIX_CACHE": "1"}' \
+  com.example.CoreMLLLMChat > /tmp/L21_prefix_cache.log 2>&1
+```
+
+Disk-backed prefix cache. Saves on multi-turn TTFT (prefill re-use).
+Not a per-token tok/s lever — but UX win for chat-bot conversations.
+Memory: `project_stateful_plan3_phase2a` says multi-turn TTFT
+-95 % (Phase 2a). Verify on iPhone.
+
+### L22. MTP_TEMPERATURE=0.7 — rejection sampling
+
+```bash
+xcrun devicectl device process launch --device "$DEVICE" --console \
+  --environment-variables '{"LLM_AUTOBENCH": "1", "LLM_AUTOBENCH_PROMPTS": "narrative", "MTP_TEMPERATURE": "0.7"}' \
+  com.example.CoreMLLLMChat > /tmp/L22_temp.log 2>&1
+```
+
+Sampling-based MTP. Mac result: T>0 SLOWED narrative (~0.85× of
+greedy on free-form per memory). iPhone CPU different — may differ.
+Quality changes from greedy; verify coherence.
+
+### L23. MTP_DRAFTER_T=0.5 — asymmetric drafter temperature
+
+```bash
+xcrun devicectl device process launch --device "$DEVICE" --console \
+  --environment-variables '{"LLM_AUTOBENCH": "1", "LLM_AUTOBENCH_PROMPTS": "narrative", "MTP_TEMPERATURE": "1.0", "MTP_DRAFTER_T": "0.5"}' \
+  com.example.CoreMLLLMChat > /tmp/L23_async_temp.log 2>&1
+```
+
+Drafter samples at T=0.5, target verifies at T=1.0. Softens drafter
+top-1 over-confidence. iPhone untested.
+
+### L24. LLM_LOAD_MAX_PARALLEL — chunk load parallelism
+
+```bash
+xcrun devicectl device process launch --device "$DEVICE" --console \
+  --environment-variables '{"LLM_AUTOBENCH": "1", "LLM_LOAD_MAX_PARALLEL": "0"}' \
+  com.example.CoreMLLLMChat > /tmp/L24_load_parallel.log 2>&1
+```
+
+Default = max parallel chunk loads. `0` = sequential. Mostly TTFT
+lever (one-time load cost), not steady-state tok/s. Useful when iOS
+thermal kicks in during parallel load (sequential may avoid
+state=serious during launch).
+
+### L25. LLM_COMPUTE_UNITS=cpuOnly — pin to CPU (diagnostic only)
+
+```bash
+# Diagnostic — confirms ANE is the bottleneck. Will be 5-10x slower.
+xcrun devicectl device process launch --device "$DEVICE" --console \
+  --environment-variables '{"LLM_AUTOBENCH": "1", "LLM_COMPUTE_UNITS": "cpuOnly", "LLM_AUTOBENCH_PROMPTS": "code"}' \
+  com.example.CoreMLLLMChat > /tmp/L25_cpu_only.log 2>&1
+```
+
+Confirms ANE path is the gain source. Not a production lever.
+
+## Algorithmic ideas (L26-L31, Swift change or research)
+
+### L26. Two-stage drafter cascade
+
+Small drafter A (38 MB, fast 1.0 ms) generates proposal; if low
+confidence per-step, fallback to centroid drafter B (149 MB, 1.8 ms)
+for that step only. Bottom-of-cycle drafter time amortizes.
+
+Memory says 38 MB drafter has worse accept on Mac. But cascade
+philosophy: 38 MB accept rate × 1.0 ms cost may beat centroid for
+"easy" tokens. Test by adding a confidence threshold + fallback.
+
+Implementation: ~100 lines Swift. Risk: medium (drafter state
+management).
+
+### L27. PLD-only mode (no drafter)
+
+Drop drafter entirely; use PromptLookupDraft for repetitive prompts.
+Saves 1.8 ms drafter call per cycle. Wins on yes-yes-style content;
+loses on novel narrative.
+
+`MTP_DRAFTER_DISABLE=1` env knob would need to be added. ~10 line
+Swift change.
+
+### L28. Token recycling
+
+Rejected drafter tokens stored as candidate PLD n-grams for next
+cycle. When future drafter proposes the same token and target also
+emits it, that's a no-cost re-acceptance.
+
+Implementation: ~50 lines Swift. Speculative gain: niche.
+
+### L29. Speculative streaming UI
+
+Yield drafter tokens to the UI BEFORE verify completes. On miss,
+"rewind" the displayed text. User perceives faster output even when
+acceptance is medium. UX lever, not tok/s.
+
+Implementation: UI + cancellation. Medium-large change.
+
+### L30. Adaptive drafter temperature
+
+Increase drafter temperature on rejection streak. Counter-intuitive
+but: drafter's argmax may be wrong, top-2/3 may be right. Lifting T
+explores those.
+
+Implementation: ~30 lines Swift.
+
+### L31. Multiple parallel drafters voting
+
+Run drafter A and drafter B concurrently (different training). Accept
+if either matches target. Requires two drafters loaded → memory
+budget; may not fit on iPhone.
+
+## Build-time levers (L32-L37)
+
+### L32. group_size sweep — INT4 quantization
+
+`PALETTIZE_GROUP_SIZE` ∈ {16, 32 (current), 64, 128}. Smaller = more
+buckets = less quant noise but bigger weights. Memory `project_stage1_w4a8_closed`
+says W4A8 closed, but **W4 group_size 16** might help K cache
+fidelity → drafter accept.
+
+Cost: full chunks rebuild × 4. ~30 min Python.
+
+### L33. AWQ on chunk1 (NOT chunk2)
+
+`project_awq_nogo_e2b` says chunk2 alone no go. chunk1 (L0-7) is
+where the drafter's first KV reads come from. AWQ on chunk1 might
+shift drafter's prior. Untested.
+
+Cost: AWQ smooth pass on chunk1 only + rebuild. ~1 hour.
+
+### L34. INT8 LM head only (rest INT4)
+
+LM head (chunk4 last Conv2d) has the most quant noise (cos 0.834 in
+INT4 per memory). Keeping it INT8 raises chunk4 size by ~3 % but
+improves numerical fidelity. Doesn't directly speed up, but may
+improve drafter accept by sharpening target's argmax.
+
+Cost: split palettize config + rebuild. ~30 min.
+
+### L35. fp16 attention on full-attn layers only
+
+Memory `project_iphone_ane_sparsity.md` notes iPhone padding-free for
+sliding. Keep sliding INT4 but full-attn layers (L13/L14) fp16. May
+improve K cache fidelity selectively.
+
+Cost: palettize config tuning + rebuild. ~30 min.
+
+### L36. Embed table INT8 → fp16
+
+Embed table is q8. Going fp16 means doubled embed memory (~768 MB)
+but cleaner first-layer signal. Could be win on iPhone with abundant
+memory.
+
+Cost: rebuild embed.bin. ~10 min.
+
+### L37. Drafter group_size sweep
+
+Drafter is centroid-quantized. Re-quantize with finer groups (g=16).
+Cost: ~30 min.
+
 ## Cross-cutting research worth doing
 
 ### R1. iPhone verify cycle timing decomposition
@@ -289,6 +518,61 @@ xcrun devicectl device process launch --device "$DEVICE" --console \
 Expected: drafter call time up (gpu slower than ane for small model),
 but ANE chunks may run faster. Net TBD.
 
+### R3. Drafter cold→warm latency curve
+
+Today saw drafter cold cycle = 81 ms (vs warm 1.8 ms). Plot per-cycle
+drafter time for cycle 0 through 20 to characterise the ANE warmup
+curve. May suggest whether multi-prompt warmup or longer single
+warmup is optimal.
+
+```bash
+# Add `MTP_VERBOSE_SETUP=1` and `SPECULATIVE_PROFILE=1` to get per-
+# cycle draft= timings; parse with awk for cycle index → draft ms.
+xcrun devicectl device process launch --device "$DEVICE" --console \
+  --environment-variables '{"LLM_AUTOBENCH": "1", "LLM_AUTOBENCH_PROMPTS": "code", "MTP_VERBOSE_SETUP": "1", "SPECULATIVE_PROFILE": "1"}' \
+  com.example.CoreMLLLMChat > /tmp/R3_warmup_curve.log 2>&1
+grep -oE 'mtp #[0-9]+\] draft=[0-9.]+ms' /tmp/R3_warmup_curve.log
+```
+
+### R4. ANE residency monitor
+
+iOS has no direct ANE residency API. Indirect signal: chunk1 .prediction
+wall time should be flat at ~6 ms; if it climbs to 20+ ms mid-bench,
+ANE pages evicted (or thermal throttle, hard to distinguish).
+Cross-reference with `[Thermal] state=` log lines.
+
+### R5. Long-form steady-state bench
+
+Currently bench at 256 tokens. Push to 1000 tokens to measure
+sustained-session tok/s post-warmup, post-thermal escalation. Drives
+realistic chat-bot UX estimate.
+
+```bash
+xcrun devicectl device process launch --device "$DEVICE" --console \
+  --environment-variables '{"LLM_AUTOBENCH": "1", "LLM_AUTOBENCH_MAX_TOKENS": "1000", "LLM_AUTOBENCH_PROMPTS": "narrative"}' \
+  com.example.CoreMLLLMChat > /tmp/R5_long.log 2>&1
+```
+
+### R6. Per-chunk timing breakdown profiling
+
+Mac smoke shows `c1=5.5 c2=6.8 c3=7.5 c4=10.5` decode breakdown.
+iPhone should print same — verify which chunk dominates iPhone-side.
+If chunk4 (LM head) dominates, focus on chunk4 tuning (subset L12,
+INT8 LM head L34). If chunk1 dominates, sliding cache reduction
+(L15) might pay off.
+
+### R7. Drafter 38 MB vs 149 MB iPhone A/B (deferred from L12)
+
+Mac proved centroid 149 MB wins. iPhone empirically untested
+directly. ANE memory pressure may shift the trade-off.
+
+### R8. Battery / energy per token
+
+`hostInfo()` energy counters or `os_log` energy traces. Per-token
+energy cost reveals whether MTP-on is net energy-positive (more
+tokens emitted per ANE cycle) or net-negative (drafter cost without
+acceptance).
+
 ## Already-tried, do NOT retest
 
 | lever | result | source |
@@ -309,24 +593,148 @@ but ANE chunks may run faster. Net TBD.
 | L5 async drafter | Mac shipped default ON | (memory) |
 | K_USE=1 iOS default | cold-bails (`e9af22d` reverted) | mistake #11 |
 
-## Tomorrow's recommended order
+## iOS system-level levers (L38-L42, advanced)
 
-If iPhone fully cool and 1 hour budget:
+### L38. Game Mode trigger
 
-1. **L1** (15 min) — K_USE=1 warmup retest. Gives the headline answer
-   about whether warmup unlocks the +24 % code default.
-2. **L4** (15 min) — PLD prefetch on code. Cheap test, possible code +10 %.
-3. **L2** (45 min) — FLy K sweep (4 values × ~5 min run + cool gaps). Highest
-   info per bench across the lever space.
-4. **L3** (30 min) — Fallback threshold on narrative. Confirms 0.30
-   choice or finds better.
+iOS 17+ Game Mode boosts ANE / GPU clocks at the cost of background
+process priority. Could expose via `CHGameMode` API or
+`requestThermalState`. Untested for LLM workload.
 
-If 30-min budget:
-* L1 + L4 only. Skip the sweeps until next session.
+### L39. Background ANE keep-alive
 
-If 2+ hour budget AND extra cool time:
-* L1, L2, L4 → L9 (stateful Linear push + bench) → L11 (Custom
-  MLFeatureProvider) Swift change.
+Run a 1-token dummy decode every 30 s in background to keep ANE
+residency warm between user turns. Trades battery for snappier
+first-token TTFT in subsequent turns.
 
-Never run more than 4 timed prompts in a single launch — iPhone
-thermal=serious kicks in around the 5th and contaminates results.
+### L40. UIApplication.isIdleTimerDisabled audit
+
+Already set in ChatView.swift:539. Confirm AutoBench inherits this
+(prevents screen sleep during long bench).
+
+### L41. Pre-load mlmodelc pages via mmap_advise
+
+CoreML lazy-loads weight pages on first inference. Pre-fault all
+weights via `mmap` advise(WILLNEED) at load time. Could eliminate
+cold-start residency miss spike (R3 above).
+
+### L42. RTKit thread priority bump
+
+Promote decode loop to QoS+thread priority both. Currently QoS is
+configurable (L16/L17); pthread_setschedparam not used.
+
+## Production-quality levers (L43-L46, ship-grade)
+
+### L43. Auto-detect prompt class
+
+Heuristic: tokenize prompt, count code-like tokens (brackets,
+keywords) vs natural language. Switch K_USE / FLy K / fallback
+threshold based on class.
+
+* Narrative → K_USE=2, FLy K=8 (less lossy), threshold 0.30
+* Code → K_USE=1, FLy K=24 (more permissive), threshold 0.20
+* List → K_USE=2, FLy K=16, threshold 0.25
+
+~100 lines Swift. Significant UX win if validated.
+
+### L44. Per-user adaptive K_USE memory
+
+Track per-conversation accept-rate history. Adapt K_USE / FLy K to
+user's prompt distribution. Stored in UserDefaults.
+
+### L45. Streaming output post-processing
+
+After tok/s win confirmed, address output quality issues seen with
+FLy K=16 ("def def def" loops). Either reduce K when streak detected,
+or filter duplicate tokens.
+
+### L46. Two-rate decode
+
+Slow start (first 16 tokens at K_USE=2 for sample-quality assurance)
+then accelerate (K_USE=1 + FLy K=24 for sustained throughput). Per
+prompt response.
+
+## Tomorrow's recommended order (updated with L16+)
+
+### Tier 1 — 15-minute info-per-bench (env-only, cool iPhone)
+
+Each launch = 1 cool bench. **Manually 10 min cool between each.**
+
+1. **L1** — K_USE=1 + warmup retest (reproducibility)
+2. **L4** — PLD prefetch on code
+3. **L18** — MARS lossy verify (quality-gated)
+4. **L20** — Lookahead engine A/B (drafter-free path)
+5. **L16** — LLM_DECODE_QOS=high (burst speed)
+
+Picks the lever that's most "binary" — either fixes the
+reproducibility issue or directly stacks tok/s.
+
+### Tier 2 — 30-minute sweeps (multi-value, cool)
+
+6. **L2** — FLy K sweep (8/16/24/32)
+7. **L3** — Fallback threshold sweep (0.20-0.40)
+
+### Tier 3 — bundle / build levers (1-2 hour)
+
+8. **L9** — Stateful Linear path A/B (separate codepath)
+9. **L11** — Custom MLFeatureProvider Swift change
+10. **L10** — Per-prompt K_USE adapter Swift change
+
+### Tier 4 — Python rebuild levers (half-day each)
+
+11. **L13** — Drafter K=2 rebuild
+12. **L32** — group_size sweep on chunks
+13. **L33** — AWQ on chunk1 only
+14. **L34** — INT8 LM head only
+
+### Tier 5 — research / probing (no immediate tok/s)
+
+15. **R3** — Cold→warm drafter latency curve
+16. **R5** — Long-form 1000-token steady-state
+17. **R6** — Per-chunk timing breakdown
+18. **R8** — Energy per token
+
+### Tier 6 — production polish
+
+19. **L43** — Auto-detect prompt class
+20. **L46** — Two-rate decode
+
+### Time budget chooser
+
+* **15 min**: only L1 (reproducibility check).
+* **30 min**: L1 + L4 (PLD on code).
+* **60 min**: L1 + L4 + L2 (FLy K sweep) + L18 (MARS quality probe).
+* **2 hours**: All of Tier 1 + L9 stateful Linear push + bench.
+* **4 hours / Sunday morning session**: above + Tier 3 Swift changes.
+
+### Never do in one sitting
+
+* > 4 timed prompts per launch — thermal=serious by 5th.
+* > 6 launches per hour — cool gap floor is 8-10 min.
+* Sweep + manual single-prompt bench back-to-back without cool gap.
+* Tier 4 Python rebuild within 30 min of a hot iPhone (rebuild
+  uses Mac, then needs iPhone push + cool bench — pad cool gap).
+
+## Combination ideas (stacked levers, advanced)
+
+Beyond individual sweep values, some combos are worth one shot each:
+
+| combo | hypothesis | command |
+|---|---|---|
+| L1 + L4 | warm K=1 + PLD on code | `{"MTP_K_USE": "1", "MTP_PLD_PREFETCH_ENABLE": "1"}` |
+| L2:24 + L1 | K=1 + FLy K=24 | `{"MTP_K_USE": "1", "MTP_FLY_TOPK": "24"}` |
+| L3:0.20 + L1 narrative | K=1 narrative w/ low bail | `{"MTP_K_USE": "1", "MTP_FALLBACK_THRESHOLD": "0.20"}` |
+| L16 + L18 | high QoS + lossy MARS | `{"LLM_DECODE_QOS": "high", "MTP_MARS_ENABLE": "1"}` |
+
+## Summary lever count
+
+* **Env-only**: L1-L8 (today's playbook) + L16-L25 (this update) +
+  L38-L42 (system-level) = **23 env knobs ready to sweep**.
+* **Swift change**: L10-L12, L26-L31, L43-L46 = **13 implementation
+  candidates** with risk + LOC notes.
+* **Python rebuild**: L13-L15, L32-L37 = **9 model rebuild
+  candidates** with cost notes.
+* **Research**: R1-R8 = **8 probing tasks**.
+
+Total candidates loaded: **53**. With memory cross-referencing,
+no overlap with the 15+ already-tried levers.
