@@ -483,7 +483,19 @@ public final class MtpDraftSource {
             }
             return false
         }
-        return rollingAcceptance >= fallbackThreshold
+        // Per-run override for the rolling-acceptance auto-bail floor.
+        // Default `fallbackThreshold` is 0.0 (never-bail) — that helps
+        // FLy top-K paths where intermittent accept still pays. For
+        // narrative free-form, drafter cost > 1-accept gain, so set
+        // `MTP_FALLBACK_THRESHOLD=0.25` to let MTP fall back to T=1.
+        let effectiveFloor: Double
+        if let s = ProcessInfo.processInfo.environment["MTP_FALLBACK_THRESHOLD"],
+           let v = Double(s) {
+            effectiveFloor = v
+        } else {
+            effectiveFloor = fallbackThreshold
+        }
+        return rollingAcceptance >= effectiveFloor
     }
 
     /// No-op kept for ABI compatibility with engine that calls it after bail.
