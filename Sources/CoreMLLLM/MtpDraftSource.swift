@@ -44,13 +44,24 @@ public final class MtpDraftSource {
     /// the ~10 tok/s lost to premature bail on translate (44 forced vs 33
     /// auto-bail). iPhone stays conservative because free-form accept
     /// typically 0.11-0.16, below iPhone break-even.
-    // 2026-05-13: unified never-bail for iOS too. Earlier iOS=0.25 threshold
-    // killed FLy top-K=16 wins after 7-8 rounds of intermittent accepts (the
-    // EMA drifts below 0.25 even when FLy hits 50% of slots), causing the
-    // iPhone to silently fall back to plain decode. Mac never-bail behaviour
-    // sustains MTP for 45+ rounds at avg 38% accept — that's the source of
-    // Mac's 1.5× number. Pay 15ms per miss cycle to capture FLy wins.
+    // 2026-05-13 (later): split Mac vs iPhone defaults.
+    //
+    // Empirical iPhone 17 Pro narrative bench: 29 tok/s @ acc 0.25 with FLy
+    // K=16 + centroid drafter. iPhone T=1 baseline = 32-37 tok/s — so MTP-on
+    // narrative is **−22% NET NEGATIVE**. Why: iPhone verify cycle 52 ms vs
+    // Mac 35 ms = +50% heavier per cycle; iPhone break-even accept is ≈ 0.36
+    // vs Mac ≈ 0.17. Narrative accept 0.25 sits below iPhone break-even.
+    //
+    // Mac stays at 0.0 (never-bail) — Mac verify cycle is cheap enough that
+    // intermittent FLy accepts always pay. iPhone defaults to 0.30 so that
+    // narrative drops to T=1 baseline (~32-37 tok/s) instead of dragging to
+    // 29 tok/s, while structured / code prompts (typical accept ≥ 0.4) stay
+    // on the MTP path. Override via `MTP_FALLBACK_THRESHOLD` env.
+    #if os(iOS)
+    public var fallbackThreshold: Double = 0.30
+    #else
     public var fallbackThreshold: Double = 0.0
+    #endif
     /// Hard bail: N consecutive `matched=0` rounds short-circuit the EMA.
     /// Platform-aware:
     ///   iPhone: 2 (cycle 45-50ms, drafter zero-rounds costly)
