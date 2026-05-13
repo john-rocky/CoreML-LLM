@@ -1,5 +1,17 @@
 # CoreML-LLM
 
+**Run LLMs on iPhone / iPad with Core ML. Optimised for the Neural Engine + GPU.**
+
+Quantized 1-3B parameter models running at 15-30 tokens/s on iPhone 15 Pro. Useful for: on-device summarisation, structured extraction, classification, function-calling. Zero per-token cost.
+
+By [Daisuke Majima](https://john-rocky.github.io). Maintainer of [CoreML-Models](https://github.com/john-rocky/CoreML-Models) (1,749★).
+
+💼 **Currently solo-lead on a 94k-line production iOS retail-vision app using on-device LLM in real-time. Open to Staff / Senior iOS / Mobile ML roles.** — [john-rocky.github.io](https://john-rocky.github.io)
+
+---
+
+# CoreML-LLM
+
 **On-device LLMs on the Apple Neural Engine.** Run Gemma 4, Qwen3.5, Qwen3-VL, FunctionGemma, EmbeddingGemma, and Liquid AI's LFM2.5 on iPhone with CoreML — ANE-first, battery-friendly, no server.
 
 Where [MLX Swift](https://github.com/ml-explore/mlx-swift) is the right call when you want maximum GPU throughput, CoreML-LLM is what you use when the LLM should live on the **ANE** so the GPU stays free for the rest of the app.
