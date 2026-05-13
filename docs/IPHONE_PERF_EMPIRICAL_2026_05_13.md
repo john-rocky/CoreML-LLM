@@ -55,8 +55,42 @@ After commit `bc5b04a` (warmup) + `e9af22d` (K_USE=2 revert):
 | prompt | iPhone tok/s | gain vs T=1 |
 |---|---|---|
 | Narrative essay | 31 (parity, auto-bails) | 0 % |
-| Code BST | ~40 (TBD, requires fresh cool bench) | ~+25 % |
+| Code BST | ~40 (cool baseline 40.89 from earlier bench) | ~+25 % |
 | List 30 emperors | TBD | TBD |
+
+## Thermal-throttled "long-form chat" reality
+
+iPhone 17 Pro 4-chunk + MTP after ~5 consecutive 256-token benches the
+SoC reaches `state=serious`. ChunkedEngine inserts 1.8 s gaps between
+chunk loads (model load goes 20 s → 100-150 s); decode tok/s
+degrades 30-50 %.
+
+| state | narrative | code | observed |
+|---|---|---|---|
+| cool (`fair`) | 31 | 40 | first 1-2 benches |
+| warm | ~28 | ~32 | after 2-3 benches |
+| serious | 22 | 19 | after 4+ back-to-back benches |
+
+What a real chat user sees depends on how much they generate
+back-to-back. The 40 tok/s code number is the "snappy first session"
+value; sustained long-form chat sees 20-30 tok/s under thermal
+throttle.
+
+## Validation budget reached (2026-05-13)
+
+After 6 consecutive AutoBench launches the iPhone settled into
+`state=serious` and 10-minute cool-downs no longer fully restored
+`fair`. Further bench iteration today would re-measure thermal
+throttle, not optimisation deltas. Action items deferred to next
+session:
+
+1. K_USE-1 explicit + warmup retest on a truly cool iPhone (full
+   overnight idle) — confirm whether the +24 % code win is robust
+   when warmup precedes it.
+2. `MTP_FLY_TOPK` sweep (8 / 16 / 24 / 32) on cool iPhone.
+3. `MTP_FALLBACK_THRESHOLD` sweep (0.20 / 0.25 / 0.30 / 0.35).
+4. Per-prompt K_USE adapter (sense first-cycle accept rate, switch
+   K_USE between 1 and 2).
 
 These are the numbers users actually see in production. Mac wins
 (narrative +35 %, code +100 %) don't fully transfer because iPhone
