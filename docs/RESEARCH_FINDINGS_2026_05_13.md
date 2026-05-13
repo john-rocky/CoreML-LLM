@@ -271,11 +271,30 @@ in any new build.
 | Apple block-shared KV (AFM trick) | blocked by Gemma 4 E2B `attention_k_eq_v=false` | memory `project_gemma4_k_eq_v_false` |
 | Apple Foundation Models inference reuse | closed loop with their 3B, not Gemma | R2 agent |
 | MLX speculative decoding | GPU/Metal only, no ANE | R3 agent |
-| LiteRT-LM 56 tok/s | GPU/Metal only, no ANE path on iOS | R3 agent |
+| LiteRT-LM 56 tok/s | different RUNTIME (TFLite GPU); we cannot port to our CoreML/ANE stack | R3 agent |
 | llama.cpp ANE backend | doesn't exist yet | R3 agent |
 | Adaptive K_USE | Mac +3.5 % vs static +13.8 % | code comment + memory |
 | iPhone Game Mode for LLM | no public API | R4 agent |
 | `experimentalMLE5EngineUsage` private key | App Store rejection risk | R6 agent |
+| **CoreML Metal/GPU routing on our chunks** | empirically SLOWER than ANE on our stack | today: `LLM_CHUNK4_DEVICE=gpu` Mac = 22 tok/s vs ANE 32; `MAC_DEPLOY_PATHS.md` line 9 already states "Metal-GPU is unavailable [for our path on iPhone]"; `METAL_ANE_KERNELS_CATALOG.md` is a research-only catalog for a hypothetical future port |
+
+### Important framing correction
+
+The earlier draft of this doc said "future iPhone wins may come from
+moving LM head to Metal-4 GPU." **That's wrong.** Existing
+`docs/MAC_DEPLOY_PATHS.md` already documents:
+* Mac path A (our CoreML/ANE INT4): 32 → 43 tok/s with MTP
+* Mac path B (LiteRT GPU): 143 tok/s baseline — but **different runtime
+  entirely (TFLite-based)**, not portable to our CoreML stack
+* iPhone Metal-GPU is unavailable for our CoreML chunks; CoreML's GPU
+  routing on iPhone tested today = **slower** than ANE
+* `METAL_ANE_KERNELS_CATALOG.md` is for an EVENTUAL standalone Metal
+  port (3-6 weeks effort per `METAL_PORT_REFERENCE.md`), not an
+  in-place CoreML tweak
+
+**ANE is the path.** All Tier-S levers (S1-S5) operate within the ANE
+path. Don't use Metal as an "alternative" — it'd be a multi-week port
+to a slower in-CoreML target.
 
 ---
 
@@ -312,6 +331,11 @@ These are **honest, sourced, not padding**.
 - **Speculative claims without citations**: previously L26-L46 padding.
 - **Production polish (L43 prompt classifier)**: real UX win, but no tok/s
   headline gain.
+- **Metal/GPU port**: documented in `METAL_ANE_KERNELS_CATALOG.md` as a
+  3-6 week standalone port. CoreML's in-place GPU routing on iPhone is
+  empirically slower than ANE on our chunks (`MAC_DEPLOY_PATHS.md` already
+  notes iPhone Metal-GPU is unavailable for our path). ANE is the path
+  we're already on; the Tier-S levers all operate within ANE.
 
 ---
 
