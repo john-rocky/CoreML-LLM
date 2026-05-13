@@ -60,6 +60,29 @@ enum AutoBench {
             exit(1)
         }
 
+        // Warmup: short prompt to warm the drafter + first-cycle ANE
+        // residency before the timed prompts. Otherwise the cold first
+        // MTP cycle hits 0/K acceptance, rolling EMA decays below
+        // fallback threshold, and MTP auto-bails for the rest of the
+        // first timed prompt. Skip via LLM_AUTOBENCH_NO_WARMUP=1.
+        if env["LLM_AUTOBENCH_NO_WARMUP"] != "1" {
+            print("[AutoBench] warmup (24 tokens, discarded)")
+            let warmStart = CFAbsoluteTimeGetCurrent()
+            let warmMsg = ChatMessage(role: .user, content: "Hello.")
+            do {
+                let stream = try await runner.generate(messages: [warmMsg])
+                var n = 0
+                for await _ in stream {
+                    n += 1
+                    if n >= 24 { break }
+                }
+            } catch {
+                print("[AutoBench] warmup ERROR: \(error.localizedDescription)")
+            }
+            let warmMs = (CFAbsoluteTimeGetCurrent() - warmStart) * 1000
+            print(String(format: "[AutoBench] warmup done in %.0f ms", warmMs))
+        }
+
         for (label, prompt) in prompts {
             if let selected, !selected.contains(label) { continue }
             print("[AutoBench] === \(label) ===")
