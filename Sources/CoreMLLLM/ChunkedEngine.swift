@@ -2060,40 +2060,38 @@ final class ChunkedEngine {
     }
 
     private func ensureDecodeOutBackings() {
-        // Decode chunks update KV state in-place (K_sliding_in === K_sliding_out
-        // memory binding). Providing a separate IOSurface backing for the
-        // K/V_*_out names causes CoreML to raise a "pixel buffer locked"
-        // error because the engine binds the SAME buffer for in and out.
-        // Only set backings for the OTHER outputs (hidden_states_out,
-        // per_layer_combined_out, kv13/14_*).
-        let kvInPlace: Set<String> = [
-            "K_sliding_out", "V_sliding_out", "K_full_out", "V_full_out"
-        ]
-        if decodeOutBackings1 == nil {
-            decodeOutBackings1 = makeBackingsForChunk(chunk1, skip: kvInPlace)
-            if let b = decodeOutBackings1, !b.isEmpty {
-                print("[Decode] chunk1 backings: \(b.keys.sorted())")
-            }
-        }
-        if decodeOutBackings2 == nil {
-            decodeOutBackings2 = makeBackingsForChunk(chunk2, skip: kvInPlace)
-            if let b = decodeOutBackings2, !b.isEmpty {
-                print("[Decode] chunk2 backings: \(b.keys.sorted())")
-            }
-        }
-        if decodeOutBackings3 == nil, let c3 = chunk3 {
-            decodeOutBackings3 = makeBackingsForChunk(c3)
-            if let b = decodeOutBackings3, !b.isEmpty {
-                print("[Decode] chunk3 backings: \(b.keys.sorted())")
-            }
-        }
-        if decodeOutBackings4 == nil {
-            // Skip token_id (int32) and logits_fp16 (1.5 MB, opt-in only).
-            decodeOutBackings4 = makeBackingsForChunk(chunk4,
-                skip: ["token_id", "token_ids", "logits_fp16"])
-            if let b = decodeOutBackings4, !b.isEmpty {
-                print("[Decode] chunk4 backings: \(b.keys.sorted())")
-            }
+        // Decode chunks form a chain — chunk1's `hidden_states_out` and
+        // `per_layer_combined_out` feed chunk2; chunk2's `kv13/14_k/v` feed
+        // chunks 3 and 4 (also mirrored / sliced via .dataPointer reads).
+        // Backing those outputs with IOSurface MLMultiArrays produces two
+        // iPhone-only failures:
+        //   1.  `kv13_v` shape mismatch — iPhone ANE 18 compiler folds the
+        //       k/v_v transpose into the verify chunk's INPUT layout
+        //       (1,1,256,512), so decode chunk2's allocated backing
+        //       (1,1,512,256) fails the input-shape constraint when handed
+        //       to verify_qK. Mac ANE doesn't transpose internally so it
+        //       silently accepts.
+        //   2.  `hidden_states_out` pixel buffer lock — reading
+        //       .dataPointer on a backed output locks the underlying
+        //       IOSurface, and the next decode cycle errors with
+        //       "The underlying pixel buffer has been locked. The output
+        //       backing cannot use such an object."
+        //
+        // Empirically caught only by iPhone end-to-end run (Mac smoke
+        // accepted both patterns silently). After fc31660 the production
+        // iPhone path used auto-allocated outputs and CoreML's marshaling
+        // handled the layout differences; my attempt to pre-allocate
+        // IOSurface backings broke that. Disable decode backings entirely
+        // to restore the working iPhone behaviour. The Mac no-op delta was
+        // within noise (32 → 32 tok/s on T=1).
+        decodeOutBackings1 = [:]
+        decodeOutBackings2 = [:]
+        decodeOutBackings3 = [:]
+        decodeOutBackings4 = [:]
+        // Keep the makeBackingsForChunk helper alive for any future
+        // platform-specific opt-in path (e.g. Mac-only via env knob).
+        if false {
+            let _ = makeBackingsForChunk(chunk1, skip: [])
         }
     }
 
