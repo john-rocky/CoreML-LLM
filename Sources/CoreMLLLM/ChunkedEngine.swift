@@ -326,6 +326,20 @@ final class ChunkedEngine {
     private var verifyOutBackings2: [String: MLMultiArray]?
     private var verifyOutBackings3: [String: MLMultiArray]?
     private var verifyOutBackings4: [String: MLMultiArray]?
+    // Ping-pong sibling sets for verify backings (opt-in via env
+    // MTP_VERIFY_BACKINGS_PING_PONG=1). When enabled, ensureVerifyOutBackings
+    // allocates two parallel IOSurface backing sets (A above + B below)
+    // and verifyCandidates* alternates between them per cycle. Mitigates
+    // the "pixel buffer locked" failure path observed today by giving the
+    // previous cycle's locked buffer a chance to release before reuse.
+    // See `docs/RESEARCH_FINDINGS_2026_05_13_R2.md` S2.
+    private var verifyOutBackings1B: [String: MLMultiArray]?
+    private var verifyOutBackings2B: [String: MLMultiArray]?
+    private var verifyOutBackings3B: [String: MLMultiArray]?
+    private var verifyOutBackings4B: [String: MLMultiArray]?
+    /// Cycle parity flag — flipped after each verifyCandidates* call when
+    /// ping-pong is enabled. false → use A set, true → use B set.
+    private var verifyCycleParityB: Bool = false
     // Same idea on the decode (T=1) path. Decode chunks output similar
     // tensors but shape (1, 1, hidden) and smaller KV slices.
     private var decodeOutBackings1: [String: MLMultiArray]?
@@ -2120,6 +2134,83 @@ final class ChunkedEngine {
         verifyOutBackings2 = [:]
         verifyOutBackings3 = [:]
         verifyOutBackings4 = [:]
+
+        // 2026-05-14 lever S2 (opt-in via MTP_VERIFY_BACKINGS_PING_PONG=1):
+        // alternate between two pre-allocated backing sets per cycle, so
+        // each underlying IOSurface gets at least one cycle of "rest"
+        // between predictions where we read .dataPointer from it. The
+        // pixel-buffer-lock failure mode is a within-cycle race; ping-pong
+        // gives enough breathing room for CoreML to release the lock from
+        // the previous use before we re-bind.
+        //
+        // Risks (untested empirically):
+        // * Lock may persist beyond one cycle — needs explicit
+        //   CVPixelBufferUnlockBaseAddress, which we don't do.
+        // * Doubles peak IOSurface footprint (~30 MB × 2 = 60 MB).
+        //
+        // If this trick works, expected +5-8% verify cycle wins back
+        // the IOSurface marshalling we lost when verify backings were
+        // disabled. Source: ANEMLL ping-pong pattern, Apple dev forum 735698.
+        let pingPong = ProcessInfo.processInfo
+            .environment["MTP_VERIFY_BACKINGS_PING_PONG"] == "1"
+        guard pingPong else { return }
+
+        let kvInPlace: Set<String> = [
+            // Decode-style K/V outputs (defensive — verify chunks emit
+            // `new_*` instead).
+            "K_sliding_out", "V_sliding_out", "K_full_out", "V_full_out",
+            // Verify per-T slice outputs — accessed via .dataPointer for
+            // commitAccepted's selective write. Don't back.
+            "new_K_sliding", "new_V_sliding", "new_K_full", "new_V_full",
+            // Verify chunk2 shared-KV emits — passed to chunk3/4 inputs
+            // and mirrored. Don't back.
+            "kv13_k", "kv13_v", "kv14_k", "kv14_v",
+        ]
+        if let v1 = verifyChunk1 {
+            verifyOutBackings1 = makeBackingsForChunk(v1, skip: kvInPlace)
+            verifyOutBackings1B = makeBackingsForChunk(v1, skip: kvInPlace)
+        }
+        if let v2 = verifyChunk2 {
+            verifyOutBackings2 = makeBackingsForChunk(v2, skip: kvInPlace)
+            verifyOutBackings2B = makeBackingsForChunk(v2, skip: kvInPlace)
+        }
+        if let v3 = verifyChunk3 {
+            verifyOutBackings3 = makeBackingsForChunk(v3, skip: kvInPlace)
+            verifyOutBackings3B = makeBackingsForChunk(v3, skip: kvInPlace)
+        }
+        if let v4 = verifyChunk4 {
+            let skip = kvInPlace.union(["token_ids", "logits_fp16"])
+            verifyOutBackings4 = makeBackingsForChunk(v4, skip: skip)
+            verifyOutBackings4B = makeBackingsForChunk(v4, skip: skip)
+        }
+        if let b = verifyOutBackings1, !b.isEmpty {
+            print("[Verify ping-pong] enabled — set A: \(b.keys.sorted())")
+        }
+    }
+
+    /// Returns the current cycle's verify backing set for the given chunk
+    /// index. When ping-pong disabled (default), always returns the A set
+    /// (which is `[:]` empty — caller treats as no backings). When
+    /// ping-pong enabled, alternates A/B based on `verifyCycleParityB`.
+    /// **Caller must flip parity after the verify cycle completes** via
+    /// `flipVerifyCycleParity()`.
+    fileprivate func currentVerifyBackings(idx: Int) -> [String: MLMultiArray]? {
+        switch (idx, verifyCycleParityB) {
+        case (1, false): return verifyOutBackings1
+        case (1, true):  return verifyOutBackings1B
+        case (2, false): return verifyOutBackings2
+        case (2, true):  return verifyOutBackings2B
+        case (3, false): return verifyOutBackings3
+        case (3, true):  return verifyOutBackings3B
+        case (4, false): return verifyOutBackings4
+        case (4, true):  return verifyOutBackings4B
+        default:         return nil
+        }
+    }
+    fileprivate func flipVerifyCycleParity() {
+        if verifyOutBackings1B != nil {  // ping-pong enabled
+            verifyCycleParityB.toggle()
+        }
     }
 
     /// Get or allocate a fp16 scratch MLMultiArray for a verify mask of
@@ -2212,7 +2303,7 @@ final class ChunkedEngine {
             "V_full_in": MLFeatureValue(multiArray: vFull1),
         ])
         let out1: MLFeatureProvider
-        if let backings = verifyOutBackings1, !backings.isEmpty {
+        if let backings = currentVerifyBackings(idx: 1), !backings.isEmpty {
             let opts = MLPredictionOptions(); opts.outputBackings = backings
             out1 = try verifyChunk1!.prediction(from: in1, options: opts)
         } else {
@@ -2245,7 +2336,7 @@ final class ChunkedEngine {
             "V_full_in": MLFeatureValue(multiArray: vFull2),
         ])
         let out2: MLFeatureProvider
-        if let backings = verifyOutBackings2 {
+        if let backings = currentVerifyBackings(idx: 2), !backings.isEmpty {
             let opts = MLPredictionOptions()
             opts.outputBackings = backings
             out2 = try verifyChunk2!.prediction(from: in2, options: opts)
@@ -2285,7 +2376,7 @@ final class ChunkedEngine {
             var d3 = shared; d3["hidden_states"] = MLFeatureValue(multiArray: h2)
             let in3 = try MLDictionaryFeatureProvider(dictionary: d3)
             let out3p: MLFeatureProvider
-            if let backings = verifyOutBackings3, !backings.isEmpty {
+            if let backings = currentVerifyBackings(idx: 3), !backings.isEmpty {
                 let opts = MLPredictionOptions(); opts.outputBackings = backings
                 out3p = try v3.prediction(from: in3, options: opts)
             } else {
@@ -2300,7 +2391,7 @@ final class ChunkedEngine {
         var d4 = shared; d4["hidden_states"] = MLFeatureValue(multiArray: h3)
         let in4 = try MLDictionaryFeatureProvider(dictionary: d4)
         let out4: MLFeatureProvider
-        if let backings = verifyOutBackings4, !backings.isEmpty {
+        if let backings = currentVerifyBackings(idx: 4), !backings.isEmpty {
             let opts = MLPredictionOptions(); opts.outputBackings = backings
             out4 = try verifyChunk4!.prediction(from: in4, options: opts)
         } else {
@@ -2324,6 +2415,7 @@ final class ChunkedEngine {
         if ProcessInfo.processInfo.environment["VERIFY_DIFF_DUMP"] == "1" {
             print("[VerifyDiff] pos=\(startPosition) input=\(tokens) argmax=\(result) hasLogits=\(lastVerifyLogits != nil)")
         }
+        flipVerifyCycleParity()
         return result
     }
 
