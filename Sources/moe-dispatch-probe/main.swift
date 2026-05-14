@@ -173,6 +173,72 @@ func probeDenseBackbone(_ url: URL, _ units: MLComputeUnits, _ label: String,
     print(stats.line(label)); return stats
 }
 
+/// ANE angle 1 probe. MLStateExpert: routed-expert weights live in two
+/// MLState buffers. Swift writes the current layer's TOP_K expert
+/// weights into the state, the model reads them. Measures two modes:
+///  - pure: state filled once, dispatch only (lower bound)
+///  - realistic: state re-filled every iteration (per-layer expert swap)
+func probeMLStateExpert(_ url: URL, _ units: MLComputeUnits, _ label: String,
+                        _ iterations: Int) -> (pure: Stats, realistic: Stats)? {
+    let cfg = MLModelConfiguration(); cfg.computeUnits = units
+    guard let model = try? MLModel(contentsOf: url, configuration: cfg) else {
+        fputs("  [\(label)] load failed\n", stderr); return nil
+    }
+    let state = model.makeState()
+    let (x, _) = makeInput()
+    guard let tw = try? MLMultiArray(shape: [TOP_K as NSNumber], dataType: .float16)
+    else { return nil }
+    for i in 0..<TOP_K { tw[i] = NSNumber(value: Float(0.25)) }
+    guard let provider = try? MLDictionaryFeatureProvider(dictionary: [
+        "x_bc1t": MLFeatureValue(multiArray: x),
+        "topk_weights": MLFeatureValue(multiArray: tw),
+    ]) else { return nil }
+
+    // Fill the state buffers with random data. expert_gate_up:
+    // (TOP_K, 2*1408, 2048), expert_down: (TOP_K, 2048, 1408).
+    let inter = 1408
+    func fillState() {
+        state.withMultiArray(for: "expert_gate_up") { arr in
+            let n = TOP_K * 2 * inter * HIDDEN
+            let p = arr.dataPointer.bindMemory(to: UInt16.self, capacity: n)
+            for i in stride(from: 0, to: n, by: 4096) { p[i] = UInt16(i & 0x3FFF) }
+        }
+        state.withMultiArray(for: "expert_down") { arr in
+            let n = TOP_K * HIDDEN * inter
+            let p = arr.dataPointer.bindMemory(to: UInt16.self, capacity: n)
+            for i in stride(from: 0, to: n, by: 4096) { p[i] = UInt16(i & 0x3FFF) }
+        }
+    }
+    fillState()
+    for _ in 0..<10 { _ = try? model.prediction(from: provider, using: state) }
+
+    // pure: state stays put, dispatch only
+    let pure = timeLoop(iterations) {
+        _ = try? model.prediction(from: provider, using: state)
+    }
+    // realistic: rewrite full state each iter (simulates per-layer expert swap)
+    let realistic = timeLoop(iterations) {
+        fillStateFull(state, inter: inter)
+        _ = try? model.prediction(from: provider, using: state)
+    }
+    print(pure.line("\(label) [pure]"))
+    print(realistic.line("\(label) [+state-write]"))
+    return (pure, realistic)
+}
+
+/// Full state rewrite — memset-speed proxy for "Swift writes 4 fresh
+/// expert weight sets". This is the per-layer cost in the real pipeline.
+func fillStateFull(_ state: MLState, inter: Int) {
+    state.withMultiArray(for: "expert_gate_up") { arr in
+        let n = TOP_K * 2 * inter * HIDDEN
+        memset(arr.dataPointer, 0x3C, n * MemoryLayout<UInt16>.stride)
+    }
+    state.withMultiArray(for: "expert_down") { arr in
+        let n = TOP_K * HIDDEN * inter
+        memset(arr.dataPointer, 0x3C, n * MemoryLayout<UInt16>.stride)
+    }
+}
+
 /// THE ANE-route probe. FusedMoEChunk: N fused layers, dense backbone
 /// as static constants + routed experts with weights passed as INPUTS.
 /// The graph is static (chunkable); only weight values vary per token.
@@ -308,6 +374,20 @@ for variant in ["dense_backbone_1L", "dense_backbone_1L_int4",
             let label = "\(variant)/\(unitName(u))"
             if let s = probeDenseBackbone(url, u, label, iterations, kvWindow: 256) {
                 S[label] = s
+            }
+        }
+    }
+}
+
+// ANE angle 1: MLStateExpert — routed-expert weights in MLState.
+print("\n--- mlstate_expert (routed-expert weights in MLState buffers) ---")
+for variant in ["mlstate_expert", "mlstate_expert_int4"] {
+    if let url = await resolveCompiled(probeDir, variant) {
+        for u in units {
+            let label = "\(variant)/\(unitName(u))"
+            if let (pure, real) = probeMLStateExpert(url, u, label, iterations) {
+                S["\(label)/pure"] = pure
+                S["\(label)/real"] = real
             }
         }
     }

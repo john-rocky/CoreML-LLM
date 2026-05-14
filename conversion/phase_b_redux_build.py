@@ -97,6 +97,41 @@ class LayerGather(nn.Module):
         return weighted.view(1, HIDDEN, 1, 1)
 
 
+class MLStateExpert(nn.Module):
+    """ANE angle 1: routed-expert weights live in MLState buffers.
+
+    weights-as-input was slow because of 415MB/chunk input marshaling.
+    MLState is a persistent buffer — Swift writes the current layer's
+    TOP_K selected expert weights into the state, the model reads them.
+    No per-call input marshaling; the question is whether (a) ANE
+    accepts a state tensor as a matmul operand and (b) the state-read
+    matmul is faster than the input-fed one.
+
+    Two state buffers (2 StateTypes — ANE-OK; only 3+ breaks):
+      expert_gate_up : (TOP_K, 2*inter, hidden)
+      expert_down    : (TOP_K, hidden, inter)
+    The model only READS these (Swift writes them). Input is just x +
+    topk_weights.
+    """
+    def __init__(self):
+        super().__init__()
+        self.register_buffer(
+            "expert_gate_up",
+            torch.zeros(TOP_K, 2 * EXPERT_INTER, HIDDEN, dtype=MODEL_DTYPE))
+        self.register_buffer(
+            "expert_down",
+            torch.zeros(TOP_K, HIDDEN, EXPERT_INTER, dtype=MODEL_DTYPE))
+
+    def forward(self, x_bc1t, topk_weights):
+        x_flat = x_bc1t.reshape(1, HIDDEN)
+        gate_up = torch.einsum("kih,bh->kbi", self.expert_gate_up, x_flat)
+        gate, up = gate_up.chunk(2, dim=-1)
+        inter = F.silu(gate) * up
+        down_out = torch.einsum("kbi,khi->kbh", inter, self.expert_down)
+        weighted = (down_out * topk_weights.view(-1, 1, 1)).sum(dim=0)
+        return weighted.view(1, HIDDEN, 1, 1)
+
+
 class FusedMoEChunk(nn.Module):
     """THE ANE-route design. N fused layers, each = dense backbone
     (static constants) + routed experts (weights passed as INPUTS).
@@ -309,6 +344,40 @@ def convert_layer_gather(out_path: str, int4: bool = False) -> str:
     return out_path
 
 
+def convert_mlstate_expert(out_path: str, int4: bool = False) -> str:
+    """Convert MLStateExpert — routed-expert weights in 2 MLState buffers."""
+    m = MLStateExpert().eval().to(MODEL_DTYPE)
+    x_ex = torch.zeros(1, HIDDEN, 1, 1, dtype=MODEL_DTYPE)
+    tw_ex = torch.full((TOP_K,), 0.25, dtype=MODEL_DTYPE)
+    traced = torch.jit.trace(m, (x_ex, tw_ex))
+    mlmodel = ct.convert(
+        traced,
+        convert_to="mlprogram",
+        compute_precision=ct.precision.FLOAT16,
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.iOS18,
+        inputs=[
+            ct.TensorType(name="x_bc1t", shape=(1, HIDDEN, 1, 1), dtype=np.float16),
+            ct.TensorType(name="topk_weights", shape=(TOP_K,), dtype=np.float16),
+        ],
+        outputs=[ct.TensorType(name="y_bc1t", dtype=np.float16)],
+        states=[
+            ct.StateType(
+                wrapped_type=ct.TensorType(
+                    shape=(TOP_K, 2 * EXPERT_INTER, HIDDEN), dtype=np.float16),
+                name="expert_gate_up"),
+            ct.StateType(
+                wrapped_type=ct.TensorType(
+                    shape=(TOP_K, HIDDEN, EXPERT_INTER), dtype=np.float16),
+                name="expert_down"),
+        ],
+    )
+    if int4:
+        mlmodel = palettize_int4(mlmodel)
+    mlmodel.save(out_path)
+    return out_path
+
+
 def convert_fused_moe_chunk(out_path: str, n_layers: int,
                             kv_window: int = 256, int4: bool = False) -> str:
     """Convert FusedMoEChunk. 6 inputs: x, kv_window, gate_w, up_w,
@@ -488,6 +557,20 @@ def main():
         print(f"[single_int4] ERROR: {e}")
         import traceback
         traceback.print_exc()
+
+    # 5b. MLStateExpert — routed-expert weights in MLState buffers.
+    for tag, is_int4 in [("", False), ("_int4", True)]:
+        print(f"[mlstate{tag}] building mlstate_expert{tag}.mlpackage")
+        t0 = time.time()
+        try:
+            convert_mlstate_expert(
+                os.path.join(args.out_dir, f"mlstate_expert{tag}.mlpackage"),
+                int4=is_int4)
+            print(f"[mlstate{tag}] done in {time.time()-t0:.1f}s")
+        except Exception as e:
+            print(f"[mlstate{tag}] ERROR: {e}")
+            import traceback
+            traceback.print_exc()
 
     # 6. FusedMoEChunk — THE ANE-route design. Dense backbone (static
     #    constants) + routed experts (weights from input) fused into one
