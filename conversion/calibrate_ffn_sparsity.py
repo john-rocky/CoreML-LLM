@@ -31,6 +31,21 @@ import time
 from collections import defaultdict
 from typing import Optional
 
+import sys as _sys
+import types as _types
+import importlib.machinery as _machinery
+
+# Stub wandb out — its actual install in this venv has a broken
+# protobuf chain that gets triggered by `accelerate` / `timm` paths
+# during Gemma 3n model loading. Accelerate calls
+# `importlib.util.find_spec("wandb")` so we need a proper __spec__.
+if "wandb" not in _sys.modules:
+    _w = _types.ModuleType("wandb")
+    _w.__path__ = []  # type: ignore[attr-defined]
+    _w.__spec__ = _machinery.ModuleSpec("wandb", loader=None,
+                                          is_package=True)
+    _sys.modules["wandb"] = _w
+
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
