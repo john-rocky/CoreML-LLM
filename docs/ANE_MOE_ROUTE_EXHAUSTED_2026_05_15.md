@@ -1,4 +1,4 @@
-# ANE route for MoE — exhausted across 7 measured designs
+# ANE route for MoE — exhausted across 8 measured designs
 
 Date: 2026-05-15
 Branch: `feat/mtp-iphone-perf`
@@ -9,7 +9,7 @@ Companion to `docs/QWEN_MOE_MLX_BREAKTHROUGH_2026_05_15.md`.
 The session twice declared the Qwen MoE pivot dead too quickly. The
 user pushed back hard — don't give up from a single perspective,
 question the premise, find the way through. So the ANE route was then
-pursued **exhaustively**: 7 distinct designs, every one measured on the
+pursued **exhaustively**: 8 distinct designs, every one measured on the
 real Swift production path (`Sources/moe-dispatch-probe`,
 IOSurface-backed buffers, warm models, 200 timed iterations) — no
 Python `predict()` proxies, no extrapolation of the per-dispatch cost.
@@ -17,7 +17,7 @@ Python `predict()` proxies, no extrapolation of the per-dispatch cost.
 This is the record so the ANE route is not re-litigated without new
 silicon or a new model class.
 
-## The 7 ANE designs and their measured results
+## The 8 ANE designs and their measured results
 
 All on Mac M-series, INT4 where applicable, extrapolated to a 24-layer
 Qwen1.5-MoE-A2.7B decode.
@@ -31,6 +31,7 @@ Qwen1.5-MoE-A2.7B decode.
 | 5 | MLState-backed expert weights (2 state buffers) | 2.8 ms/layer | ~15 tok/s — dynamic-weight matmul slow even from state |
 | 6 | expert co-firing grouping (cut dispatch count 4→2) | — | FLAT: co-fire ratio 0.76× of random; load-balancing loss decorrelates experts by design |
 | 7 | switch to a smaller-expert-count MoE | — | no silver bullet: no small MoE has 2 active experts; OLMoE-1B-7B is the best feasible but its 8×16=128 routed dispatches ≈ Qwen's 96+24 |
+| 8 | expert-bank factorization (user's idea — restructure PyTorch-side: shared basis + low-rank per-expert) | — | FULL-RANK: 95%-energy needs 56-57 of 60 singular values, shared component only 1.8% of energy. Experts near-independent — can't factor |
 
 ## The structural conclusion
 
@@ -51,6 +52,9 @@ fundamentally at odds:
 * The dispatch count can't be reduced by grouping (design 6 — experts
   are trained to be decorrelated) or by model choice (design 7 — no
   small 2-active MoE exists).
+* And it can't be reduced by factoring the expert bank (design 8 —
+  the experts are full-rank in expert-space; MoE's expert-diversity
+  objective actively prevents the redundancy a factorisation needs).
 
 Best ANE result for Qwen-class MoE: **~32 tok/s** (multifunction),
 which is ~parity with the current Gemma 4 E2B CoreML/ANE deployment
@@ -62,6 +66,25 @@ with the ANE programming model. This holds until either (a) the ANE
 driver gains efficient runtime gather, or (b) a MoE model with a
 radically lower active-expert-per-layer count appears.
 
+## Root cause — MoE training objectives ⊥ ANE architecture
+
+The 8 angles aren't 8 separate failures. They're 8 confirmations of one
+root cause: **MoE is trained to have exactly the properties ANE cannot
+exploit.**
+
+| ANE needs | MoE training produces | confirmed by |
+|---|---|---|
+| static graph | per-token dynamic routing | angles 1, 4, 5 |
+| fuseable / low dispatch count | irreducible per-layer dispatches | angles 2, 3 |
+| exploitable weight redundancy | full-rank, decorrelated experts | angle 8 |
+| predictable structure | load-balanced uniform usage | angle 6 |
+
+The load-balancing loss decorrelates expert usage. The expert-diversity
+objective makes the bank full-rank. These are not incidental — they are
+the MoE training recipe, and they are the opposite of what a static
+no-gather accelerator can use. This is why the ANE route caps out: not
+shallow investigation, structural incompatibility.
+
 ## The contrast: MLX
 
 The same model, same Mac, via MLX: **219 tok/s** at 3-bit (see
@@ -72,7 +95,7 @@ static-graph + no-gather constraints that cap ANE.
 
 So the honest split:
 * **ANE route: exhausted at ~32 tok/s.** Pursued thoroughly per the
-  directive; the negative is structural and now 7-ways confirmed.
+  directive; the negative is structural and now 8-ways confirmed.
 * **MLX route: alive at 219 tok/s Mac.** The deployment path forward,
   but it abandons ANE's power efficiency and the blocker becomes
   iPhone memory + an unmeasured iPhone tok/s.
