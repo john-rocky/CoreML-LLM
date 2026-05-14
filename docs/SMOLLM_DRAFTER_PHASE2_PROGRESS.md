@@ -110,6 +110,66 @@ seed the drafter from its own previous output** rather than the
 target's argmax, the 17.7% number doesn't affect throughput — only
 quality of the drafter's first cycle proposal after each cycle.
 
+## Mac end-to-end smoke (`SPECULATIVE_PROFILE=1 UNION_TRIP=1`)
+
+Drafter loads and runs through `DrafterUnion`:
+
+```
+[CrossVocab] Drafter loaded (K=3, coverage q->g=94.3%)
+[SpecProfile union #0001 src=cv] draft_total=34.57ms verify=32.14ms accepted=2/2 emitted=3 matches=11
+[SpecProfile union #0002 src=cv] draft_total=23.38ms verify=33.74ms accepted=0/1 emitted=1 matches=0
+[SpecProfile union #0003 src=cv] draft_total=34.70ms verify=33.68ms accepted=0/2 emitted=1 matches=01
+... (similar for 18 cycles)
+[SpecProfile union #0012 fallback] target_step=34.01ms
+```
+
+Result: **same failure mode as Qwen 0.5B cross-vocab drafter**. Cycle 1
+got lucky on a common-token continuation, then every subsequent cycle
+mispredicted at slot 0 (`matches=00`). DrafterUnion bailed to T=1
+fallback at cycle 12. Net wall-clock is **negative** (verify cycle
+~32 ms + cv drafter call ~34 ms = 66 ms for 1 token on most cycles vs
+baseline 32 ms).
+
+Two root causes, both expected:
+
+1. **Drafter not on ANE.** Mac `computeUnits=CPU_AND_GPU` ran the
+   SmolLM monolith on CPU+GPU; 34 ms/chain is consistent with that.
+   On iPhone with `.cpuAndNeuralEngine` (or `.all`) the drafter
+   *might* land on ANE (it's 79 MB INT4 + MLState — ANE compatibility
+   uncertain because of writeState/readState which our docs say ANE
+   rejects). Even at 5 ms/chain, with accept rate ≤ 5% the math
+   doesn't close.
+
+2. **Cross-model distribution mismatch.** 94.3% surface-form vocab
+   overlap doesn't translate to 94% next-token agreement. SmolLM 135M
+   was trained on a different corpus mix and weight scale than Gemma
+   4 E2B; their next-token distributions diverge after the first few
+   easy tokens. This is the same wall the Qwen 0.5B drafter hit per
+   `docs/REJECTED_APPROACHES.md` / memory `project_drafter_structurally_dead`
+   ("All accessible drafter routes are closed on Gemma 4 E2B").
+
+Conclusion: **SmolLM 135M as a cross-vocab drafter for Gemma 4 E2B
+does not deliver a net speedup**, regardless of which compute unit
+runs it. The 94% vocab map is necessary but not sufficient — the
+underlying LM has to agree with the target on next-token, which a
+different model family doesn't.
+
+## What would unblock this
+
+The path that COULD work:
+* **Distill SmolLM-class architecture from Gemma 4 E2B**. Train a
+  130-200M model to match Gemma 4's next-token distribution on a
+  large corpus. Vocab can stay 49k; cross-vocab map handles the
+  translation. With matched distributions, accept rate could climb
+  to 50-70%, and a 5 ms ANE drafter + 32 ms verify = ~37 ms/cycle
+  with 2-3 tokens/cycle = 60-80 tok/s.
+* This is **training, ~1 GPU-week** (same as the original drafter
+  Path B retrain). Out of scope for "training-free" tonight.
+
+The path that empirically doesn't:
+* Off-the-shelf small LM (SmolLM, Qwen 0.5B, Phi-3-mini, etc.) used
+  as cross-vocab drafter against Gemma 4 E2B target.
+
 ## Status against original roadmap
 
 | phase | item | status |
