@@ -23,6 +23,7 @@ let package = Package(
         // / `Gemma3BundleDownloader` directly, without pulling the sample CLIs.
         .executable(name: "functiongemma-demo", targets: ["FunctionGemmaDemo"]),
         .executable(name: "embeddinggemma-demo", targets: ["EmbeddingGemmaDemo"]),
+        .executable(name: "moe-dispatch-probe", targets: ["MoeDispatchProbe"]),
     ],
     dependencies: [
         // Range widened to 1.0.x: mlx-swift-examples caps swift-transformers at
@@ -126,6 +127,16 @@ let package = Package(
             name: "AneResidencyGate",
             dependencies: ["CoreMLLLM"],
             path: "Sources/ane-residency-gate",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // MoE dispatch-latency probe. Standalone (no CoreMLLLM dep) —
+        // loads single-expert + multifunction mlpackages and measures
+        // real Swift-side prediction() latency, since Python predict()
+        // numbers were overhead-contaminated. Go / no-go gate for the
+        // Qwen MoE pivot. See docs/PHASE_BETA1_AND_QWEN_MOE_BOTH_DEAD.
+        .executableTarget(
+            name: "MoeDispatchProbe",
+            path: "Sources/moe-dispatch-probe",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
