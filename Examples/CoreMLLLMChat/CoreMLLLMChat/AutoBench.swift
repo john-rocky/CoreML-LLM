@@ -109,6 +109,10 @@ enum AutoBench {
                 print("[AutoBench] \(label) ERROR: \(error.localizedDescription)")
             }
         }
+        // Persist cross-session speculative state (SuffixDecoding trie)
+        // before exit so subsequent app launches can read the growth
+        // accumulated this bench. No-op when LLM_SUFFIX_DRAFT wasn't set.
+        runner.flushSpeculativeState()
         print("[AutoBench] done")
         // Flush stdio before exit so devicectl --console captures everything.
         fflush(stdout)

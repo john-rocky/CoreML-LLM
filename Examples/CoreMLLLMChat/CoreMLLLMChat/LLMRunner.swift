@@ -353,6 +353,14 @@ final class LLMRunner {
         }
     }
 
+    // MARK: - Cross-session state
+
+    /// Flush any in-memory cross-session state (SuffixDecoding trie etc.)
+    /// to disk. Call from end-of-bench or app-background hooks.
+    func flushSpeculativeState() {
+        llm?.flushSpeculativeState()
+    }
+
     // MARK: - Generation
 
     func generate(messages: [ChatMessage], image: CGImage? = nil,

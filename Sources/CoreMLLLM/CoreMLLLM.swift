@@ -169,6 +169,28 @@ public final class CoreMLLLM: @unchecked Sendable {
         drafterUnion?.pldThreshold = value
     }
 
+    /// Flush in-memory speculative state to disk. Currently only the
+    /// SuffixDecoding trie has cross-session persistence. Call from
+    /// end-of-bench or app-background hooks so the trie's growth from
+    /// this session reaches subsequent sessions. Idempotent and cheap
+    /// — no-op when suffix decoding wasn't enabled (`LLM_SUFFIX_DRAFT`
+    /// not set).
+    public func flushSpeculativeState() {
+        // All three engines share the same SuffixSpeculativeEngine
+        // instance, so calling save() once on whichever is non-nil is
+        // sufficient. Prefer MTP path (production iPhone path).
+        let sfx = mtpEngine?.suffixEngine
+            ?? drafterUnion?.suffix
+            ?? lookaheadEngine?.suffix
+        guard let sfx else { return }
+        do {
+            try sfx.save()
+            print("[SuffixDraft] flushed — tree=\(sfx.tree.approximateNodeCount) nodes")
+        } catch {
+            print("[SuffixDraft] flush failed: \(error)")
+        }
+    }
+
     // Token-ID recording for offline accept-rate benches. These are populated
     // from the last `generate` / `stream` call and live until the next one.
     // See `docs/MAC_FIRST_EXECUTION_PLAN.md` §A1 for usage.
