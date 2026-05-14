@@ -317,7 +317,11 @@ class CoreMLExporter:
             convert_kwargs["compute_precision"] = ct.precision.FLOAT32
             print("  LFM2: LFM2_FORCE_FP32=1 → compute_precision=FLOAT32")
         # iOS 26 by default — its fp16 lowering path differs from iOS 18.
-        convert_kwargs["minimum_deployment_target"] = ct.target.iOS26
+        # Fall back gracefully if the local coremltools predates iOS 26.
+        target = getattr(ct.target, "iOS26", None) \
+            or getattr(ct.target, "iOS18", None) \
+            or ct.target.iOS17
+        convert_kwargs["minimum_deployment_target"] = target
         mlmodel = ct.convert(traced, **convert_kwargs)
 
         if quantize:

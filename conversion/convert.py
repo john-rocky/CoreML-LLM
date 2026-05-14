@@ -229,6 +229,9 @@ def _get_model_class(architecture: str):
     if architecture == "lfm2":
         from models.lfm2 import Lfm2Model
         return Lfm2Model
+    if architecture == "llama":
+        from models.llama import LlamaModel
+        return LlamaModel
     if architecture == "gemma3-embedding":
         raise ValueError(
             "gemma3-embedding (EmbeddingGemma) uses a dedicated export path. "
