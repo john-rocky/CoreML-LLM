@@ -97,6 +97,97 @@ class LayerGather(nn.Module):
         return weighted.view(1, HIDDEN, 1, 1)
 
 
+class FusedMoEChunk(nn.Module):
+    """THE ANE-route design. N fused layers, each = dense backbone
+    (static constants) + routed experts (weights passed as INPUTS).
+
+    The crucial property: the GRAPH is static (fixed SwiGLU shape per
+    layer). Only the routed-expert weight VALUES change per token, and
+    they arrive as inputs. A static graph CAN be chunked — so 6 layers
+    fuse into one mlpackage, 4 chunks/token like the Gemma 4 deployment,
+    no runtime `gather` op (which ANE rejects).
+
+    Swift gathers the per-layer top-K expert weights CPU-side and passes
+    them batched: gate_w (N, K, inter, hidden) etc. The `[i]` indexing
+    inside forward is a STATIC slice (i known at trace time), not a
+    runtime gather.
+
+    Inputs:
+      x_bc1t       (1, H, 1, 1)
+      kv_window    (1, H, 1, W)              attention stand-in
+      gate_w       (N, K, inter, H)          routed gate weights / layer
+      up_w         (N, K, inter, H)          routed up weights / layer
+      down_w       (N, K, H, inter)          routed down weights / layer
+      topk_w       (N, K)                    routing weights / layer
+    """
+    def __init__(self, n_layers: int = 6, kv_window: int = 256):
+        super().__init__()
+        self.n_layers = n_layers
+        self.kv_window = kv_window
+        # Dense backbone — static constants, same as DenseBackboneChunk.
+        self.norms1 = nn.ModuleList()
+        self.norms2 = nn.ModuleList()
+        self.q = nn.ModuleList(); self.k = nn.ModuleList()
+        self.v = nn.ModuleList(); self.o = nn.ModuleList()
+        self.router = nn.ModuleList()
+        self.shared_gate = nn.ModuleList()
+        self.sh_gate = nn.ModuleList(); self.sh_up = nn.ModuleList()
+        self.sh_down = nn.ModuleList()
+        for _ in range(n_layers):
+            self.norms1.append(ANERMSNorm(HIDDEN))
+            self.norms2.append(ANERMSNorm(HIDDEN))
+            self.q.append(Conv2dLinear(HIDDEN, HIDDEN, bias=False))
+            self.k.append(Conv2dLinear(HIDDEN, HIDDEN, bias=False))
+            self.v.append(Conv2dLinear(HIDDEN, HIDDEN, bias=False))
+            self.o.append(Conv2dLinear(HIDDEN, HIDDEN, bias=False))
+            self.router.append(Conv2dLinear(HIDDEN, NUM_EXPERTS, bias=False))
+            self.shared_gate.append(Conv2dLinear(HIDDEN, 1, bias=False))
+            self.sh_gate.append(Conv2dLinear(HIDDEN, SHARED_INTER, bias=False))
+            self.sh_up.append(Conv2dLinear(HIDDEN, SHARED_INTER, bias=False))
+            self.sh_down.append(Conv2dLinear(SHARED_INTER, HIDDEN, bias=False))
+        for p in self.parameters():
+            if p.dim() > 1:
+                p.data = (torch.randn_like(p.data) * 0.02).to(MODEL_DTYPE)
+
+    def forward(self, x_bc1t, kv_window_tensor, gate_w, up_w, down_w, topk_w):
+        h = x_bc1t
+        for i in range(self.n_layers):
+            # --- dense: attention ---
+            x_flat = h.reshape(1, HIDDEN)
+            normed = self.norms1[i](x_flat).reshape(1, HIDDEN, 1, 1)
+            q = self.q[i].forward_conv(normed)
+            _ = self.k[i].forward_conv(normed)
+            _ = self.v[i].forward_conv(normed)
+            q3 = q.reshape(1, 1, HIDDEN)
+            kvw = kv_window_tensor.reshape(1, HIDDEN, self.kv_window)
+            scores = torch.bmm(q3, kvw)
+            probs = F.softmax(scores, dim=-1)
+            ctx = torch.bmm(probs, kvw.transpose(1, 2))
+            attn_out = self.o[i].forward_conv(ctx.reshape(1, HIDDEN, 1, 1))
+            h = h + attn_out
+            # --- dense: norm + router + shared ---
+            x_flat2 = h.reshape(1, HIDDEN)
+            normed2 = self.norms2[i](x_flat2).reshape(1, HIDDEN, 1, 1)
+            _ = self.router[i].forward_conv(normed2)
+            sg = self.sh_gate[i].forward_conv(normed2)
+            su = self.sh_up[i].forward_conv(normed2)
+            shared = self.sh_down[i].forward_conv(F.silu(sg) * su)
+            gate_scalar = torch.sigmoid(self.shared_gate[i].forward_conv(normed2))
+            # --- routed experts: weights from INPUT, static [i] slice ---
+            moe_in = normed2.reshape(1, HIDDEN)             # (1, H)
+            gw = gate_w[i]                                  # (K, inter, H)
+            uw = up_w[i]                                    # (K, inter, H)
+            dw = down_w[i]                                  # (K, H, inter)
+            g = torch.einsum("kih,bh->kbi", gw, moe_in)     # (K, 1, inter)
+            u = torch.einsum("kih,bh->kbi", uw, moe_in)
+            inter = F.silu(g) * u                           # (K, 1, inter)
+            routed = torch.einsum("kbi,khi->kbh", inter, dw)  # (K, 1, H)
+            routed = (routed * topk_w[i].view(-1, 1, 1)).sum(dim=0)  # (1, H)
+            routed4 = routed.view(1, HIDDEN, 1, 1)
+            h = h + gate_scalar * shared + routed4
+        return h
+
+
 class DenseBackboneChunk(nn.Module):
     """N fused layers of the STATIC Qwen MoE backbone: per layer = norm
     + Q/K/V/O attention matmuls + decode-style attention reduction +
@@ -209,6 +300,46 @@ def convert_layer_gather(out_path: str, int4: bool = False) -> str:
             ct.TensorType(name="x_bc1t", shape=(1, HIDDEN, 1, 1), dtype=np.float16),
             ct.TensorType(name="topk_idx", shape=(TOP_K,), dtype=np.int32),
             ct.TensorType(name="topk_weights", shape=(TOP_K,), dtype=np.float16),
+        ],
+        outputs=[ct.TensorType(name="y_bc1t", dtype=np.float16)],
+    )
+    if int4:
+        mlmodel = palettize_int4(mlmodel)
+    mlmodel.save(out_path)
+    return out_path
+
+
+def convert_fused_moe_chunk(out_path: str, n_layers: int,
+                            kv_window: int = 256, int4: bool = False) -> str:
+    """Convert FusedMoEChunk. 6 inputs: x, kv_window, gate_w, up_w,
+    down_w, topk_w. Routed-expert weights arrive as inputs so the graph
+    stays static and chunkable."""
+    m = FusedMoEChunk(n_layers=n_layers, kv_window=kv_window)
+    m = m.eval().to(MODEL_DTYPE)
+    x_ex = torch.zeros(1, HIDDEN, 1, 1, dtype=MODEL_DTYPE)
+    kv_ex = torch.zeros(1, HIDDEN, 1, kv_window, dtype=MODEL_DTYPE)
+    gate_ex = torch.zeros(n_layers, TOP_K, EXPERT_INTER, HIDDEN, dtype=MODEL_DTYPE)
+    up_ex = torch.zeros(n_layers, TOP_K, EXPERT_INTER, HIDDEN, dtype=MODEL_DTYPE)
+    down_ex = torch.zeros(n_layers, TOP_K, HIDDEN, EXPERT_INTER, dtype=MODEL_DTYPE)
+    tw_ex = torch.full((n_layers, TOP_K), 0.25, dtype=MODEL_DTYPE)
+    traced = torch.jit.trace(m, (x_ex, kv_ex, gate_ex, up_ex, down_ex, tw_ex))
+    mlmodel = ct.convert(
+        traced,
+        convert_to="mlprogram",
+        compute_precision=ct.precision.FLOAT16,
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.iOS18,
+        inputs=[
+            ct.TensorType(name="x_bc1t", shape=(1, HIDDEN, 1, 1), dtype=np.float16),
+            ct.TensorType(name="kv_window", shape=(1, HIDDEN, 1, kv_window),
+                          dtype=np.float16),
+            ct.TensorType(name="gate_w",
+                          shape=(n_layers, TOP_K, EXPERT_INTER, HIDDEN), dtype=np.float16),
+            ct.TensorType(name="up_w",
+                          shape=(n_layers, TOP_K, EXPERT_INTER, HIDDEN), dtype=np.float16),
+            ct.TensorType(name="down_w",
+                          shape=(n_layers, TOP_K, HIDDEN, EXPERT_INTER), dtype=np.float16),
+            ct.TensorType(name="topk_w", shape=(n_layers, TOP_K), dtype=np.float16),
         ],
         outputs=[ct.TensorType(name="y_bc1t", dtype=np.float16)],
     )
@@ -357,6 +488,23 @@ def main():
         print(f"[single_int4] ERROR: {e}")
         import traceback
         traceback.print_exc()
+
+    # 6. FusedMoEChunk — THE ANE-route design. Dense backbone (static
+    #    constants) + routed experts (weights from input) fused into one
+    #    static, chunkable graph. 1L and NL variants, fp16 + INT4.
+    for nl in sorted({1, args.dense_layers}):
+        for tag, is_int4 in [("", False), ("_int4", True)]:
+            print(f"[fused{tag}] building fused_moe_{nl}L{tag}.mlpackage")
+            t0 = time.time()
+            try:
+                convert_fused_moe_chunk(
+                    os.path.join(args.out_dir, f"fused_moe_{nl}L{tag}.mlpackage"),
+                    nl, int4=is_int4)
+                print(f"[fused{tag}] done in {time.time()-t0:.1f}s")
+            except Exception as e:
+                print(f"[fused{tag}] ERROR: {e}")
+                import traceback
+                traceback.print_exc()
 
     # Report sizes
     print(f"\n=== Artifacts ===")

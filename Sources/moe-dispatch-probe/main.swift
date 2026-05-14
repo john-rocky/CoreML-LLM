@@ -173,6 +173,44 @@ func probeDenseBackbone(_ url: URL, _ units: MLComputeUnits, _ label: String,
     print(stats.line(label)); return stats
 }
 
+/// THE ANE-route probe. FusedMoEChunk: N fused layers, dense backbone
+/// as static constants + routed experts with weights passed as INPUTS.
+/// The graph is static (chunkable); only weight values vary per token.
+/// If this runs on ANE at a good latency, the ANE route is alive.
+func probeFusedMoE(_ url: URL, _ nLayers: Int, _ units: MLComputeUnits,
+                   _ label: String, _ iterations: Int, kvWindow: Int) -> Stats? {
+    let cfg = MLModelConfiguration(); cfg.computeUnits = units
+    guard let model = try? MLModel(contentsOf: url, configuration: cfg) else {
+        fputs("  [\(label)] load failed\n", stderr); return nil
+    }
+    let inter = 1408
+    let (x, _) = makeInput()
+    func zeros(_ shape: [Int]) -> MLMultiArray? {
+        guard let a = try? MLMultiArray(shape: shape.map { NSNumber(value: $0) },
+                                        dataType: .float16) else { return nil }
+        let count = shape.reduce(1, *)
+        memset(a.dataPointer, 0, count * MemoryLayout<UInt16>.stride)
+        return a
+    }
+    guard let kv = zeros([1, HIDDEN, 1, kvWindow]),
+          let gateW = zeros([nLayers, TOP_K, inter, HIDDEN]),
+          let upW = zeros([nLayers, TOP_K, inter, HIDDEN]),
+          let downW = zeros([nLayers, TOP_K, HIDDEN, inter]),
+          let topkW = zeros([nLayers, TOP_K]) else {
+        fputs("  [\(label)] input buffer alloc failed\n", stderr); return nil
+    }
+    guard let provider = try? MLDictionaryFeatureProvider(dictionary: [
+        "x_bc1t": MLFeatureValue(multiArray: x),
+        "kv_window": MLFeatureValue(multiArray: kv),
+        "gate_w": MLFeatureValue(multiArray: gateW),
+        "up_w": MLFeatureValue(multiArray: upW),
+        "down_w": MLFeatureValue(multiArray: downW),
+        "topk_w": MLFeatureValue(multiArray: topkW),
+    ]) else { return nil }
+    let stats = timeLoop(iterations) { _ = try? model.prediction(from: provider) }
+    print(stats.line(label)); return stats
+}
+
 /// Load N expert functions as N handles via functionName, time bursts
 /// of TOP_K calls — one decode layer's routed-expert dispatch with no
 /// gather (ANE-viable, unlike layer_gather).
@@ -275,6 +313,22 @@ for variant in ["dense_backbone_1L", "dense_backbone_1L_int4",
     }
 }
 
+// THE ANE-route design: FusedMoEChunk — static graph, routed-expert
+// weights as inputs, fully chunkable. 1L (per-layer) + 6L (chunked).
+print("\n--- fused_moe (ANE route: dense static + routed weights-as-input) ---")
+for variant in ["fused_moe_1L", "fused_moe_1L_int4",
+                "fused_moe_6L", "fused_moe_6L_int4"] {
+    let nl = variant.contains("6L") ? 6 : 1
+    if let url = await resolveCompiled(probeDir, variant) {
+        for u in units {
+            let label = "\(variant)/\(unitName(u))"
+            if let s = probeFusedMoE(url, nl, u, label, iterations, kvWindow: 256) {
+                S[label] = s
+            }
+        }
+    }
+}
+
 // ---- extrapolation --------------------------------------------------
 // Correct structure: per layer = dense_1L + routed-expert dispatch, in
 // strict sequence (routed output feeds next layer's dense). The dense
@@ -321,8 +375,35 @@ for v in ["", "_int4"] {
 if let db = S["dense_backbone_1L_int4/ane"],
    let mf = S["multifunction_\(nFuncs)_int4/ane"] {
     let total = db.median * Double(N_LAYERS) + mf.median * Double(N_LAYERS) + 2.0
-    designs.append(DesignResult(label: "BEST all-ANE-INT4 (dense+multifn)",
+    designs.append(DesignResult(label: "all-ANE-INT4 (dense+multifn, unfused)",
                                 msPerToken: total, tps: 1000.0 / total))
+}
+
+// Design 4: THE ANE ROUTE — FusedMoEChunk. Static graph, routed weights
+// as input, 6 layers fused → 4 chunks/token like Gemma 4. One dispatch
+// per chunk covers dense + routed for all 6 of its layers.
+print("")
+for v in ["", "_int4"] {
+    for u in ["ane", "gpu", "all"] {
+        // Prefer the 6L chunk; fall back to 1L × 6 if 6L absent.
+        if let f6 = S["fused_moe_6L\(v)/\(u)"] {
+            let total = f6.median * 4.0 + 2.0  // 4 six-layer chunks + head
+            let name = "FUSED 6L-chunk \(v.isEmpty ? "fp16" : "int4")/\(u)"
+            designs.append(DesignResult(label: name, msPerToken: total,
+                                        tps: 1000.0 / total))
+            print(String(format: "  %@: %.2f ms/chunk × 4 + head 2.0 = %.1f ms → %.1f tok/s",
+                         name.padding(toLength: 38, withPad: " ", startingAt: 0) as NSString,
+                         f6.median, total, 1000.0 / total))
+        } else if let f1 = S["fused_moe_1L\(v)/\(u)"] {
+            let total = f1.median * Double(N_LAYERS) + 2.0
+            let name = "FUSED 1L×24 \(v.isEmpty ? "fp16" : "int4")/\(u)"
+            designs.append(DesignResult(label: name, msPerToken: total,
+                                        tps: 1000.0 / total))
+            print(String(format: "  %@: %.3f ms/layer × 24 + head 2.0 = %.1f ms → %.1f tok/s",
+                         name.padding(toLength: 38, withPad: " ", startingAt: 0) as NSString,
+                         f1.median, total, 1000.0 / total))
+        }
+    }
 }
 
 print("\nReference: Gemma 4 E2B ~35 tok/s baseline; 1.5× target ~52 tok/s")
