@@ -24,6 +24,8 @@ let answer = try await llm.generate("What is the capital of France?")
 
 `repo:` accepts a registered model id (`"gemma4-e2b"`, `"qwen3.5-0.8b"`, `"lfm2.5-350m"`, …) or a full HuggingFace path — first call downloads, later calls reuse the on-device bundle. Streaming, multi-turn chat, image / video / audio, FunctionGemma, EmbeddingGemma → [package docs (Quick Start → Swift Package)](#swift-package).
 
+**→ Integrating into your own app?** See [`docs/INTEGRATION_RECIPES.md`](docs/INTEGRATION_RECIPES.md) — task-oriented, code-first recipes for chat / function calling / semantic search (RAG) / multimodal, plus the integration concerns (memory entitlement, HF auth, threading, pre-warming) that matter once you ship.
+
 ## Models
 
 | Model | Size | Task | iPhone 17 Pro decode | HuggingFace |
