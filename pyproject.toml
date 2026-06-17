@@ -1,0 +1,32 @@
+[project]
+name = "coreml-llm-pplx-embed"
+version = "0.0.0"
+description = "pplx-embed (Perplexity) → CoreML/ANE conversion, built on the CoreML-LLM fork (branch pplx-embed)"
+requires-python = ">=3.11"
+# Pins mirror conversion/requirements.txt — the versions that produced the
+# pre-converted CoreML-LLM models. Bump one at a time and re-run verification.
+dependencies = [
+    "coremltools>=9.0",
+    "torch==2.11.0",
+    "transformers==5.5.0",
+    "safetensors>=0.4.0",
+    "numpy==2.4.4",
+    "pyyaml>=6.0",
+    "huggingface-hub>=0.20.0",
+    # INT4 palettization clustering (ct.optimize.coreml.palettize_weights).
+    "scikit-learn>=1.3",
+    # pplx-embed-context-v1-0.6b ships st_quantize.py importing
+    # sentence_transformers; transformers' trust_remote_code check_imports
+    # scans every .py in the snapshot and raises ImportError unless it imports.
+    "sentence-transformers>=3.0",
+]
+
+# Dependency-management only: this is a "virtual" project (flat conversion/
+# scripts are run directly, not installed as a wheel).
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
