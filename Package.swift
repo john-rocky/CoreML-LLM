@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 import PackageDescription
 
 let package = Package(
@@ -23,6 +23,15 @@ let package = Package(
         // / `Gemma3BundleDownloader` directly, without pulling the sample CLIs.
         .executable(name: "functiongemma-demo", targets: ["FunctionGemmaDemo"]),
         .executable(name: "embeddinggemma-demo", targets: ["EmbeddingGemmaDemo"]),
+        // pplx-embed — Swift fidelity + latency harness for the native int8
+        // encoder output (not readable from the Python bridge on macOS26).
+        .executable(name: "pplx-embed-bench", targets: ["PplxEmbedBench"]),
+        // pplx-embed — the official embedding contract (plain + context late
+        // chunking; int8/binary/ubinary). The `PplxEmbed` runtime ships inside
+        // the CoreMLLLM library; this product exposes it under its own name so a
+        // wrapper can depend on just the embedder without pulling the sample CLIs.
+        .library(name: "PplxEmbed", targets: ["CoreMLLLM"]),
+        .executable(name: "pplx-embed-demo", targets: ["PplxEmbedDemo"]),
     ],
     dependencies: [
         // Range widened to 1.0.x: mlx-swift-examples caps swift-transformers at
@@ -31,12 +40,21 @@ let package = Package(
         // `Tokenizer` protocol + `AutoTokenizer.from(modelFolder:)` API that
         // CoreMLLLM uses, so 1.0.x is source-compatible with 1.1.x here.
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
+        // HF's native Swift Hub client (standalone — does NOT pull swift-transformers,
+        // so it's orthogonal to the 1.0.x cap above). Used by PplxEmbed.load(repo:) for
+        // content-addressed snapshot downloads: the byte-identical weight.bin across
+        // buckets is fetched ONCE (then reused) — native download dedup. The `Xet` trait
+        // is REQUIRED: HF stores large files Xet-backed by default, and without it the
+        // client forces the LFS transport and 404s on Xet-only blobs. (Needs tools 6.1+.)
+        .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0",
+                 traits: ["Xet"]),
     ],
     targets: [
         .target(
             name: "CoreMLLLM",
             dependencies: [
                 .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
@@ -126,6 +144,26 @@ let package = Package(
             name: "AneResidencyGate",
             dependencies: ["CoreMLLLM"],
             path: "Sources/ane-residency-gate",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // pplx-embed Swift fidelity + latency bench. No CoreMLLLM / tokenizer
+        // dependency — reads pre-tokenized fixtures (conversion/export_swift_fixtures.py),
+        // so it builds fast and stays self-contained.
+        .executableTarget(
+            name: "PplxEmbedBench",
+            path: "Sources/pplx-embed-bench",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // pplx-embed demo CLI — embeds a few strings (plain or context) and
+        // prints int8/binary/ubinary summaries. Uses the PplxEmbed runtime +
+        // tokenizer from the CoreMLLLM library.
+        .executableTarget(
+            name: "PplxEmbedDemo",
+            dependencies: [
+                "CoreMLLLM",
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Sources/pplx-embed-demo",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]

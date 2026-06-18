@@ -48,3 +48,6 @@ Examples/CoreMLLLMChat/gemma4-e2b/
 
 # W4A8 calibration data — regeneratable from gen_calib_data_real.py
 conversion/calibration_data/
+# Generated experiment artifacts (not the tracked experiments/bonsai sources)
+conversion/experiments/batching_models/
+conversion/experiments/*.log

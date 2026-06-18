@@ -68,6 +68,20 @@ MODEL_REGISTRY: dict[str, ConversionConfig] = {
         max_context_length=2048,
         description="EmbeddingGemma 300M - Gemma 3 bidirectional encoder, 768-d sentence embedding (Matryoshka)",
     ),
+    "pplx-embed": ConversionConfig(
+        hf_repo="perplexity-ai/pplx-embed-v1-0.6b",
+        architecture="qwen3-encoder",
+        default_context_length=4096,
+        max_context_length=32768,
+        description="Perplexity pplx-embed-v1 0.6B - bidirectional Qwen3 encoder, mean-pool, 1024-d int8 sentence embedding (plain). trust_remote_code; fixed-shape buckets.",
+    ),
+    "pplx-embed-context": ConversionConfig(
+        hf_repo="perplexity-ai/pplx-embed-context-v1-0.6b",
+        architecture="qwen3-encoder",
+        default_context_length=4096,
+        max_context_length=32768,
+        description="Perplexity pplx-embed-context-v1 0.6B - bidirectional Qwen3 encoder with late chunking (pool_matrix -> per-chunk 1024-d int8). trust_remote_code; fixed-shape buckets.",
+    ),
     "lfm2.5-350m": ConversionConfig(
         hf_repo="LiquidAI/LFM2.5-350M",
         architecture="lfm2",
