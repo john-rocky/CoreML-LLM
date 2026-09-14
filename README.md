@@ -6,6 +6,12 @@ Where [MLX Swift](https://github.com/ml-explore/mlx-swift) is the right call whe
 
 [![App Store](https://toolbox.marketingtools.apple.com/api/v2/badges/download-on-the-app-store/black/en-us?releaseDate=1735689600)](https://apps.apple.com/jp/app/models-zoo/id6762083207)
 
+## Also targeting Core AI on OS 27?
+
+If you need a Core AI `.aimodel` or want a custom model behind Apple's `LanguageModelSession`, see the [Core AI start page](https://john-rocky.github.io/core-ai/) for [CoreAIKit](https://github.com/john-rocky/coreai-kit#quickstart), model downloads, and demo apps with their tested environments. The [agent task index](https://john-rocky.github.io/core-ai/llms.txt) links the package guidance and machine-readable catalogs.
+
+CoreML-LLM remains the Core ML path documented below, with iOS 18+ / macOS 15+ support. Choose the runtime using your deployment target, model availability, and measurements on the target device.
+
 ## Use in your app
 
 Add the package, name a model, generate.
