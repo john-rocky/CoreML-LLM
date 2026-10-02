@@ -64,6 +64,17 @@ public final class EmbeddingGemma {
     private let model: MLModel
     private let tokenizer: Tokenizer
 
+    /// Expose the tokenizer so a harness can re-encode / decode arbitrary
+    /// text without duplicating the swift-transformers wiring.
+    ///
+    /// Mirrors `CoreMLLLM.tokenizerRef`. Without it a caller that needs a
+    /// token count — to window text against `config.maxSeqLen` before
+    /// `encode` truncates it silently — has to build a second
+    /// `AutoTokenizer` from the same `hf_model` folder this instance already
+    /// loaded, which for EmbeddingGemma's 262k-entry vocab costs about
+    /// 4.5 s and 92 MB on every load.
+    public var tokenizerRef: any Tokenizer { tokenizer }
+
     private init(model: MLModel, tokenizer: Tokenizer, config: Config) {
         self.model = model
         self.tokenizer = tokenizer
