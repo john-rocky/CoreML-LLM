@@ -1,7 +1,7 @@
 [project]
-name = "coreml-llm-pplx-embed"
+name = "coreml-llm-conversion"
 version = "0.0.0"
-description = "pplx-embed (Perplexity) → CoreML/ANE conversion, built on the CoreML-LLM fork (branch pplx-embed)"
+description = "Python environment for the CoreML-LLM conversion scripts in conversion/"
 requires-python = ">=3.11"
 # Pins mirror conversion/requirements.txt — the versions that produced the
 # pre-converted CoreML-LLM models. Bump one at a time and re-run verification.

@@ -77,7 +77,7 @@ wheels = [
 ]
 
 [[package]]
-name = "coreml-llm-pplx-embed"
+name = "coreml-llm-conversion"
 version = "0.0.0"
 source = { virtual = "." }
 dependencies = [
