@@ -30,6 +30,11 @@ let answer = try await llm.generate("What is the capital of France?")
 
 `repo:` accepts a registered model id (`"gemma4-e2b"`, `"qwen3.5-0.8b"`, `"lfm2.5-350m"`, …) or a full HuggingFace path — first call downloads, later calls reuse the on-device bundle. Streaming, multi-turn chat, image / video / audio, FunctionGemma, EmbeddingGemma → [package docs (Quick Start → Swift Package)](#swift-package).
 
+## Projects using CoreML-LLM
+
+- [VivaDicta](https://github.com/n0an/VivaDicta) — an iOS and watchOS speech-to-text app. Version 3.12.0 downloads Qwen3.5 0.8B and 2B with this package's `ModelDownloader` and runs them on-device with `Qwen35MLKVGenerator` ([source](https://github.com/n0an/VivaDicta/blob/v3.12.0/Modules/LocalLLM/Sources/LocalLLM/CoreMLQwenModelManager.swift)).
+- [Jot](https://github.com/vineetu/JOT-Transcribe) — on-device dictation for Mac and iPhone. The Mac app at v1.23.2 computes its search embeddings with this package's `EmbeddingGemma` (`downloadAndLoad`, then `encode`) ([source](https://github.com/vineetu/JOT-Transcribe/blob/v1.23.2/Sources/Search/Embeddings/EmbeddingGemmaService.swift)).
+
 ## Models
 
 | Model | Size | Task | iPhone 17 Pro decode | HuggingFace |
