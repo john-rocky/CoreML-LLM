@@ -1,7 +1,7 @@
 # Round 8 Findings — Decode-side leads (drafter excluded)
 
 **Date:** 2026-04-26
-**Scope:** Web research pass with 4 parallel Opus 4.7 max agents covering
+**Scope:** Web research pass with 4 parallel agents covering
 (1) 2025-2026 decode speedup techniques, (2) iOS 26 / coremltools 9 /
 WWDC25, (3) Gemma 4 / 3n specific optimizations, (4) ANE
 reverse-eng / driver tricks. Drafter / speculative decoding paths
@@ -219,7 +219,7 @@ modes early.
 
 ## How this round was conducted
 
-Four parallel Opus 4.7 max agents, each given a different angle and
+Four parallel agents, each given a different angle and
 the full dead-list from existing docs. Outputs cross-checked against
 this repo's docs to filter known-dead, known-done, known-in-flight.
 Each surviving candidate independently URL-verified to avoid the

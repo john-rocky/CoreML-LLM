@@ -1,7 +1,7 @@
 # In-flight work
 
 Per `docs/ROADMAP_2026_04_26.md` cross-session protocol. Each parallel
-Claude session adds a line when it claims a stage; removes it when the
+session adds a line when it claims a stage; removes it when the
 branch merges to main. Helps avoid two sessions stepping on the same
 stage / hot file.
 
