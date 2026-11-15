@@ -40,7 +40,7 @@ direct consequence.
 `model.safetensors`, single-file, 10.2 GB, `metadata = {"format":"pt"}`,
 2011 tensors total. All BF16.
 
-Source archive: `/Users/majimadaisuke/Downloads/CoreML-LLM/conversion/output/gemma4-e2b-final/hf_model/model.safetensors`.
+Source archive: `/Users/USER/Downloads/CoreML-LLM/conversion/output/gemma4-e2b-final/hf_model/model.safetensors`.
 
 ### 2.1 Counts by subsystem
 

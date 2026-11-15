@@ -1,7 +1,7 @@
 # coremltools internals + iOS 18 opportunities
 
 **Date:** 2026-04-22
-**Source:** `/Users/majimadaisuke/Downloads/workspace/repo-review/coremltools/` + WWDC24 session 10159
+**Source:** `/Users/USER/Downloads/workspace/repo-review/coremltools/` + WWDC24 session 10159
 
 ## 0. TL;DR — what we're probably leaving on the table
 

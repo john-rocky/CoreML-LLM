@@ -90,7 +90,7 @@ between aligned blocks).
 
 ### 1.2 Decoder mlmodelc breakdown (chunks-k8 path, W4 LUT, FP16 activations)
 
-Source: `/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/output/gemma4-e2b/chunks-k8/chunk{1,2,3,4}.mlpackage`
+Source: `/Users/USER/Downloads/workspace/CoreML-LLM/output/gemma4-e2b/chunks-k8/chunk{1,2,3,4}.mlpackage`
 
 | chunk | total | weights | const tensors | dominant role | layer range (E2B) |
 |---|---:|---:|---:|---|---|
@@ -143,7 +143,7 @@ RMSNorm scales.
 
 ### 1.5 Full bundle size
 
-Source: `/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/build/gemma4_stateful_ab/linear/gemma4_e2b_stateful_chunks/`
+Source: `/Users/USER/Downloads/workspace/CoreML-LLM/build/gemma4_stateful_ab/linear/gemma4_e2b_stateful_chunks/`
 
 | component | size | format | mmap'd by Swift |
 |---|---:|---|---|
@@ -408,7 +408,7 @@ To regenerate:
 
 ```bash
 python3.12 scripts/print_coreml_size_breakdown.py \
-  /Users/majimadaisuke/Downloads/workspace/CoreML-LLM/output/gemma4-e2b/chunks-k8/chunk{1,2,3,4}.mlpackage
+  /Users/USER/Downloads/workspace/CoreML-LLM/output/gemma4-e2b/chunks-k8/chunk{1,2,3,4}.mlpackage
 ```
 
 ---

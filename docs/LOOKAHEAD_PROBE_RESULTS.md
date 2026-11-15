@@ -27,7 +27,7 @@ Build target: `output/gemma4-e2b/chunks-k8/chunk{1-4}.mlpackage`
 
 **Mac (compile):**
 ```bash
-cd /Users/majimadaisuke/Downloads/workspace/CoreML-LLM
+cd /Users/USER/Downloads/workspace/CoreML-LLM
 for c in chunk1 chunk2 chunk3 chunk4; do
   xcrun coremlcompiler compile \
     output/gemma4-e2b/chunks-k8/${c}.mlpackage \
@@ -38,7 +38,7 @@ done
 **Mac (bundle assembly):**
 ```bash
 ./scripts/assemble_lookahead_probe_bundle.sh
-# → /Users/majimadaisuke/Downloads/device_deploy_lookahead_probe/
+# → /Users/USER/Downloads/device_deploy_lookahead_probe/
 ```
 
 Copies `coreml-llm-artifacts/backup-iphone-2k/` as base (no drafter artefacts,
@@ -61,7 +61,7 @@ xcrun devicectl device copy to \
   --device "$DEVICE" \
   --domain-type appDataContainer \
   --domain-identifier com.example.CoreMLLLMChat \
-  --source /Users/majimadaisuke/Downloads/device_deploy_lookahead_probe \
+  --source /Users/USER/Downloads/device_deploy_lookahead_probe \
   --destination Documents/Models/gemma4-e2b-lookahead-probe
 
 # Verify both bundles are present:
@@ -86,7 +86,7 @@ on-device test target). Or run on Mac first:
 
 ```bash
 swift run -c release verify-k8-probe \
-  /Users/majimadaisuke/Downloads/device_deploy_lookahead_probe 25
+  /Users/USER/Downloads/device_deploy_lookahead_probe 25
 ```
 
 Mac-side numbers are a sanity check only — the go / no-go gate uses
@@ -97,7 +97,7 @@ Mac-side numbers are a sanity check only — the go / no-go gate uses
 ### Mac (Mac Studio, 2026-04-22, 15 iter)
 
 Hardware: M-series Mac Studio. Bundle:
-`/Users/majimadaisuke/Downloads/device_deploy_lookahead_probe` (2K ctx,
+`/Users/USER/Downloads/device_deploy_lookahead_probe` (2K ctx,
 K=8 verify chunks). Compute units: `cpuAndNeuralEngine` (default).
 
 ```

@@ -1,7 +1,7 @@
 # ANEMLL — source-verified tricks applicable to our CoreML+ANE stack
 
 **Date:** 2026-04-22
-**Source:** `/Users/majimadaisuke/Downloads/workspace/repo-review/Anemll` (deep-read)
+**Source:** `/Users/USER/Downloads/workspace/repo-review/Anemll` (deep-read)
 
 **Context:** ANEMLL is a production-grade open-source ANE LLM runtime
 supporting Llama / Qwen 2/2.5/3 / Gemma 3 / DeepSeek. Prior
@@ -198,7 +198,7 @@ measured and it didn't help or caused races.
 
 ---
 
-## 7. Citations (all in `/Users/majimadaisuke/Downloads/workspace/repo-review/Anemll/`)
+## 7. Citations (all in `/Users/USER/Downloads/workspace/repo-review/Anemll/`)
 
 - `anemll/utils/calc_chunk_split.py:245-248`
 - `anemll/models/gemma3_model.py:118-125, 264, 308, 416-712`

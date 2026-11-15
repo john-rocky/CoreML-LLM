@@ -1,7 +1,7 @@
 # LiteRT-LM — source-verified architecture of the 56 tok/s baseline
 
 **Date:** 2026-04-22
-**Source:** `/Users/majimadaisuke/Downloads/workspace/LiteRT-LM` (deep-read, not README)
+**Source:** `/Users/USER/Downloads/workspace/LiteRT-LM` (deep-read, not README)
 
 **Context:** LiteRT-LM's ~56 tok/s on Gemma 4 E2B on iPhone is the
 baseline we're trying to beat. Memory and prior docs hypothesized this
@@ -192,7 +192,7 @@ accepting the 15-20% gap.
 
 ---
 
-## 11. Citations (all in `/Users/majimadaisuke/Downloads/workspace/LiteRT-LM/`)
+## 11. Citations (all in `/Users/USER/Downloads/workspace/LiteRT-LM/`)
 
 - `runtime/executor/llm_litert_compiled_model_executor_factory.cc:63-74, 154-159, 169-180`
 - `runtime/executor/llm_executor_settings.h:38-94, 91, 96-111, 229`

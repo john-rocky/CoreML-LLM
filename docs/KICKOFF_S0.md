@@ -171,8 +171,8 @@ Script outline: copy `build_s0_monolithic.py`, add `--two-chunk` flag, split `fo
 
 ```bash
 # Activate venv
-source /Users/majimadaisuke/Downloads/CoreML-LLM/conversion/.venv/bin/activate
-cd /Users/majimadaisuke/Downloads/CoreML-LLM/conversion
+source /Users/USER/Downloads/CoreML-LLM/conversion/.venv/bin/activate
+cd /Users/USER/Downloads/CoreML-LLM/conversion
 
 # Phase 0 already done (fp16 model exists at output/s0_probe/gemma4_monolithic.mlpackage)
 # Phase 1: INT4 palettize + parity + Mac bench

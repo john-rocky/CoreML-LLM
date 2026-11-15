@@ -85,7 +85,7 @@ Not the world's fastest LLM stack (yet) — potentially the world's best-documen
 
 ## Cross-doc source citations index
 
-Primary external sources (all in `/Users/majimadaisuke/Downloads/workspace/repo-review/` unless noted):
+Primary external sources (all in `/Users/USER/Downloads/workspace/repo-review/` unless noted):
 
 - `maderix-ANE/` — Private API reverse-engineering, training on ANE
 - `Anemll/` — Production ANE LLM runtime (Llama/Qwen/Gemma3)
@@ -101,4 +101,4 @@ Primary external sources (all in `/Users/majimadaisuke/Downloads/workspace/repo-
 - `SCAP/` + `R-Sparse/` — ROUND7 research candidates
 - `LiteRT-LM` (in workspace) — The 56 tok/s baseline
 
-HF transformers Gemma 4 at `/Users/majimadaisuke/Downloads/workspace/repo-review/transformers/src/transformers/models/gemma4/` (sparse-checked).
+HF transformers Gemma 4 at `/Users/USER/Downloads/workspace/repo-review/transformers/src/transformers/models/gemma4/` (sparse-checked).

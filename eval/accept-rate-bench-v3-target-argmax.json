@@ -3,7 +3,7 @@
   "generatedAt" : "2026-04-15T06:11:59Z",
   "maxTokens" : 128,
   "mode" : "both",
-  "modelDir" : "\/Users\/majimadaisuke\/Downloads\/coreml-llm-artifacts\/staging-2k-fast-prefill\/gemma4-e2b",
+  "modelDir" : "\/Users\/USER\/Downloads\/coreml-llm-artifacts\/staging-2k-fast-prefill\/gemma4-e2b",
   "prompts" : [
     {
       "category" : "code",

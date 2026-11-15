@@ -206,7 +206,7 @@ The full Q1 diagnostic finished in under 7 seconds on CPU. No training, no model
 
 Reproduce with:
 ```bash
-cd /Users/majimadaisuke/Downloads/CoreML-LLM
+cd /Users/USER/Downloads/CoreML-LLM
 python3 /tmp/path_a_autopsy_fp32.py
 python3 /tmp/path_a_rank_check.py
 ```

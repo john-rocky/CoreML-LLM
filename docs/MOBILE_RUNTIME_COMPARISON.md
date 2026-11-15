@@ -142,7 +142,7 @@
 
 ## 3. Per-runtime key files index
 
-### llama.cpp (`/Users/majimadaisuke/Downloads/workspace/repo-review/llama.cpp`)
+### llama.cpp (`/Users/USER/Downloads/workspace/repo-review/llama.cpp`)
 - Gemma 4 model: `src/models/gemma4-iswa.cpp:1-300`
 - ISWA dual KV: `src/llama-kv-cache-iswa.cpp:1-50`, `src/llama-hparams.h:316-343`
 - FlashAttention Metal: `ggml/src/ggml-metal/ggml-metal.metal:5628-6512` (head-dim templates)
@@ -152,65 +152,65 @@
 - iOS build: `build-xcframework.sh`
 - SwiftUI example: `examples/llama.swiftui/llama.cpp.swift/LibLlama.swift`
 
-### MLX core (`/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/mlx`)
+### MLX core (`/Users/USER/Downloads/workspace/CoreML-LLM/mlx`)
 - Backend architecture: `mlx/backend/metal/eval.cpp`, `device.h`
 - STEEL attention: `mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h:74-150`
 - RMSNorm: `mlx/backend/metal/normalization.cpp:13-93`
 - Quantized matmul: `mlx/backend/metal/quantized.cpp:19-51`
 - Compile-time fusion: `mlx/backend/metal/compiled.cpp:16-255`
 
-### MLX Swift (`/Users/majimadaisuke/Downloads/workspace/repo-review/mlx-swift`)
+### MLX Swift (`/Users/USER/Downloads/workspace/repo-review/mlx-swift`)
 - No ANE integration (confirmed)
 - Lazy eval transparent
 
-### MLX Swift Examples (`/Users/majimadaisuke/Downloads/workspace/repo-review/mlx-swift-examples`)
+### MLX Swift Examples (`/Users/USER/Downloads/workspace/repo-review/mlx-swift-examples`)
 - LLM registry: `Applications/MLXChatExample/Services/MLXService.swift:23-38`
 - Async generation stream via `AsyncStream<Generation>`
 - Gemma 3n E2B preset: `gemma3n_E2B_it_lm_4bit`
 
-### ExecuTorch (`/Users/majimadaisuke/Downloads/workspace/repo-review/executorch`)
+### ExecuTorch (`/Users/USER/Downloads/workspace/repo-review/executorch`)
 - **Primary template:** `examples/apple/coreml/llama/export_static_llm_coreml.py`
 - CoreML delegate: `backends/apple/coreml/compiler/coreml_preprocess.py:50-95`
 - Static KV cache: `examples/models/llama/static_attention.py:33-120`
 - Embedding quant: `kernels/quantized/quantized.yaml:37-71`
 
-### MLC-LLM (`/Users/majimadaisuke/Downloads/workspace/repo-review/mlc-llm`)
+### MLC-LLM (`/Users/USER/Downloads/workspace/repo-review/mlc-llm`)
 - Gemma3 model: `python/mlc_llm/model/gemma3/gemma3_model.py`
 - Paged KV cache: `python/mlc_llm/nn/kv_cache.py:17-94`
 - Group quant: `python/mlc_llm/quantization/group_quantization.py:28-80`
 - Speculative: `python/mlc_llm/interface/serve.py` (mode = small_draft / eagle / medusa)
 
-### ANEMLL (`/Users/majimadaisuke/Downloads/workspace/repo-review/Anemll`)
+### ANEMLL (`/Users/USER/Downloads/workspace/repo-review/Anemll`)
 - Gemma 3 model: `anemll/models/gemma3_model.py:416-712`
 - Converter: `anemll/ane_converter/gemma3_converter.py`
 - Chunk calc: `anemll/utils/calc_chunk_split.py:245-248`
 - Runtime: `anemll-swift-cli/Sources/AnemllCore/InferenceManager.swift`
 - FFN chunk: `anemll-swift-cli/Sources/AnemllCore/FFNChunk.swift:6-34`
 
-### LiteRT-LM (`/Users/majimadaisuke/Downloads/workspace/LiteRT-LM`)
+### LiteRT-LM (`/Users/USER/Downloads/workspace/LiteRT-LM`)
 - Backend factory: `runtime/executor/llm_litert_compiled_model_executor_factory.cc:63-180`
 - MTP drafter: `runtime/executor/llm_litert_mtp_drafter.cc:420-467`
 - Metal sampler: `runtime/components/top_k_metal_sampler.h:92-183`
 - KV cache: `runtime/executor/litert/kv_cache.h:35-100`
 - Gemma 4 data processor: `runtime/conversation/model_data_processor/gemma4_data_processor.{h,cc}`
 
-### whisper.cpp (`/Users/majimadaisuke/Downloads/workspace/repo-review/whisper.cpp`)
+### whisper.cpp (`/Users/USER/Downloads/workspace/repo-review/whisper.cpp`)
 - CoreML encoder wrapper: `src/coreml/whisper-encoder.mm`
 - Metal kernels (shared with llama.cpp)
 - SwiftUI example: `examples/whisper.swiftui/LibWhisper.swift`
 
-### maderix (`/Users/majimadaisuke/Downloads/workspace/repo-review/maderix-ANE`)
+### maderix (`/Users/USER/Downloads/workspace/repo-review/maderix-ANE`)
 - Private API bridge: `bridge/ane_bridge.m:33-156`
 - INT8 benchmark: `ane_int8_bench.m:220-264`
 - Qwen3-0.6B training: `training/training_dynamic/models/qwen3_06b.h`
 - Compile budget: `training/stories_config.h:26` (MAX_COMPILES=100)
 
-### Apple ml-ane-transformers (`/Users/majimadaisuke/Downloads/workspace/repo-review/ml-ane-transformers`)
+### Apple ml-ane-transformers (`/Users/USER/Downloads/workspace/repo-review/ml-ane-transformers`)
 - LayerNormANE: `ane_transformers/reference/layer_norm.py:10-79`
 - MultiHeadAttention (einsum channel-first): `ane_transformers/reference/multihead_attention.py:64-120`
 - FFN: `ane_transformers/reference/ffn.py:14-21`
 
-### coremltools (`/Users/majimadaisuke/Downloads/workspace/repo-review/coremltools`)
+### coremltools (`/Users/USER/Downloads/workspace/repo-review/coremltools`)
 - Pass pipeline: `coremltools/converters/mil/mil/pass_pipeline.py` (123 passes)
 - RMSNorm auto-conversion: `converters/mil/frontend/torch/ops.py:3107-3171`
 - iOS 18 SDPA: `mil/ops/defs/iOS18/transformers.py:18-167`

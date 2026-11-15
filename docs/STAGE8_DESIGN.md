@@ -279,7 +279,7 @@ Probe 1 only validated 12 GB iPhone 17 Pro at T=288. iPhone 15 / 16 / 17 non-Pro
 
 ```bash
 # Build 1: E4B 3-chunk merged decode + multifunction prefill_b8
-HF_DIR=/Users/majimadaisuke/Downloads/CoreML-LLM/output/gemma4-e4b/hf_model
+HF_DIR=/Users/USER/Downloads/CoreML-LLM/output/gemma4-e4b/hf_model
 python conversion/build_gemma4_e2b_stateful_3chunks.py \
     --model gemma4-e4b \
     --hf-dir "$HF_DIR" \
@@ -306,7 +306,7 @@ python conversion/sanity_stateful_chunks.py \
 
 # Bundle assemble for sideload (assumes legacy E4B sidecars in
 # CoreML-LLM/output/gemma4-e4b/bundle):
-SIDECARS=/Users/majimadaisuke/Downloads/CoreML-LLM/output/gemma4-e4b/bundle \
+SIDECARS=/Users/USER/Downloads/CoreML-LLM/output/gemma4-e4b/bundle \
 SRC_CHUNKS=/tmp/gemma4-e4b-stateful-3chunk \
 bash scripts/assemble_gemma4_stateful_e4b.sh
 ```

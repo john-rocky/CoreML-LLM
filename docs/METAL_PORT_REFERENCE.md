@@ -7,8 +7,8 @@ llama.cpp and MLX already provide at source level, so we can make port
 decisions against real code, not README summaries.
 
 **Sources:**
-- llama.cpp: `/Users/majimadaisuke/Downloads/workspace/repo-review/llama.cpp`
-- MLX: `/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/mlx`
+- llama.cpp: `/Users/USER/Downloads/workspace/repo-review/llama.cpp`
+- MLX: `/Users/USER/Downloads/workspace/CoreML-LLM/mlx`
 
 ---
 
@@ -180,7 +180,7 @@ we've validated. Open question — should be a separate investigation.
 
 ## 8. MLX — complementary reference
 
-**Path:** `/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/mlx`
+**Path:** `/Users/USER/Downloads/workspace/CoreML-LLM/mlx`
 
 **What MLX offers:**
 - STEEL attention kernels (`mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h:74-150`) — templated simdgroup tiling, GQA support, causal mask.

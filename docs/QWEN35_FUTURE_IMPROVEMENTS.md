@@ -133,6 +133,6 @@ needs a compatible drafter model first.
 
 **Memory result (already tested):** "2-chunk works but only +0.7
 tok/s (31→31.7); dispatch overhead is not the bottleneck"
-([chunk_consolidation_blocked.md](../../.claude/projects/-Users-majimadaisuke-Downloads-CoreML-LLM/memory/chunk_consolidation_blocked.md)).
+([chunk_consolidation_blocked.md](../../.claude/projects/-Users-USER-Downloads-CoreML-LLM/memory/chunk_consolidation_blocked.md)).
 
 **Verdict:** Marginal. Skip.

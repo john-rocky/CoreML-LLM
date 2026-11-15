@@ -192,7 +192,7 @@ device trips opportunistically.
    staging has `cross_vocab/qwen_drafter.mlmodelc` (compiled from that
    symlink). Both can coexist; code prefers the `.mlmodelc`.
 6. **Dependency on sibling repo.** The bench reads `qwen2.5-0.5b`
-   from `/Users/majimadaisuke/Downloads/CoreML-LLM/conversion/output/`
+   from `/Users/USER/Downloads/CoreML-LLM/conversion/output/`
    — that's the other working tree (MTP / training session). Don't
    delete it.
 

@@ -106,7 +106,7 @@ Branch `research/qwen3vl-2b-int4-g32` adds:
 Reproduction of the winning path:
 
 ```bash
-PY=/Users/majimadaisuke/.venv-coreml-llm-py312/bin/python
+PY=/Users/USER/.venv-coreml-llm-py312/bin/python
 
 # 1. Build fp16 once (~15 min on Mac Studio M4) — same as the existing builder.
 $PY conversion/build_qwen3_vl_2b_stateful_chunks.py \

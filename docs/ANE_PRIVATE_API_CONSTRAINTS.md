@@ -1,8 +1,8 @@
 # ANE Private API — Hard Constraints Reference (source-verified)
 
 **Date:** 2026-04-22 (updated with source-level verification)
-**Primary source:** `maderix/ANE` (`/Users/majimadaisuke/Downloads/workspace/repo-review/maderix-ANE`) — reverse-engineered training on ANE
-**Cross-check:** `ANEMLL` (`/Users/majimadaisuke/Downloads/workspace/repo-review/Anemll`) — production ANE LLM inference
+**Primary source:** `maderix/ANE` (`/Users/USER/Downloads/workspace/repo-review/maderix-ANE`) — reverse-engineered training on ANE
+**Cross-check:** `ANEMLL` (`/Users/USER/Downloads/workspace/repo-review/Anemll`) — production ANE LLM inference
 **Secondary:** `salescore/776dff7a85f781` Zenn article — author's isolated + E2E benchmarks on M4 Max
 
 **Corrections from earlier README-only draft:**
@@ -101,7 +101,7 @@ From salescore Zenn testing (macOS 15, M4 Max):
 ### 3.2 Isolated vs E2E ANE-win collapse at D≥2560 (Zenn-only)
 
 - Zenn Phase 3 table (D=896 → 2.47×, D=2560 → 0.82×) is author's measurement, no source in maderix.
-- MLX source inspection (`/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/mlx`) **refutes** the mechanism claimed ("MLX lazy eval keeps intermediates in GPU L2"): MLX fusion is **compile-time** op-inlining (`mlx/backend/metal/compiled.cpp`), with no L2-pinning logic and no ANE-aware scheduler.
+- MLX source inspection (`/Users/USER/Downloads/workspace/CoreML-LLM/mlx`) **refutes** the mechanism claimed ("MLX lazy eval keeps intermediates in GPU L2"): MLX fusion is **compile-time** op-inlining (`mlx/backend/metal/compiled.cpp`), with no L2-pinning logic and no ANE-aware scheduler.
 - **Net:** The *measured* isolated-vs-E2E gap may be real (Zenn's bench), but the *explanation* is not. Trust the numbers cautiously; don't trust the causal story.
 
 ---
@@ -170,7 +170,7 @@ From salescore Zenn testing (macOS 15, M4 Max):
 
 ## 10. Sources
 
-- maderix/ANE: `/Users/majimadaisuke/Downloads/workspace/repo-review/maderix-ANE/`
-- ANEMLL: `/Users/majimadaisuke/Downloads/workspace/repo-review/Anemll/`
-- MLX: `/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/mlx/`
+- maderix/ANE: `/Users/USER/Downloads/workspace/repo-review/maderix-ANE/`
+- ANEMLL: `/Users/USER/Downloads/workspace/repo-review/Anemll/`
+- MLX: `/Users/USER/Downloads/workspace/CoreML-LLM/mlx/`
 - Zenn article: https://zenn.dev/salescore/articles/776dff7a85f781

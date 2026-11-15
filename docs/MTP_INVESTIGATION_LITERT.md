@@ -260,11 +260,11 @@ Task specification's stop conditions:
 - `/tmp/mtp_drafter.cc` ← https://raw.githubusercontent.com/google-ai-edge/LiteRT-LM/main/runtime/executor/llm_litert_mtp_drafter.cc
 
 **Local artefacts (already in our repo):**
-- `/Users/majimadaisuke/Downloads/CoreML-LLM/output/mtp_probe/section_9.tflite` (E2B drafter, 44.3 MB)
-- `/Users/majimadaisuke/Downloads/CoreML-LLM/output/mtp_probe/section_9_weights.txt` (weight listing, 66 tensors)
-- `/Users/majimadaisuke/Downloads/CoreML-LLM/conversion/extract_mtp_drafter.py`
-- `/Users/majimadaisuke/Downloads/CoreML-LLM/conversion/mtp_drafter_model.py`
-- `/Users/majimadaisuke/Downloads/CoreML-LLM/conversion/build_mtp_drafter.py`
+- `/Users/USER/Downloads/CoreML-LLM/output/mtp_probe/section_9.tflite` (E2B drafter, 44.3 MB)
+- `/Users/USER/Downloads/CoreML-LLM/output/mtp_probe/section_9_weights.txt` (weight listing, 66 tensors)
+- `/Users/USER/Downloads/CoreML-LLM/conversion/extract_mtp_drafter.py`
+- `/Users/USER/Downloads/CoreML-LLM/conversion/mtp_drafter_model.py`
+- `/Users/USER/Downloads/CoreML-LLM/conversion/build_mtp_drafter.py`
 
 **Prior docs:**
 - `docs/LITERT_CONTAINER_ANALYSIS.md` — Section-by-section breakdown of the `.litertlm` file.
