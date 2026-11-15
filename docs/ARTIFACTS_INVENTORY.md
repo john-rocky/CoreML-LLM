@@ -23,8 +23,7 @@ staging variant.
 ├── hf-prefill-backup/            Snapshot of HF prefill/ dir before 2026-04-14 upload
 ├── hf-prefill-upload/            Staged metadata for the HF prefill/ upload
 ├── hf-verify/                    HF verify workspace
-├── push-model.sh                 USB transfer helper (calls devicectl copy to)
-└── SESSION_NOTES.md              Non-public work log (narrative / iPhone-specific notes)
+└── push-model.sh                 USB transfer helper (calls devicectl copy to)
 ```
 
 Typical sizes: 2K bundles ≈ 3–4 GB, 8K bundles ≈ 3–4 GB, raw chunks
@@ -126,12 +125,6 @@ session left important state on device (e.g. a fresh drafter not
 yet backed up). For adding a single file without wiping, call
 `devicectl` directly with a narrower `--source` and `--destination`
 and **omit `--remove-existing-content`**.
-
-### `SESSION_NOTES.md`
-
-Non-public session log. Narrative / coordination state / iPhone
-measurements that would be noisy or premature in the public repo.
-Append new entries at the top; keep each under ~80 lines.
 
 ---
 

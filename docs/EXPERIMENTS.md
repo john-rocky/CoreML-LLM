@@ -118,7 +118,7 @@ See `docs/SPEED_8K.md` for the overall speed roadmap and tier assignments.
 
 - Files: `conversion/train_medusa_heads.py`, parts of `conversion/build_speculative.py`
 - Idea: 3 lightweight ResBlocks predict the next 3 tokens from the final hidden state; verify with target model.
-- **Reason shelved**: published Medusa acceptance on Gemma-class models is ~1.3 %, far below EAGLE-3's 50–70 %. Confirmed on a small internal run. Kept because `build_speculative.py` reuses the same verify-chunk plumbing for EAGLE-3.
+- **Reason shelved**: published Medusa acceptance on Gemma-class models is ~1.3 %, far below EAGLE-3's 50–70 %. Confirmed on a small run. Kept because `build_speculative.py` reuses the same verify-chunk plumbing for EAGLE-3.
 
 ### MLState stateful KV cache  —  Rejected (2026-04-13)
 

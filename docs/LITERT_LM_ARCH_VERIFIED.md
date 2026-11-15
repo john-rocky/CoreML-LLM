@@ -41,7 +41,7 @@ from `runtime/.../vision_executor.cc:108-142`):
 
 `TopKMetalSampler` — custom Metal compute pipeline, `MTLCommandQueue`,
 `MTLBuffer` staging for logits / IDs. Uses `ml_drift::metal::Environment`
-(Google's internal ML Drift Metal library).
+(the ML Drift Metal library).
 
 **No MPSGraph. No MPS kernels. No CoreML. No ANE.**
 

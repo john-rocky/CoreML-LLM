@@ -32,7 +32,7 @@ Five findings that directly change our roadmap:
 
 4. **No MTP in the export pipeline.** The ai-edge-torch repo has zero references to
    MTP, drafter, or speculative decoding. The MTP drafter is trained/exported
-   separately (likely Google-internal). The export pipeline for the base model uses
+   separately. The export pipeline for the base model uses
    standard HuggingFace loading with minimal patches (RMSNorm → HLFB composite only).
    (See C1)
 
@@ -202,7 +202,7 @@ The full-attention Q·K subgraph (`runtime_bmm.impl_1042_0`) dequantizes the
 **entire** K cache and performs a dense matmul against all 32003 context positions.
 No block-sparse, top-k retrieval, or TriForce-style eviction is applied.
 
-**Op code remapping (Google-internal):** Google repurposes TFLite op codes:
+**Op code remapping:** Google repurposes TFLite op codes:
 - `STABLEHLO_SHIFT_RIGHT_LOGICAL` → composite subgraph call dispatcher
 - `MEAN` → sin, `TANH` → cos (for RoPE)
 - `AVERAGE_POOL_2D` → concatenation
@@ -556,8 +556,7 @@ Shape: `[batch, seq_len, num_hidden_layers, hidden_size_per_layer_input]`.
 This is a Gemma 4-specific feature — per-layer input modulation.
 
 **MTP drafter:** NOT in the ai-edge-torch export pipeline. Zero references to
-MTP, drafter, or speculative decoding. The drafter is trained/exported separately
-(likely Google-internal tooling).
+MTP, drafter, or speculative decoding. The drafter is trained/exported separately.
 
 ### C2. Quantization Recipes
 

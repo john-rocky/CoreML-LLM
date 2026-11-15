@@ -274,9 +274,8 @@ Listing these so they're not re-discovered later:
 - **No drafter recipe.** Their drafter is in
   `output/mtp_probe/section_10.tflite` (already extracted, already
   failed at the artifact level — `MTP_INTEGRATION_RESULTS.md` §5).
-  The training pipeline lives in their internal Google tooling and is
-  not in `ai-edge-torch`. Confirmed by both this audit and
-  `LITERT_RUNTIME_ANALYSIS.md` §C1.
+  The training pipeline is not in `ai-edge-torch`. Confirmed by both
+  this audit and `LITERT_RUNTIME_ANALYSIS.md` §C1.
 
 - **No fused SDPA we can lift.** Their attention is **not** SDPA-fused —
   they use a transposed-V layout and manual matmul subgraphs
