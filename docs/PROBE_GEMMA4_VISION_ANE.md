@@ -152,10 +152,10 @@ choice — delete `vision.ane.mlmodelc` to force-revert.
 - **Aspect-ratio multifunction**: add portrait/landscape fixed grids as
   additional functions so CoreML picks the closest match at predict
   time.
-- **Session #4** (video batch encoding): apply the same static-grid
+- **Video batch encoding**: apply the same static-grid
   recipe to `vision_video` with batch=4 so a 6-frame clip encodes in
   two predict calls instead of six.
-- **Session #2** (image embedding cache): hash pixels, cache image
+- **Image embedding cache**: hash pixels, cache image
   features on disk, skip re-encode for follow-up turns.
 
 ## iPhone A/B: ANE vs legacy GPU (2026-04-25)
@@ -207,8 +207,8 @@ picked file and backend:
    `devicectl copy to` if the device has only one).
 2. Launch, pick `gemma4-e2b`, wait for `[Load] vision ... prewarm
    predict in ...s` in the Xcode console.
-3. Send the same image (sunflower — previous session verified ANE
-   parity on it) with an identical prompt 5 times, 30 s cooldown
+3. Send the same image (sunflower — ANE parity was verified on it
+   earlier) with an identical prompt 5 times, 30 s cooldown
    between runs. Record `[Vision/...] predict=...` from runs 3–5
    and take the median.
 4. Toggle `LLM_VISION_FORCE_ANE` in the scheme env, repeat.

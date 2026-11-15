@@ -47,7 +47,7 @@ top-1 disagreement.
 - Tested on Mac (CPU_AND_NE compute unit). For a 512-element softmax
   the dispatcher may pick CPU; we did not force ANE-only.
 - iPhone ANE silicon may differ from Mac ANE (per
-  `project_iphone_ane_sparsity` — iPhone is realLen-aware, Mac isn't),
+  `IPHONE_ANE_SPARSITY_FINDING.md` — iPhone is realLen-aware, Mac isn't),
   but mask-value handling is a softmax-internal numeric concern, less
   likely to differ across silicon.
 - Production has been running with `0xFC00` for months at 32 tok/s; if

@@ -1,4 +1,4 @@
-# MTP investigation — one-page summary for parent session
+# MTP investigation — one-page summary
 
 Date: 2026-04-17
 Inputs: `docs/MTP_INVESTIGATION_HF.md`, `docs/MTP_INVESTIGATION_LITERT.md`, `docs/MTP_INVESTIGATION_PATH_A_AUTOPSY.md`
@@ -27,7 +27,7 @@ A full retrain at A100 × 5–10 days was priced assuming recipe *discoverabilit
 Order of operations instead:
 
 1. **Close item 11c first** (verify-vs-decode fp16 drift). Until break-even drops below ~55%, no MTP configuration, trained or extracted, produces a net speedup on device.
-2. **Prioritize the Metal-LLM Phase 3 work** (docs/metal_llm_impl memory). LiteRT's 56.5 tok/s is structurally a GPU number — Metal is where the gap is actually closeable. Expected uplift is ~25 tok/s vs MTP's projected ~5 tok/s on top.
+2. **Prioritize the Metal-LLM Phase 3 work**. LiteRT's 56.5 tok/s is structurally a GPU number — Metal is where the gap is actually closeable. Expected uplift is ~25 tok/s vs MTP's projected ~5 tok/s on top.
 3. **Revisit MTP as head-only fine-tune (~1 A100 day, not 5–10)** *after* 11c closes. Path A's extracted weights are on disk, validated as structurally healthy; fine-tune `mtp_post_proj + lm_head` against fp targets on 1–5M token pairs. Target: 30–50% acceptance. Drop full-retrain from the roadmap.
 
 ## What changed vs prior belief
@@ -36,11 +36,3 @@ Order of operations instead:
 - "Path A failed because of tensor/tokenizer bug" → ruled out cleanly.
 - "Full retrain could unlock 60%+ acceptance" → still plausible but now gated behind 11c, so the economic value drops independent of the training probability.
 - "MTP is on the critical path to beating LiteRT 56.5 tok/s" → **false**. LiteRT's number comes from GPU; MTP is an on-top optimization. Metal path is the critical path.
-
-## Stop-condition mapping
-
-- Task 1: **stop-cond-1** fired (HF has no MTP).
-- Task 2: **stop-cond-2 partial** (weights public, recipe not public).
-- Task 3: **"other"** — distribution mismatch, numerically localized.
-
-Combined effect: retreat, not ablation, not retrain.

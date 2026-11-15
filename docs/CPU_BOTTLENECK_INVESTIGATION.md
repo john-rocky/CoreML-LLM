@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-User reported the device gets noticeably hotter on this branch (ANE
+The device gets noticeably hotter on this branch (ANE
 path) than on a public LiteRT-LM iOS app (Metal GPU). Hypothesis: heat
 came from CPU orchestration saturating a P-core.
 
@@ -144,7 +144,7 @@ changing model architecture":
 | Lever | Status | Rationale |
 |-------|--------|-----------|
 | `MLOptimizationHints.specializationStrategy = .fastPrediction` | **shipped (default ON)** | Shorter ANE busy per dispatch; same tok/s, less heat per token |
-| Inter-dispatch `Task.sleep(Xms)` keyed off `thermalState` | rejected by user 2026-04-18 | Effective (ANE drops to 0 mW between chunks per Maderix) but trades throughput for heat |
+| Inter-dispatch `Task.sleep(Xms)` keyed off `thermalState` | rejected 2026-04-18 | Effective (ANE drops to 0 mW between chunks per Maderix) but trades throughput for heat |
 | Chunk3+4 merge (4→3 dispatches) | conversion-side; out of this PR | Tracked in `LITERT_RUNTIME_ANALYSIS.md` Tier S2 |
 | INT8 KV cache (50% bandwidth) | conversion-side; out of this PR | Tracked in `LITERT_RUNTIME_ANALYSIS.md` Tier S1; reduces DRAM heat |
 | Apple FM-style architectural KV-share split | already in Gemma 4 | L0–14 own KV, L15–34 shared — more aggressive than Apple's 5:3 |

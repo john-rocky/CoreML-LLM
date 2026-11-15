@@ -187,7 +187,7 @@ cml9; both are multi-day implementation efforts plus iPhone validation.
 
 ## 4.6. W8A8 + SmoothQuant follow-up (final A8 attempt)
 
-After the FP16-baseline diagnostic, the user (code review) identified
+After the FP16-baseline diagnostic, a code review identified
 AWQ as a weight-only technique by design and prescribed
 **W8A8 + SmoothQuant** as the proper-regime test. SmoothQuant
 (Xiao et al. 2022) shares AWQ's smoothing formula
@@ -225,7 +225,7 @@ weight + activation quantizers), not any PTQ combination.
 
 ## 4.5. Diagnostic decision tree (post-FP16 baseline)
 
-User feedback (筋悪い review) prompted the missing diagnostic:
+A review prompted the missing diagnostic:
 **W4A16 vs FP16**, which our prior tables didn't include — every
 "cos sim" was implicitly *vs the W4A16 reference*, hiding the
 absolute distance from fp16 truth.
@@ -268,7 +268,7 @@ approach.
 
 Future revisit options, ordered by ROI on the v1.7.0 perf goal:
 
-1. **Selective A8** (per user feedback). cml9's `op_name_configs`
+1. **Selective A8**. cml9's `op_name_configs`
    gives op-name targeting; mark unsafe ops (residual adds in chunk_1
    layers, post_attention_layernorm output, lm_head feed in chunk_4)
    as A16, leave gate/up/down MLP linears as A8. Estimated cos
@@ -299,8 +299,6 @@ HF upload + production swap (roadmap §3 phase B/C) settle.
   `--awq-alpha` CLI flags. Default behaviour unchanged.
 - This doc.
 - Roadmap §6 status row updated to reflect v3 close.
-
-INFLIGHT claim removed.
 
 ---
 

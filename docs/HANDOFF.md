@@ -1,10 +1,10 @@
-# Next-session handoff
+# Project status
 
 **Last updated:** 2026-04-24 (N=1024 prefill attempt + latent KV-write
 bug discovered + rolled back).
 
-**Most recent session summary:** `docs/SESSION_2026_04_24.md` — read
-that first, then `SESSION_2026_04_23.md`. Supersedes the "next steps"
+**Latest notes:** `docs/SESSION_2026_04_24.md`, then
+`SESSION_2026_04_23.md`. They supersede the "next steps"
 below for TTFT levers; decode optimization items still apply.
 
 ---
@@ -62,7 +62,7 @@ The bottleneck is **4 serial ANE dispatches per token** at ~13 ms each
 are not the constraint. Dispatch count is. The only ways past this are:
 
 1. Fewer chunks (2-chunk variant prototyped but ANE compiler stability
-   concerns; being explored in a separate session)
+   concerns; being explored separately)
 2. Speculative decoding (all paths blocked, see above)
 3. A future Apple OS/API change
 
@@ -72,11 +72,11 @@ None of these are on the current critical path.
 
 ## What is alive
 
-### Round 8 decode-side leads (2026-04-26) — **3 candidates for parallel sessions**
+### Round 8 decode-side leads (2026-04-26) — **3 independent candidates**
 
 `docs/ROUND8_FINDINGS.md` documents three drafter-excluded decode levers
 ranked by ROI, all single-function (no multifunction PTQ constraint),
-all dependency-free for parallel session execution:
+all dependency-free, so they can run in parallel:
 
 | Branch | Candidate | Effort | Effect (decode) |
 |---|---|---|---:|
@@ -84,8 +84,7 @@ all dependency-free for parallel session execution:
 | `feat/joint-sparse-palettized` | Joint sparse + palettized POC (`COREMLTOOLS_AND_IOS18.md` §7.4) | 2-3 days | binary, 0 or significant |
 | `feat/palu-low-rank-kv` | PALU low-rank K/V projection (arXiv 2407.21118, ICLR 2025) | 4-6 days | **+5-8 tok/s** |
 
-**PALU is the highest-effect new lead.** Read `ROUND8_FINDINGS.md`
-before claiming a branch.
+**PALU is the highest-effect new lead.** Details: `ROUND8_FINDINGS.md`.
 
 ### GPU prefill via MLX-Swift (item 27) — **CURRENT FOCUS**
 
@@ -170,7 +169,7 @@ Remaining headroom is **conversion-side only**:
 
 ---
 
-## Docs landscape (for future sessions)
+## Docs landscape
 
 The authoritative docs are:
 

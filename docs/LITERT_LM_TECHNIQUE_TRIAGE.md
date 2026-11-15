@@ -314,7 +314,7 @@ else from the LiteRT-LM read costs more time than it returns.
 
 ---
 
-## 6. Open questions for the next session
+## 6. Open questions
 
 1. Confirm sampler-driven pipelining isn't already partially landed
    somewhere in `ChunkedEngine.swift` — the audit found no PR but the

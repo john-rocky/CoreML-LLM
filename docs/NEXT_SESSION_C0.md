@@ -1,8 +1,8 @@
-# Next-session instructions — C0 (verify-chunk tightening)
+# C0 plan — verify-chunk tightening
 
-**Status:** 2026-04-15 late. Written as the concrete handoff after
+**Status:** 2026-04-15 late. Written as the concrete plan after
 PR #67 (`docs/PHASE_B_DECISION.md`). Two tracks can run **in
-parallel** across two sessions because they touch almost disjoint
+parallel** because they touch almost disjoint
 files. Either one alone may unblock Phase C.
 
 Both tracks share the same measurement instrument: `accept-rate-bench
@@ -35,7 +35,7 @@ as unblocking Phase C.
 
 ## Track A — loosen (output-space tolerance)
 
-**Session label:** `feat/c0-tolerance-bench`
+**Branch:** `feat/c0-tolerance-bench`
 **Estimated effort:** 3–4 h
 **Touches:** `Sources/CoreMLLLM/ChunkedEngine.swift`,
 `Sources/CoreMLLLM/CoreMLLLM.swift`, `Sources/accept-rate-bench/Bench.swift`.
@@ -113,7 +113,7 @@ miss. If true, tolerance acceptance recovers the accept rate.
 
 ## Track B — rebuild (verify chunk numerical tightening)
 
-**Session label:** `feat/c0-verify-requant`
+**Branch:** `feat/c0-verify-requant`
 **Estimated effort:** 2–3 days (bounded by CoreML re-conversion time).
 **Touches:** `conversion/` scripts, CoreML verify function export,
 staging model dir. **No Swift code changes** (other than maybe
@@ -183,12 +183,12 @@ Recommend order: **3 first (sanity check), then 1, then 2**.
 - Mac CoreML compile step: `xcrun coremlc compile foo.mlpackage
   /tmp/out/` per chunk. ~1–2 min each. Script it.
 - If re-export requires retraining (shouldn't for approaches 1/2/3
-  but verify), it's out of scope — flag to user and switch to
-  Track A. CLAUDE.md forbids long training runs without explicit ask.
+  but verify), it's out of scope — switch to
+  Track A.
 
 ---
 
-## Parallel-session coordination
+## Parallel-track coordination
 
 Both tracks target `main`. They touch disjoint files so rebase
 conflicts are unlikely. Merge order (if both succeed):
@@ -200,7 +200,7 @@ conflicts are unlikely. Merge order (if both succeed):
 
 If Track A's gotcha triggers (logits not exposed without re-export):
 - Track A blocks on Track B's logit-output addition.
-- Track A session should stop Swift work and wait. Use session time
+- Track A should stop Swift work and wait. Use the time
   to prepare the tolerance-check logic as a patch, ready to apply
   once Track B lands the logit output.
 

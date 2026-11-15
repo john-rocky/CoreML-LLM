@@ -8,7 +8,7 @@
 
 | Measured verify_qK=8 median | Verdict | Next step |
 |---|---|---|
-| < 50 ms | GO | Full LookAhead implementation (§3 of handoff) |
+| < 50 ms | GO | Full LookAhead implementation (§3 of the plan) |
 | 50 – 70 ms | MARGINAL | Defer; revisit if Metal Phase 3 slips |
 | > 70 ms | KILL | K-linear scaling confirmed; close LookAhead route |
 
@@ -201,7 +201,7 @@ ANE scheduler transient or thermal governor, not a K=8 regime change.
 
 - Baseline decode_q1 (probe bundle, LookAhead not routed): 29.6 – 33.5
   tok/s (from `[Profile]` log at different prompt lengths).
-- LookAhead enabled: user observed ~36 tok/s. Steady-state rolling
+- LookAhead enabled: ~36 tok/s observed. Steady-state rolling
   accept ≈ 2% (2/100 draft slots accepted); peak cycles accepted
   3-4/7 drafts → 4-5 tokens emitted per verify.
 - Estimated speedup on Japanese chat: **+10 – 20 %**.
@@ -213,7 +213,7 @@ content (list / table / template) can get 50-70%. ANE batch invariance
 
 ## Output-drift caveat (iPhone confirmed)
 
-User observation: "結果が original と微妙に違う". Same prompt through the
+Same prompt through the
 LookAhead path produces a coherent answer that differs slightly from the
 serial-decode answer. This is **stack-inherent K-dependent fp16 argmax
 drift** — the same issue that closed MTP Path A — not a LookAhead bug.
@@ -264,12 +264,12 @@ Proceed to §3 of `docs/LOOKAHEAD_PROBE_HANDOFF.md`:
 
 - Park the K=8 chunks + probe CLI on this branch for later reuse
 - Let Metal Phase 3 progress dictate revival
-- Document decision in `project_drafter_structurally_dead.md` memory
+- Document the decision in this file
 
 ### If KILL
 
-- Append "LookAhead K=8 — ANE K-linear confirmed, dead" to the drafter
-  memory's "Still dead" list
+- Record "LookAhead K=8 — ANE K-linear confirmed, dead" in
+  `REJECTED_APPROACHES.md`
 - Close this branch without merging (or merge docs-only update)
 - Metal Phase 3 becomes the sole remaining path to LiteRT 56 parity
 

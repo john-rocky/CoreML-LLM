@@ -10,9 +10,9 @@ tok/s on iPhone GPU.
 
 The 14-22 % per-position accept ceiling observed across 29 drafter rounds
 (2026-04-22) is **information-theoretic + capacity-tested**, not just
-empirical. Future sessions: do NOT propose drafter retrain (HASS, MTP,
-Section 9 fine-tune, ANE-collected labels, larger drafter, etc.) without
-explicit user approval to relax the bit-exact + no-retrain constraint.
+empirical. Drafter retrain (HASS, MTP, Section 9 fine-tune, ANE-collected
+labels, larger drafter, etc.) stays closed while the bit-exact +
+no-retrain constraint holds.
 
 ## Probe setup
 
@@ -131,8 +131,7 @@ For HF Gemma 4 E2B + ANE + W4 LUT + bit-exact + no-retrain:
 
 ## What's still open
 
-Constraint relaxations the user has NOT authorised, but which would
-re-open the door:
+Constraint relaxations that would re-open the door (not adopted):
 
 - **Quality drift OK** — soft verify (accept on top-3 / top-5) unlocks
   +10-15 pt accept at the cost of bit-exact output. PR #73 patch shape.
@@ -160,11 +159,10 @@ new base in ~10 min wall to determine if MTP-aware signal is present.
 - ROUND8 follow-up question "is drafter genuinely dead or just
   empirically un-tried?": **genuinely dead, structurally proven.**
 
-## Recommendation for future sessions
+## Recommendation
 
-The rule is to read
-`REJECTED_APPROACHES.md` before any speedup proposal. Add `H1 probe`
-to the "do not re-propose" gate for drafter-class items.
+`REJECTED_APPROACHES.md` lists the ruled-out speedup approaches; `H1 probe`
+belongs there with the drafter-class items.
 
 The project direction (updated 2026-04-27 earlier this session)
 correctly reframes "beat LiteRT 56.5" as structurally-impossible for HF

@@ -234,7 +234,7 @@ LiteRT's drafter uses **JAX/TF-style paths** (from `jax2tf_arg_N/ReadVariableOp`
 |---------------------------------------------------|------------------|-----------|
 | (a) Re-run Path A with corrected tensor mapping   | **No — not the right fix.** | Path A's failure was never a tensor-name mapping issue; all 66 weights map cleanly (see §7). The failure mode is target-distribution mismatch between LiteRT's W4A8 quantised forward and our HF-fp trunk. Until we either (i) re-quantise our target to match W4A8 exactly, or (ii) run the drafter through a *post-hoc* hidden-state calibration layer, Path A stays at 0 % acceptance. Re-extracting is a no-op; the TFLite file is byte-identical. |
 | (b) Train from scratch (a second Path C attempt) | **Possibly — but only after Phase B verify-alignment lands.** | Path C's 38 % val / 17 % live gap was not a training problem — it was `PRIORITY_ROADMAP.md` item 11c (verify_qK vs decode_q1 fp16 drift on the target, not the drafter). A bigger/longer-trained drafter on the same target would hit the same 77 % break-even cliff. Re-training only becomes attractive if verify alignment closes and the break-even drops to ~55 %. At that point the $300–1000 / 5–10 A100 days investment is reasonable. Before that, it is burning money on the wrong lever. |
-| (c) Abandon MTP (continue with GPU Metal-LLM path) | **Yes, for the next ~2 weeks.** | The current on-device baseline is 31 tok/s (ANE, Gemma 4 E2B). LiteRT ships 56.5 tok/s on iPhone 17 Pro **GPU**, not ANE. We already have `llama.cpp Metal + spec decode` implementation (per auto-memory). The cheapest path to beat 56.5 tok/s is finishing Phase 3 (ANE prefill + GPU decode mirror with ANY drafter, even prompt-lookup). MTP-specifically gains maybe +5 tok/s on top of GPU decode; GPU decode alone gains ~25 tok/s over our current ANE. The ordering matters. |
+| (c) Abandon MTP (continue with GPU Metal-LLM path) | **Yes, for the next ~2 weeks.** | The current on-device baseline is 31 tok/s (ANE, Gemma 4 E2B). LiteRT ships 56.5 tok/s on iPhone 17 Pro **GPU**, not ANE. We already have `llama.cpp Metal + spec decode` implementation. The cheapest path to beat 56.5 tok/s is finishing Phase 3 (ANE prefill + GPU decode mirror with ANY drafter, even prompt-lookup). MTP-specifically gains maybe +5 tok/s on top of GPU decode; GPU decode alone gains ~25 tok/s over our current ANE. The ordering matters. |
 
 **Recommended sequence:**
 1. Ship Phase 3 GPU decode (Metal) + any speculative drafter (prompt-lookup / shared-vocab / EAGLE-3 retry with corrected teacher forward). Measure tok/s uplift vs LiteRT.
@@ -244,12 +244,10 @@ LiteRT's drafter uses **JAX/TF-style paths** (from `jax2tf_arg_N/ReadVariableOp`
 
 ---
 
-## 9. Stop condition
+## 9. What is public
 
-Task specification's stop conditions:
-- **stop-cond-1: "recipe fully public"** → NOT fired. No training recipe is public.
-- **stop-cond-2: "partial"** → **FIRED.** Weights are public (TFLite section, already extracted), inference control flow is fully public (`llm_litert_mtp_drafter.cc` / `.h` both read in full), architecture is fully reverse-engineered (§2, §7). Training recipe is NOT public.
-- **stop-cond-3: "nothing new"** → N/A.
+- **Training recipe:** not public.
+- **Weights:** public (TFLite section, already extracted). **Inference control flow:** fully public (`llm_litert_mtp_drafter.cc` / `.h` both read in full). **Architecture:** fully reverse-engineered (§2, §7).
 
 ---
 

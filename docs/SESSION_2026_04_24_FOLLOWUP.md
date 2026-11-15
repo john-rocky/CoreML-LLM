@@ -100,7 +100,7 @@ Dead / do not re-evaluate unless premise changes:
   exhausted 2026-04-22: EAGLE-3 HASS, MTP, LayerSkip, GliDe, Clover-2,
   Harmony-Decoding. Path A confirmed dead after 29 rounds.
 - **Chunk consolidation 4→2** — +1 tok/s only, refutes dispatch-overhead
-  theory (`project_chunk_consolidation_dead.md`)
+  theory
 - **MLState** — prior attempt failed; current IOSurface MLMultiArray path
   is the fixed baseline
 
@@ -113,7 +113,7 @@ Only route: **Metal Phase 3** port. Blueprint in
 Metal GPU + MTP (source-confirmed 2026-04-22 in
 `docs/LITERT_LM_ARCH_VERIFIED.md`).
 
-## Suggested execution order next session
+## Suggested execution order
 
 Pick exactly one of:
 

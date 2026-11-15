@@ -9,7 +9,7 @@ plan-build, and shape-trace overhead.
 Baseline (per `docs/BASELINE_SPEED_AUDIT.md`, Mac Studio):
 `c1=11.0 c2=12.8 c3=11.8 c4=16.1` ms (sum 51.7 ms), 19.4 tok/s.
 
-iPhone 17 Pro reference baseline: 31.4 tok/s @ 2K (per project memory).
+iPhone 17 Pro reference baseline: 31.4 tok/s @ 2K.
 
 ---
 

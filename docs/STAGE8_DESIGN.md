@@ -267,10 +267,10 @@ Probe 1 only validated 12 GB iPhone 17 Pro at T=288. iPhone 15 / 16 / 17 non-Pro
 
 ---
 
-## Open questions for next session
+## Open questions
 
 1. **Picker entry naming.** "Gemma 4 E4B (multimodal stateful)" or "Gemma 4 E4B (stateful, vision+audio)"? UI clarity vs concision.
-2. **Default model swap.** When B is shipped, should `gemma4e2b3way` (current production multimodal) be deprecated in favor of `gemma4e2bStatefulMultimodal` (faster decode + multimodal)? Memory note says current E2B 3-chunk is the multimodal default; swapping requires a soft-deprecation cycle for users mid-download.
+2. **Default model swap.** When B is shipped, should `gemma4e2b3way` (current production multimodal) be deprecated in favor of `gemma4e2bStatefulMultimodal` (faster decode + multimodal)? The current E2B 3-chunk is the multimodal default; swapping requires a soft-deprecation cycle for users mid-download.
 3. **Cross-turn KV with vision.** Phase 2a LCP match assumes prefix invariance. If turn 1 has image and turn 2 reuses the same image, the image features may have been re-encoded — does the LCP match still hold? Stage 6 had this concern unresolved.
 
 ---
@@ -318,7 +318,7 @@ Both builds load the 15 GB E4B safetensors; estimated 60-120 min total. Run sequ
 ## Reference
 
 - `docs/MLSTATE_MULTIMODAL_PROBE.md` — probe 1 (T=288 chunk_1 compiles) + probe 2 (state bridge memcpy works).
-- `docs/HANDOFF_STAGE8_MLSTATE_MULTIMODAL.md` — original Stage 8 handoff with 5-step plan.
+- `docs/HANDOFF_STAGE8_MLSTATE_MULTIMODAL.md` — original Stage 8 plan (5 steps).
 - `docs/SESSION_2026_04_27_STAGE6_MULTIMODAL.md` — Stage 6 multimodal in legacy engine (in-place patch; ours is fresh class).
 - Stage 6 commits: `origin/stage6-multimodal-stateful` (`02ac583`, `2432995`, `987ad86`) — port these helpers verbatim into new class.
 - `Sources/CoreMLLLM/Gemma4StatefulEngine.swift` — legacy engine, reference for the patterns we duplicate (mask filling, RoPE lookup, EmbeddingLookup wiring, position scratch, etc.).

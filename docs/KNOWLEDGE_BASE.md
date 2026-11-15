@@ -71,7 +71,7 @@ Not the world's fastest LLM stack (yet) — potentially the world's best-documen
 
 5. **ANEMLL IOSurface-backed CVPixelBuffer pattern audit** — we already do something similar (`ChunkedEngine.swift:546-568`); compare against ANEMLL's explicit `ring-16 / ping-pong-2` and adopt any diff. See `ANEMLL_SOURCE_NOTES.md` §1.2.
 
-## Top 5 open questions (worth a next-session investigation)
+## Top 5 open questions (worth an investigation)
 
 1. **iOS 18 SDPA op vs our manual `ane_softmax`.** Our conversion comment says SDPA causes wrong predictions. Is that still true on iOS 18 native SDPA, or was it a pre-iOS-18 limitation? Quick A/B test on Mac Studio.
 

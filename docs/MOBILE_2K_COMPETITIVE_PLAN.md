@@ -221,7 +221,7 @@ is used for prefill only).
 ### Explicitly out of scope
 
 - Any pivot to MLX-Swift / GPU decode for steady-state inference.
-  That's a different product; the user has rejected it.
+  That's a different product and a rejected direction.
 - Further speculative-decoding wiring (items 14 / 14b) until / unless
   the verify-protocol redesign lands. Not on this plan's critical
   path.
@@ -246,7 +246,7 @@ is used for prefill only).
 
 - `docs/PRIORITY_ROADMAP.md` — the comprehensive menu; item 27 promoted
   to Phase C critical path here.
-- `docs/HANDOFF.md` — next-session plan aligned with the two-item
+- `docs/HANDOFF.md` — status and plan aligned with the two-item
   execution above.
 - `docs/PHASE_B_DECISION.md` — why speculative decoding is no longer
   a forecast input.

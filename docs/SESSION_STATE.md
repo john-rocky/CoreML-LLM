@@ -1,9 +1,6 @@
-# Session state — rolling handoff
+# Session state
 
 **Last updated:** 2026-04-15 late (post v4 chain-mode bench).
-
-Keep this doc short and always-current. Any engineer / agent picking up
-should be able to cold-start from it in under 10 minutes.
 
 ---
 
@@ -33,12 +30,12 @@ below. Gates whether defaults can be flipped back on and whether the
 A5 30–63 tok/s projection is recoverable, or whether Phase B has to
 pivot to MTP / Mirror-SD without ever shipping the cross-vocab path.
 
-> **Coordination note for sibling sessions.** Drafters being default-off
+> **Note.** Drafters being default-off
 > means any model bundle including `cross_vocab/` assets currently
 > behaves as a pure baseline target — no speculation. Don't assume a
 > regression on your branch comes from your changes if you're seeing
 > baseline-tier numbers; check `crossVocabEnabled` / `drafterUnionEnabled`
-> first. The MTP session's upcoming Path C drafter trip is unaffected
+> first. The upcoming MTP Path C drafter trip is unaffected
 > (`mtpEnabled` still defaults true and lands ahead of the cross-vocab
 > path in the engine selector).
 
@@ -52,7 +49,7 @@ pivot to MTP / Mirror-SD without ever shipping the cross-vocab path.
 | [#54](https://github.com/john-rocky/CoreML-LLM/pull/54) | **merged 2026-04-15 evening** (`ec7616b`) | Phase B Task 1 — DrafterUnion + back-port of legacy MTP/CV bookkeeping fixes (KV-hole, carry double-emit) + CrossVocabDraft ctx auto-detect + Mac bit-exact verifier | Defaults flipped OFF in same merge after iPhone returned 1.8 tok/s + degraded quality; perf investigation owns re-enabling. |
 | [#55](https://github.com/john-rocky/CoreML-LLM/pull/55) | **merged 2026-04-15** | Docs: relax Phase B B1 exit criterion (matched-prefix bookkeeping bit-exact + accept rate ±5 % + manual quality + tok/s) and file roadmap item 11c | n/a |
 | [#33](https://github.com/john-rocky/CoreML-LLM/pull/33) | **draft** | 0d prefill bypass | 6× decode regression on device (2026-04-14); root cause not isolated. Don't merge as-is. Fresh-eyes investigation later |
-| #27 | open | MTP TFLite path fix | Owned by another session |
+| #27 | open | MTP TFLite path fix | Tracked separately |
 | #16 | open | SuffixDecoding implementation | Superseded in effect by `feat/accept-rate-bench-phase-a1` which measured suffix = prompt-lookup in single-turn. Re-evaluate if someone wants a multi-turn session bench |
 
 ---
@@ -65,7 +62,7 @@ pivot to MTP / Mirror-SD without ever shipping the cross-vocab path.
 | `feat/drafter-union` | `origin` | PR #54. Merged as `ec7616b`. Safe to delete. |
 | `feat/route-b-task1-prompt-lookup-wiring` | local worktree only (`.claude/worktrees/agent-ab599231`) | Folded into PR #54 (commit 1). Safe to drop the worktree. |
 | `feature/route-b-cross-vocab-drafter` | `origin` | Already absorbed via PR #45. Safe to delete. |
-| `feature/qk-multi-function-verifier` | `origin` + local worktree | Verify write-through KV work (other session). Referenced in roadmap Phase 2 Shared item 9 |
+| `feature/qk-multi-function-verifier` | `origin` + local worktree | Verify write-through KV work. Referenced in roadmap Phase 2 Shared item 9 |
 | `feat/0d-prefill-bypass` | `origin` | PR #33 draft content |
 
 ---
@@ -85,8 +82,8 @@ items continue to share the next bundled iPhone trip.
    ~1.8 tok/s decode and 25+ s TTFT vs 30–63 tok/s Mac projection.
    Two non-overlapping signals to collect on a single device trip:
    - **Per-phase timing logs** in `CrossVocabSpeculativeEngine`
-     (and ideally the parallel `MtpSpeculativeEngine` so the MTP
-     session shares the format) — ms in drafter forward vs verify
+     (and ideally the parallel `MtpSpeculativeEngine` so both
+     engines share the format) — ms in drafter forward vs verify
      vs fallback per burst, env-var gated so baseline is unaffected.
      Tells us *how much* time is being lost to the drafter.
    - **MLComputePlan audit on `cross_vocab/qwen_drafter.mlmodelc`** —
@@ -193,7 +190,7 @@ device trips opportunistically.
    symlink). Both can coexist; code prefers the `.mlmodelc`.
 6. **Dependency on sibling repo.** The bench reads `qwen2.5-0.5b`
    from `/Users/USER/Downloads/CoreML-LLM/conversion/output/`
-   — that's the other working tree (MTP / training session). Don't
+   — that's the other working tree (MTP / training). Don't
    delete it.
 
 ---
@@ -202,7 +199,7 @@ device trips opportunistically.
 
 - iPhone 17 Pro 2K baseline (main, drafters OFF — current default):
   **31.4 tok/s**. Per-chunk c1=5.9 c2=6.8 c3=8.1 c4=10.4 ms.
-- Google LiteRT-LM iOS @ 2K Gemma 4 E2B: **56 tok/s** (user-supplied).
+- Google LiteRT-LM iOS @ 2K Gemma 4 E2B: **56 tok/s**.
 - **Mac Union live (PR #62 repro, `coreml-llm-smoke UNION_TRIP=1`):**
   code 19.3, chat 17.8, qa 15.2, summary 21.2 tok/s vs Mac baseline
   ≈ 32. Net regression on all four categories.
@@ -218,16 +215,14 @@ device trips opportunistically.
 
 ## Merge discipline (corrected 2026-04-15)
 
-Previous sessions auto-merged several code PRs based on "user approved"
-as sufficient. That was wrong. **Code PRs require an iPhone baseline
-check before merge**, regardless of user approval, because speed
-regressions only show up on device and the product's headline number
-is iPhone tok/s. Docs-only PRs keep the auto-merge permission.
+**Code PRs require an iPhone baseline check before merge**, because
+speed regressions only show up on device and the product's headline
+number is iPhone tok/s. Docs-only PRs can merge without it.
 
 Rules going forward:
 
-- **Docs-only PR** (content under `docs/` only): auto-merge OK after
-  user approval.
+- **Docs-only PR** (content under `docs/` only): merge without a device
+  check.
 - **Code PR touching Sources/ or conversion/**:
   1. Mac build + tests must pass.
   2. Land it on a feature branch and push.
@@ -255,6 +250,6 @@ Retroactive audit of 2026-04-14 / 2026-04-15 merges:
 ## Housekeeping
 
 `model_config_8k_backup.json` at repo root is an untracked leftover;
-safe to remove next session if no one has claimed it. `.claude/`
+safe to remove if no one has claimed it. `.claude/`
 directories (agent worktrees, session cache) should stay in
 `.gitignore` — they already are.

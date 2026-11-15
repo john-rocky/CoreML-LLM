@@ -179,7 +179,7 @@ bounded, the ratio shrinks.
    on iPhone where ANE + UI + audio/image coexist.
 3. Construction-safe correctness (same bytes, same buffers).
 
-## Next-session candidates (Metal-free)
+## Next candidates (Metal-free)
 
 Metal Phase 3 is off the table (no product differentiation vs
 LiteRT's implementation). Remaining ANE-only levers:
@@ -237,8 +237,8 @@ Phase 2 candidates (any one of, ~1 week each):
   prep → step t+1 emb+mask done during step t c3/c4 ANE. Saves ~0.3-
   0.5 ms/step; marginal.
 - **[D] R7-1 COMPACT** (3–5 days, Mac-heavy, +2-3 tok/s on E2B, post-
-  training, per-model). Lower priority than runtime infra, per the
-  explicit 2026-04-24 call.
+  training, per-model). Lower priority than runtime infra
+  (2026-04-24).
 - **[I] Metal Phase 3 port** — the real ANE-ceiling breaker; weeks.
 
 Ceiling reminder: ~40 tok/s @ 2K is the ANE-only asymptote. Phase 1

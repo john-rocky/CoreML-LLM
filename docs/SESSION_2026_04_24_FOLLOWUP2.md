@@ -90,11 +90,11 @@ because `hasPrefill` returns false. Mitigation available (auto-`await
 prefillLoadTask.value` in `generate()` when `tokens.count >= threshold`)
 but not shipped — 10-line Swift change. Short prompts are unaffected.
 
-## Execution order, next sessions
+## Execution order
 
-User confirmed priority order on 2026-04-24:
+Priority order (2026-04-24):
 
-1. **Next session — UX micro-fixes (0.5–1 day).** Ship small quality
+1. **UX micro-fixes (0.5–1 day).** Ship small quality
    improvements visible to the user.
    - Auto-`await prefillLoadTask.value` in `generate()` when
      `tokens.count >= 64` (empirical break-even given E4B's 12 ms/tok
@@ -104,7 +104,7 @@ User confirmed priority order on 2026-04-24:
    - Housekeeping: `docs/KNOWLEDGE_BASE.md`-level refresh if anything
      about the E4B port belongs in the mobile LLM knowledge base.
 
-2. **Session +2 — [B] Decode chunk pipelining (~1 week).** Main track.
+2. **[B] Decode chunk pipelining (~1 week).** Main track.
    - Current: chunks 1→2→3→4 serial, ~10 ms CPU prep/copy between each
      (E4B's prep/copy is longer, 20–30 ms).
    - Target: async-dispatch chunk N+1 input preparation during chunk N
@@ -115,7 +115,7 @@ User confirmed priority order on 2026-04-24:
    - Sources: `docs/BASELINE_SPEED_AUDIT.md:59-64`,
      `docs/ANE_ONLY_LEVERS.md` item B.
 
-3. **Session +3 onward — deferred.**
+3. **Deferred.**
    - **[D] R7-1 COMPACT** (3–5 days, Mac-heavy, +2–3 tok/s @ 2K,
      model-specific post-training). Lower-priority than pipelining
      because it's per-model work whereas pipelining is model-agnostic
@@ -138,8 +138,8 @@ Do not re-evaluate unless premise changes:
   consolidation 4→2, MLState).
 - **HF re-upload of E2B** — old bundle + new Swift fallback works
   exactly. Defer until a breaking change forces a repush.
-- **R7-1 before chunk pipelining** — user explicitly picked pipelining
-  first on 2026-04-24; R7-1 is architectural per-model work and should
+- **R7-1 before chunk pipelining** — pipelining goes
+  first (2026-04-24); R7-1 is architectural per-model work and should
   follow the model-agnostic runtime win.
 
 ## Ceiling reminder

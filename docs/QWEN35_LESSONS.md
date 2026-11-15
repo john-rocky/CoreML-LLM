@@ -2,7 +2,7 @@
 
 Consolidated knowledge base from the 2026-04-20 → 2026-04-22 Qwen3.5-0.8B ship (v1.0.0 → v1.0.3). Organized by topic so future work on Qwen3.5 variants — or any hybrid SSM/attention LLM targeting Apple Neural Engine — can skip the dead ends.
 
-This doc is the **source of truth** for cross-cutting learnings. Session-specific handoff (2B continuation) lives in `QWEN35_2B_CHUNKED_HANDOFF.md`.
+This doc is the **source of truth** for cross-cutting learnings. The 2B continuation plan lives in `QWEN35_2B_CHUNKED_HANDOFF.md`.
 
 ---
 
@@ -35,7 +35,7 @@ On fp16 ANE over 24 layers, hidden state stays at cos ≥ 0.9998 vs fp32 — ess
 `temperature > 0 + top-K` samples from a distribution that overlaps fp32's by ~88% in top-5 and 100% in top-3. Human-perceived quality difference is zero. Greedy decoding is the only mode where fp16 drift shows.
 
 ### 2.3 Root cause of SSM drift: per-layer, not temporal
-Per-token state recurrence does NOT compound drift noticeably (measured 30 tokens stable at cos 0.9998). The drift is per-layer fp16 accumulation in the SSM's Gated-DeltaNet recurrent path. The `full_attention` layers are effectively clean (cos 0.999999 per-layer). See `memory/qwen35_ane_decode_precision_ceiling.md` for the layer-type attribution experiments.
+Per-token state recurrence does NOT compound drift noticeably (measured 30 tokens stable at cos 0.9998). The drift is per-layer fp16 accumulation in the SSM's Gated-DeltaNet recurrent path. The `full_attention` layers are effectively clean (cos 0.999999 per-layer).
 
 ### 2.4 ANE fp16 is HARDWARE, not a graph bug
 Tried and rejected: Conv2d 1x1 replacement for Linear (`conversion/test_qwen3_5_decode_conv2d.py`), RMSNorm swaps, chunk split with fp32 boundary (`conversion/build_qwen35_decode_chunks.py`). None of these moved the precision needle — ANE's accumulator is fp16-locked and no graph-level rewrite escapes it. Accept top-3 metric and ship.
@@ -281,7 +281,7 @@ of fp32 logits (1, 1, 248320). Per-step ANE→Swift transfer drops from
 no measurable change; on iPhone the transfer crosses the runtime
 boundary, so this is a real win there.
 
-Per `chunk4_argmax_topk_parity` memory, `topk[0]` (not `argmax`) is
+`topk[0]` (not `argmax`) is
 the right primitive — argmax has ANE-vs-CPU divergence on palettized
 heads.
 
@@ -308,9 +308,7 @@ heads.
 
 ---
 
-## 11 · Memory / commit trail
-
-All session-specific discoveries were saved to auto-memory under `~/.claude/projects/.../memory/qwen35_*.md` during the 2026-04-20 → 2026-04-22 + 2026-04-28 work. This doc consolidates them into a single reference; memory files remain the source for timeline-ordered details.
+## 11 · Commit trail
 
 Key commits on main (chronological):
 - #112 ship to main ChatView

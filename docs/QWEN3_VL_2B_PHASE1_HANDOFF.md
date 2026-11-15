@@ -1,4 +1,4 @@
-# Qwen3-VL 2B — Phase 1 (MLState + multifunction + slice_update) handoff
+# Qwen3-VL 2B — Phase 1 (MLState + multifunction + slice_update) plan
 
 Target: lift iPhone 17 Pro decode from ~10 tok/s (v1.4.0 current ship) to
 **40-55 tok/s** by porting the ANEMLL recipe end-to-end **and getting
@@ -210,57 +210,6 @@ error -14 or "ANEF Error=(11)", proceed with the full rewrite. Takes
   `MLState` and drop the KV name-plumbing)
 - `Sources/CoreMLLLM/ModelDownloader.swift` (swap file list from
   decode+prefill mlpackages to stateful+multifunction mlpackages)
-
-## Next-session prompt (copy-paste to kick off Phase 1 fresh)
-
-> Implement Qwen3-VL 2B Phase 1 on iPhone ANE. Current v1.4.0 on
-> device measures ~10 tok/s decode and **1.7 GB phys_footprint**,
-> which is the fingerprint of chunks spilling to GPU Metal heap
-> despite `MLComputePlan` reporting 93% ANE operator preference.
-> Matmul-scatter KV writes from batched prefill broke A18 ANE's
-> tile budget; the runtime silently routed some of the compute
-> through Metal. Phase 1's job is to get everything back onto pure
-> ANE by porting the ANEMLL recipe end-to-end: `ct.StateType` +
-> `MLState` with `slice_update` KV writes in-graph, multi-function
-> mlpackage with `infer` (T=1) and `prefill` (T=32 try, fall back
-> to T=16/8 if A18 compile fails) sharing the same state, cos/sin
-> baked as fp16 const + `gather(table, position_ids)` in-graph,
-> 4→2 chunks (14 layers each — ANEMLL shipping config), 16-way
-> split LM head, Swift IOSurface-backed MLMultiArray I/O +
-> ping-pong output backings between chunks. Branch from `main`
-> (v1.4.0 ship with T=8 batched prefill).
->
-> Read `docs/QWEN3_VL_2B_PHASE1_HANDOFF.md` first for the full
-> plan. Reference implementation lives at
-> `/tmp/anemll_clone/` (may need re-clone:
-> `git clone https://github.com/Anemll/Anemll /tmp/anemll_clone`);
-> the key files are `anemll/ane_converter/qwen_converter.py`,
-> `anemll/utils/combine_models.py`, and
-> `anemll-swift-cli/Sources/AnemllCore/InferenceManager.swift`.
->
-> **Gate zero (~5 min, do this first)**: convert a 2-layer MLState
-> stub with the same KV state shape as the full model, compile,
-> predict on Mac ANE then iPhone ANE via devicectl. If either hits
-> error -14 or `MILCompilerForANE Error=(11)`, STOP and report
-> before touching the full converter.
->
-> **Success criteria** for the iPhone 17 Pro measurement:
-> - decode ≥ 25 tok/s (stretch ≥ 40).
-> - `phys_footprint` drops to < 500 MB during inference. **This
->   is the non-negotiable ANE-residency check** — tok/s alone can
->   mask a GPU-resident regression. Qwen3.5 2B v1.1.0 ships at
->   ≈200 MB on the same weight count.
-> - Vision smoke test: describe an image end-to-end, no "digital
->   corruption" regression.
->
-> Preserve the vision path. DeepStack chunk_0_vision and interleaved
-> mRoPE for image tokens can stay on the v1.4.0 recurrent+batched
-> path for the first pass; stateful text-only is the ship. Commit
-> incrementally (one commit per: stub smoke test, converter, Swift
-> rewrite, multi-function combine, chunk consolidation, split LM
-> head, IOSurface backings). If a specific optimization doesn't
-> compile or regresses memory above 500 MB, revert that commit and
-> continue with the rest — each technique is independently shippable.
 
 ## References
 

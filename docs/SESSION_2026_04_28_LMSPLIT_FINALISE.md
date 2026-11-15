@@ -82,6 +82,6 @@ Kept (closed but durable investigations from the same 2026-04-25 cycle):
 
 Stage 4 status row in `docs/ROADMAP_2026_04_26.md` §6 → "REJECTED 2026-04-28". v1.7.0 critical path unaffected (Stage 4 was always declared independent / low coupling).
 
-## Memory entry
+## Summary
 
-`project_lmsplit_rejected.md` — "ANEMLL 16-way LM head split rejected on Gemma 4 E2B vocab=262k (2026-04-28). −4.6 % decode tok/s, +9.3 % chunk3 latency. Single `Conv2d(2304 → 262144)` is already ANE-optimal at this scale. Don't revisit lm_head splits without a different vocab size or radically different ANE compiler behaviour."
+ANEMLL 16-way LM head split rejected on Gemma 4 E2B vocab=262k (2026-04-28). −4.6 % decode tok/s, +9.3 % chunk3 latency. Single `Conv2d(2304 → 262144)` is already ANE-optimal at this scale. Don't revisit lm_head splits without a different vocab size or radically different ANE compiler behaviour.

@@ -1,6 +1,6 @@
-# EAGLE-3 Integration — Resumable Session State
+# EAGLE-3 Integration — State
 
-Working document for the EAGLE-3 integration on MacBook Air (M3 16GB). Written so a new session can pick up without re-deriving context.
+Working document for the EAGLE-3 integration on MacBook Air (M3 16GB).
 
 **Last updated:** 2026-04-17. Active branch: `feature/eagle3-speculative` (not merged to main). Status: **Phase 2A + 2B done, Phase 3 benched, speculative currently slower than baseline. Retrain prepared on 2026-04-13 but never executed — abandoned for MTP work.**
 
@@ -253,7 +253,7 @@ Even with a perfect draft, current implementation cannot beat baseline:
 
 ---
 
-## How to resume work
+## Where to start
 
 ### Step 0: check out the right branch
 
@@ -346,7 +346,7 @@ Bench in `Examples/CoreMLLLMChat` at 10-minute thermal-stable steady state. Comp
 
 ---
 
-## First-thing-to-do on a fresh session
+## First steps
 
 ```bash
 cd /Users/daisukemajima/Downloads/CoreML-LLM

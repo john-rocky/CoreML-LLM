@@ -1,4 +1,4 @@
-# Handoff — Stage 6: Multimodal stateful (vision + audio + video)
+# Stage 6 plan — Multimodal stateful (vision + audio + video)
 
 **Created:** 2026-04-27
 **Branch suggestion:** `stage6-multimodal-stateful`

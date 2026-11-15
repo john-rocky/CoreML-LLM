@@ -140,4 +140,4 @@ $PY conversion/bench_qwen3vl_stateful_quant.py \
 3. New HF artefact: `mlboydaisuke/qwen3-vl-2b-stateful-int6-coreml` (or replace the existing INT8 repo).
 4. README + picker bundle URL update.
 
-These are out of scope for this Mac probe — see `docs/INFLIGHT.md` if you pick this up.
+These are out of scope for this Mac probe.

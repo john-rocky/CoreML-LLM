@@ -1,6 +1,4 @@
-# KICKOFF: Track C — S0 GPU Verify + ANE Decode
-
-**Self-contained prompt for a new session. Paste entire file into a fresh chat.**
+# Track C — S0 GPU Verify + ANE Decode
 
 ---
 
@@ -161,9 +159,9 @@ Script outline: copy `build_s0_monolithic.py`, add `--two-chunk` flag, split `fo
 |---|---|---|
 | `conversion/models/gemma4_verify_chunks.py` | Track B | DO NOT modify |
 | `Sources/CoreMLLLM/ChunkedEngine.swift` core verify path | Track A | DO NOT modify |
-| `Sources/CoreMLLLM/GpuVerifier.swift` | Track C (you) | add new file |
-| `conversion/build_s0_monolithic.py` | Track C (you) | extend freely |
-| `conversion/output/s0_probe/` | Track C (you) | gitignored, safe |
+| `Sources/CoreMLLLM/GpuVerifier.swift` | Track C | add new file |
+| `conversion/build_s0_monolithic.py` | Track C | extend freely |
+| `conversion/output/s0_probe/` | Track C | gitignored, safe |
 
 ---
 

@@ -164,7 +164,7 @@ warm-up noise.
 | Result | Action |
 |--------|--------|
 | Best variant ≥ +5 % E2E tok/s vs baseline | Ship it as production default; deprecate other splits |
-| Best variant +2 — 5 % | Keep as opt-in `LLM_SHOW_EXPERIMENTAL=1`, document in `project_chunk_pipeline_phase1.md`-style note |
+| Best variant +2 — 5 % | Keep as opt-in `LLM_SHOW_EXPERIMENTAL=1` and document it |
 | All within ±2 % | Drop variant code, mark "anemll lm_split is workload-specific, not universal — vocab=262k baseline is fine" in REJECTED_APPROACHES.md |
 | Any variant has token_id divergence (different output text) | Bug — investigate before shipping; check argmax / softcap chain |
 

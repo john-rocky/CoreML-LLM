@@ -4,7 +4,7 @@
 **Source:** `/Users/USER/Downloads/workspace/LiteRT-LM` (deep-read, not README)
 
 **Context:** LiteRT-LM's ~56 tok/s on Gemma 4 E2B on iPhone is the
-baseline we're trying to beat. Memory and prior docs hypothesized this
+baseline we're trying to beat. Prior docs hypothesized this
 is "structurally a GPU number." Source inspection confirms and refines.
 
 ---
@@ -175,8 +175,8 @@ split (ANE drafter + ANE verify, with sync boundaries).
 **Implication for us:** a Metal port that keeps MTP-style
 draft+verify on the same device, in the same command queue, may recover
 most of contribution #2 — but only if we can replicate a drafter that
-matches base argmax. The LiteRT-LM MTP recipe is private
-(`project_drafter_structurally_dead.md`), so this is gated on either
+matches base argmax. The LiteRT-LM MTP recipe is private,
+so this is gated on either
 (a) replicating the training recipe, or (b) shipping without MTP and
 accepting the 15-20% gap.
 

@@ -1,8 +1,8 @@
-# Qwen3.5-2B Chunked Decode — Shipping Handoff
+# Qwen3.5-2B Chunked Decode — Shipping Plan
 
 **Status (2026-04-22):** 2B monolithic INT8 fails on iPhone — jetsam kill during load because Core ML silently falls back to GPU (ANE single-mlprogram compile budget exceeded), and Metal heap + dequant-to-fp16 together blow past iOS's ~5 GB per-app memory cap. INT4 shrinks the bundle but introduces quality regression severe enough to reject (factual errors, language code-switching).
 
-**This doc is the next session's starting point** to ship 2B on iPhone via 2-chunk INT8 (layers 0-11 + 12-23), following the same pattern Gemma 4 E4B already uses successfully at 5.5 GB total / ~1.4 GB per chunk.
+**This doc is the starting point** to ship 2B on iPhone via 2-chunk INT8 (layers 0-11 + 12-23), following the same pattern Gemma 4 E4B already uses successfully at 5.5 GB total / ~1.4 GB per chunk.
 
 ---
 
@@ -38,7 +38,7 @@ Each chunk has its own 24 state tensors (12 layers × 2 states each).
 
 ### 3.2 fp16 vs fp32 hidden boundary — IMPORTANT
 
-The research-era `conversion/build_qwen35_decode_chunks.py` used **fp32 hidden handoff** between chunks to probe whether fp16 drift was the ANE precision issue (it wasn't — see `memory/qwen35_ane_decode_precision_ceiling.md`). For **shipping**, use **fp16 hidden boundary** — fp32 round-trip is wasteful and doesn't improve parity. The prior script can be reused but this specific change is required:
+The research-era `conversion/build_qwen35_decode_chunks.py` used **fp32 hidden handoff** between chunks to probe whether fp16 drift was the ANE precision issue (it wasn't). For **shipping**, use **fp16 hidden boundary** — fp32 round-trip is wasteful and doesn't improve parity. The prior script can be reused but this specific change is required:
 
 ```python
 # In DecodeChunkA's ct.TensorType output:
@@ -164,7 +164,7 @@ private func buildQwen35_2B_FileList() {
 - **`Qwen3_5ForConditionalGeneration` load**: 2B is a VL checkpoint on HF. But `AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-2B")` returns a text-only `Qwen3_5ForCausalLM` with the same `.model.layers / .model.embed_tokens / .lm_head` layout as 0.8B — no manual stripping needed.
 - **Rep-penalty fast path**: `fastArgmaxAvoidingRecent` in `Qwen35Generator.swift` should remain default-off (rep_penalty=1.0). Enabling it globally adds ~0.3 ms/step for no benefit when EOS is properly configured. Mac bench proved plain greedy + full EOS set doesn't loop.
 
-## 8 · Non-goals for this handoff
+## 8 · Non-goals
 
 - fp16 monolithic 2B ship (too big, fails ANE, blows jetsam)
 - INT4 ship (quality fail — see §2)

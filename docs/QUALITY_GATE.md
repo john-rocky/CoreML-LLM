@@ -18,8 +18,8 @@ same.
 - Whenever `lastEmittedTokenIDs`-producing code (sampling, KV writes,
   chunk boundaries) is refactored.
 
-Fits the "Mac Studio first, device only when necessary" rule (memory
-`feedback_mac_first_validate.md`). A pass is not a release gate — it's
+Fits the "Mac Studio first, device only when necessary" rule.
+A pass is not a release gate — it's
 a pre-flight: iPhone A/B still lives in `docs/HANDOFF.md`.
 
 ## Seeding an oracle

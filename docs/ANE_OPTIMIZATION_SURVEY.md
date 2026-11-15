@@ -275,7 +275,7 @@ logits = MLP_with_skip(g_t)
 | Size | 44 MB | ~5-10 MB (estimated) |
 | Draft speed | Slower (full attention) | Faster (RNN, no attention) |
 | Quality | Reads target KV directly | Uses hidden state only |
-| Training | Unknown (Google internal) | KD from frozen target |
+| Training | Unknown | KD from frozen target |
 
 **Actionable:** If Google's MTP drafter shows poor acceptance on our pipeline,
 ReDrafter is a lighter backup. The RNN is trivially ANE-compatible (Linear + GELU).

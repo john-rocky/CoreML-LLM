@@ -131,8 +131,7 @@ needs a compatible drafter model first.
 
 **Goal:** cut 4 ANE dispatches per step to 2.
 
-**Memory result (already tested):** "2-chunk works but only +0.7
-tok/s (31→31.7); dispatch overhead is not the bottleneck"
-([chunk_consolidation_blocked.md](../../.claude/projects/-Users-USER-Downloads-CoreML-LLM/memory/chunk_consolidation_blocked.md)).
+**Earlier result (already tested):** 2-chunk works but only +0.7
+tok/s (31→31.7); dispatch overhead is not the bottleneck.
 
 **Verdict:** Marginal. Skip.

@@ -367,12 +367,12 @@ external embedding pipeline.
   established that LiteRT-LM uses K=(1,1,ctx,head_dim), V=(1,1,head_dim,ctx),
   and that this matches our ChunkedEngine. No layout transpose is needed.
 - **Phase 6 (prefill_bN):** Already in flight on `stage3-prefill-bn` branch
-  per `docs/ROADMAP_2026_04_26.md:331` and the project memory record. Mac
+  per `docs/ROADMAP_2026_04_26.md:316`. Mac
   shipped, iPhone validation pending. Re-doing it on this branch would be
   duplicate work.
 - **W4A8 / W8A8 activation quantization:** explicitly excluded by the task
   framing. `STAGE1_W4A8_FINAL.md` is the canonical close.
-- **iPhone benchmarks:** scoped out by user choice. The `outputBackings`
+- **iPhone benchmarks:** scoped out of this analysis. The `outputBackings`
   recommendations in §4.7 are explicitly gated on a future iPhone session.
 
 ---

@@ -202,7 +202,6 @@ Future work (not committing to a stage right now):
   max abs diff).
 - This doc.
 - Roadmap §6 update: Stage 1 status → HOLD with reason.
-- `INFLIGHT.md` claim removed.
 
 ## 7. Reproduction
 

@@ -1,16 +1,14 @@
-# LookAhead K=8 probe — next-session handoff
+# LookAhead K=8 probe — plan
 
 **Date prepared:** 2026-04-22
-**Prepared by:** drafter-refutation session (user direction)
 **Estimated elapsed:** 1-2 days (probe) → 1.5-2 weeks (full impl if probe passes)
 
 ## 0. TL;DR
 
-All drafter-based speculative routes on Gemma 4 E2B are empirically dead (see `project_drafter_structurally_dead.md` memory). The only remaining drafter-free speculation route is **LookAhead / Jacobi decoding**. Success hinges on a single unknown: does our `verify_qK` scale flat or linearly with K on ANE? Measure this first with a cheap probe before committing to full implementation.
+All drafter-based speculative routes on Gemma 4 E2B are empirically dead. The only remaining drafter-free speculation route is **LookAhead / Jacobi decoding**. Success hinges on a single unknown: does our `verify_qK` scale flat or linearly with K on ANE? Measure this first with a cheap probe before committing to full implementation.
 
 ## 1. Context (read first)
 
-- `project_drafter_structurally_dead.md` (memory) — why drafters are dead on E2B
 - `docs/SPECULATIVE_DECODING_SURVEY.md` §1.10 — LookAhead / Jacobi mechanism
 - `docs/ROUND7_FINDINGS.md:39-45` — measured iPhone timings (decode_q1 = 32.3ms, verify_qK=3 = 31.5ms, i.e. near-flat)
 - `docs/OUR_STACK_ANATOMY.md` — current decode path and chunk layout
@@ -121,7 +119,7 @@ Abandon the route if any of:
 - Full impl produces ≥ 30 tok/s but regression in output quality (argmax divergence)
 - ANE compile budget exhausted by adding K=8 bucket (would need to drop K=3)
 
-Document the kill reason in a new `docs/LOOKAHEAD_RESULTS.md`; append to `project_drafter_structurally_dead.md` under "Still dead".
+Document the kill reason in a new `docs/LOOKAHEAD_RESULTS.md`.
 
 ## 6. Code pointers
 
@@ -139,8 +137,7 @@ Document the kill reason in a new `docs/LOOKAHEAD_RESULTS.md`; append to `projec
 - [ ] `swift test --filter ChunkedEngineKVParityTests` passes (with `KV_PARITY_MODEL_DIR`)
 - [ ] No regression in `coreml-llm-smoke` baseline (default mode)
 - [ ] iPhone default-mode smoke confirms baseline tok/s unchanged
-- [ ] Update `project_drafter_structurally_dead.md` memory with LookAhead verdict
 
-## 8. If you need more context
+## 8. More context
 
-Ask the user to point you at the docs knowledge base (`docs/KNOWLEDGE_BASE.md`) and the drafter-dead memory. The current session already validated: drafter training paths are closed, Metal Phase 3 is parallel path, LookAhead probe is the cheapest remaining experiment.
+The docs knowledge base is `docs/KNOWLEDGE_BASE.md`. Already established: drafter training paths are closed, Metal Phase 3 is a parallel path, and the LookAhead probe is the cheapest remaining experiment.

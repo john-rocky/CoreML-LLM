@@ -147,7 +147,7 @@ Exit criterion: ≥ 100 tok/s @ 2K, decisive win over Google.
 |---|---|
 | PR #33 prefill bypass (draft) | 6× regression, root cause not isolated. Mac reproduction pending; no Phase A–C item depends on it. |
 | 8K ctx optimizations (DuoAttention, SparQ, TransMLA) | Compete with 2K target budget. Re-open after 100 tok/s @ 2K lands. |
-| Route A drafter training (MTP / HASS / EAGLE-3 retrain) | Owned by the other session; this plan doesn't block on it. When it lands, drops into Phase C2's union as an additional source. |
+| Route A drafter training (MTP / HASS / EAGLE-3 retrain) | Tracked separately; this plan doesn't block on it. When it lands, drops into Phase C2's union as an additional source. |
 | ANE micro-opts (PR #17 items: MLP tile, GQA broadcast, exp2) | Rejected. Don't revive without an isolated ANE? audit identifying which specific op fell off. |
 
 ---
@@ -179,7 +179,7 @@ trip**.
 
 ## Task list mapping
 
-For tracking, the phases map directly to the session's task list. Each
+For tracking, the phases map directly to the task list. Each
 Phase X item becomes one task. Phase A tasks are the starting queue.
 
 ---

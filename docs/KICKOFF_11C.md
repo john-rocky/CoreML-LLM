@@ -1,6 +1,4 @@
-# Kickoff: Item 11C — Verify-Protocol Redesign (Write-After-Accept)
-
-**Paste this into a new session to resume work.**
+# Item 11C — Verify-Protocol Redesign (Write-After-Accept)
 
 ---
 
@@ -23,7 +21,7 @@ No code has been modified. All four deliverable docs live in `docs/`.
 ## Branch and Worktree
 
 ```bash
-# Open this session in the dedicated worktree:
+# Work in the dedicated worktree:
 cd /path/to/CoreML-LLM
 git worktree add ../coreml-llm-11c feat/verify-protocol-redesign 2>/dev/null \
     || git -C ../coreml-llm-11c checkout feat/verify-protocol-redesign
@@ -120,7 +118,7 @@ done
 
 ---
 
-## Open Questions for This Session
+## Open Questions
 
 1. Does removing `update_indicator` from chunk1/2 verify inputs require a mask shape change in `makeVerifyUpdateIndicator` in ChunkedEngine? (Probably yes — that method should be deleted or made no-op.)
 2. For sliding-layer write-back: `shiftAndAppend` must match the `torch.cat([K[:, :, 1:, :], k_padded], dim=2)` semantics exactly. Validate with a unit test comparing the buffer contents after N=1 vs N=3 commits.

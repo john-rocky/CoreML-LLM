@@ -316,7 +316,7 @@ for repetitive / long-prompt workloads.**
 - **MTP_PATH_A_FINDINGS.md**: archived — Path A was abandoned
   2026-04-14 (TFLite drafter's target-distribution mismatch). Kept
   for the I/O contract and parity-gate methodology, referenced by
-  the self-trained Path C effort in the sibling session.
+  the self-trained Path C effort.
 - **MTP_PATH_C_FINDINGS.md**: 2026-04-15 — Path C (self-trained K=2
   DeepSeek V3-style drafter against our own HF trunk) **shelved**
   after iPhone measurement (~16 tok/s vs 31 baseline, output drift

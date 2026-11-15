@@ -60,7 +60,7 @@ to overflow.
 - ❌ **DROP** "P1-2: FP16 residual scaling (α=0.5)". The intervention
   would be a no-op at best and a perplexity-neutral weight rewrite at
   worst.
-- ✅ This refutes the anemll team's E2B/E4B hypothesis. If the user wants
+- ✅ This refutes the anemll team's E2B/E4B hypothesis. For an
   external citation, point to this doc; the anemll source explicitly
   flags those numbers as unverified.
 

@@ -194,7 +194,7 @@ Rationale:
 
 - Path C is not blocked by a bug in our drafter, training, or conversion. The drafter is correct. The deployment is correct.
 - The blocker is item 11c — target-side numerical drift between `decode_q1` and `verify_qK`. That is load-bearing for **every** speculative drafter on this target (Path A, Path C, Qwen cross-vocab, prompt-lookup, future EAGLE-3). Training a third or fourth drafter doesn't help.
-- The main line of work (Phase B DrafterUnion, see `SESSION_STATE.md` and `MAC_FIRST_EXECUTION_PLAN.md`) is independent of Path C's outcome. Nothing that session does depends on whether Path C ships.
+- The main line of work (Phase B DrafterUnion, see `SESSION_STATE.md` and `MAC_FIRST_EXECUTION_PLAN.md`) is independent of Path C's outcome. Nothing there depends on whether Path C ships.
 - `mtpEnabled` remains `true` as a default — Path A's code path is dormant (no drafter on the iPhone bundle) and Path C's `MtpModuleStackEngine` only auto-activates if both `mtp_module_*.mlmodelc` files are on the device, which the current shipped bundle does not carry. No user-visible surface area changes from this decision.
 
 ### 5.1 Re-open criteria
@@ -210,7 +210,7 @@ Any of the following unlocks re-opening Path C:
 - The Mac-first verification methodology (§2.4). Three harnesses caught three structural bugs in one day. This pattern generalizes — every future drafter trip should open with its own equivalence test before any iPhone build.
 - `precompute.py`'s forward-hook approach to extracting a specific layer's pre-norm output. Applicable to any distillation/speculation training that has to match what a chunked target serves at inference.
 - The DeepSeek V3 MTP indexing in the training code. If someone else wants to train a K>2 drafter later, this is the correct baseline to fork.
-- `scripts/measure_verify_drift.sh` — a reproducible, iPhone-free handoff artefact for whoever investigates item 11c next (§7).
+- `scripts/measure_verify_drift.sh` — a reproducible, iPhone-free artefact for investigating item 11c (§7).
 
 ---
 
@@ -218,7 +218,7 @@ Any of the following unlocks re-opening Path C:
 
 ---
 
-## 7. Handoff for item 11c: Mac-side drift measurement harness
+## 7. Item 11c: Mac-side drift measurement harness
 
 `scripts/measure_verify_drift.sh` runs `MtpMacCheck` twice against the same deploy directory — once with the two `mtp_module_*.mlmodelc` moved aside (so the speculative path is disabled and generation stays on `decode_q1`), and once with them in place (so generation goes through `verify_qK`). The only variable between the two runs is which chunk function produces each position's hidden state. Any token-stream divergence between the two runs is item 11c's drift surfacing on the target's chunks, in isolation from drafter quality.
 

@@ -306,7 +306,7 @@ a different shader, which is structurally unlikely.
 
 ---
 
-## 9. Open items (next sessions)
+## 9. Open items
 
 - **Phase 2b** (multifunction prefill_bN) — see §5. Reference Qwen3-VL
   v1.5.0 commit `e9feb2a`.

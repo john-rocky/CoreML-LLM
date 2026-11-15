@@ -1,6 +1,6 @@
-# Qwen3-VL 2B Vision Integration — Session Handoff
+# Qwen3-VL 2B Vision Integration — Plan
 
-Handoff for **Phase 2c–2d** of the Qwen3-VL 2B iPhone ship. Phase 1
+Plan for **Phase 2c–2d** of the Qwen3-VL 2B iPhone ship. Phase 1
 (text-only decode) and Phase 2a (vision encoder converter) + Phase 2b
 (chunk_0 DeepStack-aware converter) are done on branch
 `research/qwen3-vl-4b` (yes, the branch kept the 4B name; 4B was
@@ -181,12 +181,3 @@ Main commits on `research/qwen3-vl-4b`:
 - **2B pivot** (this session's ship path): 2B converter, 2B Swift
   generator, 2B ModelDownloader entry, vision encoder converter,
   chunk_0 DeepStack converter — **commit at session end**
-
-## Next session prompt
-
-> Continue Qwen3-VL 2B vision integration (Phase 2c/2d). Text ship
-> ready at 7.5 tok/s, vision encoder + DeepStack-aware chunk_0 already
-> built on disk. Read `docs/QWEN3_VL_2B_PHASE2_HANDOFF.md`, implement
-> `Qwen3VL2BVisionEncoder.swift`, extend the generator + LLMRunner to
-> feed vision features + DeepStack, wire PhotosPicker into ChatView,
-> test on iPhone, then commit + HF upload + README + v1.2.0 release.

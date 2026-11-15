@@ -5,7 +5,7 @@
 (1) 2025-2026 decode speedup techniques, (2) iOS 26 / coremltools 9 /
 WWDC25, (3) Gemma 4 / 3n specific optimizations, (4) ANE
 reverse-eng / driver tricks. Drafter / speculative decoding paths
-excluded by user choice.
+excluded by scope choice.
 
 All findings cross-checked against `REJECTED_APPROACHES.md`,
 `SURVIVING_HYPOTHESES.md`, `PRIORITY_ROADMAP.md`, `ROUND7_FINDINGS.md`,
@@ -28,8 +28,8 @@ re-confirms the existing roadmap.
 | 3 | Joint sparse + palettized POC | 2-3 days | binary, 0 or significant | medium | ALIVE in `COREMLTOOLS_AND_IOS18.md` §7.4 |
 
 All three are independent, single-function (no multifunction PTQ
-constraint per `COREMLTOOLS_AND_IOS18.md` §6.1), and can be claimed by
-different sessions. **PALU is the highest-effect new lead from this round.**
+constraint per `COREMLTOOLS_AND_IOS18.md` §6.1), and can run in
+parallel. **PALU is the highest-effect new lead from this round.**
 
 ---
 
@@ -181,19 +181,18 @@ different sessions. **PALU is the highest-effect new lead from this round.**
 
 ---
 
-## Recommended ordering for downstream sessions (post-2026-04-26 update)
+## Recommended ordering (post-2026-04-26 update)
 
 #1 INT8 LUT is dead per Mac probe. Two candidates remain:
 
-| Session | Branch | Candidate | First go/no-go gate |
+| Track | Branch | Candidate | First go/no-go gate |
 |---|---|---|---|
 | ~~A~~ | ~~`feat/joint-int8-lut`~~ | ~~#1 INT8 LUT entries~~ | **CLOSED 2026-04-26 — ANE rejects INT8 LUT dequant; latency regression. See SESSION_2026_04_26_ROUND8_INT8_LUT_PROBE.md.** |
 | B | `feat/joint-sparse-palettized` | #3 Joint sparse + palettized | Mac chunk_1 build with N:M (2:4) sparse + W4 LUT; ANE placement audit; if `non-ANE op(s) > 5 %` → fall back; cos sim vs W4 LUT |
 | C | `feat/palu-low-rank-kv` | #2 PALU | PyTorch reference run (Mac, no ANE) of PALU on Gemma 4 E2B HF model; verify accuracy holds at rank-r per paper; only then proceed to MIL graph rewrite |
 
-Cross-session protocol per `docs/ROADMAP_2026_04_26.md` §1: each
-session adds a line to `docs/INFLIGHT.md`; rebase onto current main;
-PR-or-fast-forward merge.
+Branch protocol per `docs/ROADMAP_2026_04_26.md` §1: rebase onto
+current main; PR-or-fast-forward merge.
 
 **Mac probe convention for sibling candidates:** the probe pattern in
 `docs/SESSION_2026_04_26_ROUND8_INT8_LUT_PROBE.md` (build + ANE audit

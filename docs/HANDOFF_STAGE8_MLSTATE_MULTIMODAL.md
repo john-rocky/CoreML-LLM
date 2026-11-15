@@ -1,4 +1,4 @@
-# Handoff — Stage 8: Stateful multimodal via prefill→decode state bridge
+# Stage 8 plan — Stateful multimodal via prefill→decode state bridge
 
 **Created:** 2026-04-28
 **Branch suggestion:** `stage8-mlstate-multimodal`
@@ -352,8 +352,7 @@ If only Pro passes:
       video, multi-turn TTFT). Cross-device probe on 8 GB device.
 - [ ] Step 6: picker default decision (universal vs Pro-only)
 - [ ] PR opened with the same iPhone-baseline-check gate Stage 7
-      followed (per `~/.claude/CLAUDE.md` memory:
-      `feedback_code_pr_iphone_check`)
+      followed.
 
 ---
 
@@ -366,7 +365,7 @@ If only Pro passes:
   contains Swift multimodal helpers that Stage 8 will salvage).
 - `main` post-Stage 7: PR #145 merged at 2026-04-27, tag `v1.7.0`.
 
-## How to resume
+## Where to start
 
 1. Read `docs/MLSTATE_MULTIMODAL_PROBE.md` (the verdict + raw probe
    evidence).

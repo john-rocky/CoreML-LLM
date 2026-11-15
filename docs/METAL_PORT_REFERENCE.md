@@ -1,7 +1,7 @@
 # Metal Port Reference — llama.cpp + MLX source-verified blueprint
 
 **Date:** 2026-04-22
-**Context:** Per `docs/project_drafter_structurally_dead.md`, Metal-LLM Phase 3 is
+**Context:** Metal-LLM Phase 3 is
 the critical path to beating LiteRT-LM 56 tok/s. This doc inventories what
 llama.cpp and MLX already provide at source level, so we can make port
 decisions against real code, not README summaries.

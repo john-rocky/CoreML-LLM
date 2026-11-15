@@ -93,7 +93,7 @@ Every method fights the same battle: **driver acceptance rate must hold up live,
 
 **L-MTP (NeurIPS 2025):** Curriculum learning (NTP → k=2 → k=4 → k=6). Code available on GitHub.
 
-**Our status:** DEFERRED per `project_drafter_structurally_dead.md`. Gated on item 11c. Training cost: 1-2 A100 days.
+**Our status:** DEFERRED. Gated on item 11c. Training cost: 1-2 A100 days.
 
 **Why this might actually work:**
 - MTP heads are trained to match base argmax BY CONSTRUCTION (they ARE the base model's forward pass).
@@ -203,7 +203,7 @@ live_speedup (live acc 0.08-0.25) = 1.08-1.25 / 1.13 = 0.96-1.11× [net even]
 - DrafterUnion: active path, works for repetition-heavy prompts.
 - PLD n=2/3 + suffix: cheap, active.
 
-### 4.3 Future (gated on 11c per memory)
+### 4.3 Future (gated on 11c)
 
 - L-MTP training on Gemma 4 E2B: 1-2 A100 days. Only credible path to +15-20% tok/s via speculative.
 

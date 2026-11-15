@@ -63,7 +63,7 @@ Steady-state (iter 3+) from `[Profile]` instrumentation in `ChunkedEngine.swift`
 
 Even quartering chunk2 only gets ~19 tok/s. To reach the §2 target of 34 tok/s, chunk2 alone isn't enough — either chunk2 must drop near-zero AND the other chunks shrink (EAGLE-3 batches multiple steps per chunk call), OR a speculative / multi-step gain multiplies on top.
 
-**Next action when this session is resumed.** Target chunk2 with a full-attention-layer-specific bandwidth reduction. Three viable approaches, ordered by ROI × implementation cost:
+**Next action.** Target chunk2 with a full-attention-layer-specific bandwidth reduction. Three viable approaches, ordered by ROI × implementation cost:
 
 1. **DuoAttention on the 7 full-attn layers only** (Tier A, training-free after offline head classification). Gemma 4 E2B has `num_heads=8` per full-attn layer → classify which heads need full KV vs streaming-window. If ~50% fall to streaming, chunk2 KV halves → ~10 ms → ~18 tok/s. Code in `docs/SPEED_8K.md §1 A1` + Phase 3 of `docs/EAGLE3_INTEGRATION_STATE.md` has the pipeline sketch. Start at `conversion/identify_retrieval_heads.py` (already scaffolded) and `conversion/models/gemma4_swa_chunks.py` (per-head KV budget wiring).
 2. **Block-static TriForce / Quest retrieval on the 7 full-attn layers** (§1 A3/A4). Higher ceiling (~¼ KV read) but needs the block-static top-k redesign to stay ANE. Not started.

@@ -112,5 +112,3 @@ Blockers:
 1. `torch.Tensor.unfold()` not supported by coremltools → rewrite with explicit slice
 2. NumPy 2.4+ breaks `_int` cast → downgrade to `numpy<2.4`
 3. Dynamic masking → monkey-patch `create_bidirectional_mask = None`
-
-See [project_audio_conversion.md](../.claude/projects/.../memory/project_audio_conversion.md) for full plan.

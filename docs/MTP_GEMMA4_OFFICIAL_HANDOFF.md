@@ -1,6 +1,6 @@
-# Gemma 4 Official MTP Drafter — Cross-Device Handoff
+# Gemma 4 Official MTP Drafter — plan
 
-**Status:** 2026-05-06. New work, captured for pick-up on another device.
+**Status:** 2026-05-06. New work.
 
 ## TL;DR
 
@@ -128,13 +128,13 @@ At 80 % live accept:
 
 Speedup is gated on actual live acceptance. ≥ 60 % is the floor to be worth shipping. If drafter forward is 8 ms (INT4 fallback worst-case), break-even rises to 56 %.
 
-## Open questions (resolve on next device)
+## Open questions
 
 1. **`gemma4_assistant` MIL compat.** Does the architecture trace cleanly through `coremltools 9` to ANE? The custom model_type may carry non-standard ops needing a converter shim like base Gemma 4.
 2. **Tied embeddings.** If `tie_word_embeddings=true` and the 262 K × hidden embedding is duplicated rather than shared with base, drafter blob bloats. Confirm in config and decide whether to alias the base embedding into the drafter bundle.
 3. **iPhone 11c regression risk.** Mac validated, iPhone never. Possible fp16 drift between verify and decode functions on ANE that doesn't appear on Mac. MTP iPhone bench will surface this.
 
-## First-thing-to-do on the new device
+## First steps
 
 ```bash
 cd <repo>
@@ -168,4 +168,4 @@ If Step 3 passes, drafter quality is verified at the algorithm level. Then proce
 - Prior investigation this supersedes: `docs/MTP_INVESTIGATION_SUMMARY.md`
 - 11c implementation: commit `9840a09` (2026-04-17, "feat(11c): write-after-accept verify protocol — Mac-validated")
 - Speculative survey (2026-04-22): `docs/SPECULATIVE_DECODING_SURVEY.md` — explicitly identified L-MTP as the only credible path
-- Round 8 (2026-04-26): `docs/ROUND8_FINDINGS.md` — drafter excluded by user choice, not because dead
+- Round 8 (2026-04-26): `docs/ROUND8_FINDINGS.md` — drafter excluded by scope choice, not because dead
