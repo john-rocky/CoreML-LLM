@@ -135,7 +135,7 @@ Proj activations cosine sim: 0.542546
 Logit max abs diff: 29.96, mean abs diff: 5.27
 ```
 
-This is consistent with the memory note (`mtp_drafter_conversion`: "Full model = 0.82 (numerical drift from TFLite quantized inference vs fp32)"). It was known going in. **But 0.82 cosine + 0/5 argmax overlap is not enough quality to clear any acceptance check** — the drafter's top-1 is never the target's top-1 with this level of drift.
+This is consistent with the earlier drafter conversion ("Full model = 0.82 (numerical drift from TFLite quantized inference vs fp32)"). It was known going in. **But 0.82 cosine + 0/5 argmax overlap is not enough quality to clear any acceptance check** — the drafter's top-1 is never the target's top-1 with this level of drift.
 
 ### 4.1 Things eliminated as causes
 

@@ -91,8 +91,7 @@ additional K-future signal.**
 
 ## Why the base is MTP-blind
 
-Cross-references prior investigation (`docs/MTP_INVESTIGATION_LITERT.md`,
-`memory: mtp_drafter_conversion`):
+Cross-references prior investigation (`docs/MTP_INVESTIGATION_LITERT.md`):
 
 - LiteRT runs a **4-layer Q-only mini-transformer drafter (hidden = 256,
   44 MB)** that achieves ≈ 65 % per-position accept on Gemma 4 E2B.
@@ -160,16 +159,14 @@ new base in ~10 min wall to determine if MTP-aware signal is present.
 
 - ROUND8 follow-up question "is drafter genuinely dead or just
   empirically un-tried?": **genuinely dead, structurally proven.**
-- `memory: project_drafter_structurally_dead` — augmented with H1 probe
-  in `memory: h1_probe_2026_04_27`.
 
 ## Recommendation for future sessions
 
-`memory: feedback_read_dead_first` already requires reading
+The rule is to read
 `REJECTED_APPROACHES.md` before any speedup proposal. Add `H1 probe`
 to the "do not re-propose" gate for drafter-class items.
 
-`memory: project_direction` (updated 2026-04-27 earlier this session)
+The project direction (updated 2026-04-27 earlier this session)
 correctly reframes "beat LiteRT 56.5" as structurally-impossible for HF
 Gemma 4 E2B without base aux retrain. This probe is the empirical
 backstop for that reframe.
