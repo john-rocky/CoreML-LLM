@@ -33,7 +33,7 @@ SRC_CHUNKS="${SRC_CHUNKS:-/tmp/gemma4-e4b-stateful}"
 # CoreML-LLM workspace already ships every sidecar we need (same names
 # the E2B staging-2k-fast-prefill dir uses). Override via env if you
 # moved the bundle.
-SIDECARS="${SIDECARS:-/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/output/gemma4-e4b/bundle}"
+SIDECARS="${SIDECARS:-$HOME/Downloads/workspace/CoreML-LLM/output/gemma4-e4b/bundle}"
 OUT_PARENT="${OUT_PARENT:-$ROOT/build/gemma4_stateful_e4b}"
 OUT="$OUT_PARENT/gemma4_e2b_stateful_chunks"
 

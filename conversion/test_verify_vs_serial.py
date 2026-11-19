@@ -10,7 +10,7 @@ modified verify path (KV bookkeeping, mask, RoPE, kv13/kv14 sharing).
 
 Usage:
     PYENV_VERSION=lama-cml python conversion/test_verify_vs_serial.py \
-        --hf-dir /Users/majimadaisuke/Downloads/CoreML-LLM/conversion/output/gemma4-e2b-final/hf_model
+        --hf-dir ~/Downloads/CoreML-LLM/conversion/output/gemma4-e2b-final/hf_model
 """
 from __future__ import annotations
 

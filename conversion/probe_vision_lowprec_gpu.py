@@ -28,8 +28,8 @@ from coremltools.models import CompiledMLModel
 
 
 DEFAULT_MODEL = (
-    "/Users/majimadaisuke/Downloads/coreml-llm-artifacts/"
-    "staging-2k-fast-prefill/gemma4-e2b/vision.mlmodelc"
+    str(Path.home() / "Downloads/coreml-llm-artifacts/"
+    "staging-2k-fast-prefill/gemma4-e2b/vision.mlmodelc")
 )
 
 

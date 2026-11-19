@@ -53,7 +53,7 @@ def main():
     }
     H = cfg["hidden"]
     # Load real lm_head weight so logits are meaningful.
-    lm_head_path = Path("/Users/majimadaisuke/Downloads/lm_head_weight.bin")
+    lm_head_path = Path.home() / "Downloads/lm_head_weight.bin"
     if lm_head_path.exists():
         lm_head_np = np.fromfile(lm_head_path, dtype=np.float16).reshape(cfg["vocab"], H)
         lm_head_weight = torch.from_numpy(lm_head_np.copy())

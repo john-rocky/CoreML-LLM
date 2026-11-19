@@ -29,9 +29,9 @@ import torch
 from safetensors import safe_open
 
 
-HF_MODEL = "/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/output/gemma4-e2b/hf_model/model.safetensors"
-PROD_INT8 = "/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/build/gemma4_stateful_ab/linear/gemma4_e2b_stateful_chunks/embed_tokens_per_layer_q8.bin"
-PROD_SCALES = "/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/build/gemma4_stateful_ab/linear/gemma4_e2b_stateful_chunks/embed_tokens_per_layer_scales.bin"
+HF_MODEL = os.path.expanduser("~/Downloads/workspace/CoreML-LLM/output/gemma4-e2b/hf_model/model.safetensors")
+PROD_INT8 = os.path.expanduser("~/Downloads/workspace/CoreML-LLM/build/gemma4_stateful_ab/linear/gemma4_e2b_stateful_chunks/embed_tokens_per_layer_q8.bin")
+PROD_SCALES = os.path.expanduser("~/Downloads/workspace/CoreML-LLM/build/gemma4_stateful_ab/linear/gemma4_e2b_stateful_chunks/embed_tokens_per_layer_scales.bin")
 PLE_KEY = "model.language_model.embed_tokens_per_layer.weight"
 
 

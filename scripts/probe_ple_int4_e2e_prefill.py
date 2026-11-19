@@ -33,8 +33,8 @@ import coremltools as ct
 from safetensors import safe_open
 
 
-BUNDLE = Path("/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/build/gemma4_stateful_ab/linear/gemma4_e2b_stateful_chunks")
-HF_MODEL = "/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/output/gemma4-e2b/hf_model/model.safetensors"
+BUNDLE = Path.home() / "Downloads/workspace/CoreML-LLM/build/gemma4_stateful_ab/linear/gemma4_e2b_stateful_chunks"
+HF_MODEL = str(Path.home() / "Downloads/workspace/CoreML-LLM/output/gemma4-e2b/hf_model/model.safetensors")
 
 VOCAB = 262_144
 HIDDEN = 1536

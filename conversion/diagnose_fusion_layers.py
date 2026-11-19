@@ -75,8 +75,8 @@ NUM_LAYERS = 35
 HIDDEN = 1536
 DEFAULT_MODEL_ID = "google/gemma-4-E2B-it"
 DEFAULT_SNAPSHOT_DIR = (
-    "/Users/majimadaisuke/.cache/huggingface/hub/"
-    "models--google--gemma-4-E2B-it/snapshots"
+    str(Path.home() / ".cache/huggingface/hub/"
+    "models--google--gemma-4-E2B-it/snapshots")
 )
 
 

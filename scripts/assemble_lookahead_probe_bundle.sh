@@ -9,9 +9,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BASELINE_SRC="/Users/majimadaisuke/Downloads/coreml-llm-artifacts/backup-iphone-2k"
+BASELINE_SRC="$HOME/Downloads/coreml-llm-artifacts/backup-iphone-2k"
 K8_CHUNKS="${REPO_ROOT}/output/gemma4-e2b/chunks-k8"
-DEST="/Users/majimadaisuke/Downloads/device_deploy_lookahead_probe"
+DEST="$HOME/Downloads/device_deploy_lookahead_probe"
 
 if [[ ! -d "$BASELINE_SRC" ]]; then
   echo "ERROR: baseline missing: $BASELINE_SRC" >&2

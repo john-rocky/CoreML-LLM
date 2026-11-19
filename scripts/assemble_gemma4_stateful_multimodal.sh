@@ -67,16 +67,16 @@ SRC_PREFILL_T288="${SRC_PREFILL_T288:-/tmp/$MODEL-singlefunc-prefill-T288}"
 # defaults to the iphone_8k staging dir; E4B defaults to its own legacy
 # bundle (text-only — vision/audio come from ENCODERS below).
 if [[ "$MODEL" == "gemma4-e2b" ]]; then
-    SIDECARS="${SIDECARS:-/Users/majimadaisuke/Downloads/CoreML-LLM/conversion/output/iphone_8k}"
+    SIDECARS="${SIDECARS:-$HOME/Downloads/CoreML-LLM/conversion/output/iphone_8k}"
 else
-    SIDECARS="${SIDECARS:-/Users/majimadaisuke/Downloads/CoreML-LLM/output/$MODEL/bundle}"
+    SIDECARS="${SIDECARS:-$HOME/Downloads/CoreML-LLM/output/$MODEL/bundle}"
 fi
 # Multimodal encoders + audio sidecars. Shared between E2B and E4B (same
 # SigLIP + Conformer regardless of LM size).
-ENCODERS="${ENCODERS:-/Users/majimadaisuke/Downloads/CoreML-LLM/conversion/output/iphone_8k}"
+ENCODERS="${ENCODERS:-$HOME/Downloads/CoreML-LLM/conversion/output/iphone_8k}"
 # mel_filterbank.bin lives in a separate dir in some build trees; the
 # script falls back to this path if it's not under ENCODERS.
-MEL_FALLBACK="${MEL_FALLBACK:-/Users/majimadaisuke/Downloads/CoreML-LLM/conversion/output/audio}"
+MEL_FALLBACK="${MEL_FALLBACK:-$HOME/Downloads/CoreML-LLM/conversion/output/audio}"
 
 OUT_PARENT="${OUT_PARENT:-$ROOT/build/gemma4_stateful_multimodal_$SHORT}"
 OUT="$OUT_PARENT/gemma4_e2b_stateful_chunks"

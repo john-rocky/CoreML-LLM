@@ -15,7 +15,7 @@
 # Sources (must already exist):
 #   /tmp/g4_chunk1_ab/conv/chunk_{1..4}.mlmodelc       (Conv2d-1×1 wrapper)
 #   /tmp/g4_chunk1_ab/linear/chunk_{1..4}.mlmodelc     (nn.Linear native)
-#   /Users/majimadaisuke/Downloads/coreml-llm-artifacts/staging-2k-fast-prefill/gemma4-e2b/
+#   ~/Downloads/coreml-llm-artifacts/staging-2k-fast-prefill/gemma4-e2b/
 #     (sidecars)
 #
 # Push to iPhone:
@@ -34,7 +34,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_BASE="/tmp/g4_chunk1_ab"
-STAGING="/Users/majimadaisuke/Downloads/coreml-llm-artifacts/staging-2k-fast-prefill/gemma4-e2b"
+STAGING="$HOME/Downloads/coreml-llm-artifacts/staging-2k-fast-prefill/gemma4-e2b"
 OUT_BASE="$ROOT/build/gemma4_stateful_ab"
 
 # Sidecar files copied into both A and B bundles unchanged.

@@ -25,8 +25,8 @@ from safetensors import safe_open
 
 
 # Paths
-BUNDLE = Path("/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/build/gemma4_stateful_ab/linear/gemma4_e2b_stateful_chunks")
-HF_MODEL = "/Users/majimadaisuke/Downloads/workspace/CoreML-LLM/output/gemma4-e2b/hf_model/model.safetensors"
+BUNDLE = Path.home() / "Downloads/workspace/CoreML-LLM/build/gemma4_stateful_ab/linear/gemma4_e2b_stateful_chunks"
+HF_MODEL = os.path.expanduser("~/Downloads/workspace/CoreML-LLM/output/gemma4-e2b/hf_model/model.safetensors")
 
 # Architecture (per build_gemma4_e2b_stateful_chunks.py + LITERT_CONTAINER_ANALYSIS.md)
 VOCAB = 262_144
